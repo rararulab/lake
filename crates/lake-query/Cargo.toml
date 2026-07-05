@@ -9,13 +9,17 @@ publish.workspace = true
 description = "Stateless query-layer server: Flight SQL over the lake catalog"
 
 [dependencies]
+arrow-flight = { workspace = true }
 async-trait = { workspace = true }
 datafusion = { workspace = true }
+futures = { workspace = true }
 lake-catalog = { workspace = true }
 lake-engine = { workspace = true }
 lake-meta = { workspace = true }
+prost = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true }
+tonic = { workspace = true }
 tracing = { workspace = true }
 
 [lints]

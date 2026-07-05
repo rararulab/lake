@@ -10,6 +10,8 @@ description = "HA KV metastore: MetaStore trait, table registry, version pointer
 
 [dependencies]
 async-trait = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-dynamodb = { workspace = true }
 lake-common = { workspace = true }
 rocksdb = { workspace = true }
 serde = { workspace = true }

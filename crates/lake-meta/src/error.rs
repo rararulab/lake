@@ -36,6 +36,12 @@ pub enum MetaError {
 
     #[snafu(display("registry conflict on '{table}': entry moved under us"))]
     Conflict { table: String },
+
+    #[snafu(display("dynamodb {message}"))]
+    Dynamo {
+        message: String,
+        source:  Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, MetaError>;

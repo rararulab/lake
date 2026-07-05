@@ -20,16 +20,21 @@
 //! scale it by running many instances behind a load balancer. It caches the
 //! catalog and refreshes on demand, shielding the metadata authority.
 //!
-//! ponytail: v0 exposes an in-process `execute_sql`; the Arrow Flight SQL
-//! wire surface (`serve`) is a v1 skeleton.
+//! `execute_sql` runs SQL in-process; [`serve`] exposes the same engine over
+//! the Arrow Flight SQL wire (see [`flight`]).
+
+mod flight;
 
 use std::sync::Arc;
 
+use arrow_flight::flight_service_server::FlightServiceServer;
 use datafusion::{arrow::array::RecordBatch, error::DataFusionError, prelude::SessionContext};
 use lake_catalog::LakeCatalog;
 use lake_engine::TableEngineRef;
 use lake_meta::MetaStoreRef;
 use snafu::{ResultExt, Snafu};
+
+use crate::flight::FlightSqlServiceImpl;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -39,6 +44,15 @@ pub enum QueryError {
 
     #[snafu(display("query execution failed"))]
     Execute { source: DataFusionError },
+
+    #[snafu(display("invalid listen address {addr:?}"))]
+    Address {
+        addr:   String,
+        source: std::net::AddrParseError,
+    },
+
+    #[snafu(display("Flight SQL server failed"))]
+    Serve { source: tonic::transport::Error },
 }
 
 pub type Result<T> = std::result::Result<T, QueryError>;
@@ -72,13 +86,20 @@ impl QueryEngine {
     pub fn context(&self) -> &SessionContext { &self.ctx }
 }
 
-/// Run the query server. ponytail: v0 has no Flight SQL wire — this holds a
-/// warmed engine alive so the process form exists; the Arrow Flight SQL
-/// endpoint lands in v1.
+/// Run the Arrow Flight SQL server, serving SQL from `engine` over `addr`.
+///
+/// Warms the catalog, then binds a tonic server exposing the Flight SQL
+/// statement path. Runs until the server stops or the process is killed.
 pub async fn serve(engine: Arc<QueryEngine>, addr: &str) -> Result<()> {
     engine.refresh().await?;
-    tracing::info!(%addr, "query server ready (in-process execute_sql; Flight SQL wire is v1)");
-    // ponytail: replace with an arrow-flight FlightSqlService in v1.
-    std::future::pending::<()>().await;
-    Ok(())
+
+    let socket = addr.parse().context(AddressSnafu { addr })?;
+    let service = FlightServiceServer::new(FlightSqlServiceImpl { engine });
+
+    tracing::info!(%addr, "Flight SQL server ready");
+    tonic::transport::Server::builder()
+        .add_service(service)
+        .serve(socket)
+        .await
+        .context(ServeSnafu)
 }

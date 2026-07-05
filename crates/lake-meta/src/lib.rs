@@ -23,11 +23,13 @@
 //! conditional puts) is v1 — see `docs/architecture.md`; the trait is the
 //! seam it will slot into.
 
+mod dynamo;
 mod error;
 pub mod registry;
 mod rocks;
 mod store;
 
+pub use dynamo::DynamoMeta;
 pub use error::{MetaError, Result};
 pub use rocks::RocksMeta;
 pub use store::{MetaStore, MetaStoreRef};

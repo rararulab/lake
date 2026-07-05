@@ -24,6 +24,12 @@
 //! in-process API. The gRPC wire surface and lease-in-KV election are v1/v2
 //! — the authority logic here is what they will wrap.
 
+//! [`election`] adds the lease-in-KV leader election that gives this tier HA
+//! (leader + standby) over the [`MetaStore`](lake_meta::MetaStore) CAS
+//! primitive — no self-built consensus.
+
+pub mod election;
+
 use std::sync::Arc;
 
 use datafusion::{arrow::datatypes::SchemaRef, execution::SendableRecordBatchStream};
