@@ -1,0 +1,62 @@
+# https://doc.rust-lang.org/clippy/configuration.html
+
+# unwrap()/print! stay legal inside #[test] fns and #[cfg(test)] modules;
+# the workspace-level unwrap_used / print_stdout lints (#2174) only bite
+# non-test code.
+allow-unwrap-in-tests = true
+allow-print-in-tests = true
+
+allowed-wildcard-imports = ["prelude"]
+too-many-arguments-threshold = 10
+max-struct-bools = 4
+too-many-lines-threshold = 150
+type-complexity-threshold = 300
+
+doc-valid-idents = [
+    "gRPC",
+    "OpenTelemetry", 
+    "GitHub",
+    "WebSocket",
+    "PostgreSQL",
+    "MySQL",
+    "SQLite",
+    "Redis",
+    "Kafka",
+    "RabbitMQ",
+    "OAuth",
+    "JSON",
+    "YAML",
+    "TOML",
+    "UTF-8",
+    "ASCII",
+    "UUID",
+    "URI",
+    "URL",
+    "HTTP",
+    "HTTPS",
+    "TCP",
+    "UDP",
+    "TLS",
+    "SSL",
+    "API",
+    "REST",
+    "RPC",
+    "CLI",
+    "CPU",
+    "GPU",
+    "I/O",
+    "mmap",
+    "CRC",
+    "CRC32",
+    "CRC64",
+    "LRU",
+    "FIFO",
+    "LIFO",
+    "async/await",
+    "Tokio",
+    "Serde",
+    "Axum",
+    "Tonic",
+]
+
+msrv = "1.92"
