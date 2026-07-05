@@ -16,5 +16,8 @@ Closes #N
 - **Breaking changes** use `!`: `feat(manifest)!: change manifest schema version field`
 - Include `(#N)` issue reference in commit subject
 - Include `Closes #N` in commit body
-- A local `commit-msg` hook (`scripts/check-conventional-commit.sh`) enforces this — do NOT bypass it
+- jj fires no git hooks, so nothing checks the message at commit time — the grammar is enforced by
+  CI (`bun scripts/check-conventional-commit.ts --range`) and by the reviewer. Write it right the
+  first time
 - Do NOT use free-form commit messages like `"update code"` or `"fix stuff"` — they will be rejected
+  in CI

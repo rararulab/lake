@@ -19,12 +19,16 @@ test function** that fails before the change and passes after. Examples:
 
 Lane 1 flow:
 
-1. `spec-author` writes `specs/issue-N-<slug>.spec.md` inheriting `project`.
+1. `spec-author` scaffolds with `mise run spec-init <slug>`, writes
+   `specs/issue-N-<slug>.spec.md` inheriting `project`, and lints it with
+   `mise run spec-lint` (min-score 0.7).
 2. `spec-author` creates the GitHub issue, referencing the spec file.
-3. `implementer` reads the spec, implements, runs the quality gate
-   locally, commits inside the worktree, **does not push**.
-4. `reviewer` reads the worktree diff plus the spec; verifies the BDD
-   scenarios pass; produces a verdict.
+3. `implementer` reads the spec, implements, runs `mise run spec-lifecycle
+   <spec>` plus the quality gate locally, commits inside the workspace,
+   **does not push**.
+4. `reviewer` reads the workspace diff plus the spec; re-runs
+   `mise run spec-lifecycle` and verifies the BDD scenarios pass; produces a
+   verdict.
 5. On APPROVE: implementer pushes, opens the PR, watches CI, merges.
 
 ### Lane 2 — Lightweight chore (structural, cleanup, CI, rename, config)
@@ -45,7 +49,7 @@ Lane 2 flow:
    minus BDD scenarios. No `specs/*.spec.md` file is created.
 2. `implementer` reads the issue, implements, runs `cargo check` /
    `prek run --all-files`, commits, **does not push**.
-3. `reviewer` reads the worktree diff plus the issue body.
+3. `reviewer` reads the workspace diff plus the issue body.
 4. On APPROVE: implementer pushes, opens the PR, watches CI, merges.
 
 ## How spec-author chooses the lane
@@ -58,3 +62,21 @@ to a real test function that meaningfully verifies the outcome?"**
 
 If unsure, lane 2 — err on the side of less overhead. Lane 1's value is the
 BDD binding; a spec without a real test binding is ceremony.
+
+## Tooling
+
+The lane-1 gate is [`agent-spec`](https://github.com/ZhangHanDong/agent-spec)
+(pinned in `mise.toml`), wrapped by mise run recipes:
+
+- `mise run spec-init <slug>` — scaffold a task spec.
+- `mise run spec-lint <spec>` — lint, min-score 0.7.
+- `mise run spec-lifecycle <spec>` — lint + verify + report against the
+  current workspace, routed through `scripts/spec-lifecycle-guard.ts`:
+  a `Test:` selector that resolves to **zero** tests is a FAIL even when
+  agent-spec itself reports green (upstream false-green,
+  https://github.com/ZhangHanDong/agent-spec/issues/4).
+- `mise run spec-selftest` — regression lock: the gate must REJECT
+  `specs/fixtures/zero-match.spec.md`. If it passes, the false-green is
+  back.
+
+Every lane-1 `Test:` selector must resolve to >= 1 real test function.

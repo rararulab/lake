@@ -2,8 +2,7 @@
 
 ## Style Direction
 
-Write Rust in the style region defined by BurntSushi, dtolnay, and Niko Matsakis (see CLAUDE.md
-for what to take from each). This means: functional-first, iterator chains over imperative loops,
+Write Rust in the style region defined by BurntSushi, dtolnay, and Niko Matsakis. This means: functional-first, iterator chains over imperative loops,
 combinators on Option/Result for simple transforms, `match` for complex branching, immutable by
 default, early returns with `?` to keep the happy path flat.
 
@@ -16,11 +15,12 @@ These are zero-ambiguity rules — not style preferences, but mechanical require
 
 ### Error Handling
 - `snafu` exclusively in domain code — never `thiserror` or manual `impl Error`
-- `anyhow` allowed only at the application boundary (`main.rs`)
+- `anyhow` allowed only at the application boundary (`crates/lake-cli`)
 - Error enum pattern: `#[derive(Debug, Snafu)]` + `#[snafu(visibility(pub))]`
-- Naming: `LakeError` (in `src/error.rs`), variants use `#[snafu(display("..."))]`
+- Naming: per-crate `{CrateName}Error` enums (`MetaError` in `lake-meta`, `ManifestError` in
+  `lake-manifest`), variants use `#[snafu(display("..."))]`
 - Propagation: `.context(XxxSnafu)?` or `.whatever_context("msg")?`
-- Project-wide alias: `pub type Result<T> = std::result::Result<T, LakeError>`
+- Per-crate alias: each crate defines `pub type Result<T> = std::result::Result<T, {CrateName}Error>`
 
 ### Struct Construction — `bon::Builder`
 - 3+ fields: `#[derive(bon::Builder)]` — no manual `fn new()` constructors

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Error types for the lake crate.
+//! Error types for manifests and the commit protocol.
 
 use std::path::PathBuf;
 
@@ -20,21 +20,18 @@ use snafu::Snafu;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
-pub enum LakeError {
-    #[snafu(display("metastore operation failed on key '{key}'"))]
-    Meta {
-        key:    String,
-        source: rocksdb::Error,
-    },
+pub enum ManifestError {
+    #[snafu(display("metastore access failed"))]
+    Meta { source: lake_meta::MetaError },
 
     #[snafu(display("manifest I/O failed at {}", path.display()))]
-    ManifestIo {
+    Io {
         path:   PathBuf,
         source: std::io::Error,
     },
 
     #[snafu(display("manifest encode/decode failed at {}", path.display()))]
-    ManifestCodec {
+    Codec {
         path:   PathBuf,
         source: serde_json::Error,
     },
@@ -45,10 +42,10 @@ pub enum LakeError {
     #[snafu(display(
         "manifest v{version} for table '{table}' already exists (concurrent writer?)"
     ))]
-    ManifestExists { table: String, version: u64 },
+    Exists { table: String, version: u64 },
 
     #[snafu(display("commit conflict on table '{table}': version pointer moved"))]
     CommitConflict { table: String },
 }
 
-pub type Result<T> = std::result::Result<T, LakeError>;
+pub type Result<T> = std::result::Result<T, ManifestError>;

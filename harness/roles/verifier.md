@@ -23,7 +23,7 @@ its own.
 
 ## Inputs the parent must provide
 
-- **Worktree path** (e.g. `.worktrees/issue-42-foo`).
+- **Workspace path** (e.g. `.worktrees/issue-42-foo`).
 - **Issue number** (so you can `gh issue view <N>`).
 - **Lane**: `1` (spec-driven) or `2` (lightweight chore).
 - **Spec path** (lane 1): `specs/issue-N-<slug>.spec.md` — or, for
@@ -40,13 +40,13 @@ see it.
 - **Fresh context is structural, not honorary.** Do not read the
   implementer's hand-off report. Derive what to verify from the issue
   / spec alone.
-- **Cold boot, never stale state.** The `cargo run` self-check reads
-  and writes `./data` relative to the worktree. Delete or relocate the
-  worktree's `data/` directory before booting so nothing from a
-  previous run (a leftover RocksDB, stale manifests, an old pointer)
-  can fake a pass. Never verify against a `data/` dir another process
-  is using.
-- **Clean state.** Re-run the quality gate yourself from the worktree
+- **Cold boot, never stale state.** The `mise run e2e` self-check
+  (`cargo run -p lake-cli`) reads and writes `./data` relative to the
+  workspace. Delete or relocate the workspace's `data/` directory before
+  booting so nothing from a previous run (a leftover RocksDB, stale
+  manifests, an old pointer) can fake a pass. Never verify against a
+  `data/` dir another process is using.
+- **Clean state.** Re-run the quality gate yourself from the workspace
   as it stands. "It passed for the implementer" is `self_check_only`.
 - **Read-only on the diff.** You never edit code, amend commits, or
   fix what you find. FAIL findings go back to the implementer as a
@@ -59,21 +59,23 @@ see it.
 ### (a) Re-run the full quality gate from clean state
 
 ```bash
-git -C <worktree> status --short          # must be clean (committed work only)
-prek run --all-files                      # in the worktree
-cargo test --all-targets                  # in the worktree
+jj st                                     # in the workspace — must be clean (committed work only)
+mise run gate                             # hooks + cargo test --workspace --all-targets + e2e
 ```
 
-Record `base_sha` (`git -C <worktree> merge-base HEAD origin/main`)
-and `head_sha` (`git -C <worktree> rev-parse HEAD`) now — the report
-pins both.
+Record `base_sha` (`git -C <workspace> merge-base HEAD origin/main`)
+and `head_sha` (`git -C <workspace> rev-parse HEAD`) now — the report
+pins both (read-only git works; the repo is colocated).
 
 ### (b) Run the spec's or issue's own verification
 
-- Lane 1: run **every** command in the spec's `Acceptance Criteria`
-  (including each `Test:` selector via `cargo test <name>`) verbatim
-  and capture raw output. Every criterion must produce its stated
-  result — no skips, no "close enough".
+- Lane 1: re-run `mise run spec-lifecycle <spec>` yourself from clean
+  state (zero-match guarded via `scripts/spec-lifecycle-guard.ts` — a
+  `Test:` selector matching zero tests is a FAIL even if agent-spec
+  reports green). Then run **every** command in the spec's `Acceptance
+  Criteria` (including each `Test:` selector via `cargo test <name>`)
+  verbatim and capture raw output. Every criterion must produce its
+  stated result — no skips, no "close enough".
 - Lane 2: run each command in the issue's `Verify:` section verbatim
   and capture raw output.
 
@@ -85,9 +87,9 @@ real system from the candidate build and drive the changed path the
 way a user would:
 
 ```bash
-# in the worktree — fresh state, never a reused data dir
-rm -rf <worktree>/data
-cargo run                                 # ingest -> commit -> SQL query
+# in the workspace — fresh state, never a reused data dir
+rm -rf <workspace>/data
+cargo run -p lake-cli                     # ingest -> commit -> SQL query (mise run e2e)
 ```
 
 Then exercise the changed feature end-to-end: read the self-check
@@ -120,7 +122,7 @@ must land as a regression test before the repair round closes.
 
 ### (e) Write the report
 
-Write `verification/report.md` **in the worktree**, with this schema:
+Write `verification/report.md` **in the workspace**, with this schema:
 
 ```markdown
 # Verification report — issue #N
@@ -173,12 +175,12 @@ is FAIL — there is no "PASS with caveats".
   `self_check_only` by definition, not by quality.
 - Do NOT edit code, fix findings, or commit anything except
   `verification/report.md` artifacts the parent asks you to leave in
-  the worktree.
+  the workspace.
 - Do NOT reuse a stale `data/` dir, a shared RocksDB instance, or
   another checkout's state for the cold boot.
 - Do NOT emit PASS on partial verification ("gate green, boot skipped
   for time"). Skipping a step that applies means FAIL or an explicit
   escalation, never a silent pass.
-- Do NOT verify against `main` — you verify the worktree's candidate
-  build at `head_sha`, pinned against `base_sha`. If the branch moved
+- Do NOT verify against `main` — you verify the workspace's candidate
+  build at `head_sha`, pinned against `base_sha`. If the work moved
   under you (rebase), start over.

@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! DataFusion catalog backed by the KV metastore. Table resolution: KV
-//! version pointer -> immutable manifest -> parquet file list.
+//! Schema provider: resolves table names through the metastore.
 
 use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
-    catalog::{CatalogProvider, SchemaProvider},
+    catalog::SchemaProvider,
     datasource::{
         TableProvider,
         file_format::parquet::ParquetFormat,
@@ -28,39 +27,23 @@ use datafusion::{
     error::{DataFusionError, Result as DfResult},
     execution::session_state::{SessionState, SessionStateBuilder},
 };
-
-use crate::{manifest, meta::MetaStoreRef};
-
-#[derive(Debug)]
-pub struct LakeCatalog {
-    schema: Arc<LakeSchema>,
-}
-
-impl LakeCatalog {
-    pub fn new(meta: MetaStoreRef, table_root: PathBuf) -> Self {
-        Self {
-            schema: Arc::new(LakeSchema {
-                meta,
-                table_root,
-                state: SessionStateBuilder::new().with_default_features().build(),
-            }),
-        }
-    }
-}
-
-impl CatalogProvider for LakeCatalog {
-    fn schema_names(&self) -> Vec<String> { vec!["public".to_string()] }
-
-    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        (name == "public").then(|| self.schema.clone() as _)
-    }
-}
+use lake_meta::MetaStoreRef;
 
 pub struct LakeSchema {
     meta:       MetaStoreRef,
     table_root: PathBuf,
     /// Only used for parquet schema inference.
     state:      SessionState,
+}
+
+impl LakeSchema {
+    pub(crate) fn new(meta: MetaStoreRef, table_root: PathBuf) -> Self {
+        Self {
+            meta,
+            table_root,
+            state: SessionStateBuilder::new().with_default_features().build(),
+        }
+    }
 }
 
 impl std::fmt::Debug for LakeSchema {
@@ -73,11 +56,18 @@ impl std::fmt::Debug for LakeSchema {
 
 #[async_trait]
 impl SchemaProvider for LakeSchema {
-    fn table_names(&self) -> Vec<String> { self.meta.list_prefix("ptr/").unwrap_or_default() }
+    fn table_names(&self) -> Vec<String> {
+        // ponytail: DataFusion's trait method is sync; block_on is safe here
+        // because RocksMeta futures are ready immediately. Revisit with a
+        // cached table list when the DynamoDB (network-bound) backend lands.
+        futures::executor::block_on(self.meta.list_prefix("ptr/")).unwrap_or_default()
+    }
 
     async fn table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
-        let Some(manifest) = manifest::load_current(self.meta.as_ref(), &self.table_root, name)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?
+        let Some(manifest) =
+            lake_manifest::load_current(self.meta.as_ref(), &self.table_root, name)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
         else {
             return Ok(None);
         };
@@ -98,8 +88,8 @@ impl SchemaProvider for LakeSchema {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.meta
-            .get(&format!("ptr/{name}"))
+        // ponytail: see table_names — same sync-trait bridge.
+        futures::executor::block_on(self.meta.get(&format!("ptr/{name}")))
             .ok()
             .flatten()
             .is_some()

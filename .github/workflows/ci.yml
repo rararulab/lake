@@ -45,7 +45,23 @@ jobs:
         run: env RUSTDOCFLAGS="-D warnings" cargo +nightly doc --no-deps --document-private-items
 
       - name: test
-        run: cargo test --all-targets
+        run: cargo test --workspace --all-targets
 
       - name: e2e self-check
-        run: cargo run
+        run: cargo run -p lake-cli
+
+  # jj fires no git hooks locally, so Conventional Commits are enforced here.
+  commits:
+    name: Conventional Commits
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: check commit messages
+        run: bun scripts/check-conventional-commit.ts --range "origin/${{ github.base_ref }}..HEAD"

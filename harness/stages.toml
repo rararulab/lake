@@ -23,19 +23,19 @@ produces = "acknowledged plan (issue set + lane); auto-chaining unlocked"
 check = "user filed / acknowledged the task"
 
 [stages.implement] # S2
-requires = ["issue", "worktree .worktrees/issue-N-<slug>", "spec (lane 1)"]
+requires = ["issue", "jj workspace .worktrees/issue-N-<slug>", "spec (lane 1)"]
 role = "harness/roles/implementer.md"
 produces = "local commits + self-check evidence (score_authority: self_check_only)"
-check = "quality gate green (prek run --all-files + cargo test --all-targets + cargo run); lane 1: every acceptance criterion executed"
+check = "quality gate green (mise run gate: hooks + cargo test --workspace --all-targets + e2e); lane 1: mise run spec-lifecycle <spec> green + every acceptance criterion executed"
 
 [stages.verify] # S3
-requires = ["worktree", "issue number", "spec or issue Verify: commands"] # NO implementer context
+requires = ["workspace", "issue number", "spec or issue Verify: commands"] # NO implementer context
 role = "harness/roles/verifier.md"
 produces = "verification/report.md (score_authority: verifier) with PASS/FAIL verdict"
-check = "test -f <worktree>/verification/report.md && verdict is PASS; pass_to_fail == 0"
+check = "test -f <workspace>/verification/report.md && verdict is PASS; pass_to_fail == 0"
 
 [stages.review] # S4
-requires = ["worktree diff vs origin/main", "spec or issue", "verification report"]
+requires = ["workspace diff vs origin/main", "spec or issue", "verification report"]
 role = "harness/roles/reviewer.md"
 produces = "verdict APPROVE / REQUEST_CHANGES with P0–P3 findings"
 check = "APPROVE with no P0/P1 findings remaining"
@@ -43,17 +43,17 @@ check = "APPROVE with no P0/P1 findings remaining"
 [stages.ship] # S5
 requires = ["reviewer APPROVE", "verifier PASS"]
 role = "harness/roles/implementer.md"
-produces = "pushed branch + PR (verification report path in body) + green required checks"
+produces = "pushed bookmark + PR (verification report path in body) + green required checks"
 check = "gh pr checks <PR> --watch"
 
 [stages.merge] # S6 — human gate; never automated
 requires = ["PR with green required checks"]
 role = "human"
-produces = "squash-merged commit on main + worktree/branch cleanup"
+produces = "squash-merged commit on main + workspace/bookmark cleanup (jj workspace forget + delete dir)"
 check = "gh pr merge <PR> --squash --delete-branch, after explicit user confirmation"
 
 [stages.retro] # S7 — not yet automated
 requires = ["merged PR", "verification report"]
 role = "human"
-produces = "regression tests from failed probes; lessons folded into CLAUDE.md"
+produces = "regression tests from failed probes; lessons folded into docs/architecture.md and docs/guides/*"
 check = "none (manual)"

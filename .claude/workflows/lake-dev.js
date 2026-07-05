@@ -9,7 +9,8 @@
 // orchestrates. Each agent() call dispatches the corresponding agentType, so
 // there is no prompt duplication: spec-author / implementer / verifier /
 // reviewer are the single source of truth. Lake has ONE implementer lane
-// (single-crate Rust project — no backend/frontend variants).
+// (Rust workspace: crates/lake-meta, lake-manifest, lake-catalog, lake-cli —
+// no backend/frontend variants).
 //
 // HARD BOUNDARY: a Workflow runs headless in the background and cannot pause to
 // ask the user anything. lake's merge-to-main is gate (a) — a human gate — so
@@ -22,14 +23,14 @@
 // a child of the CLI session and is killed with it): if a run dies mid-flight,
 // relaunch with Workflow({ scriptPath, resumeFromRunId }). Completed agent() calls
 // (e.g. spec-author) return cached results; the interrupted stage re-runs. The
-// implement stage is idempotent (it reuses an existing worktree), so resume is safe.
+// implement stage is idempotent (it reuses an existing workspace), so resume is safe.
 
 export const meta = {
   name: 'lake-dev',
   description: "lake deterministic dev workflow: spec -> fan-out -> implement -> verify -> review-loop -> push -> PR -> CI green (stops before merge gate)",
   phases: [
-    { title: 'Spec', detail: 'spec-author gates against goal.md + CLAUDE.md Architecture Invariants, prior-art search, splits into independent issues' },
-    { title: 'Implement', detail: 'one implementer per issue: worktree + code + quality gate + local commit' },
+    { title: 'Spec', detail: 'spec-author gates against goal.md + docs/architecture.md invariants, prior-art search, splits into independent issues' },
+    { title: 'Implement', detail: 'one implementer per issue: jj workspace + code + quality gate (mise run gate) + local commit' },
     { title: 'Verify', detail: 'fresh-context verifier (S3, harness/roles/verifier.md): clean-state gate + cold boot + hostile probes; FAIL -> one repair round -> escalate' },
     { title: 'Review', detail: 'reviewer <-> implementer loop until APPROVE (max 3 rounds), before push; fix commits invalidate the verify verdict and trigger a one-shot re-verify' },
     { title: 'Ship', detail: 'push + gh pr create (verification report path in PR body) + gh pr checks --watch (real CI gate); stops before merge' },
@@ -63,8 +64,8 @@ if (!['watch', 'signoff', 'skip'].includes(CI_MODE)) {
 if (CI_MODE === 'signoff') {
   log('⚠️  CI_MODE=signoff — EMERGENCY OVERRIDE. Real CI (gh pr checks --watch) is being bypassed; ' +
       'this is only valid during a GitHub-hosted runner outage with branch protection flipped to ' +
-      '["signoff"]. If CI is healthy, drop the ci arg and use watch. Note: lake is a single crate, ' +
-      'so the local quality gate already covers the full CI test scope.')
+      '["signoff"]. If CI is healthy, drop the ci arg and use watch. Note: lake has a single Rust ' +
+      'lane, so the local quality gate (mise run gate) already covers the full CI test scope.')
 }
 if (CI_MODE === 'skip') {
   log('⚠️  CI_MODE=skip — NO GitHub-level gate at all (no CI watch, no signoff). The implement-stage ' +
@@ -89,7 +90,7 @@ const PLAN_SCHEMA = {
         properties: {
           issueNumber: { type: 'integer', description: 'The GitHub issue number actually filed.' },
           title: { type: 'string' },
-          slug: { type: 'string', description: 'kebab-case short name for worktree/branch (issue-N-<slug>).' },
+          slug: { type: 'string', description: 'kebab-case short name for workspace/bookmark (issue-N-<slug>).' },
           lane: { type: 'string', enum: ['lane-1', 'lane-2'] },
           specPath: { type: ['string', 'null'], description: 'specs/issue-N-<slug>.spec.md for lane-1, null for lane-2.' },
           allowedPaths: { type: 'array', items: { type: 'string' }, description: 'Glob roots the implementer may touch.' },
@@ -105,7 +106,7 @@ const IMPL_SCHEMA = {
   required: ['committed', 'worktreePath', 'commits', 'outcome'],
   properties: {
     committed: { type: 'boolean', description: 'true only if the quality gate passed and a local commit exists.' },
-    worktreePath: { type: 'string', description: 'Absolute or repo-relative .worktrees/issue-N-<slug> path.' },
+    worktreePath: { type: 'string', description: 'Absolute or repo-relative .worktrees/issue-N-<slug> workspace path.' },
     commits: { type: 'array', items: { type: 'string' }, description: 'Local commit SHAs (not pushed).' },
     outcome: { type: 'string', description: 'Concrete outcome verification — evidence the change works, not a restatement.' },
     blockers: { type: 'string', description: 'Why committed=false, if applicable. Empty otherwise.' },
@@ -118,7 +119,7 @@ const VERIFY_SCHEMA = {
   required: ['verdict', 'reportPath', 'baseSha', 'headSha', 'summary'],
   properties: {
     verdict: { type: 'string', enum: ['PASS', 'FAIL'], description: 'PASS only if gate green from clean state, spec scenarios / Verify commands green, end-to-end drive observed, pass_to_fail == 0.' },
-    reportPath: { type: 'string', description: 'Path to verification/report.md inside the worktree.' },
+    reportPath: { type: 'string', description: 'Path to verification/report.md inside the workspace.' },
     baseSha: { type: 'string', description: 'merge-base with origin/main at verification time.' },
     headSha: { type: 'string', description: 'Worktree HEAD the verdict binds to. A new commit invalidates the verdict.' },
     summary: { type: 'string', description: 'One-paragraph verdict rationale. On FAIL: the failing commands / probe inputs, verbatim.' },
@@ -163,12 +164,14 @@ const SHIP_SCHEMA = {
 
 // ---- helpers --------------------------------------------------------------
 
-// Lake is a single crate with a single implementer lane — no variant dispatch.
-// The quality gate is uniform: prek (cargo check / fmt --check / clippy -D
-// warnings / doc -D warnings) + full test suite + the end-to-end self-check.
-// This matches CI scope exactly (.github/workflows/ci.yml `Check` job), so no
-// widening is needed in signoff mode.
-const QUALITY_GATE = 'prek run --all-files / cargo test --all-targets / cargo run (end-to-end self-check: ingest -> commit -> SQL query)'
+// Lake is a Rust workspace with a single implementer lane — no variant dispatch.
+// The quality gate is uniform: `mise run gate` = hooks (prek: cargo check /
+// fmt --check / clippy -D warnings / doc -D warnings) + full workspace test
+// suite + the end-to-end self-check. jj fires NO git hooks, so the gate is
+// run manually before push. This matches CI scope exactly
+// (.github/workflows/ci.yml `Check` job), so no widening is needed in
+// signoff mode.
+const QUALITY_GATE = 'mise run gate (hooks: prek run --all-files / cargo test --workspace --all-targets / cargo run -p lake-cli end-to-end self-check: ingest -> commit -> SQL query)'
 
 const branchOf = (i) => `issue-${i.issueNumber}-${i.slug}`
 const worktreeOf = (i) => `.worktrees/${branchOf(i)}`
@@ -188,21 +191,21 @@ function implementPrompt(issue) {
 Follow your full contract in .claude/agents/implementer.md (-> harness/roles/implementer.md).
 
 This step is IDEMPOTENT — it may run on a RESUMED workflow, so first reconcile state:
-0. \`git worktree list | grep ${branchOf(issue)}\`.
-   - If the worktree exists AND \`git -C ${wt} log origin/main..HEAD\` already shows a commit that satisfies this issue: re-run the quality gate to confirm it still passes, then return the existing worktree path + commit SHAs. Do NOT redo the work.
-   - If it does not exist: \`git worktree add ${wt} -b ${branchOf(issue)}\` from the main checkout.
+0. \`jj workspace list | grep ${branchOf(issue)}\`.
+   - If the workspace exists AND \`git -C ${wt} log origin/main..HEAD\` already shows a commit that satisfies this issue: re-run the quality gate to confirm it still passes, then return the existing workspace path + commit SHAs. Do NOT redo the work.
+   - If it does not exist: \`jj workspace add ${wt}\` from the main checkout, then \`jj new main\` inside it to start work on top of main.
    Do ALL edits inside ${wt} — never on main.
 
 Otherwise implement:
 1. Read \`gh issue view ${issue.issueNumber}\`${lane1 ? ` and the spec \`${issue.specPath}\`` : ''}.
-2. Implement the SMALLEST change that satisfies the ${lane1 ? 'spec' : 'issue'}, touching ONLY these allowed paths: ${issue.allowedPaths.join(', ')}. Respect the Architecture Invariants in CLAUDE.md (immutable manifests, pointer-only KV, manifest-then-CAS commit protocol, backends behind MetaStore, DataFusion SQL surface).
-3. Run the quality gate: ${QUALITY_GATE}.${lane1 ? `\n4. Walk EVERY scenario in \`${issue.specPath}\` — each must map to a passing test or an observed end-to-end behavior (no skip, no uncertain).` : ''}
-${lane1 ? '5' : '4'}. Commit LOCALLY in the worktree: Conventional Commit subject + "Closes #${issue.issueNumber}" in the body. Do NOT push.
+2. Implement the SMALLEST change that satisfies the ${lane1 ? 'spec' : 'issue'}, touching ONLY these allowed paths: ${issue.allowedPaths.join(', ')}. Respect the architecture invariants in docs/architecture.md (immutable manifests, pointer-only KV, manifest-then-CAS commit protocol, backends behind MetaStore inside crates/lake-meta, DataFusion SQL surface).
+3. Run the quality gate MANUALLY (jj fires no git hooks): ${QUALITY_GATE}.${lane1 ? `\n4. Run \`mise run spec-lifecycle ${issue.specPath}\` (zero-match guarded) and walk EVERY scenario in \`${issue.specPath}\` — each must map to a passing test or an observed end-to-end behavior (no skip, no uncertain).` : ''}
+${lane1 ? '5' : '4'}. Commit LOCALLY in the workspace (\`jj commit\`): Conventional Commit subject + "Closes #${issue.issueNumber}" in the body. Do NOT push.
 
 Set committed=true ONLY if the gate passed and a local commit exists. Put concrete outcome verification in \`outcome\` (evidence, not a restatement of the task).` + EMIT
 }
 
-// FRESH CONTEXT by construction: this prompt carries the worktree path, the
+// FRESH CONTEXT by construction: this prompt carries the workspace path, the
 // issue number, and the lane — and deliberately NOT impl.outcome or any other
 // implementer evidence. The verifier's value is exactly that it never saw the
 // implementation story (score authority: only it may emit `verified`).
@@ -211,29 +214,29 @@ function verifyPrompt(issue, impl, attempt) {
   return `You are lake's verifier (S3${attempt > 1 ? `, re-verification after a repair round` : ''}) for GitHub issue #${issue.issueNumber}.
 Follow your full contract in .claude/agents/verifier.md (-> harness/roles/verifier.md). You are a FRESH context: you have not seen the implementation and must not ask for it — derive what to verify from the issue${lane1 ? ' and the spec' : ''} alone.
 
-Inputs: worktree \`${impl.worktreePath}\`, issue #${issue.issueNumber}, lane ${issue.lane}${lane1 ? `, spec \`${issue.specPath}\`` : ` (read the issue's Verify: commands from \`gh issue view ${issue.issueNumber}\`)`}.
+Inputs: workspace \`${impl.worktreePath}\`, issue #${issue.issueNumber}, lane ${issue.lane}${lane1 ? `, spec \`${issue.specPath}\`` : ` (read the issue's Verify: commands from \`gh issue view ${issue.issueNumber}\`)`}.
 
 Do, per the contract:
-(a) re-run the full quality gate from clean state in the worktree (${QUALITY_GATE}); record base_sha and head_sha;
-(b) ${lane1 ? `walk every scenario in \`${issue.specPath}\` — each must map to a passing test or an observed behavior; none may be skipped or uncertain` : `run the issue's Verify: commands verbatim`};
-(c) if the change has a runtime surface, cold-boot the candidate build (\`cargo run\` with a FRESH temp data dir for the RocksDB metastore — NEVER reuse existing state) and drive the changed feature end-to-end (ingest -> commit -> SQL query through the DataFusion catalog);
+(a) re-run the full quality gate from clean state in the workspace (${QUALITY_GATE}); record base_sha and head_sha;
+(b) ${lane1 ? `re-run \`mise run spec-lifecycle ${issue.specPath}\` yourself from clean state (zero-match guarded) and walk every scenario in \`${issue.specPath}\` — each must map to a passing test or an observed behavior; none may be skipped or uncertain` : `run the issue's Verify: commands verbatim`};
+(c) if the change has a runtime surface, cold-boot the candidate build (\`cargo run -p lake-cli\` with a FRESH temp data dir for the RocksDB metastore — NEVER reuse existing state) and drive the changed feature end-to-end (ingest -> commit -> SQL query through the DataFusion catalog);
 (d) run 2-3 hostile probes (CJK/odd table names, empty/boundary values, concurrent commits racing the CAS pointer);
-(e) write \`verification/report.md\` in the worktree (base_sha, head_sha, score_authority: verifier, commands with raw outputs, transition matrix, verdict).
+(e) write \`verification/report.md\` in the workspace (base_sha, head_sha, score_authority: verifier, commands with raw outputs, transition matrix, verdict).
 
 Return verdict PASS or FAIL with the report path. FAIL summaries must contain the failing commands / probe inputs verbatim — they become the repair contract.` + EMIT
 }
 
 function repairPrompt(issue, impl, verify) {
-  return `You are lake's implementer addressing an S3 verification FAIL for issue #${issue.issueNumber} in worktree \`${impl.worktreePath}\`.
+  return `You are lake's implementer addressing an S3 verification FAIL for issue #${issue.issueNumber} in workspace \`${impl.worktreePath}\`.
 Follow .claude/agents/implementer.md. This is the ONLY repair round — a second FAIL escalates to a human.
 
 The independent verifier's failing findings (report: ${verify.reportPath}):
 ${verify.summary}
 
 Do:
-1. Read the full report at ${verify.reportPath} in the worktree.
+1. Read the full report at ${verify.reportPath} in the workspace.
 2. Fix the root cause with NEW commits (no amend). Any failing probe input MUST land as a regression test, not just be patched.
-3. Re-run the quality gate: ${QUALITY_GATE}.${issue.lane === 'lane-1' ? ` Re-walk the spec scenarios in \`${issue.specPath}\`.` : ''}
+3. Re-run the quality gate: ${QUALITY_GATE}.${issue.lane === 'lane-1' ? ` Re-run \`mise run spec-lifecycle ${issue.specPath}\` and re-walk the spec scenarios.` : ''}
 
 Do NOT claim "verified" — your evidence is self_check_only; the verifier re-verifies from scratch. Return the updated result (committed=true if the gate passes again, with the new commit SHAs appended).` + EMIT
 }
@@ -241,20 +244,20 @@ Do NOT claim "verified" — your evidence is self_check_only; the verifier re-ve
 function reviewPrompt(issue, impl, round, verify) {
   const lane1 = issue.lane === 'lane-1'
   return `You are lake's reviewer (round ${round}/${MAX_REVIEW_ROUNDS}) for issue #${issue.issueNumber}, BEFORE push.
-Follow your full contract in .claude/agents/reviewer.md (-> harness/roles/reviewer.md). The implementer worked in worktree \`${impl.worktreePath}\` (commits: ${impl.commits.join(', ') || 'see git log'}).
-The S3 verification report (verdict PASS, score_authority: verifier) is at \`${verify?.reportPath ?? '<worktree>/verification/report.md'}\` — a required review input; read it alongside the diff.
+Follow your full contract in .claude/agents/reviewer.md (-> harness/roles/reviewer.md). The implementer worked in workspace \`${impl.worktreePath}\` (commits: ${impl.commits.join(', ') || 'see git log'}).
+The S3 verification report (verdict PASS, score_authority: verifier) is at \`${verify?.reportPath ?? '<workspace>/verification/report.md'}\` — a required review input; read it alongside the diff.
 
 Do:
-1. Read \`git -C ${impl.worktreePath} diff origin/main..HEAD\`.
-${lane1 ? `2. Do the CRITICAL spec review of ${issue.specPath} (aligns with goal.md (what lake is / is NOT) and CLAUDE.md's Architecture Invariants? scenarios non-vacuous and actually falsify the Intent? Boundaries narrow?).\n` : ''}3. Run the generalized cross-file regression-decision check: \`git log --since=30.days\` on every file the diff touches; flag any re-introduction of what a recent PR removed.
-4. Check the diff against the Architecture Invariants in CLAUDE.md (no mutable state in the KV store beyond pointers, no manifest rewrites, manifest-then-CAS ordering, no backend types outside src/meta.rs). Inspect the implementer's outcome evidence — does it verify the outcome or only a side effect?
+1. Read \`git -C ${impl.worktreePath} diff origin/main..HEAD\` (read-only git is fine — colocated repo).
+${lane1 ? `2. Do the CRITICAL spec review of ${issue.specPath} (aligns with goal.md (what lake is / is NOT) and docs/architecture.md's invariants? scenarios non-vacuous and actually falsify the Intent? Boundaries narrow?). Re-run \`mise run spec-lifecycle ${issue.specPath}\` YOURSELF in the workspace, and do the manual diff-vs-Boundaries glob check as a complementary P0 check.\n` : ''}3. Run the generalized cross-file regression-decision check: \`git log --since=30.days\` on every file the diff touches; flag any re-introduction of what a recent PR removed.
+4. Check the diff against the architecture invariants in docs/architecture.md (no mutable state in the KV store beyond pointers, no manifest rewrites, manifest-then-CAS ordering, no backend types outside crates/lake-meta). Inspect the implementer's outcome evidence — does it verify the outcome or only a side effect?
 
 Return the verdict. approved=true ONLY if there are no P0/P1 findings${lane1 ? ' and the spec review passes' : ''}. List every finding with severity.` + EMIT
 }
 
 function fixPrompt(issue, impl, verdict) {
-  return `You are lake's implementer addressing review findings for issue #${issue.issueNumber} in worktree \`${impl.worktreePath}\`.
-Follow .claude/agents/implementer.md. Fix every P0/P1 finding with NEW commits (no amend), then re-run the quality gate: ${QUALITY_GATE}.${issue.lane === 'lane-1' ? ` Re-walk the spec scenarios in \`${issue.specPath}\`.` : ''}
+  return `You are lake's implementer addressing review findings for issue #${issue.issueNumber} in workspace \`${impl.worktreePath}\`.
+Follow .claude/agents/implementer.md. Fix every P0/P1 finding with NEW commits (no amend), then re-run the quality gate: ${QUALITY_GATE}.${issue.lane === 'lane-1' ? ` Re-run \`mise run spec-lifecycle ${issue.specPath}\` and re-walk the spec scenarios.` : ''}
 
 Findings to address:
 ${verdict.findings.map(f => `- [${f.severity}] ${f.where}: ${f.problem}`).join('\n')}
@@ -271,13 +274,13 @@ function shipPrompt(issue, impl, verify) {
       : CI_MODE === 'signoff'
         ? `EMERGENCY OVERRIDE (CI outage): branch protection has been temporarily flipped so main's only required check is \`signoff\`. Do NOT run \`gh pr checks --watch\` (it would hang). The local quality gate already passed in the implement stage, so run \`gh signoff\` to sign off the pushed commit — this satisfies the required check and makes the PR mergeable. signoff binds to the commit: if you pushed again after the last gate run, re-run the gate then \`gh signoff\` again.\n\nSTOP after signoff succeeds. Set ciGreen=true (signoff is the green signal) and put "CI outage override; signed off after local gate" in ciSummary.`
         : `GitHub CI is UNAVAILABLE and signoff is not required — do NOT run \`gh pr checks --watch\`. Stop after the PR is created. Set ciGreen=false and put "no GitHub gate; local quality gate passed in implement stage" in ciSummary.`
-  return `You are lake's implementer shipping issue #${issue.issueNumber} from worktree \`${wt}\`. The verifier PASSED (S3) and the reviewer APPROVED — push is unlocked.
+  return `You are lake's implementer shipping issue #${issue.issueNumber} from workspace \`${wt}\`. The verifier PASSED (S3) and the reviewer APPROVED — push is unlocked.
 
 Do:
-1. \`git -C ${wt} push -u origin ${branchOf(issue)}\`.
+1. In ${wt}: \`jj bookmark create ${branchOf(issue)} -r @-\` (if not created yet), then \`jj git push --bookmark ${branchOf(issue)} --allow-new\`.
 2. \`gh pr create --base main --title "<conventional subject> (#${issue.issueNumber})" --body "<summary of the change, include Closes #${issue.issueNumber}>"\`.
    The PR body MUST include a "Verification" section with the S3 report path and verdict:
-   \`Verification: PASS — ${verify?.reportPath ?? '<worktree>/verification/report.md'} (base ${verify?.baseSha ?? '<base_sha>'}, head ${verify?.headSha ?? '<head_sha>'}; score_authority: verifier)\`.
+   \`Verification: PASS — ${verify?.reportPath ?? '<workspace>/verification/report.md'} (base ${verify?.baseSha ?? '<base_sha>'}, head ${verify?.headSha ?? '<head_sha>'}; score_authority: verifier)\`.
 3. ${step3}
 
 Do NOT merge — merge-to-main is human gate (a). Return prNumber, prUrl, ciGreen, and ciSummary.` + EMIT
@@ -316,7 +319,7 @@ phase('Spec')
 const plan = await agent(
   `You are lake's spec-author. The user's verbatim request:\n\n"""\n${REQUEST}\n"""\n\n` +
   `Follow your full contract in .claude/agents/spec-author.md (-> harness/roles/spec-author.md):\n` +
-  `1. Read goal.md (what lake is / is NOT / observable signals) and the Architecture Invariants in CLAUDE.md, and gate the request against them.\n` +
+  `1. Read goal.md (what lake is / is NOT / observable signals) and the architecture invariants in docs/architecture.md, and gate the request against them.\n` +
   `2. Run the MANDATORY prior-art search (gh issue list, gh pr list, git log --grep, rg) — do not skip.\n` +
   `3. Write a private reproducer (the concrete bug that appears if we do nothing). If none can be written, the request is too vague — say so in summary and return zero issues.\n` +
   `4. Pick the lane per the single test (can a Test: selector bind to a real test that fails-before/passes-after?).\n` +
@@ -337,7 +340,7 @@ log(`spec-author filed ${plan.issues.length} issue(s): ${plan.issues.map(i => `#
 const results = await pipeline(
   plan.issues,
 
-  // stage 1 — implement in an isolated worktree, local commit only
+  // stage 1 — implement in an isolated workspace, local commit only
   (issue) => agent(
     implementPrompt(issue),
     { agentType: 'implementer', label: `impl:#${issue.issueNumber}`, phase: 'Implement', schema: IMPL_SCHEMA },
@@ -435,8 +438,8 @@ return {
   ready_to_merge: readyToMerge.map((r) => ({ issue: r.issue, pr: r.prNumber, url: r.prUrl, ci: r.ciSummary, verify_report: r.verifyReport ?? null })),
   blocked: blocked.map((r) => ({ issue: r.issue, pr: r.prNumber ?? null, escalated: r.escalated ?? false, reason: r.reason ?? r.ciSummary ?? 'CI not green' })),
   gate: CI_MODE === 'signoff'
-    ? 'STOPPED before merge. EMERGENCY OVERRIDE mode: each ready PR has been `gh signoff`-ed (local quality gate from the implement stage is the green signal), satisfying the temporarily-flipped required check. Restore the real required checks once the outage ends. merge-to-main is human gate (a): the parent confirms each PR with the user, then `gh pr merge --squash --delete-branch`, then cleans up the worktree.'
+    ? 'STOPPED before merge. EMERGENCY OVERRIDE mode: each ready PR has been `gh signoff`-ed (local quality gate from the implement stage is the green signal), satisfying the temporarily-flipped required check. Restore the real required checks once the outage ends. merge-to-main is human gate (a): the parent confirms each PR with the user, then `gh pr merge --squash --delete-branch`, then cleans up the workspace (jj workspace forget + delete dir).'
     : CI_MODE === 'skip'
-      ? 'STOPPED after PR creation. GitHub CI is UNAVAILABLE and signoff not required — the only verification is the LOCAL quality gate (prek/cargo) from the implement stage. merge-to-main is human gate (a); merging without any GitHub gate is entirely the user\'s call.'
-      : 'STOPPED before merge. merge-to-main is human gate (a): the parent confirms each PR with the user, then `gh pr merge --squash --delete-branch`, then cleans up the worktree.',
+      ? 'STOPPED after PR creation. GitHub CI is UNAVAILABLE and signoff not required — the only verification is the LOCAL quality gate (mise run gate) from the implement stage. merge-to-main is human gate (a); merging without any GitHub gate is entirely the user\'s call.'
+      : 'STOPPED before merge. merge-to-main is human gate (a): the parent confirms each PR with the user, then `gh pr merge --squash --delete-branch`, then cleans up the workspace (jj workspace forget + delete dir).',
 }

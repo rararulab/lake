@@ -17,11 +17,6 @@
 // CLI binary: stdout is the output channel.
 #![allow(clippy::print_stdout)]
 
-mod catalog;
-mod error;
-mod manifest;
-mod meta;
-
 use std::sync::Arc;
 
 use datafusion::{
@@ -32,8 +27,8 @@ use datafusion::{
     parquet::arrow::ArrowWriter,
     prelude::*,
 };
-
-use crate::meta::{MetaStoreRef, RocksMeta};
+use lake_catalog::LakeCatalog;
+use lake_meta::{MetaStoreRef, RocksMeta};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -62,20 +57,18 @@ async fn main() -> anyhow::Result<()> {
     writer.close()?;
 
     // 2. Commit: immutable manifest file + CAS the version pointer.
-    let version = manifest::commit(
+    let version = lake_manifest::commit(
         meta.as_ref(),
         &table_root,
         "episodes",
         vec![file.canonicalize()?.display().to_string()],
-    )?;
+    )
+    .await?;
     println!("committed table 'episodes' at v{version}");
 
     // 3. Query through the catalog with plain SQL.
     let ctx = SessionContext::new();
-    ctx.register_catalog(
-        "lake",
-        Arc::new(catalog::LakeCatalog::new(meta.clone(), table_root)),
-    );
+    ctx.register_catalog("lake", Arc::new(LakeCatalog::new(meta.clone(), table_root)));
     let df = ctx
         .sql(
             "SELECT robot_id, count(*) AS episodes, avg(reward) AS avg_reward FROM \

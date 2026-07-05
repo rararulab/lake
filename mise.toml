@@ -1,0 +1,96 @@
+## lake dev toolchain + tasks — managed by mise (https://mise.jdx.dev)
+##
+## `mise install` is the whole environment setup; `mise run doctor` is the
+## session-start health check. mise is the ONLY tool a user must install
+## themselves — it takes over everything else.
+##
+## Rust is intentionally NOT here: `rust-toolchain.toml` pins stable, and
+## nightly (for fmt + doc warnings) comes from rustup. mise's rust backend
+## would fight rustup.
+##
+## No inline scripts in this file: anything beyond a one-liner lives in
+## scripts/*.ts (TypeScript, run with bun).
+
+[tools]
+jj   = "latest"        # VCS — jj with colocated git backend (GitHub interop)
+gh   = "latest"        # PR + issue workflow
+bun  = "latest"        # runs scripts/*.ts
+uv   = "latest"        # uvx runs the code-review-graph MCP server (.mcp.json)
+"ubi:j178/prek" = "latest"    # quality gate runner (.pre-commit-config.yaml)
+"cargo:agent-spec" = "0.3.0"  # lane-1 BDD gate (spec-lint / spec-lifecycle)
+
+# ========================================================================================
+# Lifecycle
+# ========================================================================================
+
+[tasks.doctor]
+description = "session-start health check: tools, nightly rustfmt, cargo check, jj, gh"
+run = "bun scripts/doctor.ts"
+
+[tasks.agenda]
+description = "list open agent:claude issues from GitHub"
+run = "gh issue list --label agent:claude --state open --limit 30"
+
+[tasks.codegraph]
+description = "(re)build the code knowledge graph used by the code-review-graph MCP"
+run = "uvx code-review-graph build"
+
+[tasks.codegraph-update]
+description = "incremental codegraph update (only changed files)"
+run = "uvx code-review-graph update"
+
+# ========================================================================================
+# Code Quality
+# ========================================================================================
+
+[tasks.fmt]
+description = "format Rust code (nightly rustfmt)"
+run = "cargo +nightly fmt --all"
+
+[tasks.fmt-check]
+description = "check formatting without writing"
+run = "cargo +nightly fmt --all -- --check"
+
+[tasks.clippy]
+description = "cargo clippy with -D warnings"
+run = "cargo clippy --workspace --all-targets --all-features --no-deps -- -D warnings"
+
+[tasks.hooks]
+description = "run all pre-commit hooks against all files"
+run = "prek run --all-files"
+
+# ========================================================================================
+# Build & Test
+# ========================================================================================
+
+[tasks.test]
+description = "run workspace tests"
+run = "cargo test --workspace --all-targets"
+
+[tasks.e2e]
+description = "end-to-end self-check: ingest -> commit -> SQL query"
+run = "cargo run -p lake-cli"
+
+[tasks.gate]
+description = "full quality gate: hooks + test + e2e"
+depends = ["hooks", "test", "e2e"]
+
+# ========================================================================================
+# Spec / agent-spec (Task Contracts) — see specs/README.md
+# ========================================================================================
+
+[tasks.spec-init]
+description = "scaffold a new lane-1 task spec: mise run spec-init <slug>"
+run = 'agent-spec init --level task --lang en --name "{{arg(name="slug")}}"'
+
+[tasks.spec-lint]
+description = "lint a task spec (min-score 0.7): mise run spec-lint specs/issue-N-<slug>.spec.md"
+run = 'agent-spec lint {{arg(name="spec")}} --min-score 0.7'
+
+[tasks.spec-lifecycle]
+description = "verify a task spec against this workspace (zero-match guarded)"
+run = 'bun scripts/spec-lifecycle-guard.ts {{arg(name="spec")}}'
+
+[tasks.spec-selftest]
+description = "assert the lifecycle gate rejects the zero-match fixture"
+run = "bun scripts/spec-selftest.ts"

@@ -35,7 +35,7 @@ repos:
 
       - id: conventional-commit
         name: conventional commit message
-        entry: scripts/check-conventional-commit.sh
-        language: script
+        entry: bun scripts/check-conventional-commit.ts
+        language: system
         stages: [commit-msg]
         always_run: true

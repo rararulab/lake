@@ -1,89 +1,41 @@
 # CLAUDE.md — Lake Development Guide
 
-**新会话第一步：`./init.sh`**（or `just doctor`）— 一键检查工具链、git hooks、`cargo check`，以及 open `agent:claude` issue 数量。
+**新会话第一步：`mise run doctor`**（用户只需自装 mise，其余工具 `mise install`
+接管；Rust 例外，由 rustup + `rust-toolchain.toml` 管）。
 
 ## Communication
 - 用中文与用户交流
 
-## North Star
+## 渐进式披露
 
-`goal.md` at the repo root defines what lake is, what lake is NOT, and the
-observable signals that mean lake is working. Read it before drafting any
-spec or proposing any change. `spec-author` uses it as a gate; you should too.
+本文件和 `AGENT.md` 都是**目录**：按需读对应文档，不要把全部内容塞进上下文。
+每个 folder 有自己的 `AGENT.md` 目录卡片；探索代码优先用 code-review-graph
+MCP 工具（索引：`mise run codegraph`）。
 
-## Project Philosophy
+- `AGENT.md` — 硬规则 + 完整文档目录（按任务查表）
+- `goal.md` — 北极星：what lake is / is NOT；任何新需求先拿它做门禁
+- `docs/architecture.md` — 系统设计、读路径、commit 协议、架构不变量、crate 划分
+- `specs/README.md` — lane 1（spec 驱动、BDD 绑定测试）vs lane 2（轻量 chore）triage
+- `harness/roles/*.md` — 角色契约（spec-author / implementer / reviewer / verifier）；`.claude/agents/*.md` 是薄包装
+- `docs/guides/*.md` — workflow / rust-style / commit-style / code-comments / anti-patterns
 
-Lake is a lakehouse for embodied-AI data (robot episodes: images, video,
-pointclouds, sensor streams), in the spirit of LanceDB. Read traffic is
-DDoS-like: fleets of nodes hammer the same tables concurrently, so metadata
-must scale reads without a hot central store.
+## 硬规则
 
-Design ethos: **immutability over coordination**. The KV metastore holds
-only tiny version pointers; everything readers touch is immutable and
-cacheable. When in doubt, choose the design that keeps per-query KV load
-at zero.
+- 改代码先建 workspace：`jj workspace add .worktrees/issue-N-<slug>`，禁止在主
+  checkout 上开发（`.claude/hooks/guard-main-branch.ts` 强制）。
+- jj 不触发 git hooks：push 前必须 `mise run gate`（lane 1 另加
+  `mise run spec-lifecycle <spec>`）；CI 是兜底。
+- Conventional Commits，由 CI 和 reviewer 强制。
+- 所有变更走 issue → workspace → PR → merge，无例外。
 
-## Architecture Invariants
-
-These are load-bearing. Do not violate them without an explicit decision:
-
-1. **The KV metastore holds only tiny mutable pointers** (`ptr/<table>` ->
-   current version). Nothing else is mutable.
-2. **Manifests are immutable.** Written once at
-   `<table_root>/<table>/_manifests/v<N>.json`, never rewritten. This is
-   what makes reader-side caching safe and unbounded.
-3. **Commit protocol**: write the immutable manifest file first, then CAS
-   the version pointer. Losers of the race fail cleanly and retry.
-4. **Backends**: RocksDB for dev, DynamoDB (conditional put = CAS) for prod.
-   Both live behind the `MetaStore` trait — no backend types outside
-   `src/meta.rs`.
-5. **SQL surface is DataFusion.** Tables resolve through
-   `LakeCatalog`/`LakeSchema` (KV pointer -> manifest -> parquet file list).
-   Wire protocol direction is Arrow Flight SQL, not MySQL protocol.
-
-## Style Anchors
-
-Rust style triangulated from three voices — each covers a different blind spot:
-
-- **BurntSushi** (Andrew Gallant): error ergonomics via `snafu`, CLI patterns, exhaustive matching, documentation-first design
-- **dtolnay** (David Tolnay): API minimalism, derive-macro philosophy (`serde`, `bon`), "if it compiles it works" surface area
-- **Niko Matsakis**: ownership-first API design, type safety as a feature, making invalid states unrepresentable
-
-When these anchors conflict, prefer: safety (Niko) > ergonomics (BurntSushi) > minimalism (dtolnay).
-
-Details in `docs/guides/rust-style.md`.
-
-## External Reality
-
-These artifacts are authoritative — your work is accountable to them, not just to the user:
-
-- `goal.md` — north star: read this **first** for any new request; spec-author uses it as a gate
-- `specs/project.spec` — project-level technical/process constraints inherited by every task spec
-- `specs/README.md` — lane 1 (spec-driven, BDD-bound test) vs lane 2 (lightweight chore) triage criteria; read this **before** opening an issue
-- `.pre-commit-config.yaml` — code quality gate (check, fmt, clippy, doc warnings)
-- `harness/roles/*.md` — engine-neutral role contracts (spec-author, implementer, reviewer, verifier); `.claude/agents/*.md` are thin wrappers over them
-- `AGENT.md` — 行为契约：推理框架、执行边界、协作工作流
-
-## Development Workflow
-
-All changes — no matter how small — follow the issue → worktree → PR → merge
-flow. No exceptions. See `docs/guides/workflow.md`.
-
-- Branch work happens in `.worktrees/issue-N-<slug>` — never on the main
-  checkout (`.claude/hooks/guard-main-branch.sh` enforces this).
-- Lane triage per `specs/README.md`; lane-1 work gets a Task Contract in
-  `specs/issue-N-<slug>.spec.md`.
-- Quality gate before any push: `just gate` (= `prek run --all-files` +
-  `cargo test --all-targets` + `cargo run` e2e self-check).
-- Conventional Commits enforced by commit-msg hook.
-
-## Commands
+## 常用命令
 
 ```bash
-./init.sh             # session-start health check (= just doctor)
-just gate             # full quality gate: hooks + test + e2e
-just fmt              # cargo +nightly fmt --all
-just clippy           # clippy -D warnings
-cargo run             # end-to-end self-check: ingest -> commit -> SQL query
-just agenda           # open agent:claude issues
+mise run doctor          # 新会话第一步：环境健康检查
+mise run gate            # 质量门禁：hooks + test + e2e
+mise run e2e             # 端到端自检：ingest -> commit -> SQL
+mise run spec-lifecycle specs/issue-N-<slug>.spec.md   # lane-1 BDD 验证
+mise tasks               # 全部任务列表（定义在 mise.toml）
+jj st / jj log           # 工作副本状态 / 历史
+jj commit -m "type(scope): msg (#N)"
 ```

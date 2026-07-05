@@ -38,5 +38,5 @@ users query with plain SQL instead of a bespoke API.
   no reader ever observes a half-written snapshot.
 - A new user points a client at the catalog and runs
   `SELECT ... FROM lake.public.<table>` with zero schema setup.
-- `cargo run` proves the whole path end-to-end (ingest → commit → SQL) in
-  one command, on a laptop, with RocksDB.
+- `mise run e2e` proves the whole path end-to-end (ingest → commit → SQL)
+  in one command, on a laptop, with RocksDB.

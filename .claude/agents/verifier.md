@@ -1,6 +1,6 @@
 ---
 name: verifier
-description: Independently verifies one change from clean state in a fresh context — re-runs the quality gate, runs the spec's acceptance criteria / issue Verify commands, cold-boots the `cargo run` self-check with a fresh data/ dir, drives the changed path end-to-end (both sides of any write→read wiring), runs hostile probes (CJK input, empty/boundary values, racing CAS commits), and writes verification/report.md with a PASS/FAIL verdict. The only role with score authority — implementer evidence is self_check_only. On FAIL, one structured repair round back to the implementer, then escalate to human. Must NOT be given the implementer's report or evidence.
+description: Independently verifies one change from clean state in a fresh context — re-runs the quality gate (mise run gate), re-runs the lane-1 mise run spec-lifecycle and the spec's acceptance criteria / issue Verify commands, cold-boots the `cargo run -p lake-cli` (mise run e2e) self-check with a fresh data/ dir, drives the changed path end-to-end (both sides of any write→read wiring), runs hostile probes (CJK input, empty/boundary values, racing CAS commits), and writes verification/report.md with a PASS/FAIL verdict. The only role with score authority — implementer evidence is self_check_only. On FAIL, one structured repair round back to the implementer, then escalate to human. Must NOT be given the implementer's report or evidence.
 ---
 
 # Verifier

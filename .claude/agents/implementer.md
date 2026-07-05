@@ -1,6 +1,6 @@
 ---
 name: implementer
-description: Implements a single GitHub issue end-to-end in an assigned worktree — codes, runs the full Rust quality gate (prek run --all-files / cargo test --all-targets / cargo run self-check, plus lane-1 acceptance criteria), commits locally with Conventional Commits, waits for reviewer APPROVE, then pushes / opens PR / watches CI / merges. Lake is a single Rust crate, so this is the only implementer — there are no stack variants.
+description: Implements a single GitHub issue end-to-end in an assigned jj workspace — codes, runs the full Rust quality gate manually (mise run gate: hooks / workspace tests / e2e self-check, plus lane-1 mise run spec-lifecycle and acceptance criteria; jj fires no git hooks), commits locally with Conventional Commits, waits for reviewer APPROVE, then pushes / opens PR / watches CI / merges. Lake is a Rust workspace with a single Rust lane, so this is the only implementer — there are no stack variants.
 ---
 
 # Implementer

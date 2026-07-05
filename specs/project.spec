@@ -22,19 +22,22 @@ that lives in `goal.md`.
   `<table_root>/<table>/_manifests/v<N>.json`, never rewritten.
 - Commit protocol: write the immutable manifest file first, then CAS the
   version pointer. Losers of the race fail cleanly and retry.
-- Backend types (RocksDB, DynamoDB) never leak outside `src/meta.rs`;
-  everything else programs against the `MetaStore` trait.
+- Backend types (RocksDB, DynamoDB) never leak outside the `lake-meta`
+  crate; everything else programs against the `MetaStore` trait.
 - SQL surface is DataFusion; wire-protocol direction is Arrow Flight SQL.
 
 ### Style and toolchain
 
-- Errors: `snafu` exclusively in domain code (`LakeError` + `Result<T>`
-  alias). `anyhow` only at application boundaries (`main.rs`, bootstrap).
+- Errors: `snafu` exclusively in domain crates (per-crate `{CrateName}Error` +
+  `Result<T>` alias). `anyhow` only at application boundaries (`lake-cli`).
   Never `thiserror` or hand-rolled `impl Error`.
 - Construction: `#[derive(bon::Builder)]` for any struct with 3 or more
   fields crossing module boundaries. Struct literals within the defining
   module are fine.
-- Async: `#[async_trait]` + `Send + Sync` on async trait definitions.
+- Async-first: public APIs in domain crates are async
+  (`#[async_trait]` + `Send + Sync` on trait definitions). Sync bridges
+  (e.g. `block_on` for sync framework traits) are boundary-only and carry
+  a `ponytail:` note naming the upgrade path.
 - No wildcard imports (`use foo::*`).
 - `.expect("context")` over `unwrap()` in non-test code.
 - Apache-2.0 license header on every source file.
@@ -47,13 +50,16 @@ that lives in `goal.md`.
 
 ### Process
 
-- Conventional Commits, enforced by local `commit-msg` hook. Format:
+- Conventional Commits, enforced by CI and reviewer (jj fires no git hooks). Format:
   `<type>(<scope>): <description> (#N)` with `Closes #N` in body.
 - Allowed types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `ci`,
   `perf`, `style`, `build`, `revert`. Breaking uses `!`.
-- Worktree-only edits. The main agent and all subagents never edit files
-  on `main` directly. Every change goes through
-  `git worktree add .worktrees/issue-N-<slug>`.
+- Workspace-only edits. The main agent and all subagents never edit files
+  on the main checkout. Every change goes through
+  `jj workspace add .worktrees/issue-N-<slug>`.
 - One issue → one PR targeting `main`. No stacked PRs.
-- Quality gate before any push: `prek run --all-files` +
-  `cargo test --all-targets` + `cargo run` (end-to-end self-check).
+- Every folder carries an `AGENT.md` (10–20 lines: purpose, invariants,
+  layout). New crates/directories require one before merge; keep it a
+  catalog card, not a manual.
+- Quality gate before any push: `mise run gate` (prek hooks + workspace
+  tests + e2e self-check); lane 1 adds `mise run spec-lifecycle <spec>`.

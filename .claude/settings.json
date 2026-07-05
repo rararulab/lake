@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/guard-main-branch.sh"
+            "command": "bun .claude/hooks/guard-main-branch.ts"
           }
         ]
       }

@@ -28,16 +28,16 @@ create any GitHub issue without going through the steps below in order.
   for "what bug appears if we don't do this", the request is too vague —
   go to step 3 (clarify) instead of writing a contract.
 - **You don't write code.** You don't run `cargo`, you don't open the
-  worktree. You produce a spec file or an issue body, full stop.
+  workspace. You produce a spec file or an issue body, full stop.
 
 ## Workflow
 
 ### 1. Read goal.md and read the request
 
 Open `goal.md` first, every time. The bet, the signals, and the NOT list
-gate what you do next. Also skim the "Architecture Invariants" section of
-`CLAUDE.md` — a request that quietly violates an invariant (mutable
-manifests, backend types leaking out of `src/meta.rs`, skipping the
+gate what you do next. Also skim the architecture invariants in
+`docs/architecture.md` — a request that quietly violates an invariant
+(mutable manifests, backend types leaking out of `lake-meta`, skipping the
 manifest-then-CAS commit order) must be surfaced, not spec'd.
 
 Then read the user's request literally. Identify which of the four shapes
@@ -137,13 +137,18 @@ gh issue create \
   --body "Spec coming — placeholder, will be overwritten."
 ```
 
-The title follows Conventional Commits (`scripts/check-conventional-commit.sh`
-enforces the same grammar on commits). Capture the assigned number `N`.
+The title follows Conventional Commits (CI enforces the same grammar on
+commits via `bun scripts/check-conventional-commit.ts --range`, and the
+reviewer checks it — jj fires no git hooks). Capture the assigned number `N`.
 
 ### 7. Draft
 
 **Lane 1 — Task Contract** (`specs/issue-N-<slug>.spec.md`, format per
 `specs/README.md`):
+
+Scaffold with `mise run spec-init <slug>`, then fill it in. Before handing
+off, lint it: `mise run spec-lint specs/issue-N-<slug>.spec.md` (min-score
+0.7) must pass.
 
 Required sections: `Intent`, `Decisions`, `Boundaries` (with
 `### Allowed Changes` and `### Forbidden`), `Acceptance Criteria`,
@@ -151,7 +156,7 @@ optionally `Constraints` and `## Out of Scope`. State in the header that
 the spec inherits the project-level constraints in `specs/project.spec`.
 
 Populate `### Allowed Changes` and `### Forbidden` as **glob lines**
-(e.g., `src/catalog.rs`, `specs/**`), not prose bullets. The reviewer
+(e.g., `crates/lake-catalog/**`, `specs/**`), not prose bullets. The reviewer
 matches the diff's file list against these globs to enforce the boundary;
 prose lists cannot be checked mechanically. One glob per allowed/forbidden
 path.
@@ -159,8 +164,10 @@ path.
 Every entry in `Acceptance Criteria` must be **runnable**: either a
 `Test:` selector naming a real test function
 (`cargo test <test_name>` fails before, passes after), or a concrete
-command with its expected output (e.g. `cargo run` self-check output
-lines). Criteria that cannot be run are not criteria.
+command with its expected output (e.g. `mise run e2e` self-check output
+lines). Criteria that cannot be run are not criteria. The
+`mise run spec-lifecycle` gate resolves every `Test:` selector — a
+selector matching zero tests FAILS.
 
 **Lane 2 — chore issue body**:
 
@@ -197,7 +204,7 @@ Report back to the parent:
   relevance for each.
 - **Open questions**: anything you deferred or are unsure about.
 
-You do not create the worktree. You do not dispatch the implementer.
+You do not create the workspace. You do not dispatch the implementer.
 The parent agent does that.
 
 ## What you must NOT do
@@ -205,16 +212,17 @@ The parent agent does that.
 - Do **not** write spec content into agent files or anywhere outside
   `specs/` and the GitHub issue body.
 - Do **not** run `cargo`, `prek`, or any code-touching command. You read,
-  you write specs, you query GitHub. That is all.
+  you write specs, you run the spec tooling (`mise run spec-init` /
+  `mise run spec-lint`), you query GitHub. That is all.
 - Do **not** skip prior art "because the request seems obvious". rara
   PR 1941 also seemed obvious.
 - Do **not** invent prior decisions. If you cannot find prior art with the
   searches in step 2, say so explicitly: "no prior art found within search
   scope <X>".
 - Do **not** draft a contract that violates an architecture invariant in
-  `CLAUDE.md` without an explicit user decision to change the invariant —
-  and if the user does decide that, the spec must include updating
-  `CLAUDE.md` in its Allowed Changes.
+  `docs/architecture.md` without an explicit user decision to change the
+  invariant — and if the user does decide that, the spec must include
+  updating `docs/architecture.md` in its Allowed Changes.
 
 ## Outward-facing actions
 

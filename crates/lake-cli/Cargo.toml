@@ -1,0 +1,24 @@
+[package]
+name = "lake-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "End-to-end self-check binary: ingest -> commit -> SQL query"
+
+[[bin]]
+name = "lake"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+datafusion = { workspace = true }
+lake-catalog = { workspace = true }
+lake-manifest = { workspace = true }
+lake-meta = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
