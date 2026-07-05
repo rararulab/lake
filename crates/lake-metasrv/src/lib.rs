@@ -26,18 +26,35 @@
 
 //! [`election`] adds the lease-in-KV leader election that gives this tier HA
 //! (leader + standby) over the [`MetaStore`](lake_meta::MetaStore) CAS
-//! primitive — no self-built consensus.
+//! primitive — no self-built consensus. [`control`] wraps the authority in an
+//! Arrow Flight `DoAction` wire surface, and [`serve`] runs it alongside a
+//! background [`leadership`] campaign so writes gate on the lease.
 
 pub mod election;
 
-use std::sync::Arc;
+mod control;
+mod leadership;
 
+use std::{
+    net::AddrParseError,
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
+};
+
+use arrow_flight::flight_service_server::FlightServiceServer;
 use datafusion::{arrow::datatypes::SchemaRef, execution::SendableRecordBatchStream};
 use lake_catalog::create_table;
 use lake_common::{Namespace, TableLocation, TableName, TableRef, Version};
 use lake_engine::TableEngineRef;
 use lake_meta::{MetaStoreRef, registry, registry::TableRegistration};
 use snafu::{OptionExt, ResultExt, Snafu};
+use tonic::transport::Server;
+
+use crate::{
+    control::MetasrvFlightService,
+    election::LeaseElection,
+    leadership::{Leadership, run_campaign_loop},
+};
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -53,6 +70,15 @@ pub enum MetasrvError {
 
     #[snafu(display("table '{table}' not found"))]
     NotFound { table: String },
+
+    #[snafu(display("invalid listen address {addr:?}"))]
+    Address {
+        addr:   String,
+        source: AddrParseError,
+    },
+
+    #[snafu(display("metasrv control plane server failed"))]
+    Serve { source: tonic::transport::Error },
 }
 
 pub type Result<T> = std::result::Result<T, MetasrvError>;
@@ -134,17 +160,35 @@ impl Metasrv {
     pub fn engine(&self) -> &TableEngineRef { &self.engine }
 }
 
-/// Run the metadata server. ponytail: v0 has no gRPC wire and no election —
-/// this holds the authority alive so the process form exists; the network
-/// surface (tonic) and lease-election land in v1/v2.
+/// Run the metadata server: the Arrow Flight control plane plus a background
+/// leader-election campaign.
+///
+/// Spawns a campaign loop that renews the lease and publishes leadership into
+/// a shared flag, then binds a tonic server exposing the control-plane
+/// [`FlightService`](arrow_flight::flight_service_server::FlightService) over
+/// `DoAction`. Writes (`create_table`) are refused unless this node holds the
+/// lease; reads are always served. The node id is `addr`, unique enough per
+/// instance in dev. Runs until the server stops or the process is killed.
 pub async fn serve(metasrv: Arc<Metasrv>, addr: &str) -> Result<()> {
-    let namespaces = metasrv.list_namespaces().await?;
+    let election = LeaseElection::new(metasrv.meta().clone(), addr, Duration::from_secs(10));
+    let is_leader = Arc::new(AtomicBool::new(false));
+    tokio::spawn(run_campaign_loop(election, is_leader.clone()));
+
+    let leadership = Arc::new(Leadership { is_leader });
+    let svc = MetasrvFlightService {
+        metasrv,
+        leadership,
+    };
+
+    let socket = addr.parse().context(AddressSnafu { addr })?;
     tracing::info!(
         %addr,
-        namespaces = namespaces.len(),
-        "metasrv ready (in-process authority; gRPC wire is v1)"
+        "metasrv control plane ready (Flight do_action; writes gated on leadership)"
     );
-    // ponytail: replace with a tonic server + graceful shutdown in v1.
-    std::future::pending::<()>().await;
+    Server::builder()
+        .add_service(FlightServiceServer::new(svc))
+        .serve(socket)
+        .await
+        .context(ServeSnafu)?;
     Ok(())
 }

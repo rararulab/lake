@@ -178,14 +178,14 @@ from lease-election over an already-HA KV.
 Grep for `ponytail:` in code for shortcuts with known ceilings. Current
 design-level ones:
 
-- `lake-metasrv` has the lease-election building block (`election::LeaseElection`)
-  but the server process does not yet gate writes on being leader, and there
-  is no standby failover loop — wire election into `serve()` when running
-  more than one metadata instance.
-- `lake-metasrv::serve` / `lake-query::serve`: the query server speaks real
-  Arrow Flight SQL; the metadata server's own gRPC/Flight control wire is
-  still a hold-open stub (its authority logic and Flight SQL for reads are
-  real). Fleet nodes hit the query layer, so this is not on the hot path.
+- Both servers speak real Arrow Flight: `lake-query` a Flight SQL endpoint,
+  `lake-metasrv` a Flight `do_action` control plane (create_table/resolve/
+  list). `lake-metasrv::serve` runs the lease-election campaign loop and
+  gates writes (`create_table`) on being leader; a standby takes over on
+  lease expiry. Ceiling: leadership currently gates only at the action
+  boundary — background coordinators (GC/compaction) are not built yet, and
+  there is no client that discovers the leader (clients hit any instance;
+  reads work anywhere, writes 412 on a follower).
 - The Lance `ExternalManifestStore` adapter exists and wires into
   `LanceEngine::with_manifest_store`, but the read-path `open` still uses
   Lance's default resolver — a fully external S3 flow should thread the
@@ -198,14 +198,14 @@ design-level ones:
 - **v0 (core)** ✅ — `lake-common` + `lake-meta` (RocksMeta) + `lake-engine`
   + `lake-engine-lance` + `lake-catalog`, exercised by `lake-cli`'s e2e
   self-check (create → ingest → SQL). All tiers present as libraries.
-- **v1 (wires + prod backend)** — mostly done: `DynamoMeta` (prod HA KV, ✅),
-  the Lance `ExternalManifestStore` adapter for S3 commits (✅), and the
-  `lake-query` Arrow Flight SQL server (✅). Remaining: the `lake-metasrv`
-  control-plane gRPC/Flight wire.
-- **v2 (metadata HA + ops)** — the lease-election primitive is built (✅);
-  remaining: gate writes on leadership + standby failover in `serve()`,
-  background GC/compaction coordination, client-side SDK cache. Self-built
-  engine slots in behind `TableEngine` if/when Lance's ceiling is hit.
+- **v1 (wires + prod backend)** ✅ — `DynamoMeta` (prod HA KV), the Lance
+  `ExternalManifestStore` adapter for S3 commits, the `lake-query` Arrow
+  Flight SQL server, and the `lake-metasrv` Flight `do_action` control plane.
+- **v2 (metadata HA + ops)** — mostly done: lease-election (✅) is wired into
+  `lake-metasrv::serve` with leadership-gated writes + standby takeover (✅).
+  Remaining: background GC/compaction coordination, a leader-aware client,
+  client-side SDK cache. Self-built engine slots in behind `TableEngine`
+  if/when Lance's ceiling is hit.
 
 Invariant across all phases: fleet reads go through the stateless query
 layer, never directly at the metadata authority.

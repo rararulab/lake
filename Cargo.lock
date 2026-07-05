@@ -4020,17 +4020,21 @@ dependencies = [
 name = "lake-metasrv"
 version = "0.0.1"
 dependencies = [
+ "arrow-flight",
  "async-trait",
  "datafusion",
+ "futures",
  "lake-catalog",
  "lake-common",
  "lake-engine",
  "lake-meta",
+ "prost",
  "serde",
  "serde_json",
  "snafu",
  "tempfile",
  "tokio",
+ "tonic",
  "tracing",
 ]
 

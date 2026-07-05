@@ -9,16 +9,20 @@ publish.workspace = true
 description = "Stateful metadata-layer server: registry authority and write coordination"
 
 [dependencies]
+arrow-flight = { workspace = true }
 async-trait = { workspace = true }
 datafusion = { workspace = true }
+futures = { workspace = true }
 lake-catalog = { workspace = true }
 lake-common = { workspace = true }
 lake-engine = { workspace = true }
 lake-meta = { workspace = true }
+prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true }
+tonic = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
