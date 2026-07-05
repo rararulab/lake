@@ -1,19 +1,23 @@
 # lake-catalog
 
-DataFusion catalog over the metastore. Table resolution: KV version
-pointer -> immutable manifest -> parquet file list.
+The db→table catalog: resolves table names to DataFusion tables over the
+registry + storage engine. The cache shield in front of the metadata
+authority.
 
 ## Invariants
 
-- This crate is read-path only — it never mutates the metastore.
-- SQL surface is DataFusion; wire-protocol direction is Arrow Flight SQL
-  (see `docs/architecture.md`), not MySQL protocol.
-- `table_names` / `table_exist` bridge DataFusion's sync trait methods
-  with `futures::executor::block_on` — fine for RocksDB (ready futures),
-  must be revisited (cached table list) before a network-bound backend.
+- DataFusion's sync listing methods (`schema_names`, `table_names`) read an
+  in-memory snapshot only — they must NEVER block on the metastore (doing so
+  panics inside the async runtime). Refresh the snapshot with
+  `LakeCatalog::refresh`.
+- Per-table lookups hit the moka cache before the registry.
+- Read-only over the engine; table creation is an explicit `ops::create_table`
+  call the metadata layer makes.
 
 ## Layout
 
-- `catalog.rs` — `LakeCatalog` (one `public` schema)
-- `schema.rs` — `LakeSchema` (`SchemaProvider`: resolution + schema
-  inference)
+- `catalog.rs` — `CatalogState` + `LakeCatalog` (`CatalogProvider`, snapshot,
+  registration cache, `refresh`)
+- `schema.rs` — `LakeSchema` (`SchemaProvider`: snapshot listing + live
+  `table()` resolution)
+- `ops.rs` — `create_table` (engine create + registry register)

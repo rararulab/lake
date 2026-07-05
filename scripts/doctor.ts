@@ -39,4 +39,7 @@ if (await passes(["jj", "root"])) {
 if (await passes(["gh", "auth", "status"])) ok("gh authenticated");
 else warn("gh not authenticated — issue/PR flow unavailable");
 
+if (await passes(["git", "remote", "get-url", "origin"])) ok("git remote: origin");
+else warn("git remote origin missing — issue/PR flow unavailable");
+
 process.exit(failures === 0 ? 0 : 1);

@@ -1,9 +1,13 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/lake-common",
     "crates/lake-meta",
-    "crates/lake-manifest",
+    "crates/lake-engine",
+    "crates/lake-engine-lance",
     "crates/lake-catalog",
+    "crates/lake-query",
+    "crates/lake-metasrv",
     "crates/lake-cli",
 ]
 
@@ -16,19 +20,35 @@ repository = "https://github.com/rararulab/lake"
 publish = false
 
 [workspace.dependencies]
+# DataFusion/arrow are pinned to what lance 8 depends on (datafusion 53 /
+# arrow 55): the storage engine and query engine MUST share one datafusion,
+# or LanceTableProvider cannot be registered into our SessionContext.
+# datafusion 53.1 and lance 8 both resolve to arrow 58.3 — pin our direct
+# arrow/arrow-flight to the same major so there is one arrow in the graph.
 anyhow = "^1.0"
+arrow = "^58.0"
+arrow-flight = { version = "^58.0", features = ["flight-sql-experimental"] }
 async-trait = "^0.1"
-datafusion = "^54.0"
+datafusion = "^53.0"
 futures = "^0.3"
+lance = "^8.0"
+lance-datafusion = "^8.0"
+moka = { version = "^0.12", features = ["future"] }
 rocksdb = "^0.24"
 serde = { version = "^1.0", features = ["derive"] }
 serde_json = "^1.0"
 snafu = "^0.9"
 tokio = { version = "^1.52", features = ["rt-multi-thread", "macros"] }
+tonic = "^0.12"
+tracing = "^0.1"
 
+lake-common = { path = "crates/lake-common" }
 lake-meta = { path = "crates/lake-meta" }
-lake-manifest = { path = "crates/lake-manifest" }
+lake-engine = { path = "crates/lake-engine" }
+lake-engine-lance = { path = "crates/lake-engine-lance" }
 lake-catalog = { path = "crates/lake-catalog" }
+lake-query = { path = "crates/lake-query" }
+lake-metasrv = { path = "crates/lake-metasrv" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

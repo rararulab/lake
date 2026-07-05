@@ -37,8 +37,24 @@ These are zero-ambiguity rules — not style preferences, but mechanical require
   and auditable at the application boundary
 
 ### Async
+- Lake is async-first at I/O and query boundaries. DataFusion query APIs are
+  async; metastore/network/object-store operations stay async instead of being
+  hidden behind sync wrappers.
 - `#[async_trait]` + `Send + Sync` bound on async trait definitions
+- Blocking CPU/filesystem work is isolated from async control flow; do not hold
+  locks across `.await`.
 - Logging: `tracing` macros + `#[instrument(skip_all)]`
+
+### Rustdoc
+- Crate and module roots use `//!` to describe purpose, invariants, and the
+  smallest useful example.
+- New or modified public items require `///` docs that explain contract,
+  invariants, errors, and async/blocking behavior when relevant.
+- Public API docs should include examples when the example clarifies why the
+  API exists. Keep examples doctestable unless they require external services;
+  mark external-service examples `no_run` and explain the requirement.
+- `cargo +nightly doc --workspace --no-deps --document-private-items` runs with
+  `RUSTDOCFLAGS="-D warnings"` in the `mise run doc`/CI gate.
 
 ### Code Organization
 - `mod.rs` only for re-exports + `//!` module docs — when a module grows into a directory,

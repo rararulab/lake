@@ -12,26 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Manifest data model and on-disk layout.
-
-use std::path::{Path, PathBuf};
+//! Where a table's data lives.
 
 use serde::{Deserialize, Serialize};
 
-/// One immutable snapshot of a table, stored at
-/// `<table_root>/<table>/_manifests/v<N>.json`.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Manifest {
-    pub version: u64,
-    /// Paths/URLs of parquet data files in this snapshot.
-    pub files:   Vec<String>,
-}
+/// The storage URI of a table's dataset (e.g. `s3://bucket/ns/tbl` or a
+/// local path in dev). The engine interprets it; the registry only stores
+/// it as part of a table's registration.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TableLocation(pub String);
 
-pub fn manifest_path(table_root: &Path, table: &str, version: u64) -> PathBuf {
-    table_root
-        .join(table)
-        .join("_manifests")
-        .join(format!("v{version}.json"))
-}
+impl TableLocation {
+    pub fn new(uri: impl Into<String>) -> Self { Self(uri.into()) }
 
-pub(crate) fn ptr_key(table: &str) -> String { format!("ptr/{table}") }
+    pub fn as_str(&self) -> &str { &self.0 }
+}

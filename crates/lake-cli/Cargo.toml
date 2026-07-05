@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "End-to-end self-check binary: ingest -> commit -> SQL query"
+description = "The all-in-one lake CLI: run servers, query, ingest, admin"
 
 [[bin]]
 name = "lake"
@@ -14,10 +14,17 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+arrow = { workspace = true }
+clap = { version = "^4.5", features = ["derive"] }
 datafusion = { workspace = true }
+futures = { workspace = true }
 lake-catalog = { workspace = true }
-lake-manifest = { workspace = true }
+lake-common = { workspace = true }
+lake-engine = { workspace = true }
+lake-engine-lance = { workspace = true }
 lake-meta = { workspace = true }
+lake-metasrv = { workspace = true }
+lake-query = { workspace = true }
 tokio = { workspace = true }
 
 [lints]

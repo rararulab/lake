@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Error types for the metastore.
+//! Metastore error type.
 
 use snafu::Snafu;
 
@@ -24,6 +24,18 @@ pub enum MetaError {
         key:    String,
         source: rocksdb::Error,
     },
+
+    #[snafu(display("corrupt registry entry at key '{key}'"))]
+    CorruptEntry {
+        key:    String,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display("table '{table}' already registered"))]
+    AlreadyRegistered { table: String },
+
+    #[snafu(display("registry conflict on '{table}': entry moved under us"))]
+    Conflict { table: String },
 }
 
 pub type Result<T> = std::result::Result<T, MetaError>;

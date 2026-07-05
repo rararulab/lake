@@ -1,5 +1,6 @@
 /target
 /data
+.lake/
 .DS_Store
 .worktrees/
 .jj/

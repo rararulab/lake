@@ -1,15 +1,21 @@
 # lake-cli
 
-The `lake` binary: end-to-end self-check (ingest parquet -> commit
-manifest -> SQL query). Run via `mise run e2e`.
+The all-in-one `lake` binary: run the tier servers, query, and administer
+tables. clap derive, thin `main.rs`, one handler module per command.
 
 ## Invariants
 
-- Application boundary: the ONLY crate allowed to use `anyhow`. Domain
-  crates use per-crate snafu enums.
-- The self-check must keep proving the whole path in one command on a
-  laptop (goal.md signal). New user-visible behavior should extend it.
+- Application boundary: the ONLY crate allowed `anyhow`. Domain crates use
+  per-crate snafu enums.
+- `main.rs` stays thin — parse, build `Context`, dispatch. Command logic
+  lives in `commands/`, split by subcommand.
+- Agent-friendly: results to stdout, deterministic exit codes. (Structured
+  `--format json` output is a planned addition.)
+- `selftest` must keep proving the whole path (create → ingest → SQL) in one
+  command on a laptop — the goal.md working signal.
 
 ## Layout
 
-- `main.rs` — the self-check. Data lands in `./data` (gitignored).
+- `main.rs` — clap `Cli` + dispatch
+- `commands/mod.rs` — `Context` (metastore + engine + metasrv wiring)
+- `commands/{selftest,sql,table,serve}.rs` — one per subcommand group

@@ -12,11 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! KV metadata store. Only holds tiny mutable pointers (table -> current
-//! version); everything else lives as immutable files. Prod impl: DynamoDB
-//! with conditional puts.
+//! The HA KV metastore.
+//!
+//! [`MetaStore`] is the KV backend abstraction (a small `KvBackend`
+//! analog): tiny mutable pointers only, mutated via compare-and-set. The
+//! [`registry`] module layers lake's db→table registry on top of it. The
+//! authoritative durable state of the whole metadata tier lives here.
+//!
+//! Backends: [`RocksMeta`] for dev. `DynamoMeta` (prod, multi-AZ HA via
+//! conditional puts) is v1 — see `docs/architecture.md`; the trait is the
+//! seam it will slot into.
 
 mod error;
+pub mod registry;
 mod rocks;
 mod store;
 

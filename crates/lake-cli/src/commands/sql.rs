@@ -12,15 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Immutable table snapshots. A manifest lists the data files of one table
-//! version and is written once, never rewritten — so every reader node can
-//! cache it forever. The KV metastore only holds the current-version
-//! pointer.
+//! `lake sql` — run a SQL statement through the query engine.
 
-mod commit;
-mod error;
-mod model;
+use lake_query::QueryEngine;
 
-pub use commit::{commit, current_version, load_current};
-pub use error::{ManifestError, Result};
-pub use model::{Manifest, manifest_path};
+use super::Context;
+
+pub async fn run(ctx: &Context, query: &str) -> anyhow::Result<()> {
+    let engine = QueryEngine::new(ctx.meta.clone(), ctx.engine.clone());
+    let batches = engine.execute_sql(query).await?;
+    println!(
+        "{}",
+        datafusion::arrow::util::pretty::pretty_format_batches(&batches)?
+    );
+    Ok(())
+}

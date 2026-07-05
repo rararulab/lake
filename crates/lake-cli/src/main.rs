@@ -12,74 +12,63 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! End-to-end self-check: ingest parquet -> commit manifest -> SQL query.
+//! The all-in-one `lake` binary. Thin entry point: parse args, build the
+//! shared context, dispatch to a command module. Command logic lives in
+//! `commands/`, not here.
 
 // CLI binary: stdout is the output channel.
 #![allow(clippy::print_stdout)]
 
-use std::sync::Arc;
+mod commands;
 
-use datafusion::{
-    arrow::{
-        array::{Float64Array, Int64Array, RecordBatch, StringArray},
-        datatypes::{DataType, Field, Schema},
+use clap::{Parser, Subcommand};
+
+/// lake — a lakehouse for embodied-AI data.
+#[derive(Parser)]
+#[command(name = "lake", version, about)]
+struct Cli {
+    /// Root directory for the dev metastore and table data.
+    #[arg(long, default_value = "./data", global = true)]
+    data_dir: String,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the end-to-end self-check: create → ingest → SQL query.
+    Selftest,
+    /// Execute a SQL statement against the catalog.
+    Sql {
+        /// The SQL to run, e.g. `SELECT * FROM robots.arm`.
+        query: String,
     },
-    parquet::arrow::ArrowWriter,
-    prelude::*,
-};
-use lake_catalog::LakeCatalog;
-use lake_meta::{MetaStoreRef, RocksMeta};
+    /// Table administration.
+    #[command(subcommand)]
+    Table(commands::table::TableCmd),
+    /// Run the stateless query-layer server.
+    Query {
+        #[arg(long, default_value = "127.0.0.1:50051")]
+        addr: String,
+    },
+    /// Run the stateful metadata-layer server.
+    Meta {
+        #[arg(long, default_value = "127.0.0.1:50052")]
+        addr: String,
+    },
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let root = std::path::PathBuf::from("./data");
-    let table_root = root.join("tables");
-    std::fs::create_dir_all(table_root.join("episodes"))?;
-    let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.join("meta"))?);
+    let cli = Cli::parse();
+    let ctx = commands::Context::open(&cli.data_dir)?;
 
-    // 1. Ingest: write a parquet data file (stand-in for robot episode data).
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("robot_id", DataType::Utf8, false),
-        Field::new("episode", DataType::Int64, false),
-        Field::new("reward", DataType::Float64, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(vec!["alpha", "alpha", "beta"])),
-            Arc::new(Int64Array::from(vec![1, 2, 1])),
-            Arc::new(Float64Array::from(vec![0.9, 0.7, 0.4])),
-        ],
-    )?;
-    let file = table_root.join("episodes/part-0.parquet");
-    let mut writer = ArrowWriter::try_new(std::fs::File::create(&file)?, schema, None)?;
-    writer.write(&batch)?;
-    writer.close()?;
-
-    // 2. Commit: immutable manifest file + CAS the version pointer.
-    let version = lake_manifest::commit(
-        meta.as_ref(),
-        &table_root,
-        "episodes",
-        vec![file.canonicalize()?.display().to_string()],
-    )
-    .await?;
-    println!("committed table 'episodes' at v{version}");
-
-    // 3. Query through the catalog with plain SQL.
-    let ctx = SessionContext::new();
-    ctx.register_catalog("lake", Arc::new(LakeCatalog::new(meta.clone(), table_root)));
-    let df = ctx
-        .sql(
-            "SELECT robot_id, count(*) AS episodes, avg(reward) AS avg_reward FROM \
-             lake.public.episodes GROUP BY robot_id ORDER BY robot_id",
-        )
-        .await?;
-    let results = df.collect().await?;
-    datafusion::arrow::util::pretty::print_batches(&results)?;
-
-    let rows: usize = results.iter().map(|b| b.num_rows()).sum();
-    anyhow::ensure!(rows == 2, "expected one row per robot, got {rows}");
-    println!("self-check ok");
-    Ok(())
+    match cli.command {
+        Command::Selftest => commands::selftest::run(&ctx).await,
+        Command::Sql { query } => commands::sql::run(&ctx, &query).await,
+        Command::Table(cmd) => commands::table::run(&ctx, cmd).await,
+        Command::Query { addr } => commands::serve::query(&ctx, &addr).await,
+        Command::Meta { addr } => commands::serve::meta(&ctx, &addr).await,
+    }
 }

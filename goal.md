@@ -2,41 +2,61 @@
 
 ## What lake is
 
-lake is a lakehouse for embodied-AI data, in the spirit of LanceDB: robot
+lake is a lakehouse for embodied-AI data, in the spirit of LanceDB. Robot
 fleets write episode data (images, video, pointclouds, sensor streams) as
-immutable files, and large batches of training/eval nodes read it back
-concurrently through a SQL interface.
+immutable files; large batches of training/eval nodes read it back
+concurrently through SQL. Scale target: ~10⁴ tables holding ~10¹¹ episodes
+total (many episodes per table), under DDoS-like read fan-out.
 
-The bet: **immutable metadata plus a thin CAS pointer scales DDoS-like read
-traffic without a hot central store.** The KV metastore holds only tiny
-version pointers; manifests and data files are immutable and infinitely
-cacheable on every reader node. DataFusion provides the SQL surface so
-users query with plain SQL instead of a bespoke API.
+lake is organized as three tiers with disaggregated compute and storage:
+
+- **Query layer** — truly stateless SQL compute (DataFusion). Fleet nodes
+  fan out onto it; it reads data files directly from object storage and
+  caches catalog info. This is the tier that absorbs the read flood.
+- **Metadata layer** — the stateful catalog authority: which tables exist,
+  where they live, their current version, and write coordination. Bounded,
+  leader-elected replication — NOT freely fan-out.
+- **Storage** — per-table datasets on object storage via a pluggable
+  storage engine (Lance is the default; a self-built engine is a
+  first-class future).
+
+The bet: **put a stateless query layer in front of a bounded stateful
+metadata authority.** The query layer fans out with load and shields the
+metadata tier behind a cache, so the authority sees only cache-miss and
+write traffic. Compute and storage are separate, so read throughput scales
+by adding query nodes, not by growing a central store.
 
 ## What lake is NOT
 
 - **NOT a general-purpose data warehouse.** The workload is embodied-AI
   training/eval reads: huge scans, few point lookups, bursty fan-out.
   We do not optimize for BI dashboards or OLTP.
-- **NOT a MySQL clone.** The SQL dialect is DataFusion's; the wire
-  protocol direction is Arrow Flight SQL. We will not implement the MySQL
-  wire protocol for compatibility's sake.
-- **NOT a transaction engine.** One table, one version pointer, one CAS.
-  No cross-table transactions, no MVCC beyond snapshot-by-version. Losers
-  of a commit race retry.
-- **NOT a storage format project.** We ride Parquet (and Lance when blob
-  workloads demand it); we do not invent a file format.
-- **NOT a metadata service.** If a design puts per-query load on the KV
-  store proportional to reader count, it is wrong — readers must be
-  servable from immutable, cached artifacts.
+- **NOT a MySQL clone.** The SQL dialect is DataFusion's; the wire protocol
+  is Arrow Flight SQL. We will not implement the MySQL wire protocol.
+- **NOT a design where reader count hits the metadata authority
+  directly.** Fleet nodes talk to the stateless query layer; if a design
+  puts per-query load on the metadata tier proportional to reader count,
+  it is wrong — the query layer must shield it via cache.
+- **NOT locked to one storage engine.** Lance is the default and confined
+  to a single crate. Everything above programs against the engine trait so
+  a self-built engine can replace it.
+- **NOT a cross-table transaction engine.** Versioning and commit are
+  per-table (per dataset). No cross-table transactions, no MVCC beyond
+  snapshot-by-version. Losers of a commit race retry.
+- **NOT a storage-node system.** Storage is disaggregated object storage;
+  the query layer reads it directly. There is no datanode tier.
 
 ## What working lake looks like
 
-- A fleet of N reader nodes issues the same SQL query simultaneously; the
-  KV store sees O(1) traffic per version change, not O(N) per query.
+- A fleet of N reader nodes fans out onto the query layer; the metadata
+  authority sees ~O(cache-miss) traffic, not O(N) per query.
 - A writer commits a new table version while readers stream the old one;
   no reader ever observes a half-written snapshot.
-- A new user points a client at the catalog and runs
-  `SELECT ... FROM lake.public.<table>` with zero schema setup.
+- A new user lists the tables in a namespace and runs
+  `SELECT ... FROM <db>.<table>` with zero schema setup.
+- The metadata leader fails; a standby takes over from HA-KV-durable state;
+  the query layer keeps serving reads from cache throughout.
+- The storage engine is swapped from Lance to a self-built engine without
+  the query or metadata layers changing.
 - `mise run e2e` proves the whole path end-to-end (ingest → commit → SQL)
   in one command, on a laptop, with RocksDB.

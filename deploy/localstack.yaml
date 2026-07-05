@@ -1,0 +1,45 @@
+# localstack (DynamoDB only) for lake integration tests.
+# Portless by design: host access is through a dynamic kubectl port-forward
+# started by scripts/test-env.ts and recorded in .lake/test-env.env.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: localstack
+  labels:
+    app: localstack
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: localstack
+  template:
+    metadata:
+      labels:
+        app: localstack
+    spec:
+      containers:
+        - name: localstack
+          image: localstack/localstack:latest
+          env:
+            - name: SERVICES
+              value: dynamodb
+          ports:
+            - containerPort: 4566
+          readinessProbe:
+            httpGet:
+              path: /_localstack/health
+              port: 4566
+            initialDelaySeconds: 5
+            periodSeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: localstack
+spec:
+  type: ClusterIP
+  selector:
+    app: localstack
+  ports:
+    - port: 4566
+      targetPort: 4566

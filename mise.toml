@@ -12,12 +12,20 @@
 ## scripts/*.ts (TypeScript, run with bun).
 
 [tools]
-jj   = "latest"        # VCS — jj with colocated git backend (GitHub interop)
-gh   = "latest"        # PR + issue workflow
-bun  = "latest"        # runs scripts/*.ts
-uv   = "latest"        # uvx runs the code-review-graph MCP server (.mcp.json)
-"ubi:j178/prek" = "latest"    # quality gate runner (.pre-commit-config.yaml)
+jj   = "0.43.0"        # VCS — jj with colocated git backend (GitHub interop)
+gh   = "2.92.0"        # PR + issue workflow
+bun  = "1.3.14"        # runs scripts/*.ts
+uv   = "0.11.26"       # uvx runs the code-review-graph MCP server (.mcp.json)
+"ubi:j178/prek" = "0.4.8"     # quality gate runner (.pre-commit-config.yaml)
 "cargo:agent-spec" = "0.3.0"  # lane-1 BDD gate (spec-lint / spec-lifecycle)
+
+[env]
+# CARGO_INCREMENTAL deliberately NOT disabled here: local gates rely on
+# incremental builds for speed. CI sets CARGO_INCREMENTAL=0 itself.
+CARGO_TERM_COLOR = "always"
+CARGO_NET_RETRY = "10"
+RUST_BACKTRACE = "1"
+RUSTUP_MAX_RETRIES = "10"
 
 # ========================================================================================
 # Lifecycle
@@ -68,12 +76,40 @@ description = "run workspace tests"
 run = "cargo test --workspace --all-targets"
 
 [tasks.e2e]
-description = "end-to-end self-check: ingest -> commit -> SQL query"
-run = "cargo run -p lake-cli"
+description = "end-to-end self-check: create -> ingest -> SQL query"
+run = "cargo run -p lake-cli -- selftest"
 
+[tasks.test-env-up]
+description = "start portless local integration deps: checkout-scoped kind + localstack"
+tools = { kind = "0.32.0", kubectl = "1.36.2" }
+run = "bun scripts/test-env.ts up"
+
+[tasks.test-env-down]
+description = "tear down the kind integration cluster"
+tools = { kind = "0.32.0", kubectl = "1.36.2" }
+run = "bun scripts/test-env.ts down"
+
+# ponytail: gate = the FAST local loop (hooks, cargo test, e2e).
+# Slow passes (cargo doc warnings, spec-selftest tooling lock) run in CI
+# via `mise run ci`.
 [tasks.gate]
-description = "full quality gate: hooks + test + e2e"
+description = "fast local quality gate: hooks + test + e2e"
 depends = ["hooks", "test", "e2e"]
+
+[tasks.doc]
+description = "cargo doc with -D warnings (slow; CI and on demand)"
+run = 'env RUSTDOCFLAGS="-D warnings" cargo +nightly doc --workspace --no-deps --document-private-items'
+
+[tasks.ci]
+description = "full CI gate: gate + doc + spec-selftest"
+depends = ["gate", "doc", "spec-selftest"]
+
+[tasks.check-commits]
+description = "validate Conventional Commit subjects in a git revision range"
+usage = '''
+arg "<range>" help="git revision range, e.g. origin/main..HEAD"
+'''
+run = 'bun scripts/check-conventional-commit.ts --range "${usage_range?}"'
 
 # ========================================================================================
 # Spec / agent-spec (Task Contracts) — see specs/README.md
@@ -81,15 +117,24 @@ depends = ["hooks", "test", "e2e"]
 
 [tasks.spec-init]
 description = "scaffold a new lane-1 task spec: mise run spec-init <slug>"
-run = 'agent-spec init --level task --lang en --name "{{arg(name="slug")}}"'
+usage = '''
+arg "<slug>" help="short spec slug"
+'''
+run = 'agent-spec init --level task --lang en --name "${usage_slug?}"'
 
 [tasks.spec-lint]
 description = "lint a task spec (min-score 0.7): mise run spec-lint specs/issue-N-<slug>.spec.md"
-run = 'agent-spec lint {{arg(name="spec")}} --min-score 0.7'
+usage = '''
+arg "<spec>" help="path to specs/issue-N-<slug>.spec.md"
+'''
+run = 'agent-spec lint "${usage_spec?}" --min-score 0.7'
 
 [tasks.spec-lifecycle]
 description = "verify a task spec against this workspace (zero-match guarded)"
-run = 'bun scripts/spec-lifecycle-guard.ts {{arg(name="spec")}}'
+usage = '''
+arg "<spec>" help="path to specs/issue-N-<slug>.spec.md"
+'''
+run = 'bun scripts/spec-lifecycle-guard.ts "${usage_spec?}"'
 
 [tasks.spec-selftest]
 description = "assert the lifecycle gate rejects the zero-match fixture"

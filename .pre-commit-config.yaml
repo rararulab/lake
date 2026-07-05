@@ -1,14 +1,9 @@
 repos:
   - repo: local
     hooks:
-      - id: cargo-check
-        name: cargo check
-        entry: cargo check --all-targets
-        language: system
-        pass_filenames: false
-        types_or: [rust, toml]
-        files: \.(rs|toml)$|Cargo\.lock$|rust-toolchain\.toml$
-
+      # ponytail: hooks are the FAST local gate — fmt + clippy only.
+      # clippy subsumes cargo check; the slow passes (cargo doc warnings,
+      # spec-selftest) run in CI via `mise run ci`.
       - id: cargo-fmt
         name: cargo fmt
         entry: cargo +nightly fmt --all -- --check
@@ -19,15 +14,7 @@ repos:
 
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --all-targets --all-features --no-deps -- -D warnings
-        language: system
-        pass_filenames: false
-        types_or: [rust, toml]
-        files: \.(rs|toml)$|Cargo\.lock$|rust-toolchain\.toml$
-
-      - id: cargo-doc
-        name: cargo doc
-        entry: env RUSTDOCFLAGS="-D warnings" cargo +nightly doc --no-deps --document-private-items
+        entry: cargo clippy --workspace --all-targets --all-features --no-deps -- -D warnings
         language: system
         pass_filenames: false
         types_or: [rust, toml]

@@ -12,11 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! DataFusion catalog backed by the KV metastore. Table resolution: KV
-//! version pointer -> immutable manifest -> parquet file list.
+//! The db→table catalog: resolves table names to DataFusion tables.
+//!
+//! [`LakeCatalog`] maps a lake namespace to a DataFusion schema and a table
+//! name to a [`TableProvider`](datafusion::catalog::TableProvider) obtained
+//! from the storage engine. It is the cache shield in front of the metadata
+//! authority: DataFusion's sync listing methods read an in-memory snapshot
+//! (never blocking on I/O), and per-table lookups hit a moka cache before
+//! the registry. Refresh the snapshot with [`LakeCatalog::refresh`].
 
 mod catalog;
+mod ops;
 mod schema;
 
-pub use catalog::LakeCatalog;
-pub use schema::LakeSchema;
+pub use catalog::{CatalogState, LakeCatalog};
+pub use ops::{CatalogError, create_table};

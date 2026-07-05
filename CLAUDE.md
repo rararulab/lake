@@ -17,7 +17,7 @@ MCP 工具（索引：`mise run codegraph`）。
 - `docs/architecture.md` — 系统设计、读路径、commit 协议、架构不变量、crate 划分
 - `specs/README.md` — lane 1（spec 驱动、BDD 绑定测试）vs lane 2（轻量 chore）triage
 - `harness/roles/*.md` — 角色契约（spec-author / implementer / reviewer / verifier）；`.claude/agents/*.md` 是薄包装
-- `docs/guides/*.md` — workflow / rust-style / commit-style / code-comments / anti-patterns
+- `docs/guides/*.md` — workflow / mise-ci / local-deploy / cli / rust-style / commit-style / code-comments / anti-patterns
 
 ## 硬规则
 

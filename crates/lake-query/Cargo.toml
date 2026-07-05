@@ -1,0 +1,22 @@
+[package]
+name = "lake-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Stateless query-layer server: Flight SQL over the lake catalog"
+
+[dependencies]
+async-trait = { workspace = true }
+datafusion = { workspace = true }
+lake-catalog = { workspace = true }
+lake-engine = { workspace = true }
+lake-meta = { workspace = true }
+snafu = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true
