@@ -19,10 +19,11 @@ spec:
     spec:
       containers:
         - name: localstack
-          image: localstack/localstack:latest
+          # Community edition (:latest now requires a LOCALSTACK_AUTH_TOKEN).
+          image: localstack/localstack:3
           env:
             - name: SERVICES
-              value: dynamodb
+              value: dynamodb,s3
           ports:
             - containerPort: 4566
           readinessProbe:

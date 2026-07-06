@@ -25,7 +25,7 @@
 //! [`MetaManifestStore`] backed by our `MetaStore`, giving Lance the
 //! put-if-not-exists it needs for concurrent commits — see [`manifest_store`].
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -44,7 +44,8 @@ use lake_meta::MetaStoreRef;
 use lance::{
     Dataset,
     datafusion::LanceTableProvider,
-    dataset::{WriteMode, WriteParams},
+    dataset::{WriteMode, WriteParams, builder::DatasetBuilder},
+    io::{ObjectStoreParams, StorageOptionsAccessor},
 };
 use lance_table::io::commit::{
     CommitHandler,
@@ -54,34 +55,103 @@ use lance_table::io::commit::{
 mod manifest_store;
 pub use manifest_store::MetaManifestStore;
 
+/// How this engine writes and opens datasets: which commit handler (external
+/// manifest store) and which object-store options (S3 endpoint, credentials).
+/// Shared by the engine and each open table handle so appends use the same
+/// configuration as the create.
+#[derive(Clone, Debug, Default)]
+struct WriteConfig {
+    // ponytail: `None` -> Lance's default object-store commit (atomic on local
+    // FS). `Some` -> commits route through our `MetaStore`-backed external
+    // manifest store, giving put-if-not-exists semantics on S3.
+    commit_handler:  Option<Arc<dyn CommitHandler>>,
+    // Empty -> local filesystem. Non-empty -> object_store config keys
+    // (`aws_endpoint`, `aws_access_key_id`, …) threaded into every read/write.
+    storage_options: HashMap<String, String>,
+}
+
+impl WriteConfig {
+    fn object_store_params(&self) -> Option<ObjectStoreParams> {
+        if self.storage_options.is_empty() {
+            return None;
+        }
+        let accessor = StorageOptionsAccessor::with_static_options(self.storage_options.clone());
+        Some(ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(accessor)),
+            ..Default::default()
+        })
+    }
+
+    fn write_params(&self, mode: WriteMode) -> WriteParams {
+        WriteParams {
+            mode,
+            commit_handler: self.commit_handler.clone(),
+            store_params: self.object_store_params(),
+            ..Default::default()
+        }
+    }
+
+    /// Open a dataset through the configured commit handler + storage options,
+    /// so both the local and the S3-with-external-manifest paths resolve the
+    /// latest version the same way.
+    async fn open_dataset(&self, uri: &str) -> lance::Result<Dataset> {
+        let mut builder = DatasetBuilder::from_uri(uri);
+        if !self.storage_options.is_empty() {
+            builder = builder.with_storage_options(self.storage_options.clone());
+        }
+        if let Some(handler) = &self.commit_handler {
+            builder = builder.with_commit_handler(handler.clone());
+        }
+        builder.load().await
+    }
+}
+
 /// A `TableEngine` backed by Lance datasets.
 #[derive(Debug, Default)]
 pub struct LanceEngine {
-    // ponytail: `None` -> Lance's default object-store commit (atomic on local
-    // FS). `Some` -> commits route through our `MetaStore`-backed external
-    // manifest store, which gives put-if-not-exists semantics on S3.
-    commit_handler: Option<Arc<dyn CommitHandler>>,
+    config: WriteConfig,
 }
 
 impl LanceEngine {
     #[must_use]
     pub fn new() -> Self { Self::default() }
 
-    /// Build an engine whose commits route through `meta`.
+    /// Build an engine whose commits route through `meta` (external manifest
+    /// store) on the local filesystem.
     ///
-    /// Every `create`/`append` then writes its manifest pointer via a
+    /// Every `create`/`append` writes its manifest pointer via a
     /// [`MetaManifestStore`], so concurrent writers serialize through lake's
     /// compare-and-set instead of relying on object-store atomic renames.
     #[must_use]
     pub fn with_manifest_store(meta: MetaStoreRef) -> Self {
-        let store: Arc<dyn ExternalManifestStore> = Arc::new(MetaManifestStore::new(meta));
-        let handler = ExternalManifestCommitHandler {
-            external_manifest_store: store,
-        };
         Self {
-            commit_handler: Some(Arc::new(handler)),
+            config: WriteConfig {
+                commit_handler:  Some(external_handler(meta)),
+                storage_options: HashMap::new(),
+            },
         }
     }
+
+    /// Build an engine for object storage: commits route through `meta`'s
+    /// external manifest store, and `storage_options` (object_store config
+    /// keys — `aws_endpoint`, `aws_access_key_id`, `aws_region`, …) point Lance
+    /// at the bucket. This is the production path.
+    #[must_use]
+    pub fn for_object_store(meta: MetaStoreRef, storage_options: HashMap<String, String>) -> Self {
+        Self {
+            config: WriteConfig {
+                commit_handler: Some(external_handler(meta)),
+                storage_options,
+            },
+        }
+    }
+}
+
+fn external_handler(meta: MetaStoreRef) -> Arc<dyn CommitHandler> {
+    let store: Arc<dyn ExternalManifestStore> = Arc::new(MetaManifestStore::new(meta));
+    Arc::new(ExternalManifestCommitHandler {
+        external_manifest_store: store,
+    })
 }
 
 #[async_trait]
@@ -89,38 +159,26 @@ impl TableEngine for LanceEngine {
     fn kind(&self) -> &'static str { "lance" }
 
     async fn create(&self, location: &TableLocation, schema: SchemaRef) -> Result<TableHandleRef> {
-        if Dataset::open(location.as_str()).await.is_ok() {
+        if self.config.open_dataset(location.as_str()).await.is_ok() {
             return Err(EngineError::already_exists(location.clone()));
         }
         let empty = RecordBatchIterator::new(
             std::iter::empty::<std::result::Result<RecordBatch, ArrowError>>(),
             schema,
         );
-        let params = WriteParams {
-            mode: WriteMode::Create,
-            // ponytail: `None` keeps Lance's default commit; `Some` routes the
-            // manifest through our MetaStore. The existence probe above still
-            // uses Lance's default open — fine as a probe, but a fully external
-            // S3 flow should also thread the handler into that open.
-            commit_handler: self.commit_handler.clone(),
-            ..Default::default()
-        };
-        let dataset = Dataset::write(empty, location.as_str(), Some(params))
-            .await
-            .map_err(EngineError::backend)?;
-        Ok(LanceTable::handle(dataset, self.commit_handler.clone()))
+        let dataset = Dataset::write(
+            empty,
+            location.as_str(),
+            Some(self.config.write_params(WriteMode::Create)),
+        )
+        .await
+        .map_err(EngineError::backend)?;
+        Ok(LanceTable::handle(dataset, self.config.clone()))
     }
 
     async fn open(&self, location: &TableLocation) -> Result<Option<TableHandleRef>> {
-        // ponytail: on a fully external S3 flow, resolving the latest version
-        // on open should also go through `self.commit_handler` (via
-        // `DatasetBuilder::with_commit_handler`); the default open is enough on
-        // local FS and for the existence probe in `create`.
-        match Dataset::open(location.as_str()).await {
-            Ok(dataset) => Ok(Some(LanceTable::handle(
-                dataset,
-                self.commit_handler.clone(),
-            ))),
+        match self.config.open_dataset(location.as_str()).await {
+            Ok(dataset) => Ok(Some(LanceTable::handle(dataset, self.config.clone()))),
             Err(lance::Error::DatasetNotFound { .. }) => Ok(None),
             Err(e) => Err(EngineError::backend(e)),
         }
@@ -129,21 +187,21 @@ impl TableEngine for LanceEngine {
 
 /// A handle to one open Lance dataset.
 struct LanceTable {
-    uri:            String,
-    dataset:        Arc<Dataset>,
-    schema:         SchemaRef,
-    commit_handler: Option<Arc<dyn CommitHandler>>,
+    uri:     String,
+    dataset: Arc<Dataset>,
+    schema:  SchemaRef,
+    config:  WriteConfig,
 }
 
 impl LanceTable {
-    fn handle(dataset: Dataset, commit_handler: Option<Arc<dyn CommitHandler>>) -> TableHandleRef {
+    fn handle(dataset: Dataset, config: WriteConfig) -> TableHandleRef {
         let dataset = Arc::new(dataset);
         let provider = LanceTableProvider::new(dataset.clone(), false, false);
         Arc::new(Self {
             uri: dataset.uri().to_string(),
             schema: provider.schema(),
             dataset,
-            commit_handler,
+            config,
         })
     }
 }
@@ -173,14 +231,13 @@ impl TableHandle for LanceTable {
                 .map(std::result::Result::<_, ArrowError>::Ok),
             schema,
         );
-        let params = WriteParams {
-            mode: WriteMode::Append,
-            commit_handler: self.commit_handler.clone(),
-            ..Default::default()
-        };
-        let dataset = Dataset::write(reader, &self.uri, Some(params))
-            .await
-            .map_err(EngineError::backend)?;
+        let dataset = Dataset::write(
+            reader,
+            &self.uri,
+            Some(self.config.write_params(WriteMode::Append)),
+        )
+        .await
+        .map_err(EngineError::backend)?;
         Ok(Version(dataset.version().version))
     }
 }

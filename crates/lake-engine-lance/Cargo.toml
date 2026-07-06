@@ -23,6 +23,8 @@ snafu = { workspace = true }
 
 [dev-dependencies]
 arrow = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
 
