@@ -17,9 +17,11 @@ lake-engine = { workspace = true }
 lake-meta = { workspace = true }
 lance = { workspace = true }
 lance-table = { workspace = true }
+object_store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 snafu = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 arrow = { workspace = true }

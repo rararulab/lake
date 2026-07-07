@@ -19,11 +19,14 @@ tables. clap derive, thin `main.rs`, one handler module per command.
 - **local** (default) — RocksDB metastore + local-FS Lance under `--data-dir`.
 - **cloud** — set `LAKE_S3_BUCKET` → `DynamoMeta` + Lance on S3. Config:
   `LAKE_DYNAMODB_ENDPOINT`/`LAKE_DYNAMODB_TABLE`, `LAKE_S3_ENDPOINT`, `AWS_*`,
-  and `LAKE_S3_PROXY_EXCLUDES` (bypass an ambient `PROXY_URL` for the endpoint).
+  and `LAKE_S3_PROXY_EXCLUDES` (bypass an ambient `PROXY_URL` for the endpoint;
+  behind a proxy also set the standard `NO_PROXY` so the drop path's direct
+  object_store client bypasses it too).
 
 ## Layout
 
 - `main.rs` — clap `Cli` + dispatch
 - `commands/mod.rs` — `Context` (local/cloud storage wiring: metastore + engine
   + metasrv)
-- `commands/{selftest,sql,table,serve}.rs` — one per subcommand group
+- `commands/{selftest,sql,ingest,table,serve}.rs` — one per subcommand group
+  (`table` covers create/list/drop; `ingest` loads a Parquet file)

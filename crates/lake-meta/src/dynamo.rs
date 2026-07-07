@@ -215,4 +215,17 @@ impl MetaStore for DynamoMeta {
         }
         Ok(out)
     }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        // Unconditional delete — DynamoDB's DeleteItem is idempotent (deleting
+        // an absent key succeeds).
+        self.client
+            .delete_item()
+            .table_name(&self.table)
+            .key("pk", AttributeValue::S(key.to_owned()))
+            .send()
+            .await
+            .map_err(dynamo_err(format!("delete_item on '{key}'")))?;
+        Ok(())
+    }
 }

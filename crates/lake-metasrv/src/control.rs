@@ -148,6 +148,22 @@ impl MetasrvFlightService {
         Ok(Response::new(stream))
     }
 
+    /// `drop_table`: gate on leadership, then delete the table's data and
+    /// deregister it. Idempotent.
+    async fn action_drop_table(&self, body: &[u8]) -> Result<Response<ActionStream>, Status> {
+        if !self.leadership.is_leader() {
+            return Err(Status::failed_precondition("not the leader"));
+        }
+        let req: TableIdent = parse_body(body)?;
+        let table = TableRef::new(req.namespace, req.name);
+        self.metasrv
+            .drop_table(&table)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let stream: ActionStream = Box::pin(futures::stream::empty());
+        Ok(Response::new(stream))
+    }
+
     /// `resolve`: return the table's registration as one JSON result, or
     /// `not_found` if it is not registered.
     async fn action_resolve(&self, body: &[u8]) -> Result<Response<ActionStream>, Status> {
@@ -262,6 +278,7 @@ impl FlightService for MetasrvFlightService {
         let body = action.body;
         match action.r#type.as_str() {
             "create_table" => self.action_create_table(&body).await,
+            "drop_table" => self.action_drop_table(&body).await,
             "resolve" => self.action_resolve(&body).await,
             "list_tables" => self.action_list_tables(&body).await,
             "list_namespaces" => self.action_list_namespaces().await,
@@ -281,6 +298,12 @@ impl FlightService for MetasrvFlightService {
                 r#type:      "create_table".to_string(),
                 description: "Create and register a table (leader only). Body JSON: {namespace, \
                               name, columns:[\"name:type\"], location}"
+                    .to_string(),
+            },
+            ActionType {
+                r#type:      "drop_table".to_string(),
+                description: "Delete a table's data and deregister it (leader only). Body JSON: \
+                              {namespace, name}"
                     .to_string(),
             },
             ActionType {

@@ -37,7 +37,7 @@ use datafusion::{
     catalog::TableProvider,
     execution::SendableRecordBatchStream,
 };
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lake_common::{TableLocation, Version};
 use lake_engine::{EngineError, Result, TableEngine, TableHandle, TableHandleRef};
 use lake_meta::MetaStoreRef;
@@ -183,6 +183,44 @@ impl TableEngine for LanceEngine {
             Err(e) => Err(EngineError::backend(e)),
         }
     }
+
+    async fn remove(&self, location: &TableLocation) -> Result<()> {
+        // Delete every object under the dataset's path, on whatever store the
+        // URI names (local FS or S3). Idempotent: listing an absent prefix
+        // yields nothing to delete.
+        let url = dataset_url(location)?;
+        let (store, path) = object_store::parse_url_opts(&url, self.config.storage_options.clone())
+            .map_err(EngineError::backend)?;
+        let paths = store.list(Some(&path)).map_ok(|meta| meta.location).boxed();
+        store
+            .delete_stream(paths)
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(EngineError::backend)?;
+        Ok(())
+    }
+}
+
+/// Resolve a [`TableLocation`] to an object-store URL. A bare path (local dev)
+/// becomes a `file://` directory URL; anything with a scheme (`s3://`, …) is
+/// used as-is.
+fn dataset_url(location: &TableLocation) -> Result<url::Url> {
+    let raw = location.as_str();
+    match url::Url::parse(raw) {
+        Ok(url) => Ok(url),
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
+            // A bare filesystem path. Absolutize (without requiring it to
+            // exist — it may already be deleted) before the file:// URL.
+            let abs = std::path::absolute(raw).map_err(EngineError::backend)?;
+            url::Url::from_directory_path(&abs).map_err(|()| {
+                EngineError::backend(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("cannot form a file URL from {}", abs.display()),
+                ))
+            })
+        }
+        Err(e) => Err(EngineError::backend(e)),
+    }
 }
 
 /// A handle to one open Lance dataset.
@@ -286,5 +324,25 @@ mod tests {
         let engine = LanceEngine::new();
         let loc = TableLocation::new("/nonexistent/path/x.lance");
         assert!(engine.open(&loc).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_data_and_allows_recreate() {
+        let dir = tempfile::tempdir().unwrap();
+        let loc = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
+        let engine = LanceEngine::new();
+
+        engine.create(&loc, batch().schema()).await.unwrap();
+        assert!(engine.open(&loc).await.unwrap().is_some());
+
+        engine.remove(&loc).await.unwrap();
+        assert!(engine.open(&loc).await.unwrap().is_none(), "data is gone");
+
+        // remove is idempotent, and the name is free to reuse.
+        engine.remove(&loc).await.unwrap();
+        assert!(
+            engine.create(&loc, batch().schema()).await.is_ok(),
+            "recreate works"
+        );
     }
 }

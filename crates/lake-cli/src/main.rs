@@ -44,6 +44,13 @@ enum Command {
         /// The SQL to run, e.g. `SELECT * FROM robots.arm`.
         query: String,
     },
+    /// Load a Parquet file into a table (creating it if absent).
+    Ingest {
+        /// `<namespace>.<name>`, e.g. `robots.arm_left`.
+        table: String,
+        /// Path to the Parquet file to load.
+        file:  String,
+    },
     /// Table administration.
     #[command(subcommand)]
     Table(commands::table::TableCmd),
@@ -67,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Selftest => commands::selftest::run(&ctx).await,
         Command::Sql { query } => commands::sql::run(&ctx, &query).await,
+        Command::Ingest { table, file } => commands::ingest::run(&ctx, &table, &file).await,
         Command::Table(cmd) => commands::table::run(&ctx, cmd).await,
         Command::Query { addr } => commands::serve::query(&ctx, &addr).await,
         Command::Meta { addr } => commands::serve::meta(&ctx, &addr).await,

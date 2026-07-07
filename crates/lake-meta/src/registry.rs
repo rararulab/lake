@@ -61,6 +61,11 @@ pub async fn register(
     Ok(())
 }
 
+/// Remove a table's registration. Idempotent.
+pub async fn delete(meta: &dyn MetaStore, table: &TableRef) -> Result<()> {
+    meta.delete(&key(table)).await
+}
+
 /// Look up a table's registration.
 pub async fn get(meta: &dyn MetaStore, table: &TableRef) -> Result<Option<TableRegistration>> {
     let k = key(table);

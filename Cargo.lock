@@ -4156,11 +4156,13 @@ dependencies = [
  "lake-meta",
  "lance",
  "lance-table",
+ "object_store",
  "serde",
  "serde_json",
  "snafu",
  "tempfile",
  "tokio",
+ "url",
 ]
 
 [[package]]

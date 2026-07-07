@@ -23,6 +23,7 @@
 //!   `LAKE_DYNAMODB_*`, and the S3 endpoint plus credentials from
 //!   `LAKE_S3_ENDPOINT` and the standard `AWS_*` variables.
 
+pub mod ingest;
 pub mod selftest;
 pub mod serve;
 pub mod sql;
@@ -128,6 +129,10 @@ fn s3_storage_options() -> HashMap<String, String> {
     // object_store's bypass key is `proxy_excludes`, which no standard env var
     // maps to. Set `LAKE_S3_PROXY_EXCLUDES` (e.g. for a private/loopback
     // endpoint behind a corporate proxy) to restore direct connections.
+    //
+    // The drop path (`engine.remove`) builds object_store directly rather than
+    // through lance-io, so its client falls back to the system/`reqwest` proxy;
+    // behind a proxy, also set the standard `NO_PROXY` for the endpoint host.
     for (key, var) in [
         ("aws_access_key_id", "AWS_ACCESS_KEY_ID"),
         ("aws_secret_access_key", "AWS_SECRET_ACCESS_KEY"),

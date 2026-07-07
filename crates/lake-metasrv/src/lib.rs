@@ -134,6 +134,28 @@ impl Metasrv {
         Ok(new_version)
     }
 
+    /// Drop a table: delete its data via the engine, then remove the registry
+    /// entry. Idempotent — dropping an absent table is a no-op. Data-first so a
+    /// crash leaves at worst orphaned data (reclaimable by GC), never a
+    /// registry entry pointing at deleted data.
+    ///
+    /// ponytail: query-layer caches self-heal (a dropped table's dataset is
+    /// gone, so `open` returns `None`) and refresh drops it from listings; a
+    /// push-based cache invalidation across instances is a v2 concern.
+    pub async fn drop_table(&self, table: &TableRef) -> Result<()> {
+        let Some(reg) = self.resolve(table).await? else {
+            return Ok(());
+        };
+        self.engine
+            .remove(&reg.location)
+            .await
+            .context(EngineSnafu)?;
+        registry::delete(self.meta.as_ref(), table)
+            .await
+            .context(RegistrySnafu)?;
+        Ok(())
+    }
+
     /// Resolve a table to its current registration.
     pub async fn resolve(&self, table: &TableRef) -> Result<Option<TableRegistration>> {
         registry::get(self.meta.as_ref(), table)

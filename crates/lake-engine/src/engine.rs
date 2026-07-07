@@ -44,6 +44,11 @@ pub trait TableEngine: Send + Sync {
 
     /// Open an existing table, or `None` if nothing lives at `location`.
     async fn open(&self, location: &TableLocation) -> Result<Option<TableHandleRef>>;
+
+    /// Delete all storage backing a table. Idempotent — removing an absent
+    /// table is not an error. Used by drop-table; the registry entry is
+    /// removed separately by the metadata layer.
+    async fn remove(&self, location: &TableLocation) -> Result<()>;
 }
 
 /// A handle to one table backed by an engine. Resolves to DataFusion for

@@ -38,16 +38,22 @@ pub enum TableCmd {
         /// Namespace to list tables for; omit to list namespaces.
         namespace: Option<String>,
     },
+    /// Drop a table: delete its data and deregister it.
+    Drop {
+        /// `<namespace>.<name>`, e.g. `robots.arm_left`.
+        table: String,
+    },
 }
 
 pub async fn run(ctx: &Context, cmd: TableCmd) -> anyhow::Result<()> {
     match cmd {
         TableCmd::Create { table, columns } => create(ctx, &table, &columns).await,
         TableCmd::List { namespace } => list(ctx, namespace.as_deref()).await,
+        TableCmd::Drop { table } => drop_table(ctx, &table).await,
     }
 }
 
-fn parse_table_ref(s: &str) -> anyhow::Result<TableRef> {
+pub(crate) fn parse_table_ref(s: &str) -> anyhow::Result<TableRef> {
     let (ns, name) = s
         .split_once('.')
         .context("table must be <namespace>.<name>")?;
@@ -81,6 +87,16 @@ async fn create(ctx: &Context, table: &str, columns: &[String]) -> anyhow::Resul
         .await
         .with_context(|| format!("creating {table}"))?;
     println!("created table {table}");
+    Ok(())
+}
+
+async fn drop_table(ctx: &Context, table: &str) -> anyhow::Result<()> {
+    let table = parse_table_ref(table)?;
+    ctx.metasrv
+        .drop_table(&table)
+        .await
+        .with_context(|| format!("dropping {table}"))?;
+    println!("dropped table {table}");
     Ok(())
 }
 

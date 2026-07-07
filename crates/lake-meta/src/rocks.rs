@@ -81,6 +81,10 @@ impl MetaStore for RocksMeta {
         }
         Ok(out)
     }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.db.delete(key).context(BackendSnafu { key })
+    }
 }
 
 #[cfg(test)]
