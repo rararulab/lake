@@ -240,4 +240,29 @@ async fn lance_engine_on_s3_with_dynamo_external_manifest() {
         pointer.starts_with(b"{"),
         "manifest pointer is the JSON value written by MetaManifestStore"
     );
+
+    // 8. Drop the table: `remove` must delete every S3 object under the dataset
+    //    path (the object_store S3 delete path, distinct from local FS) and `open`
+    //    must then report the table gone.
+    engine.remove(&location).await.expect("engine remove on s3");
+    assert!(
+        engine
+            .open(&location)
+            .await
+            .expect("engine open after remove")
+            .is_none(),
+        "table is gone after remove"
+    );
+    let remaining = s3
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix("ns/tbl.lance/")
+        .send()
+        .await
+        .expect("list objects after remove");
+    assert_eq!(
+        remaining.key_count().unwrap_or(0),
+        0,
+        "remove deleted all S3 objects under the dataset"
+    );
 }

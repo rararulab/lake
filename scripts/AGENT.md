@@ -14,3 +14,6 @@ files instead). Read `docs/guides/mise-ci.md` before changing Bun Shell usage.
 - `test-env.ts` — checkout-scoped LocalStack (DynamoDB + S3) in Docker, up/down
   (`mise run test-env-up` / `test-env-down`); writes the dynamic endpoint to
   `.lake/test-env.env`
+- `test-integration.ts` — `mise run test-integration`: up → run the `#[ignore]`
+  LocalStack tests (`--run-ignored ignored-only`) against the endpoint → down.
+  CI runs the same tests against a LocalStack service container.

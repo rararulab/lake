@@ -40,6 +40,51 @@ jobs:
       - name: ci gate
         run: mise run ci
 
+  # Exercise the production path (DynamoMeta + Lance-on-S3) against LocalStack.
+  # These tests are `#[ignore]` and skip without LAKE_DYNAMODB_ENDPOINT, so the
+  # `check` job never runs them — this job provisions the emulator and does.
+  integration:
+    name: Integration (LocalStack)
+    runs-on: ubuntu-latest
+    services:
+      localstack:
+        # Community edition; `:latest` now requires a LOCALSTACK_AUTH_TOKEN.
+        image: localstack/localstack:3
+        ports:
+          - 4566:4566
+        env:
+          SERVICES: dynamodb,s3
+        # Make GitHub wait for LocalStack to be ready before the steps run,
+        # so tests never race its startup.
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/_localstack/health"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      LAKE_DYNAMODB_ENDPOINT: http://localhost:4566
+      LAKE_S3_ENDPOINT: http://localhost:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable
+
+      - uses: jdx/mise-action@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          install: true
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: run integration tests (ignored-only)
+        run: cargo nextest run -p lake-meta -p lake-engine-lance --run-ignored ignored-only
+
   # jj fires no git hooks locally, so Conventional Commits are enforced here.
   commits:
     name: Conventional Commits
