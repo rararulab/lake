@@ -62,7 +62,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let ctx = commands::Context::open(&cli.data_dir)?;
+    let ctx = commands::Context::open(&cli.data_dir).await?;
 
     match cli.command {
         Command::Selftest => commands::selftest::run(&ctx).await,

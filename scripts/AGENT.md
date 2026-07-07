@@ -11,6 +11,6 @@ files instead). Read `docs/guides/mise-ci.md` before changing Bun Shell usage.
   lifecycle`; exit contract 0/1/2 documented in the file header
 - `spec-selftest.ts` — regression lock: the guard must reject
   `specs/fixtures/zero-match.spec.md`
-- `test-env.ts` — checkout-scoped kind + localstack integration deps up/down
-  (`mise run test-env-up` / `test-env-down`); writes the dynamic DynamoDB
-  endpoint to `.lake/test-env.env`
+- `test-env.ts` — checkout-scoped LocalStack (DynamoDB + S3) in Docker, up/down
+  (`mise run test-env-up` / `test-env-down`); writes the dynamic endpoint to
+  `.lake/test-env.env`

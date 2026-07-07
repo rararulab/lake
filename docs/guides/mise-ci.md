@@ -34,7 +34,7 @@ first.
   `latest` for `bun`, `uv`, `jj`, `gh`, `prek`, or `agent-spec` unless the PR
   is explicitly a toolchain refresh and records the reason.
 - Top-level `[tools]` is the base developer environment. Do not put deploy-only
-  tools such as `kind` and `kubectl` there; attach them to the deploy tasks
+  tools (cloud emulators, load-test tools) there; attach them to the deploy tasks
   that need them.
 - Tool bumps are their own chore unless a feature genuinely requires them.
 - After changing `[tools]`, run `mise install`, `mise ls --current`, and

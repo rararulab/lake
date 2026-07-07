@@ -80,13 +80,11 @@ description = "end-to-end self-check: create -> ingest -> SQL query"
 run = "cargo run -p lake-cli -- selftest"
 
 [tasks.test-env-up]
-description = "start portless local integration deps: checkout-scoped kind + localstack"
-tools = { kind = "0.32.0", kubectl = "1.36.2" }
+description = "start portless local integration deps: checkout-scoped localstack (Docker)"
 run = "bun scripts/test-env.ts up"
 
 [tasks.test-env-down]
-description = "tear down the kind integration cluster"
-tools = { kind = "0.32.0", kubectl = "1.36.2" }
+description = "tear down this checkout's localstack container"
 run = "bun scripts/test-env.ts down"
 
 # ponytail: gate = the FAST local loop (hooks, cargo test, e2e).

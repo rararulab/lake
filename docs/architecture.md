@@ -186,12 +186,13 @@ design-level ones:
   boundary — background coordinators (GC/compaction) are not built yet, and
   there is no client that discovers the leader (clients hit any instance;
   reads work anywhere, writes 412 on a follower).
-- `LanceEngine::for_object_store` threads S3 storage options + the
-  `ExternalManifestStore` (DynamoDB commit pointer) through create/open/
-  append — the full prod path is verified end-to-end against localstack
-  (`tests/s3_lance_localstack.rs`, `#[ignore]`). Ceiling: `lake-cli` still
-  builds `LanceEngine::new()` (local FS only) — wire storage options up from
-  config/flags so the CLI can point at a real bucket.
+- The full prod path (Lance on S3 + DynamoDB commit pointer via
+  `ExternalManifestStore`) is wired end to end: `LanceEngine::for_object_store`
+  threads S3 storage options + the commit handler through create/open/append,
+  and `lake-cli` selects it via `LAKE_S3_BUCKET` (+ `LAKE_DYNAMODB_*` / `AWS_*`
+  / `LAKE_S3_PROXY_EXCLUDES`). Verified against localstack both directly
+  (`tests/s3_lance_localstack.rs`, `#[ignore]`) and through `lake selftest` in
+  cloud mode.
 - No client-side SDK cache yet — the query layer caches, the SDK does not.
   Add SDK-side catalog caching when fleet-node QPS demands another tier.
 

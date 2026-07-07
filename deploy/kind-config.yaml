@@ -1,8 +1,0 @@
-# Portless kind cluster config for lake integration tests.
-# The cluster name is supplied by scripts/test-env.ts so parallel checkouts do
-# not collide. Host ports are forbidden; services are reached through dynamic
-# kubectl port-forward endpoints recorded under .lake/.
-kind: Cluster
-apiVersion: kind.x-k8s.io/v1alpha4
-nodes:
-  - role: control-plane

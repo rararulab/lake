@@ -13,29 +13,32 @@ not assume one developer, one checkout, or one fixed port.
   Humans can read stdout; agents should read the file.
 - Every `down` command must tear down only the resources created by the same
   checkout. Never delete a shared cluster or a hard-coded namespace.
-- Kubernetes manifests stay portless by default: `ClusterIP` services, no
-  `NodePort`, no kind `extraPortMappings`.
-- If the host needs to call a service, create a dynamic `kubectl port-forward`
-  with an omitted local port such as `:4566`, then record the allocated port.
+- Bind to an ephemeral host port (Docker `-p 4566`, no fixed left-hand side)
+  and read the allocated port back, rather than reserving a global one.
+- Prefer the lightest thing that works: a single container needs Docker, not a
+  Kubernetes cluster. Do not stand up kind/k8s for one emulator.
 
 ## Mise Layering
 
 - `mise install` installs only the base development tools needed for normal
-  Rust work.
-- Local deploy tools (`kind`, `kubectl`, cloud emulators, load-test tools) are
-  task-scoped tools on deploy tasks. They must not appear in top-level
-  `[tools]` unless the whole repo needs them for normal edit/test cycles.
+  Rust work. Docker is assumed present (not a mise tool).
+- Any local-deploy-only tools (cloud emulators, load-test tools) are
+  task-scoped `tools` on the deploy tasks, never top-level `[tools]`.
 - CI should not run local deploy unless the job explicitly owns the environment.
 
 ## Current Contract
 
-`mise run test-env-up` creates a checkout-scoped kind cluster and deploys
-LocalStack for DynamoDB. It writes `.lake/test-env.env` with:
+`mise run test-env-up` runs a checkout-scoped LocalStack container (DynamoDB +
+S3) directly in Docker — no kind/k8s. The container is named per checkout
+(path hash) and bound to an ephemeral port, both discovered dynamically. It
+writes `.lake/test-env.env` with:
 
 ```bash
-LAKE_TEST_CLUSTER=<cluster-name>
 LAKE_DYNAMODB_ENDPOINT=http://127.0.0.1:<dynamic-port>
 ```
 
-`mise run test-env-down` kills that checkout's port-forward and deletes that
-checkout's cluster.
+(the same endpoint serves S3, since LocalStack multiplexes all services on one
+port). `mise run test-env-down` removes that checkout's container.
+
+The community image `localstack/localstack:3` is pinned deliberately —
+`:latest` now requires a `LOCALSTACK_AUTH_TOKEN` and exits without one.
