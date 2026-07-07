@@ -34,12 +34,9 @@ pub mod election;
 
 mod control;
 mod leadership;
+mod maintenance;
 
-use std::{
-    net::AddrParseError,
-    sync::{Arc, atomic::AtomicBool},
-    time::Duration,
-};
+use std::{net::AddrParseError, sync::Arc, time::Duration};
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use datafusion::{arrow::datatypes::SchemaRef, execution::SendableRecordBatchStream};
@@ -54,6 +51,7 @@ use crate::{
     control::MetasrvFlightService,
     election::LeaseElection,
     leadership::{Leadership, run_campaign_loop},
+    maintenance::run_maintenance_loop,
 };
 
 #[derive(Debug, Snafu)]
@@ -186,20 +184,28 @@ impl Metasrv {
 /// leader-election campaign.
 ///
 /// Spawns a campaign loop that renews the lease and publishes leadership into
-/// a shared flag, then binds a tonic server exposing the control-plane
+/// shared state, a leader-only maintenance sweep, then binds a tonic server
+/// exposing the control-plane
 /// [`FlightService`](arrow_flight::flight_service_server::FlightService) over
-/// `DoAction`. Writes (`create_table`) are refused unless this node holds the
-/// lease; reads are always served. The node id is `addr`, unique enough per
-/// instance in dev. Runs until the server stops or the process is killed.
+/// `DoAction`. Writes that land on a follower are forwarded to the current
+/// leader; reads are always served locally. The node id is `addr`, unique
+/// enough per instance in dev. Runs until the server stops or the process is
+/// killed.
 pub async fn serve(metasrv: Arc<Metasrv>, addr: &str) -> Result<()> {
     let election = LeaseElection::new(metasrv.meta().clone(), addr, Duration::from_secs(10));
-    let is_leader = Arc::new(AtomicBool::new(false));
-    tokio::spawn(run_campaign_loop(election, is_leader.clone()));
+    let leadership = Arc::new(Leadership::new());
+    // The maintenance sweep gates on the same leader flag the campaign loop
+    // publishes, so only the current leader does housekeeping.
+    tokio::spawn(run_maintenance_loop(
+        metasrv.clone(),
+        leadership.is_leader_flag(),
+    ));
+    tokio::spawn(run_campaign_loop(election, leadership.clone()));
 
-    let leadership = Arc::new(Leadership { is_leader });
     let svc = MetasrvFlightService {
         metasrv,
         leadership,
+        own_addr: addr.to_string(),
     };
 
     let socket = addr.parse().context(AddressSnafu { addr })?;

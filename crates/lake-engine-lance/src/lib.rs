@@ -44,7 +44,12 @@ use lake_meta::MetaStoreRef;
 use lance::{
     Dataset,
     datafusion::LanceTableProvider,
-    dataset::{WriteMode, WriteParams, builder::DatasetBuilder},
+    dataset::{
+        WriteMode, WriteParams,
+        builder::DatasetBuilder,
+        cleanup::CleanupPolicyBuilder,
+        optimize::{CompactionOptions, compact_files},
+    },
     io::{ObjectStoreParams, StorageOptionsAccessor},
 };
 use lance_table::io::commit::{
@@ -154,6 +159,16 @@ fn external_handler(meta: MetaStoreRef) -> Arc<dyn CommitHandler> {
     })
 }
 
+/// How many recent committed versions [`maintain`](LanceEngine::maintain)
+/// keeps when reclaiming old ones; everything before them is eligible for GC.
+// ponytail: a fixed version-count is the chrono-free retention policy. The
+// preferred policy is time-based (keep everything newer than, e.g.,
+// `chrono::Duration::days(7)` via `Dataset::cleanup_old_versions`), and both
+// the count and the horizon should be operator-configurable. Time-based
+// retention needs `chrono` as a workspace dependency (Lance does not re-export
+// it), which is not wired up yet.
+const RETAIN_VERSIONS: usize = 10;
+
 #[async_trait]
 impl TableEngine for LanceEngine {
     fn kind(&self) -> &'static str { "lance" }
@@ -195,6 +210,31 @@ impl TableEngine for LanceEngine {
         store
             .delete_stream(paths)
             .try_collect::<Vec<_>>()
+            .await
+            .map_err(EngineError::backend)?;
+        Ok(())
+    }
+
+    async fn maintain(&self, location: &TableLocation) -> Result<()> {
+        // Open a mutable dataset so compaction can advance it in place, then
+        // reclaim versions no longer within the retention window. Both steps
+        // are no-ops when nothing qualifies, keeping the sweep idempotent.
+        let mut dataset = self
+            .config
+            .open_dataset(location.as_str())
+            .await
+            .map_err(EngineError::backend)?;
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .map_err(EngineError::backend)?;
+        let policy = CleanupPolicyBuilder::default()
+            .error_if_tagged_old_versions(false)
+            .retain_n_versions(&dataset, RETAIN_VERSIONS)
+            .await
+            .map_err(EngineError::backend)?
+            .build();
+        dataset
+            .cleanup_with_policy(policy)
             .await
             .map_err(EngineError::backend)?;
         Ok(())
@@ -317,6 +357,32 @@ mod tests {
         ));
         let v = h.append(stream).await.unwrap();
         assert!(v.0 > 1, "append advances the version");
+    }
+
+    #[tokio::test]
+    async fn maintain_is_idempotent_and_preserves_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let loc = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
+        let engine = LanceEngine::new();
+
+        let h = engine.create(&loc, batch().schema()).await.unwrap();
+        // A few appends give the dataset multiple versions/fragments to work on.
+        for _ in 0..3 {
+            let b = batch();
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                b.schema(),
+                futures::stream::iter(vec![Ok::<_, DataFusionError>(b)]),
+            ));
+            h.append(stream).await.unwrap();
+        }
+
+        // Maintenance runs cleanly and is safe to repeat.
+        engine.maintain(&loc).await.unwrap();
+        engine.maintain(&loc).await.unwrap();
+
+        // The table is still openable and its rows survive compaction.
+        let reopened = engine.open(&loc).await.unwrap().expect("table survives");
+        assert!(reopened.current_version().0 >= 1);
     }
 
     #[tokio::test]

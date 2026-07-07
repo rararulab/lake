@@ -49,6 +49,12 @@ pub trait TableEngine: Send + Sync {
     /// table is not an error. Used by drop-table; the registry entry is
     /// removed separately by the metadata layer.
     async fn remove(&self, location: &TableLocation) -> Result<()>;
+
+    /// Compact fragments and reclaim old versions for the table at
+    /// `location`. Idempotent — a table with nothing to compact or reclaim is
+    /// left unchanged, so it is safe to run repeatedly. Intended for the
+    /// leader-only background maintenance sweep.
+    async fn maintain(&self, location: &TableLocation) -> Result<()>;
 }
 
 /// A handle to one table backed by an engine. Resolves to DataFusion for

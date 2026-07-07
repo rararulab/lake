@@ -213,6 +213,24 @@ impl LeaseElection {
     /// Campaign using the wall clock.
     pub async fn campaign(&self) -> Result<LeaseStatus> { self.campaign_at(now_ms()).await }
 
+    /// The address of the node currently holding a valid lease, if any.
+    ///
+    /// Returns `Some(holder)` when a lease exists and has not expired
+    /// (`expires_at_ms > now_ms`), otherwise `None`. Followers use this to
+    /// locate the leader to forward writes to.
+    pub async fn current_leader(&self) -> Result<Option<String>> {
+        self.current_leader_at(now_ms()).await
+    }
+
+    /// [`current_leader`](Self::current_leader) against the injected clock
+    /// `now_ms`.
+    async fn current_leader_at(&self, now_ms: u64) -> Result<Option<String>> {
+        Ok(self
+            .read_lease()
+            .await?
+            .and_then(|lease| (lease.expires_at_ms > now_ms).then_some(lease.holder)))
+    }
+
     /// Resign at the injected clock `now_ms`: if this node holds the lease,
     /// CAS it to an already-expired record so a standby steals it on its next
     /// campaign instead of waiting out the full TTL. Returns whether we held
@@ -320,6 +338,29 @@ mod tests {
             LeaseStatus::Follower {
                 current_holder: "b".to_string(),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn current_leader_reports_holder_until_expiry() {
+        let (_dir, meta) = shared_store();
+        let a = election(&meta, "a");
+
+        // No lease installed yet: nobody leads.
+        assert_eq!(a.current_leader_at(0).await.expect("read empty"), None);
+
+        // a wins the lease at now=0; it runs until TTL_MS.
+        assert!(a.campaign_at(0).await.expect("a leads").is_leader());
+        assert_eq!(
+            a.current_leader_at(1000).await.expect("fresh lease"),
+            Some("a".to_string())
+        );
+
+        // At and past expiry the lease no longer names a live leader.
+        assert_eq!(a.current_leader_at(TTL_MS).await.expect("at expiry"), None);
+        assert_eq!(
+            a.current_leader_at(TTL_MS + 1).await.expect("past expiry"),
+            None
         );
     }
 

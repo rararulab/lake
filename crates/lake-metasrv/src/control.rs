@@ -22,23 +22,25 @@
 //! `body` carries a small JSON payload. Every other Flight method is
 //! unimplemented — this service never serves `DoGet`/`DoPut` data.
 //!
-//! Writes gate on leadership: `create_table` returns
-//! [`failed_precondition`](Status::failed_precondition) unless this node holds
-//! the lease. Reads (`resolve`, `list_*`) are served regardless, matching the
-//! HA model in `docs/architecture.md`.
+//! Writes are leader-aware: a write (`create_table`, `drop_table`) that lands
+//! on a follower is transparently forwarded over Flight to the current leader
+//! and its result relayed, so any node accepts writes. If no leader is known
+//! yet, the write fails with [`unavailable`](Status::unavailable). Reads
+//! (`resolve`, `list_*`) are always served locally, matching the HA model in
+//! `docs/architecture.md`.
 
 use std::{pin::Pin, sync::Arc};
 
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, Result as FlightResult, SchemaResult,
-    Ticket, flight_service_server::FlightService,
+    Ticket, flight_service_client::FlightServiceClient, flight_service_server::FlightService,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use futures::Stream;
 use lake_common::{Namespace, TableLocation, TableRef};
 use serde::{Serialize, de::DeserializeOwned};
-use tonic::{Request, Response, Status, Streaming};
+use tonic::{Request, Response, Status, Streaming, transport::Channel};
 
 use crate::{Metasrv, leadership::Leadership};
 
@@ -59,8 +61,11 @@ type ActionStream = BoxStream<FlightResult>;
 pub(crate) struct MetasrvFlightService {
     /// The registry authority every action dispatches to.
     pub(crate) metasrv:    Arc<Metasrv>,
-    /// The shared leader flag consulted before serving a write.
+    /// The shared leadership state consulted before serving a write.
     pub(crate) leadership: Arc<Leadership>,
+    /// This node's own Flight address, used to tell "the leader is me" apart
+    /// from "forward to another node" when the leader flag is briefly stale.
+    pub(crate) own_addr:   String,
 }
 
 /// `create_table` action body: the table to materialize and register.
@@ -128,13 +133,49 @@ fn respond_json<T: Serialize>(value: &T) -> Result<Response<ActionStream>, Statu
 }
 
 impl MetasrvFlightService {
-    /// `create_table`: gate on leadership, then materialize and register the
-    /// table described by the JSON body.
-    async fn action_create_table(&self, body: &[u8]) -> Result<Response<ActionStream>, Status> {
-        if !self.leadership.is_leader() {
-            return Err(Status::failed_precondition("not the leader"));
+    /// Decide how to serve a write action given current leadership.
+    ///
+    /// Returns `Ok(None)` when this node should serve the write locally (it
+    /// holds the lease, or the observed leader *is* this node while the flag
+    /// catches up). Returns `Ok(Some(response))` when the write was forwarded
+    /// to the current leader and its result should be relayed. Returns
+    /// `Err(unavailable)` when no leader is known to forward to.
+    async fn maybe_forward(
+        &self,
+        action: &Action,
+    ) -> Result<Option<Response<ActionStream>>, Status> {
+        if self.leadership.is_leader() {
+            return Ok(None);
         }
-        let req: CreateTableReq = parse_body(body)?;
+        match self.leadership.leader() {
+            // We are the elected leader; the flag is just briefly stale.
+            Some(addr) if addr == self.own_addr => Ok(None),
+            Some(addr) => self.forward(&addr, action).await.map(Some),
+            None => Err(Status::unavailable("no leader elected")),
+        }
+    }
+
+    /// Forward `action` to the leader at `addr` over Flight `DoAction`,
+    /// relaying its streamed result as this call's response.
+    async fn forward(&self, addr: &str, action: &Action) -> Result<Response<ActionStream>, Status> {
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .map_err(|e| Status::unavailable(format!("invalid leader address '{addr}': {e}")))?
+            .connect()
+            .await
+            .map_err(|e| Status::unavailable(format!("cannot reach leader '{addr}': {e}")))?;
+        let mut client = FlightServiceClient::new(channel);
+        let response = client.do_action(Request::new(action.clone())).await?;
+        let stream: ActionStream = Box::pin(response.into_inner());
+        Ok(Response::new(stream))
+    }
+
+    /// `create_table`: serve locally if leader, else forward to the leader,
+    /// then materialize and register the table described by the JSON body.
+    async fn action_create_table(&self, action: Action) -> Result<Response<ActionStream>, Status> {
+        if let Some(forwarded) = self.maybe_forward(&action).await? {
+            return Ok(forwarded);
+        }
+        let req: CreateTableReq = parse_body(&action.body)?;
         let location = req
             .location
             .ok_or_else(|| Status::invalid_argument("create_table requires a 'location' field"))?;
@@ -148,13 +189,13 @@ impl MetasrvFlightService {
         Ok(Response::new(stream))
     }
 
-    /// `drop_table`: gate on leadership, then delete the table's data and
-    /// deregister it. Idempotent.
-    async fn action_drop_table(&self, body: &[u8]) -> Result<Response<ActionStream>, Status> {
-        if !self.leadership.is_leader() {
-            return Err(Status::failed_precondition("not the leader"));
+    /// `drop_table`: serve locally if leader, else forward to the leader, then
+    /// delete the table's data and deregister it. Idempotent.
+    async fn action_drop_table(&self, action: Action) -> Result<Response<ActionStream>, Status> {
+        if let Some(forwarded) = self.maybe_forward(&action).await? {
+            return Ok(forwarded);
         }
-        let req: TableIdent = parse_body(body)?;
+        let req: TableIdent = parse_body(&action.body)?;
         let table = TableRef::new(req.namespace, req.name);
         self.metasrv
             .drop_table(&table)
@@ -275,12 +316,11 @@ impl FlightService for MetasrvFlightService {
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
         let action = request.into_inner();
-        let body = action.body;
         match action.r#type.as_str() {
-            "create_table" => self.action_create_table(&body).await,
-            "drop_table" => self.action_drop_table(&body).await,
-            "resolve" => self.action_resolve(&body).await,
-            "list_tables" => self.action_list_tables(&body).await,
+            "create_table" => self.action_create_table(action).await,
+            "drop_table" => self.action_drop_table(action).await,
+            "resolve" => self.action_resolve(&action.body).await,
+            "list_tables" => self.action_list_tables(&action.body).await,
             "list_namespaces" => self.action_list_namespaces().await,
             other => Err(Status::unimplemented(format!(
                 "unknown action type '{other}'"
