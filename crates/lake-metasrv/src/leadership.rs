@@ -106,27 +106,40 @@ pub(crate) async fn run_campaign_loop(election: LeaseElection, leadership: Arc<L
         // is conservative when the store is slow and immune to wall-clock
         // jumps after the lease is written.
         let campaign_started = Instant::now();
-        let (leader, local_deadline) = match election.campaign().await {
-            Ok(LeaseStatus::Leader { .. }) => (
-                Some(election.node_id().to_string()),
-                Some(campaign_started + election.ttl()),
-            ),
-            Ok(LeaseStatus::Follower { current_holder }) => {
-                // An empty holder means the lease vanished under a lost race;
-                // report "no known leader" so writes fail fast rather than
-                // forwarding to nowhere.
-                let leader = (!current_holder.is_empty()).then_some(current_holder);
-                (leader, None)
-            }
-            Err(err) => {
-                tracing::warn!(
-                    node_id = election.node_id(),
-                    error = %err,
-                    "leadership campaign failed; treating as not leader this round"
-                );
-                (None, None)
-            }
-        };
+        // A renewal starts halfway through the production lease. Spending at
+        // most another 40% of the lease on store I/O leaves a 10% demotion
+        // margin before the previously published deadline.
+        let campaign_timeout = election.ttl() * 2 / 5;
+        let (leader, local_deadline) =
+            match tokio::time::timeout(campaign_timeout, election.campaign()).await {
+                Ok(Ok(LeaseStatus::Leader { .. })) => (
+                    Some(election.node_id().to_string()),
+                    Some(campaign_started + election.ttl()),
+                ),
+                Ok(Ok(LeaseStatus::Follower { current_holder })) => {
+                    // An empty holder means the lease vanished under a lost race;
+                    // report "no known leader" so writes fail fast rather than
+                    // forwarding to nowhere.
+                    let leader = (!current_holder.is_empty()).then_some(current_holder);
+                    (leader, None)
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        node_id = election.node_id(),
+                        error = %err,
+                        "leadership campaign failed; treating as not leader this round"
+                    );
+                    (None, None)
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        node_id = election.node_id(),
+                        timeout_ms = campaign_timeout.as_millis(),
+                        "leadership campaign timed out; treating as not leader this round"
+                    );
+                    (None, None)
+                }
+            };
 
         let now_leader = local_deadline.is_some_and(|deadline| Instant::now() < deadline);
         let was_leader = leadership.publish(leader, local_deadline);
@@ -144,7 +157,10 @@ pub(crate) async fn run_campaign_loop(election: LeaseElection, leadership: Arc<L
 
 #[cfg(test)]
 mod tests {
-    use lake_meta::{MetaStoreRef, RocksMeta};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use async_trait::async_trait;
+    use lake_meta::{MetaStore, MetaStoreRef, RocksMeta};
 
     use super::*;
 
@@ -169,6 +185,61 @@ mod tests {
             !leadership.is_leader(),
             "a completed campaign must not authorize writes past its lease deadline"
         );
+        campaign.abort();
+    }
+
+    struct HangingMeta {
+        cancelled: Arc<AtomicBool>,
+    }
+
+    struct CancelSignal(Arc<AtomicBool>);
+
+    impl Drop for CancelSignal {
+        fn drop(&mut self) { self.0.store(true, Ordering::Relaxed); }
+    }
+
+    #[async_trait]
+    impl MetaStore for HangingMeta {
+        async fn get(&self, _key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            let _cancel = CancelSignal(self.cancelled.clone());
+            std::future::pending().await
+        }
+
+        async fn cas(
+            &self,
+            _key: &str,
+            _expected: Option<&[u8]>,
+            _new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            unreachable!()
+        }
+
+        async fn list_prefix(&self, _prefix: &str) -> lake_meta::Result<Vec<String>> {
+            unreachable!()
+        }
+
+        async fn delete(&self, _key: &str, _expected: &[u8]) -> lake_meta::Result<bool> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn campaign_io_is_cancelled_inside_the_lease_safety_margin() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let meta: MetaStoreRef = Arc::new(HangingMeta {
+            cancelled: cancelled.clone(),
+        });
+        let election = LeaseElection::new(meta, "node-a", Duration::from_millis(50));
+        let leadership = Arc::new(Leadership::new());
+        let campaign = tokio::spawn(run_campaign_loop(election, leadership));
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !cancelled.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("campaign I/O must be cancelled before the 50ms lease can expire");
         campaign.abort();
     }
 }
