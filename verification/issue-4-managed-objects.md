@@ -138,3 +138,40 @@ interruption probe observed cleanup before publication.
 PASS — the repaired candidate is clean, gated, spec-complete, cold-booted,
 and independently demonstrates durable staged publication, canonical managed-
 root containment, and cleanup after a real mid-stream reader interruption.
+
+## FILE contract refinement
+
+The post-verification API refinement keeps the stored `DataLocation` and
+direct-reader behavior intact while making the public write vocabulary match
+the SQL logical type: `InsertValue::File(FileUpload::from_path(...))`.
+
+```text
+$ cargo test -p lake-sdk insert_sql_file_uploads_and_queries_datalocation
+error[E0432]: unresolved import `crate::FileUpload`
+error[E0599]: no variant, associated function, or constant named `File`
+
+$ cargo test -p lake-sdk insert_sql_file_uploads_and_queries_datalocation
+running 1 test
+test tests::insert_sql_file_uploads_and_queries_datalocation ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out
+
+$ cargo test -p lake-sdk -p lake-objects
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+$ mise run spec-lint specs/issue-4-managed-objects.spec.md
+Quality: 100% (determinism: 100%, testability: 100%, coverage: 100%)
+
+$ mise run spec-lifecycle specs/issue-4-managed-objects.spec.md
+[PASS] SQL FILE insert uploads an object before publishing its DataLocation row
+[PASS] failed object upload does not publish a partial row
+[PASS] unsupported INSERT syntax is rejected before any upload
+
+$ mise run gate
+Finished successfully: hooks, workspace tests, CLI self-check, and site check
+```
+
+The first command is the required red proof: the intended `FILE` SDK API did
+not exist. The second is the green proof. The current design names only the
+logical value and upload binding; it does not store a signed URL or turn SQL
+into an arbitrary object-store URI interface.

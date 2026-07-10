@@ -17,7 +17,7 @@
 use bon::Builder;
 use serde::{Deserialize, Serialize};
 
-/// A complete immutable object managed by lake storage.
+/// The physical representation of a complete, immutable SQL `FILE` value.
 ///
 /// The URI is durable object identity, not an expiring download capability.
 /// Callers use the SDK's object reader to resolve it into direct I/O.

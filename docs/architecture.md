@@ -154,7 +154,7 @@ a service-owned S3 prefix and publishes short-lived HTTPS locations through
 | Crate | Owns | Tier |
 |-------|------|------|
 | `lake-common` | shared newtypes: `Namespace`, `TableName`, `Version`, `TableLocation` | — |
-| `lake-objects` | immutable `DataLocation`, Arrow representation, direct object I/O | storage |
+| `lake-objects` | SQL `FILE` physical representation (`DataLocation`), Arrow encoding, direct object I/O | storage |
 | `lake-meta` | `MetaStore` (KvBackend) trait; `RocksMeta` (dev), `DynamoMeta` (prod); Lance `ExternalManifestStore` adapter | metastore |
 | `lake-engine` | `TableEngine` / `TableHandle` traits + shared types | storage |
 | `lake-engine-lance` | Lance impl; the ONLY crate that names `lance::` | storage |
@@ -162,7 +162,7 @@ a service-owned S3 prefix and publishes short-lived HTTPS locations through
 | `lake-query` | stateless query-layer server (Flight SQL, DataFusion execution) | query |
 | `lake-metasrv` | stateful metadata-layer server (registry authority, write coordination, leader election) | metadata |
 | `lake-cli` | thin `clap` binary: subcommands to run each server + client | — |
-| `lake-sdk` | Rust parameterized INSERT binding and direct `DataLocation` reader | client |
+| `lake-sdk` | Rust parameterized `FILE` INSERT binding and direct `DataLocation` reader | client |
 
 Conventions: **thin libs** (`lib.rs` is module docs + re-exports; logic in
 sub-files), **async-first** (engine, metastore, catalog, servers are async;
@@ -207,10 +207,11 @@ design-level ones:
 - No client-side SDK cache yet — the query layer caches, the SDK does not.
   Add SDK-side catalog caching when fleet-node QPS demands another tier.
 - Managed large objects currently have a local Rust SDK vertical slice:
-  `INSERT ... VALUES (?, ?)` accepts `ObjectFile`, streams it into a
-  Lake-owned prefix, and stores an immutable `DataLocation` in Lance. Remote
-  Flight writes, S3 multipart presigning, authenticated expiring locations,
-  and object GC are deliberately deferred.
+  `INSERT ... VALUES (?, ?)` binds `InsertValue::File(FileUpload)`, streams it
+  into a Lake-owned managed stage, and stores an immutable `DataLocation`
+  physical representation in Lance. Remote Flight writes, S3 multipart
+  presigning, authenticated expiring locations, and object GC are deliberately
+  deferred.
 
 ## Phasing
 

@@ -59,7 +59,7 @@ pub enum ObjectError {
 /// The result type for managed-object operations.
 pub type Result<T> = std::result::Result<T, ObjectError>;
 
-/// Arrow field used for a `DataLocation` table column.
+/// Arrow field encoding a logical SQL `FILE` table column as `DataLocation`.
 #[must_use]
 pub fn data_location_field(name: impl Into<String>, nullable: bool) -> Field {
     Field::new(name, DataType::Struct(data_location_fields()), nullable)

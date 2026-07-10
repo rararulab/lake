@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Rust SDK for parameterized SQL inserts containing managed object files.
+//! Rust SDK for parameterized SQL inserts containing managed `FILE` values.
 
 use std::{
     collections::BTreeMap,
@@ -75,8 +75,11 @@ pub enum SdkError {
 /// The result type for Rust SDK operations.
 pub type Result<T> = std::result::Result<T, SdkError>;
 
-/// A local file to stream into Lake-managed object storage.
-pub struct ObjectFile {
+/// An SDK upload source bound to a SQL `FILE` value.
+///
+/// The SDK streams this source directly into a Lake-managed stage. It never
+/// sends the file bytes through SQL, Flight, or the metadata service.
+pub struct FileUpload {
     source:       ObjectSource,
     content_type: String,
 }
@@ -86,22 +89,22 @@ enum ObjectSource {
     Reader(Box<dyn AsyncRead + Send + Unpin>),
 }
 
-impl fmt::Debug for ObjectFile {
+impl fmt::Debug for FileUpload {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let source = match &self.source {
             ObjectSource::Path(path) => path.display().to_string(),
             ObjectSource::Reader(_) => "reader".to_owned(),
         };
         formatter
-            .debug_struct("ObjectFile")
+            .debug_struct("FileUpload")
             .field("source", &source)
             .field("content_type", &self.content_type)
             .finish()
     }
 }
 
-impl ObjectFile {
-    /// Bind `path` as a managed object with the supplied IANA media type.
+impl FileUpload {
+    /// Bind `path` as a SQL `FILE` with the supplied IANA media type.
     #[must_use]
     pub fn from_path(path: impl AsRef<Path>, content_type: impl Into<String>) -> Self {
         Self {
@@ -110,7 +113,7 @@ impl ObjectFile {
         }
     }
 
-    /// Bind an async source that the SDK streams directly to managed storage.
+    /// Bind an async source that the SDK streams directly to the managed stage.
     #[must_use]
     pub fn from_reader<R>(reader: R, content_type: impl Into<String>) -> Self
     where
@@ -128,8 +131,8 @@ impl ObjectFile {
 pub enum InsertValue {
     /// UTF-8 scalar value.
     Utf8(String),
-    /// Large local file streamed directly to managed storage.
-    Object(ObjectFile),
+    /// SQL `FILE` streamed directly to the Lake-managed stage.
+    File(FileUpload),
 }
 
 /// An in-process Rust SDK client for managed-object inserts and direct reads.
@@ -150,7 +153,7 @@ impl LakeClient {
         }
     }
 
-    /// Execute a parameterized, single-row INSERT with typed scalar/object
+    /// Execute a parameterized, single-row INSERT with typed scalar/`FILE`
     /// values.
     pub async fn insert(&self, sql: &str, values: Vec<InsertValue>) -> Result<Version> {
         let insert = parse_insert(sql)?;
@@ -226,7 +229,7 @@ impl LakeClient {
             (DataType::Utf8, InsertValue::Utf8(value)) => {
                 Ok(Arc::new(StringArray::from(vec![value])))
             }
-            (data_type, InsertValue::Object(file))
+            (data_type, InsertValue::File(file))
                 if data_type == data_location_field("ignored", false).data_type() =>
             {
                 let location = match file.source {
@@ -324,7 +327,7 @@ fn validate_bindings(schema: &SchemaRef, columns: &[String], values: &[InsertVal
             })?;
         let matches = match value {
             InsertValue::Utf8(_) => field.data_type() == &DataType::Utf8,
-            InsertValue::Object(_) => {
+            InsertValue::File(_) => {
                 field.data_type() == data_location_field("ignored", false).data_type()
             }
         };
@@ -382,10 +385,10 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
-    use crate::{InsertValue, LakeClient, ObjectFile};
+    use crate::{FileUpload, InsertValue, LakeClient};
 
     #[tokio::test]
-    async fn insert_sql_uploads_object_and_queries_datalocation() {
+    async fn insert_sql_file_uploads_and_queries_datalocation() {
         let root = tempdir().unwrap();
         let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
@@ -419,7 +422,7 @@ mod tests {
                 "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
                 vec![
                     InsertValue::Utf8("episode-42".to_owned()),
-                    InsertValue::Object(ObjectFile::from_path(&source, "video/mp4")),
+                    InsertValue::File(FileUpload::from_path(&source, "video/mp4")),
                 ],
             )
             .await
@@ -467,7 +470,7 @@ mod tests {
                 "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
                 vec![
                     InsertValue::Utf8("episode-43".to_owned()),
-                    InsertValue::Object(ObjectFile::from_reader(
+                    InsertValue::File(FileUpload::from_reader(
                         FailingReader { emitted: false },
                         "video/mp4",
                     )),
@@ -507,7 +510,7 @@ mod tests {
         let error = client
             .insert(
                 "INSERT INTO robots.episodes VALUES (?)",
-                vec![InsertValue::Object(ObjectFile::from_path(
+                vec![InsertValue::File(FileUpload::from_path(
                     &source,
                     "video/mp4",
                 ))],

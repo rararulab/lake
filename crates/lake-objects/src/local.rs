@@ -29,14 +29,14 @@ use crate::{ObjectError, Result};
 /// Bounded copy chunk, chosen to keep multi-gigabyte uploads off the heap.
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
-/// Development object storage rooted at a Lake-owned local directory.
+/// Development managed stage rooted at a Lake-owned local directory.
 #[derive(Clone, Debug)]
 pub struct LocalObjectStore {
     root: PathBuf,
 }
 
 impl LocalObjectStore {
-    /// Open or create the Lake-owned object prefix at `root`.
+    /// Open or create the Lake-owned managed stage at `root`.
     pub async fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = std::path::absolute(root.as_ref()).map_err(|source| ObjectError::Io {
             action: "absolutizing".to_owned(),
@@ -60,7 +60,7 @@ impl LocalObjectStore {
         Ok(Self { root })
     }
 
-    /// Stream a local file into the managed prefix and return its immutable
+    /// Stream a local file into the managed stage and return its immutable
     /// identity.
     pub async fn put_file(
         &self,
@@ -78,7 +78,7 @@ impl LocalObjectStore {
         self.put_reader(input, content_type).await
     }
 
-    /// Stream an arbitrary SDK reader into the managed prefix.
+    /// Stream an arbitrary SDK reader into the managed stage.
     pub async fn put_reader<R>(
         &self,
         mut input: R,
@@ -188,7 +188,7 @@ impl LocalObjectStore {
             .build())
     }
 
-    /// Open a direct local reader for a managed `file://` location.
+    /// Open a direct local reader for a `FILE` in the managed `file://` stage.
     pub async fn open_reader(&self, location: &DataLocation) -> Result<File> {
         let path = Url::parse(&location.uri)
             .ok()

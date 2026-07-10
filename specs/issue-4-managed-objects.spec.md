@@ -30,13 +30,14 @@ metadata and RecordBatch streams.
 - The first public SDK is Rust. Its in-process client is the vertical slice;
   remote Flight write transport and Python bindings are follow-up work.
 - The accepted SQL subset is one parameterized statement of the form
-  `INSERT INTO <namespace>.<table> (<columns...>) VALUES (?, ...)`. Object
-  parameters use `ObjectFile::from_path`; arbitrary SQL DML remains rejected
-  by the public query service.
-- `DataLocation` is a stable, immutable object reference: managed URI,
-  content type, byte size, and SHA-256. Expiring signed URLs and tenant
-  authorization are not stored in table rows and are deferred until the
-  authenticated remote SDK exists.
+  `INSERT INTO <namespace>.<table> (<columns...>) VALUES (?, ...)`. Its
+  logical large-object type is `FILE`; Rust binds it with
+  `InsertValue::File(FileUpload::from_path(...))`. Arbitrary SQL DML remains
+  rejected by the public query service.
+- A SQL `FILE` is physically represented by a stable, immutable
+  `DataLocation`: managed URI, content type, byte size, and SHA-256. Expiring
+  signed URLs and tenant authorization are not stored in table rows and are
+  deferred until the authenticated remote SDK exists.
 - Uploads stream local files into a Lake-managed object prefix; the full file
   is never buffered in memory. The first slice supports the local filesystem
   backend and shares the same storage-location seam as the cloud backend.
@@ -77,12 +78,13 @@ metadata and RecordBatch streams.
 
 ## Completion Criteria
 
-Scenario: SQL insert uploads an object before publishing its DataLocation row
+Scenario: SQL FILE insert uploads an object before publishing its DataLocation row
   Test:
     Package: lake-sdk
-    Filter: insert_sql_uploads_object_and_queries_datalocation
+    Filter: insert_sql_file_uploads_and_queries_datalocation
   Given an empty Lance table with an object column and a local video file
-  When the Rust SDK executes a parameterized INSERT with ObjectFile::from_path
+  When the Rust SDK executes a parameterized INSERT with
+  InsertValue::File(FileUpload::from_path(...))
   Then the row contains the immutable DataLocation and its direct reader yields
   the original bytes without query or metadata services carrying the payload
 

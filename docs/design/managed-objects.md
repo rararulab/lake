@@ -3,7 +3,8 @@
 ## Decision
 
 Lake treats videos, pointclouds, model weights, and other multi-gigabyte
-payloads as immutable managed objects. SQL rows contain a `DataLocation`, not
+payloads as immutable managed objects. SQL exposes them as `FILE` values;
+Lance physically stores their immutable `DataLocation` representation, not
 the object bytes. A client SDK resolves that location and reads the object
 directly from storage, so query and metadata services do not become a
 large-file proxy.
@@ -17,21 +18,22 @@ client.insert(
     "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
     vec![
         InsertValue::Utf8("episode-42".into()),
-        InsertValue::Object(ObjectFile::from_path("episode.mp4", "video/mp4")),
+        InsertValue::File(FileUpload::from_path("episode.mp4", "video/mp4")),
     ],
 ).await?;
 ```
 
 The SDK validates the SQL subset, placeholders, column names, and Arrow types
-before opening any object file. It then streams each `ObjectFile` into the
-Lake-owned object prefix in bounded chunks while computing SHA-256. Only after
+before opening any file upload. It then streams each `FileUpload` into the
+Lake-owned managed stage in bounded chunks while computing SHA-256. Only after
 the upload succeeds does it build a RecordBatch containing the immutable
-`DataLocation` and call the existing `Metasrv::append` commit path.
+`DataLocation` physical representation and call the existing `Metasrv::append`
+commit path.
 
 ```text
-Rust SDK INSERT
+Rust SDK INSERT (logical FILE)
   -> schema + parameter validation
-  -> direct chunked object upload
+  -> direct chunked managed-stage upload
   -> DataLocation { uri, content_type, size_bytes, sha256 }
   -> Lance append
   -> registry version CAS
@@ -45,9 +47,11 @@ open its `DataLocation` directly through the SDK.
 ## Boundaries
 
 `DataLocation.uri` is a stable identity, never an expiring signed URL. The
-local implementation uses `file://`; cloud locations must be backed by an
-authenticated ticket or short-lived direct-read capability generated at query
-time. No raw object bytes travel over Flight SQL or the metasrv control plane.
+managed stage is the only storage namespace accepted by this SDK; public SQL
+never accepts arbitrary storage URIs or credentials. The local implementation
+uses `file://`; cloud locations must be backed by an authenticated ticket or
+short-lived direct-read capability generated at query time. No raw object
+bytes travel over Flight SQL or the metasrv control plane.
 
 The current slice does not provide remote Flight data writes, S3 multipart
 presigning/resume, tenant authorization, signed locations, object

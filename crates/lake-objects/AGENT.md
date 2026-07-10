@@ -5,7 +5,7 @@ Managed large-object values and direct storage access for the Rust SDK.
 ## Invariants
 
 - A `DataLocation` identifies one immutable, fully uploaded object.
-- Object bytes move directly between the SDK and object storage; servers only
+- Object bytes move directly between the SDK and the managed stage; servers only
   receive table metadata and RecordBatch streams.
 - Arrow conversion is the only bridge between object values and Lance tables.
 - Storage backends must stream files in bounded chunks; never buffer whole
