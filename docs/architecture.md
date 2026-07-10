@@ -86,6 +86,7 @@ catalog and metadata layers call:
 pub trait TableEngine: Send + Sync {
     async fn create(&self, loc: &TableLocation, schema: SchemaRef) -> Result<TableHandleRef>;
     async fn open(&self, loc: &TableLocation) -> Result<Option<TableHandleRef>>;
+    async fn maintain(&self, loc: &TableLocation, version: Version) -> Result<Option<Version>>;
 }
 
 #[async_trait]
@@ -94,7 +95,7 @@ pub trait TableHandle: Send + Sync {
     fn current_version(&self) -> Version;
     /// A DataFusion table at a specific snapshot — this is how the query
     /// layer reads.
-    fn table_provider(&self, version: Version) -> Arc<dyn TableProvider>;
+    async fn table_provider(&self, version: Version) -> Result<Arc<dyn TableProvider>>;
     /// Append rows, producing a new immutable version.
     async fn append(&self, batches: SendableRecordBatchStream) -> Result<Version>;
 }
@@ -138,6 +139,16 @@ version: the pointer only ever advances to a fully-written one. Consistency
 is snapshot-by-version with at-most-one-commit staleness on cache-served
 reads — acceptable for training/eval, see `goal.md`.
 
+## SQL over object storage
+
+The public query protocol is read-only Arrow Flight SQL. Query nodes resolve
+the exact registry version and stream its files directly from S3; SQL text
+cannot register arbitrary object-store locations. Interactive results stream
+over `DoGet`. The planned large-result tier materializes Arrow/Parquet parts to
+a service-owned S3 prefix and publishes short-lived HTTPS locations through
+`PollFlightInfo`. The complete API and security boundary are in
+[`docs/design/sql-api-over-s3.md`](design/sql-api-over-s3.md).
+
 ## Crate map
 
 | Crate | Owns | Tier |
@@ -178,14 +189,12 @@ from lease-election over an already-HA KV.
 Grep for `ponytail:` in code for shortcuts with known ceilings. Current
 design-level ones:
 
-- Both servers speak real Arrow Flight: `lake-query` a Flight SQL endpoint,
-  `lake-metasrv` a Flight `do_action` control plane (create_table/resolve/
-  list). `lake-metasrv::serve` runs the lease-election campaign loop and
-  gates writes (`create_table`) on being leader; a standby takes over on
-  lease expiry. Ceiling: leadership currently gates only at the action
-  boundary — background coordinators (GC/compaction) are not built yet, and
-  there is no client that discovers the leader (clients hit any instance;
-  reads work anywhere, writes 412 on a follower).
+- Both servers speak real Arrow Flight: `lake-query` a read-only, streaming
+  Flight SQL endpoint, and `lake-metasrv` a Flight `do_action` control plane.
+  `lake-metasrv::serve` runs deadline-aware lease election, forwards follower
+  writes to the observed leader, serializes mutations per table, and gates
+  maintenance on the same lease. Ceiling: there is no durable query scheduler
+  or asynchronous large-result service yet.
 - The full prod path (Lance on S3 + DynamoDB commit pointer via
   `ExternalManifestStore`) is wired end to end: `LanceEngine::for_object_store`
   threads S3 storage options + the commit handler through create/open/append,
@@ -204,11 +213,11 @@ design-level ones:
 - **v1 (wires + prod backend)** ✅ — `DynamoMeta` (prod HA KV), the Lance
   `ExternalManifestStore` adapter for S3 commits, the `lake-query` Arrow
   Flight SQL server, and the `lake-metasrv` Flight `do_action` control plane.
-- **v2 (metadata HA + ops)** — mostly done: lease-election (✅) is wired into
-  `lake-metasrv::serve` with leadership-gated writes + standby takeover (✅).
-  Remaining: background GC/compaction coordination, a leader-aware client,
-  client-side SDK cache. Self-built engine slots in behind `TableEngine`
-  if/when Lance's ceiling is hit.
+- **v2 (metadata HA + ops)** — lease-election, follower forwarding,
+  leadership-gated writes, per-table serialization, and leader-only
+  maintenance are wired. Remaining: durable operation state, production
+  observability, and client-side SDK caching. A self-built engine slots in
+  behind `TableEngine` if/when Lance's ceiling is hit.
 
 Invariant across all phases: fleet reads go through the stateless query
 layer, never directly at the metadata authority.

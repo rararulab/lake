@@ -29,7 +29,12 @@ mod flight;
 use std::{sync::Arc, time::Duration};
 
 use arrow_flight::flight_service_server::FlightServiceServer;
-use datafusion::{arrow::array::RecordBatch, error::DataFusionError, prelude::SessionContext};
+use datafusion::{
+    arrow::array::RecordBatch,
+    dataframe::DataFrame,
+    error::DataFusionError,
+    prelude::{SQLOptions, SessionContext},
+};
 use lake_catalog::LakeCatalog;
 use lake_engine::TableEngineRef;
 use lake_meta::MetaStoreRef;
@@ -40,13 +45,20 @@ use crate::flight::FlightSqlServiceImpl;
 /// Maximum age of the in-memory catalog listing used on the query hot path.
 const CATALOG_MAX_AGE: Duration = Duration::from_secs(5);
 
+fn read_only_sql_options() -> SQLOptions {
+    SQLOptions::new()
+        .with_allow_ddl(false)
+        .with_allow_dml(false)
+        .with_allow_statements(false)
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum QueryError {
     #[snafu(display("catalog refresh failed"))]
     Refresh { source: lake_meta::MetaError },
 
-    #[snafu(display("query execution failed"))]
+    #[snafu(display("query execution failed: {source}"))]
     Execute { source: DataFusionError },
 
     #[snafu(display("invalid listen address {addr:?}"))]
@@ -89,12 +101,20 @@ impl QueryEngine {
 
     /// Execute a SQL statement and collect the results.
     pub async fn execute_sql(&self, sql: &str) -> Result<Vec<RecordBatch>> {
-        self.refresh_if_stale().await?;
-        let df = self.ctx.sql(sql).await.context(ExecuteSnafu)?;
+        let df = self.plan_sql(sql).await?;
         df.collect().await.context(ExecuteSnafu)
     }
 
-    pub fn context(&self) -> &SessionContext { &self.ctx }
+    /// Validate and plan a statement through the public read-only SQL surface.
+    pub(crate) async fn plan_sql(&self, sql: &str) -> Result<DataFrame> {
+        self.refresh_if_stale().await?;
+        self.ctx
+            .sql_with_options(sql, read_only_sql_options())
+            .await
+            .context(ExecuteSnafu)
+    }
+
+    pub(crate) fn context(&self) -> &SessionContext { &self.ctx }
 }
 
 /// Run the Arrow Flight SQL server, serving SQL from `engine` over `addr`.
@@ -180,6 +200,45 @@ mod tests {
             meta.scans.load(Ordering::Relaxed),
             after_first,
             "a warm catalog must shield the registry from the SQL hot path"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_sql_surface_is_read_only() {
+        let meta: MetaStoreRef = Arc::new(CountingMeta::default());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let query = QueryEngine::new(meta, engine);
+
+        query.execute_sql("SELECT 1").await.unwrap();
+        query.execute_sql("EXPLAIN SELECT 1").await.unwrap();
+
+        query
+            .context()
+            .sql("CREATE TABLE sink (value BIGINT)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let dml = query
+            .execute_sql("INSERT INTO sink VALUES (1)")
+            .await
+            .unwrap_err();
+        assert!(
+            dml.to_string().contains("DML not supported"),
+            "public SQL must reject data mutation: {dml}"
+        );
+
+        let ddl = query
+            .execute_sql(
+                "CREATE EXTERNAL TABLE arbitrary STORED AS PARQUET LOCATION \
+                 's3://untrusted-bucket/private/'",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            ddl.to_string().contains("DDL not supported"),
+            "public SQL must reject arbitrary object-store registration: {ddl}"
         );
     }
 }

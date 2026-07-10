@@ -53,8 +53,7 @@ impl FlightSqlServiceImpl {
     /// Used by `GetFlightInfo` to advertise the result schema without
     /// materializing any rows.
     async fn plan_schema(&self, sql: &str) -> std::result::Result<Schema, Status> {
-        self.engine.refresh_if_stale().await.map_err(to_status)?;
-        let df = self.engine.context().sql(sql).await.map_err(to_status)?;
+        let df = self.engine.plan_sql(sql).await.map_err(to_status)?;
         Ok(df.schema().as_arrow().clone())
     }
 }
@@ -111,8 +110,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let sql = String::from_utf8(ticket.statement_handle.to_vec())
             .map_err(|e| Status::invalid_argument(format!("ticket is not utf-8: {e}")))?;
 
-        self.engine.refresh_if_stale().await.map_err(to_status)?;
-        let df = self.engine.context().sql(&sql).await.map_err(to_status)?;
+        let df = self.engine.plan_sql(&sql).await.map_err(to_status)?;
         let batches = df.execute_stream().await.map_err(to_status)?;
         let schema: SchemaRef = batches.schema();
         let batches = batches.map_err(|err| FlightError::ExternalError(Box::new(err)));

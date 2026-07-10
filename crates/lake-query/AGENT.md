@@ -16,5 +16,5 @@ The query layer: stateless SQL compute. `QueryEngine` wires a DataFusion
 
 ## Layout
 
-- `lib.rs` — `QueryEngine` (`new`/`refresh`/`execute_sql`) + `serve`
-  (v1 Flight SQL wire is a ponytail stub)
+- `lib.rs` — read-only `QueryEngine` (`new`/`refresh`/`execute_sql`) + `serve`
+- `flight.rs` — streaming Flight SQL statement path (`GetFlightInfo`/`DoGet`)
