@@ -50,11 +50,14 @@ pub trait TableEngine: Send + Sync {
     /// removed separately by the metadata layer.
     async fn remove(&self, location: &TableLocation) -> Result<()>;
 
-    /// Compact fragments and reclaim old versions for the table at
-    /// `location`. Idempotent — a table with nothing to compact or reclaim is
-    /// left unchanged, so it is safe to run repeatedly. Intended for the
-    /// leader-only background maintenance sweep.
-    async fn maintain(&self, location: &TableLocation) -> Result<()>;
+    /// Compact fragments and reclaim old versions starting from the registered
+    /// `version`. Returns the new version when compaction commits, or `None`
+    /// when no version-producing work was needed.
+    ///
+    /// The caller must publish a returned version through the registry CAS
+    /// before readers may observe it.
+    async fn maintain(&self, location: &TableLocation, version: Version)
+    -> Result<Option<Version>>;
 }
 
 /// A handle to one table backed by an engine. Resolves to DataFusion for

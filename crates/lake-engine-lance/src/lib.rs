@@ -215,18 +215,27 @@ impl TableEngine for LanceEngine {
         Ok(())
     }
 
-    async fn maintain(&self, location: &TableLocation) -> Result<()> {
+    async fn maintain(
+        &self,
+        location: &TableLocation,
+        version: Version,
+    ) -> Result<Option<Version>> {
         // Open a mutable dataset so compaction can advance it in place, then
         // reclaim versions no longer within the retention window. Both steps
         // are no-ops when nothing qualifies, keeping the sweep idempotent.
-        let mut dataset = self
+        let dataset = self
             .config
             .open_dataset(location.as_str())
+            .await
+            .map_err(EngineError::backend)?;
+        let mut dataset = dataset
+            .checkout_version(version.0)
             .await
             .map_err(EngineError::backend)?;
         compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
             .map_err(EngineError::backend)?;
+        let maintained_version = Version(dataset.version().version);
         let policy = CleanupPolicyBuilder::default()
             .error_if_tagged_old_versions(false)
             .retain_n_versions(&dataset, RETAIN_VERSIONS)
@@ -237,7 +246,7 @@ impl TableEngine for LanceEngine {
             .cleanup_with_policy(policy)
             .await
             .map_err(EngineError::backend)?;
-        Ok(())
+        Ok((maintained_version != version).then_some(maintained_version))
     }
 }
 
@@ -423,8 +432,9 @@ mod tests {
         }
 
         // Maintenance runs cleanly and is safe to repeat.
-        engine.maintain(&loc).await.unwrap();
-        engine.maintain(&loc).await.unwrap();
+        let before = engine.open(&loc).await.unwrap().unwrap().current_version();
+        let after = engine.maintain(&loc, before).await.unwrap().unwrap_or(before);
+        engine.maintain(&loc, after).await.unwrap();
 
         // The table is still openable and its rows survive compaction.
         let reopened = engine.open(&loc).await.unwrap().expect("table survives");

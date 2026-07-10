@@ -31,6 +31,7 @@ use std::{
 };
 
 use lake_common::TableRef;
+use lake_meta::{MetaError, registry};
 
 use crate::Metasrv;
 
@@ -81,8 +82,28 @@ async fn sweep(metasrv: &Metasrv) {
         for name in tables {
             let table = TableRef::new(namespace.0.clone(), name.0);
             match metasrv.resolve(&table).await {
-                Ok(Some(reg)) => match metasrv.engine().maintain(&reg.location).await {
-                    Ok(()) => tracing::debug!(%table, "maintained table"),
+                Ok(Some(reg)) => match metasrv
+                    .engine()
+                    .maintain(&reg.location, reg.current_version)
+                    .await
+                {
+                    Ok(Some(version)) => match registry::set_version(
+                        metasrv.meta().as_ref(),
+                        &table,
+                        &reg,
+                        version,
+                    )
+                    .await
+                    {
+                        Ok(()) => tracing::debug!(%table, %version, "maintained table"),
+                        Err(MetaError::Conflict { .. }) => {
+                            tracing::debug!(%table, %version, "maintenance result lost registry CAS")
+                        }
+                        Err(err) => {
+                            tracing::warn!(%table, error = %err, "publishing maintenance failed")
+                        }
+                    },
+                    Ok(None) => tracing::debug!(%table, "table needs no maintenance"),
                     Err(err) => {
                         tracing::warn!(%table, error = %err, "maintenance failed for table");
                     }
@@ -94,5 +115,67 @@ async fn sweep(metasrv: &Metasrv) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::{
+        arrow::{
+            array::{Int64Array, RecordBatch},
+            datatypes::{DataType, Field, Schema},
+        },
+        error::DataFusionError,
+        physical_plan::stream::RecordBatchStreamAdapter,
+    };
+    use lake_common::{TableLocation, TableRef};
+    use lake_engine::TableEngineRef;
+    use lake_engine_lance::LanceEngine;
+    use lake_meta::{MetaStoreRef, RocksMeta};
+
+    use super::*;
+
+    fn batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("ep", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sweep_advances_registry_to_maintenance_version() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let table_dir = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::new(meta, engine.clone());
+        let table = TableRef::new("robots", "episodes");
+        let location = TableLocation::new(table_dir.path().join("episodes.lance").to_string_lossy());
+
+        metasrv
+            .create_table(&table, location.clone(), batch().schema())
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let b = batch();
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                b.schema(),
+                futures::stream::iter(vec![Ok::<_, DataFusionError>(b)]),
+            ));
+            metasrv.append(&table, stream).await.unwrap();
+        }
+
+        let before = metasrv.resolve(&table).await.unwrap().unwrap().current_version;
+        sweep(&metasrv).await;
+        let after = metasrv.resolve(&table).await.unwrap().unwrap().current_version;
+        let engine_version = engine
+            .open(&location)
+            .await
+            .unwrap()
+            .unwrap()
+            .current_version();
+
+        assert!(engine_version > before, "compaction must create a new version");
+        assert_eq!(after, engine_version, "registry must publish maintenance commit");
     }
 }
