@@ -23,6 +23,7 @@
 //!   `LAKE_DYNAMODB_*`, and the S3 endpoint plus credentials from
 //!   `LAKE_S3_ENDPOINT` and the standard `AWS_*` variables.
 
+pub mod client;
 pub mod ingest;
 pub mod selftest;
 pub mod serve;

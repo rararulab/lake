@@ -64,19 +64,37 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:50052")]
         addr: String,
     },
+    /// Talk to a running metadata-layer server over Flight (network client).
+    Client {
+        /// The metasrv Flight address to connect to.
+        #[arg(long, default_value = "127.0.0.1:50052")]
+        addr:    String,
+        #[command(subcommand)]
+        command: commands::client::ClientCmd,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    let ctx = commands::Context::open(&cli.data_dir).await?;
+    let Cli { data_dir, command } = Cli::parse();
+    match command {
+        // A pure network client: it holds no local storage, so it must not
+        // build a Context (which would require a data-dir or S3 config).
+        Command::Client { addr, command } => commands::client::run(&addr, command).await,
+        command => run_with_context(&data_dir, command).await,
+    }
+}
 
-    match cli.command {
+/// Run a command that needs the in-process tiers wired from `--data-dir`.
+async fn run_with_context(data_dir: &str, command: Command) -> anyhow::Result<()> {
+    let ctx = commands::Context::open(data_dir).await?;
+    match command {
         Command::Selftest => commands::selftest::run(&ctx).await,
         Command::Sql { query } => commands::sql::run(&ctx, &query).await,
         Command::Ingest { table, file } => commands::ingest::run(&ctx, &table, &file).await,
         Command::Table(cmd) => commands::table::run(&ctx, cmd).await,
         Command::Query { addr } => commands::serve::query(&ctx, &addr).await,
         Command::Meta { addr } => commands::serve::meta(&ctx, &addr).await,
+        Command::Client { .. } => unreachable!("Client is dispatched before Context::open"),
     }
 }
