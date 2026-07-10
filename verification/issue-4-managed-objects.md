@@ -175,3 +175,15 @@ The first command is the required red proof: the intended `FILE` SDK API did
 not exist. The second is the green proof. The current design names only the
 logical value and upload binding; it does not store a signed URL or turn SQL
 into an arbitrary object-store URI interface.
+
+## README and runnable example
+
+`README.md` now links the public `FILE` flow to
+`crates/lake-sdk/examples/managed_file.rs`. The example creates an isolated
+local table, streams a video through `InsertValue::File`, queries its
+`DataLocation`, and verifies the SDK direct reader returns the original bytes.
+
+```text
+$ cargo run -p lake-sdk --example managed_file
+FILE upload and direct read succeeded: file:///.../objects/<immutable-id>
+```

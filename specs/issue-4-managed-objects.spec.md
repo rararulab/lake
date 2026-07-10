@@ -58,6 +58,7 @@ metadata and RecordBatch streams.
 - `crates/lake-objects/**`
 - `crates/lake-sdk/**`
 - `crates/lake-cli/**`
+- `README.md`
 - `docs/architecture.md`
 - `docs/design/managed-objects.md`
 - `docs/plans/**`
