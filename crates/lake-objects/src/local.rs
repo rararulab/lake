@@ -20,7 +20,7 @@ use lake_common::DataLocation;
 use sha2::{Digest, Sha256};
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
 };
 use url::Url;
 
@@ -50,6 +50,13 @@ impl LocalObjectStore {
                 path: root.clone(),
                 source,
             })?;
+        let root = tokio::fs::canonicalize(&root)
+            .await
+            .map_err(|source| ObjectError::Io {
+                action: "resolving".to_owned(),
+                path: root.clone(),
+                source,
+            })?;
         Ok(Self { root })
     }
 
@@ -61,22 +68,36 @@ impl LocalObjectStore {
         content_type: impl Into<String>,
     ) -> Result<DataLocation> {
         let source = source.as_ref();
-        let mut input = File::open(source)
+        let input = File::open(source)
             .await
             .map_err(|source_error| ObjectError::Io {
                 action: "opening".to_owned(),
                 path:   source.to_path_buf(),
                 source: source_error,
             })?;
-        let destination = self.root.join(uuid::Uuid::now_v7().to_string());
+        self.put_reader(input, content_type).await
+    }
+
+    /// Stream an arbitrary SDK reader into the managed prefix.
+    pub async fn put_reader<R>(
+        &self,
+        mut input: R,
+        content_type: impl Into<String>,
+    ) -> Result<DataLocation>
+    where
+        R: AsyncRead + Send + Unpin,
+    {
+        let object_id = uuid::Uuid::now_v7().to_string();
+        let staging = self.root.join(format!(".{object_id}.uploading"));
+        let destination = self.root.join(object_id);
         let mut output = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&destination)
+            .open(&staging)
             .await
             .map_err(|source_error| ObjectError::Io {
                 action: "creating".to_owned(),
-                path:   destination.clone(),
+                path:   staging.clone(),
                 source: source_error,
             })?;
 
@@ -87,11 +108,7 @@ impl LocalObjectStore {
             let read = input
                 .read(&mut buffer)
                 .await
-                .map_err(|source_error| ObjectError::Io {
-                    action: "reading".to_owned(),
-                    path:   source.to_path_buf(),
-                    source: source_error,
-                })?;
+                .map_err(|source| ObjectError::Read { source })?;
             if read == 0 {
                 break;
             }
@@ -101,7 +118,7 @@ impl LocalObjectStore {
                 .await
                 .map_err(|source_error| ObjectError::Io {
                     action: "writing".to_owned(),
-                    path:   destination.clone(),
+                    path:   staging.clone(),
                     source: source_error,
                 })?;
             size_bytes = size_bytes.saturating_add(read as u64);
@@ -111,8 +128,35 @@ impl LocalObjectStore {
             .await
             .map_err(|source_error| ObjectError::Io {
                 action: "flushing".to_owned(),
-                path:   destination.clone(),
+                path:   staging.clone(),
                 source: source_error,
+            })?;
+        output.sync_all().await.map_err(|source| ObjectError::Io {
+            action: "durably syncing".to_owned(),
+            path: staging.clone(),
+            source,
+        })?;
+        drop(output);
+        tokio::fs::rename(&staging, &destination)
+            .await
+            .map_err(|source| ObjectError::Io {
+                action: "publishing".to_owned(),
+                path: destination.clone(),
+                source,
+            })?;
+        File::open(&self.root)
+            .await
+            .map_err(|source| ObjectError::Io {
+                action: "opening".to_owned(),
+                path: self.root.clone(),
+                source,
+            })?
+            .sync_all()
+            .await
+            .map_err(|source| ObjectError::Io {
+                action: "durably syncing".to_owned(),
+                path: self.root.clone(),
+                source,
             })?;
 
         let uri = Url::from_file_path(&destination)
@@ -136,6 +180,19 @@ impl LocalObjectStore {
             .ok_or_else(|| ObjectError::InvalidLocalUri {
                 uri: location.uri.clone(),
             })?;
+        let path = tokio::fs::canonicalize(&path)
+            .await
+            .map_err(|source| ObjectError::Io {
+                action: "resolving".to_owned(),
+                path,
+                source,
+            })?;
+        if !path.starts_with(&self.root) {
+            return Err(ObjectError::OutsideManagedPrefix {
+                path,
+                root: self.root.clone(),
+            });
+        }
         File::open(&path).await.map_err(|source| ObjectError::Io {
             action: "opening".to_owned(),
             path,

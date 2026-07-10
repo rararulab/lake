@@ -16,6 +16,7 @@
 
 use std::{
     collections::BTreeMap,
+    fmt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -34,7 +35,7 @@ use lake_common::{DataLocation, TableRef, Version};
 use lake_metasrv::Metasrv;
 use lake_objects::{LocalObjectStore, data_location_array, data_location_field};
 use snafu::{ResultExt, Snafu};
-use tokio::fs::File;
+use tokio::{fs::File, io::AsyncRead};
 
 /// Errors raised by the typed Rust SDK.
 #[derive(Debug, Snafu)]
@@ -75,10 +76,28 @@ pub enum SdkError {
 pub type Result<T> = std::result::Result<T, SdkError>;
 
 /// A local file to stream into Lake-managed object storage.
-#[derive(Clone, Debug)]
 pub struct ObjectFile {
-    path:         PathBuf,
+    source:       ObjectSource,
     content_type: String,
+}
+
+enum ObjectSource {
+    Path(PathBuf),
+    Reader(Box<dyn AsyncRead + Send + Unpin>),
+}
+
+impl fmt::Debug for ObjectFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let source = match &self.source {
+            ObjectSource::Path(path) => path.display().to_string(),
+            ObjectSource::Reader(_) => "reader".to_owned(),
+        };
+        formatter
+            .debug_struct("ObjectFile")
+            .field("source", &source)
+            .field("content_type", &self.content_type)
+            .finish()
+    }
 }
 
 impl ObjectFile {
@@ -86,14 +105,26 @@ impl ObjectFile {
     #[must_use]
     pub fn from_path(path: impl AsRef<Path>, content_type: impl Into<String>) -> Self {
         Self {
-            path:         path.as_ref().to_path_buf(),
+            source:       ObjectSource::Path(path.as_ref().to_path_buf()),
+            content_type: content_type.into(),
+        }
+    }
+
+    /// Bind an async source that the SDK streams directly to managed storage.
+    #[must_use]
+    pub fn from_reader<R>(reader: R, content_type: impl Into<String>) -> Self
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+    {
+        Self {
+            source:       ObjectSource::Reader(Box::new(reader)),
             content_type: content_type.into(),
         }
     }
 }
 
 /// A typed parameter accepted by the SDK's narrow INSERT binding.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum InsertValue {
     /// UTF-8 scalar value.
     Utf8(String),
@@ -198,11 +229,15 @@ impl LakeClient {
             (data_type, InsertValue::Object(file))
                 if data_type == data_location_field("ignored", false).data_type() =>
             {
-                let location = self
-                    .objects
-                    .put_file(file.path, file.content_type)
-                    .await
-                    .context(ObjectSnafu)?;
+                let location = match file.source {
+                    ObjectSource::Path(path) => {
+                        self.objects.put_file(path, file.content_type).await
+                    }
+                    ObjectSource::Reader(reader) => {
+                        self.objects.put_reader(reader, file.content_type).await
+                    }
+                }
+                .context(ObjectSnafu)?;
                 Ok(Arc::new(data_location_array(&[location])))
             }
             (..) => Err(SdkError::TypeMismatch {
@@ -325,7 +360,12 @@ fn duplicate(values: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        io,
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+    };
 
     use datafusion::arrow::{
         array::{Array, StringArray, StructArray},
@@ -338,8 +378,9 @@ mod tests {
     use lake_metasrv::Metasrv;
     use lake_objects::{LocalObjectStore, data_location_field, data_location_from_array};
     use lake_query::QueryEngine;
+    use sha2::{Digest, Sha256};
     use tempfile::tempdir;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
     use crate::{InsertValue, LakeClient, ObjectFile};
 
@@ -401,6 +442,9 @@ mod tests {
             .downcast_ref::<StructArray>()
             .unwrap();
         let location = data_location_from_array(locations, 0).unwrap();
+        assert_eq!(location.content_type, "video/mp4");
+        assert_eq!(location.size_bytes, expected.len() as u64);
+        assert_eq!(location.sha256, format!("{:x}", Sha256::digest(expected)));
         let mut reader = client.open(&location).await.unwrap();
         let mut actual = Vec::new();
         reader.read_to_end(&mut actual).await.unwrap();
@@ -423,8 +467,8 @@ mod tests {
                 "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
                 vec![
                     InsertValue::Utf8("episode-43".to_owned()),
-                    InsertValue::Object(ObjectFile::from_path(
-                        root.path().join("missing.mp4"),
+                    InsertValue::Object(ObjectFile::from_reader(
+                        FailingReader { emitted: false },
                         "video/mp4",
                     )),
                 ],
@@ -492,5 +536,24 @@ mod tests {
             LocalObjectStore::open(root.join("objects")).await.unwrap(),
         );
         (client, metasrv, table)
+    }
+
+    struct FailingReader {
+        emitted: bool,
+    }
+
+    impl AsyncRead for FailingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if !self.emitted {
+                self.emitted = true;
+                buf.put_slice(b"first chunk");
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Ready(Err(io::Error::other("source stream interrupted")))
+        }
     }
 }

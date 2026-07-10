@@ -52,6 +52,7 @@ metadata and RecordBatch streams.
 
 ### Allowed Changes
 - `Cargo.toml`
+- `Cargo.lock`
 - `crates/lake-common/**`
 - `crates/lake-objects/**`
 - `crates/lake-sdk/**`

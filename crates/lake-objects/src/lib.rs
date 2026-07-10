@@ -48,6 +48,12 @@ pub enum ObjectError {
 
     #[snafu(display("DataLocation URI '{uri}' is not a valid local file URI"))]
     InvalidLocalUri { uri: String },
+
+    #[snafu(display("DataLocation path {path:?} escapes managed object root {root:?}"))]
+    OutsideManagedPrefix { path: PathBuf, root: PathBuf },
+
+    #[snafu(display("reading the object source failed"))]
+    Read { source: std::io::Error },
 }
 
 /// The result type for managed-object operations.
@@ -127,9 +133,10 @@ fn u64_value(array: &StructArray, column: &'static str, row: usize) -> Result<u6
 #[cfg(test)]
 mod tests {
     use lake_common::DataLocation;
+    use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
-    use crate::{LocalObjectStore, data_location_array, data_location_from_array};
+    use crate::{LocalObjectStore, ObjectError, data_location_array, data_location_from_array};
 
     #[test]
     fn datalocation_arrow_roundtrip_preserves_identity() {
@@ -162,8 +169,31 @@ mod tests {
 
         assert_eq!(location.content_type, "video/mp4");
         assert_eq!(location.size_bytes, bytes.len() as u64);
+        assert_eq!(location.sha256, format!("{:x}", Sha256::digest(&bytes)));
         assert!(location.uri.starts_with("file://"));
         let path = location.uri.strip_prefix("file://").unwrap();
         assert_eq!(tokio::fs::read(path).await.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn local_reader_rejects_locations_outside_the_managed_prefix() {
+        let outside_dir = tempdir().unwrap();
+        let outside = outside_dir.path().join("secret.txt");
+        tokio::fs::write(&outside, b"not a managed object")
+            .await
+            .unwrap();
+        let managed_dir = tempdir().unwrap();
+        let store = LocalObjectStore::open(managed_dir.path()).await.unwrap();
+        let location = DataLocation::builder()
+            .uri(url::Url::from_file_path(outside).unwrap().to_string())
+            .content_type("text/plain")
+            .size_bytes(20)
+            .sha256("unused")
+            .build();
+
+        assert!(matches!(
+            store.open_reader(&location).await,
+            Err(ObjectError::OutsideManagedPrefix { .. })
+        ));
     }
 }

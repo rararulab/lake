@@ -4280,6 +4280,7 @@ dependencies = [
  "lake-metasrv",
  "lake-objects",
  "lake-query",
+ "sha2 0.10.9",
  "snafu",
  "tempfile",
  "tokio",
