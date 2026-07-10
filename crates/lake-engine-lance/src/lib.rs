@@ -49,6 +49,7 @@ use lance::{
         builder::DatasetBuilder,
         cleanup::CleanupPolicyBuilder,
         optimize::{CompactionOptions, compact_files},
+        write::InsertBuilder,
     },
     io::{ObjectStoreParams, StorageOptionsAccessor},
 };
@@ -274,7 +275,6 @@ fn dataset_url(location: &TableLocation) -> Result<url::Url> {
 
 /// A handle to one open Lance dataset.
 struct LanceTable {
-    uri:     String,
     dataset: Arc<Dataset>,
     schema:  SchemaRef,
     config:  WriteConfig,
@@ -285,7 +285,6 @@ impl LanceTable {
         let dataset = Arc::new(dataset);
         let provider = LanceTableProvider::new(dataset.clone(), false, false);
         Arc::new(Self {
-            uri: dataset.uri().to_string(),
             schema: provider.schema(),
             dataset,
             config,
@@ -313,35 +312,23 @@ impl TableHandle for LanceTable {
     }
 
     async fn append(&self, batches: SendableRecordBatchStream) -> Result<Version> {
-        let schema = batches.schema();
-        // ponytail: collect the stream before writing — fine for bounded
-        // append batches; stream straight through when payloads grow.
-        let collected: Vec<RecordBatch> =
-            batches.try_collect().await.map_err(EngineError::backend)?;
-        let reader = RecordBatchIterator::new(
-            collected
-                .into_iter()
-                .map(std::result::Result::<_, ArrowError>::Ok),
-            schema,
-        );
-        let dataset = Dataset::write(
-            reader,
-            &self.uri,
-            Some(self.config.write_params(WriteMode::Append)),
-        )
-        .await
-        .map_err(EngineError::backend)?;
+        let params = self.config.write_params(WriteMode::Append);
+        let dataset = InsertBuilder::new(self.dataset.clone())
+            .with_params(&params)
+            .execute_stream(batches)
+            .await
+            .map_err(EngineError::backend)?;
         Ok(Version(dataset.version().version))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Weak};
 
     use datafusion::{
         arrow::{
-            array::{Int64Array, RecordBatch},
+            array::{Array, ArrayRef, Int64Array, RecordBatch},
             datatypes::{DataType, Field, Schema},
         },
         error::DataFusionError,
@@ -372,6 +359,44 @@ mod tests {
         ));
         let v = h.append(stream).await.unwrap();
         assert!(v.0 > 1, "append advances the version");
+    }
+
+    #[tokio::test]
+    async fn append_releases_consumed_batches_before_stream_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let loc = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
+        let engine = LanceEngine::new();
+        let schema = batch().schema();
+        let h = engine.create(&loc, schema.clone()).await.unwrap();
+
+        type State = (usize, Option<Weak<dyn Array>>, bool);
+        let state: State = (0, None, false);
+        let batches = futures::stream::unfold(state, move |(index, previous, done)| {
+            let schema = schema.clone();
+            async move {
+                if done || index == 3 {
+                    return None;
+                }
+                if previous.is_some_and(|batch| batch.upgrade().is_some()) {
+                    return Some((
+                        Err(DataFusionError::Execution(
+                            "consumer retained every prior batch".to_string(),
+                        )),
+                        (index, None, true),
+                    ));
+                }
+
+                let array: ArrayRef = Arc::new(Int64Array::from(vec![index as i64]));
+                let weak = Arc::downgrade(&array);
+                let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+                Some((Ok(batch), (index + 1, Some(weak), false)))
+            }
+        });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(h.schema(), batches));
+
+        h.append(stream)
+            .await
+            .expect("streaming append must release each consumed input batch");
     }
 
     #[tokio::test]

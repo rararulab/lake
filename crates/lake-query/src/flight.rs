@@ -113,17 +113,144 @@ impl FlightSqlService for FlightSqlServiceImpl {
 
         self.engine.refresh_if_stale().await.map_err(to_status)?;
         let df = self.engine.context().sql(&sql).await.map_err(to_status)?;
-        let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
-        let batches = df.collect().await.map_err(to_status)?;
+        let batches = df.execute_stream().await.map_err(to_status)?;
+        let schema: SchemaRef = batches.schema();
+        let batches = batches.map_err(|err| FlightError::ExternalError(Box::new(err)));
 
         let stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
-            .build(futures::stream::iter(
-                batches.into_iter().map(Ok::<_, FlightError>),
-            ))
+            .build(batches)
             .map_err(Status::from);
         Ok(Response::new(Box::pin(stream)))
     }
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use datafusion::{
+        arrow::{
+            array::Int64Array,
+            datatypes::{DataType, Field},
+            record_batch::RecordBatch,
+        },
+        catalog::streaming::StreamingTable,
+        error::DataFusionError,
+        execution::TaskContext,
+        physical_plan::{
+            SendableRecordBatchStream, stream::RecordBatchStreamAdapter, streaming::PartitionStream,
+        },
+    };
+    use futures::StreamExt;
+    use lake_engine::TableEngineRef;
+    use lake_engine_lance::LanceEngine;
+    use lake_meta::{MetaStore, MetaStoreRef};
+    use tokio::sync::Notify;
+
+    use super::*;
+
+    struct EmptyMeta;
+
+    #[async_trait]
+    impl MetaStore for EmptyMeta {
+        async fn get(&self, _key: &str) -> lake_meta::Result<Option<Vec<u8>>> { Ok(None) }
+
+        async fn cas(
+            &self,
+            _key: &str,
+            _expected: Option<&[u8]>,
+            _new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            Ok(true)
+        }
+
+        async fn list_prefix(&self, _prefix: &str) -> lake_meta::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn delete(&self, _key: &str, _expected: &[u8]) -> lake_meta::Result<bool> { Ok(true) }
+    }
+
+    #[derive(Debug)]
+    struct DelayedPartition {
+        schema:  SchemaRef,
+        release: Arc<Notify>,
+    }
+
+    impl PartitionStream for DelayedPartition {
+        fn schema(&self) -> &SchemaRef { &self.schema }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let first = RecordBatch::try_new(
+                self.schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1]))],
+            )
+            .unwrap();
+            let second = RecordBatch::try_new(
+                self.schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![2]))],
+            )
+            .unwrap();
+            let release = self.release.clone();
+            let batches = futures::stream::once(async move { Ok(first) }).chain(
+                futures::stream::once(async move {
+                    release.notified().await;
+                    Ok::<_, DataFusionError>(second)
+                }),
+            );
+            Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), batches))
+        }
+    }
+
+    #[tokio::test]
+    async fn do_get_returns_before_the_input_stream_finishes() {
+        let meta: MetaStoreRef = Arc::new(EmptyMeta);
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let engine = Arc::new(QueryEngine::new(meta, storage));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let release = Arc::new(Notify::new());
+        let table = StreamingTable::try_new(
+            schema.clone(),
+            vec![Arc::new(DelayedPartition {
+                schema,
+                release: release.clone(),
+            })],
+        )
+        .unwrap();
+        engine
+            .context()
+            .register_table("delayed", Arc::new(table))
+            .unwrap();
+
+        let service = FlightSqlServiceImpl { engine };
+        let ticket = TicketStatementQuery {
+            statement_handle: b"SELECT * FROM delayed".to_vec().into(),
+        };
+        let mut request = tokio::spawn(async move {
+            service
+                .do_get_statement(ticket, Request::new(Ticket::default()))
+                .await
+        });
+
+        let returned_early = tokio::time::timeout(Duration::from_millis(100), &mut request)
+            .await
+            .is_ok();
+        release.notify_waiters();
+        if !returned_early {
+            request.await.unwrap().unwrap();
+        }
+
+        assert!(
+            returned_early,
+            "DoGet must return its Flight stream before the producer completes"
+        );
+    }
 }
