@@ -101,50 +101,62 @@ impl LocalObjectStore {
                 source: source_error,
             })?;
 
-        let mut hasher = Sha256::new();
-        let mut size_bytes = 0_u64;
-        let mut buffer = vec![0; COPY_BUFFER_BYTES];
-        loop {
-            let read = input
-                .read(&mut buffer)
-                .await
-                .map_err(|source| ObjectError::Read { source })?;
-            if read == 0 {
-                break;
+        let copied: Result<(u64, String)> = async {
+            let mut hasher = Sha256::new();
+            let mut size_bytes = 0_u64;
+            let mut buffer = vec![0; COPY_BUFFER_BYTES];
+            loop {
+                let read = input
+                    .read(&mut buffer)
+                    .await
+                    .map_err(|source| ObjectError::Read { source })?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                output
+                    .write_all(&buffer[..read])
+                    .await
+                    .map_err(|source_error| ObjectError::Io {
+                        action: "writing".to_owned(),
+                        path:   staging.clone(),
+                        source: source_error,
+                    })?;
+                size_bytes = size_bytes.saturating_add(read as u64);
             }
-            hasher.update(&buffer[..read]);
             output
-                .write_all(&buffer[..read])
+                .flush()
                 .await
                 .map_err(|source_error| ObjectError::Io {
-                    action: "writing".to_owned(),
+                    action: "flushing".to_owned(),
                     path:   staging.clone(),
                     source: source_error,
                 })?;
-            size_bytes = size_bytes.saturating_add(read as u64);
-        }
-        output
-            .flush()
-            .await
-            .map_err(|source_error| ObjectError::Io {
-                action: "flushing".to_owned(),
-                path:   staging.clone(),
-                source: source_error,
+            output.sync_all().await.map_err(|source| ObjectError::Io {
+                action: "durably syncing".to_owned(),
+                path: staging.clone(),
+                source,
             })?;
-        output.sync_all().await.map_err(|source| ObjectError::Io {
-            action: "durably syncing".to_owned(),
-            path: staging.clone(),
-            source,
-        })?;
+            Ok((size_bytes, format!("{:x}", hasher.finalize())))
+        }
+        .await;
         drop(output);
-        tokio::fs::rename(&staging, &destination)
-            .await
-            .map_err(|source| ObjectError::Io {
+        let (size_bytes, sha256) = match copied {
+            Ok(copied) => copied,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&staging).await;
+                return Err(error);
+            }
+        };
+        if let Err(source) = tokio::fs::rename(&staging, &destination).await {
+            let _ = tokio::fs::remove_file(&staging).await;
+            return Err(ObjectError::Io {
                 action: "publishing".to_owned(),
                 path: destination.clone(),
                 source,
-            })?;
-        File::open(&self.root)
+            });
+        }
+        let directory_sync = File::open(&self.root)
             .await
             .map_err(|source| ObjectError::Io {
                 action: "opening".to_owned(),
@@ -157,7 +169,11 @@ impl LocalObjectStore {
                 action: "durably syncing".to_owned(),
                 path: self.root.clone(),
                 source,
-            })?;
+            });
+        if let Err(error) = directory_sync {
+            let _ = tokio::fs::remove_file(&destination).await;
+            return Err(error);
+        }
 
         let uri = Url::from_file_path(&destination)
             .map_err(|()| ObjectError::FileUri {
@@ -168,7 +184,7 @@ impl LocalObjectStore {
             .uri(uri)
             .content_type(content_type)
             .size_bytes(size_bytes)
-            .sha256(format!("{:x}", hasher.finalize()))
+            .sha256(sha256)
             .build())
     }
 

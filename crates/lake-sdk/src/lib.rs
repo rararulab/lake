@@ -486,6 +486,13 @@ mod tests {
             after, before,
             "a failed upload must not append a table version"
         );
+        let mut objects = tokio::fs::read_dir(root.path().join("objects"))
+            .await
+            .unwrap();
+        assert!(
+            objects.next_entry().await.unwrap().is_none(),
+            "a failed upload must remove its staging object"
+        );
     }
 
     #[tokio::test]
