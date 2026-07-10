@@ -137,8 +137,8 @@ It does not publish the internal crates, which remain `publish = false`.
   release version. TOML extra-file updaters keep
   `workspace.package.version` and every lake package entry in `Cargo.lock`
   synchronized.
-- Adding a workspace crate requires adding its exact Cargo.lock JSONPath to
-  `release-please-config.json`.
+- When a new crate is added, add its exact `Cargo.lock` extra-file JSONPath
+  using `.name.value` to `release-please-config.json`.
 
 The workflow needs a dedicated `RELEASE_PLEASE_TOKEN` repository secret.
 Using the default `GITHUB_TOKEN` would prevent the generated release PR from
