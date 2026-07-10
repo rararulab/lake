@@ -90,16 +90,6 @@ impl DynamoMeta {
     /// not already present. Idempotent: a concurrent creator's
     /// `ResourceInUseException` is treated as success.
     pub async fn ensure_table(&self) -> Result<()> {
-        let existing = self
-            .client
-            .list_tables()
-            .send()
-            .await
-            .map_err(dynamo_err("list_tables"))?;
-        if existing.table_names().contains(&self.table) {
-            return Ok(());
-        }
-
         let attribute = AttributeDefinition::builder()
             .attribute_name("pk")
             .attribute_type(ScalarAttributeType::S)
@@ -142,6 +132,7 @@ impl MetaStore for DynamoMeta {
             .get_item()
             .table_name(&self.table)
             .key("pk", AttributeValue::S(key.to_owned()))
+            .consistent_read(true)
             .send()
             .await
             .map_err(dynamo_err(format!("get_item on '{key}'")))?;
@@ -192,6 +183,7 @@ impl MetaStore for DynamoMeta {
                 .client
                 .scan()
                 .table_name(&self.table)
+                .consistent_read(true)
                 .projection_expression("pk")
                 .filter_expression("begins_with(pk, :prefix)")
                 .expression_attribute_values(":prefix", AttributeValue::S(prefix.to_owned()))

@@ -271,4 +271,23 @@ async fn lance_engine_on_s3_with_dynamo_external_manifest() {
         0,
         "remove deleted all S3 objects under the dataset"
     );
+
+    let stale_manifests = meta
+        .list_prefix("lance-manifest/")
+        .await
+        .expect("list manifest pointers after remove");
+    assert!(
+        stale_manifests.is_empty(),
+        "remove must clear external manifest pointers; got {stale_manifests:?}"
+    );
+
+    let recreated = engine
+        .create(&location, schema)
+        .await
+        .expect("recreate the same S3 location after remove");
+    assert_eq!(
+        recreated.current_version().0,
+        1,
+        "a recreated dataset starts a fresh version history"
+    );
 }

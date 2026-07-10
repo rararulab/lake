@@ -213,6 +213,9 @@ impl TableEngine for LanceEngine {
             .try_collect::<Vec<_>>()
             .await
             .map_err(EngineError::backend)?;
+        if let Some(handler) = &self.config.commit_handler {
+            handler.delete(&path).await.map_err(EngineError::backend)?;
+        }
         Ok(())
     }
 

@@ -174,6 +174,36 @@ impl ExternalManifestStore for MetaManifestStore {
             )))
         }
     }
+
+    async fn delete(&self, base_uri: &str) -> Result<()> {
+        let prefix = Self::base_prefix(base_uri);
+        let versions = self.meta.list_prefix(&prefix).await.map_err(store_err)?;
+        for version in versions {
+            let key = format!("{prefix}{version}");
+            let Some(value) = self.meta.get(&key).await.map_err(store_err)? else {
+                continue;
+            };
+            if !self.meta.delete(&key, &value).await.map_err(store_err)? {
+                return Err(Error::io(format!(
+                    "manifest delete raced with a writer: {base_uri}@{version}"
+                )));
+            }
+        }
+
+        if self
+            .meta
+            .list_prefix(&prefix)
+            .await
+            .map_err(store_err)?
+            .is_empty()
+        {
+            Ok(())
+        } else {
+            Err(Error::io(format!(
+                "manifest history changed during delete: {base_uri}"
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -243,5 +273,23 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn delete_clears_history_for_recreate() {
+        let (s, _dir) = store();
+        s.put_if_not_exists("ds", 1, "v1.manifest", 4, None)
+            .await
+            .unwrap();
+        s.put_if_not_exists("ds", 2, "v2.manifest", 4, None)
+            .await
+            .unwrap();
+
+        s.delete("ds").await.unwrap();
+
+        assert_eq!(s.get_latest_version("ds").await.unwrap(), None);
+        s.put_if_not_exists("ds", 1, "new-v1.manifest", 4, None)
+            .await
+            .expect("a recreated dataset can claim version one");
     }
 }
