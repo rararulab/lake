@@ -1,0 +1,36 @@
+# cargo-deny configuration. Runs in CI only when the dependency graph changes
+# (see the `cargo_deps` path filter in .github/workflows/ci.yml). Triage new
+# findings here with a per-entry reason rather than softening the whole check.
+
+[advisories]
+version = 2
+# Add `ignore = ["RUSTSEC-XXXX-YYYY"]` entries with a justification comment as
+# advisories are triaged.
+
+[bans]
+# Large dependency trees (arrow / datafusion / lance) legitimately pull several
+# versions of some crates; keep this a warning, not a hard failure.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "MPL-2.0",
+  "CC0-1.0",
+  "OpenSSL",
+]
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"

@@ -1,0 +1,19 @@
+# Nextest configuration.
+#
+# The `ci` profile is used by `.github/workflows/ci.yml` on the
+# `arc-runner-set` self-hosted runners. ARC pods report the underlying
+# node's `nproc` (16) while the pod has a smaller cgroup CPU quota, so
+# nextest's default `test-threads = num_cpus` over-subscribes the pod:
+# individual tests get inflated wall-clock (sub-second locally, tens of
+# seconds on CI) and the tokio runtimes inside each test compound the
+# starvation. Several test jobs also share one host. Cap parallelism to fit.
+
+[profile.ci]
+# Keep test processes within the pod's CPU budget (and leave room for the
+# other CI jobs sharing the host). Compilation parallelism is capped
+# separately via CARGO_BUILD_JOBS in the workflow.
+test-threads = 4
+
+# Fail hung tests instead of burning the job timeout: kill a test that
+# exceeds the period three times in a row.
+slow-timeout = { period = "60s", terminate-after = 3 }

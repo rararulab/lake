@@ -9,42 +9,99 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
 permissions:
   contents: read
+  pull-requests: read
 
 env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
   # Local dev keeps incremental builds (see mise.toml); CI disables them.
   CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
 
 jobs:
-  check:
-    name: Check
+  # Path filter so docs-/specs-only PRs skip the heavy Rust legs. Pushes to
+  # main always run the full gate.
+  changes:
+    name: Detect changes
     runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      site: ${{ steps.filter.outputs.site }}
+      specs: ${{ steps.filter.outputs.specs }}
+      cargo_deps: ${{ steps.filter.outputs.cargo_deps }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-
-      - name: Install Rust toolchains
-        run: |
-          rustup toolchain install stable --component clippy
-          rustup toolchain install nightly --component rustfmt
-
-      - uses: jdx/mise-action@v4
+          fetch-depth: 0
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: filter
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          install: true
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'harness/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'clippy.toml'
+              - 'mise.toml'
+              - '.config/nextest.toml'
+              - '.github/workflows/ci.yml'
+              - '.github/actions/**'
+            site:
+              - 'site/**'
+              - '.github/workflows/ci.yml'
+            specs:
+              - 'specs/**'
+              - 'scripts/**'
+            cargo_deps:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'deny.toml'
 
-      - uses: Swatinem/rust-cache@v2
+  # One check per job so they run in parallel on separate GitHub-hosted runners
+  # (public repo => free, unlimited, ~20 concurrent).
+  rust:
+    name: ${{ matrix.name }}
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: clippy, cmd: mise run clippy }
+          # nextest with the `ci` profile — see .config/nextest.toml.
+          - { name: test, cmd: cargo nextest run --workspace --profile ci }
+          - { name: doc, cmd: mise run doc }
+          - { name: fmt, cmd: mise run fmt-check }
+          - { name: e2e, cmd: mise run e2e }
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-lake-build
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2
+        with:
+          tool: cargo-nextest
+      - run: ${{ matrix.cmd }}
 
-      - name: ci gate
-        run: mise run ci
-
-  # Exercise the production path (DynamoMeta + Lance-on-S3) against LocalStack.
-  # These tests are `#[ignore]` and skip without LAKE_DYNAMODB_ENDPOINT, so the
-  # `check` job never runs them — this job provisions the emulator and does.
+  # Production path (DynamoMeta + Lance-on-S3) against LocalStack. These tests
+  # are `#[ignore]` and skip without LAKE_DYNAMODB_ENDPOINT, so the `test` job
+  # never runs them — this job provisions the emulator and does.
   integration:
     name: Integration (LocalStack)
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'push' }}
     runs-on: ubuntu-latest
     services:
       localstack:
@@ -68,38 +125,110 @@ jobs:
       AWS_SECRET_ACCESS_KEY: test
       AWS_REGION: us-east-1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-
-      - name: Install Rust toolchain
-        run: rustup toolchain install stable
-
-      - uses: jdx/mise-action@v4
+      - uses: ./.github/actions/setup-lake-build
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          install: true
-
-      - uses: Swatinem/rust-cache@v2
-
+          tool: cargo-nextest
       - name: run integration tests (ignored-only)
-        run: cargo nextest run -p lake-meta -p lake-engine-lance --run-ignored ignored-only
+        run: cargo nextest run -p lake-meta -p lake-engine-lance --profile ci --run-ignored ignored-only
+
+  # Task-Contract spec self-test (bun tooling; no Rust build).
+  spec:
+    name: Spec selftest
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.specs == 'true' || github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4
+        with:
+          github_token: ${{ github.token }}
+          install: true
+      - run: mise run spec-selftest
+
+  # Marketing site — a JS (bun) build, no Rust toolchain needed.
+  site:
+    name: Site
+    needs: changes
+    if: ${{ needs.changes.outputs.site == 'true' || github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4
+        with:
+          github_token: ${{ github.token }}
+          install: true
+      - run: mise run site-check
 
   # jj fires no git hooks locally, so Conventional Commits are enforced here.
   commits:
     name: Conventional Commits
-    if: github.event_name == 'pull_request'
+    if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           fetch-depth: 0
-
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_token: ${{ github.token }}
           install: true
+      - run: mise run check-commits "origin/${{ github.base_ref }}..HEAD"
 
-      - name: check commit messages
-        run: mise run check-commits "origin/${{ github.base_ref }}..HEAD"
+  # Advisory/ban/license/source sweep. Only runs when the dependency graph
+  # changes; triage findings in deny.toml.
+  cargo-deny:
+    name: Cargo Deny
+    needs: changes
+    if: ${{ needs.changes.outputs.cargo_deps == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
+
+  # Detects unused dependencies declared in Cargo.toml files.
+  cargo-shear:
+    name: Cargo Shear
+    needs: changes
+    if: ${{ needs.changes.outputs.cargo_deps == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2
+        with:
+          tool: cargo-shear
+      - run: cargo shear
+
+  # Single required status check for branch protection: green unless a job
+  # actually failed or was cancelled (a filtered `skipped` leg is fine).
+  #
+  # cargo-deny and cargo-shear are intentionally NOT in `needs`: lake has not
+  # yet triaged its advisory / unused-dep baseline, so they run as advisory
+  # (visible red in the checks list) without blocking the gate. Promote them
+  # to required once the baseline is clean — the way rara did (#2175).
+  ci-ok:
+    name: CI OK
+    if: always()
+    needs: [changes, rust, integration, spec, site, commits]
+    runs-on: ubuntu-latest
+    steps:
+      - name: verify no job failed
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1
+      - run: echo "all checks passed"
