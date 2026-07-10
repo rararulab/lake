@@ -28,7 +28,7 @@ size, and SHA-256 digest.
 
 **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p lake-objects datalocation_arrow_roundtrip_preserves_identity -- --exact`
+Run: `cargo test -p lake-objects datalocation_arrow_roundtrip_preserves_identity`
 
 Expected: FAIL because `lake-objects` and the Arrow conversion do not exist.
 
@@ -39,7 +39,7 @@ array conversion in `lake-objects`; expose no storage backend here.
 
 **Step 4: Run the test to verify it passes**
 
-Run: `cargo test -p lake-objects datalocation_arrow_roundtrip_preserves_identity -- --exact`
+Run: `cargo test -p lake-objects datalocation_arrow_roundtrip_preserves_identity`
 
 Expected: PASS.
 
@@ -64,7 +64,7 @@ read-back bytes.
 
 **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p lake-objects put_file_streams_bytes_and_returns_verified_location -- --exact`
+Run: `cargo test -p lake-objects put_file_streams_bytes_and_returns_verified_location`
 
 Expected: FAIL because no managed-object store exists.
 
@@ -76,7 +76,7 @@ complete; return a `file://` `DataLocation`.
 
 **Step 4: Run the test to verify it passes**
 
-Run: `cargo test -p lake-objects put_file_streams_bytes_and_returns_verified_location -- --exact`
+Run: `cargo test -p lake-objects put_file_streams_bytes_and_returns_verified_location`
 
 Expected: PASS.
 
@@ -104,7 +104,7 @@ returned location to assert byte equality.
 
 **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p lake-sdk insert_sql_uploads_object_and_queries_datalocation -- --exact`
+Run: `cargo test -p lake-sdk insert_sql_uploads_object_and_queries_datalocation`
 
 Expected: FAIL because `LakeClient`, typed parameters, and INSERT binding do
 not exist.
@@ -118,7 +118,7 @@ object parameters, then call `Metasrv::append` once.
 
 **Step 4: Run the test to verify it passes**
 
-Run: `cargo test -p lake-sdk insert_sql_uploads_object_and_queries_datalocation -- --exact`
+Run: `cargo test -p lake-sdk insert_sql_uploads_object_and_queries_datalocation`
 
 Expected: PASS.
 
@@ -163,32 +163,26 @@ Expected: PASS.
 jj commit -m "test(sdk): cover managed object insert failures (#4)"
 ```
 
-### Task 5: Wire local CLI construction and document the capability
+### Task 5: Document the local SDK capability
 
 **Files:**
-- Modify: `crates/lake-cli/src/commands/mod.rs`
 - Modify: `docs/architecture.md`
 - Create: `docs/design/managed-objects.md`
 - Test: `crates/lake-sdk/src/lib.rs`
 
-**Step 1: Write the failing test**
+**Step 1: Verify the existing end-to-end test**
 
-Add a construction test proving the local CLI context gives the SDK an object
-prefix separate from Lance datasets.
+Run: `cargo test -p lake-sdk insert_sql_uploads_object_and_queries_datalocation`
 
-**Step 2: Run the test to verify it fails**
+Expected: PASS. The test proves the SDK owns an object prefix separate from
+the Lance table path without coupling the SDK to the CLI binary crate.
 
-Run: `cargo test -p lake-sdk local_context_uses_a_managed_object_prefix -- --exact`
+**Step 2: Write the documentation**
 
-Expected: FAIL because the context has no object-storage seam.
+Document `DataLocation`, SDK upload/reading, snapshot visibility,
+retention/GC limits, and the planned cloud ticket path.
 
-**Step 3: Write the minimal implementation and documentation**
-
-Expose the local object prefix through the application boundary. Document
-DataLocation, SDK upload/reading, snapshot visibility, retention/GC limits,
-and the planned cloud ticket path.
-
-**Step 4: Run focused tests and quality gates**
+**Step 3: Run focused tests and quality gates**
 
 Run: `cargo test -p lake-objects -p lake-sdk`
 
@@ -202,7 +196,7 @@ Run: `mise run gate`
 
 Expected: PASS.
 
-**Step 5: Commit**
+**Step 4: Commit**
 
 ```bash
 jj commit -m "docs(objects): describe SQL-managed large files (#4)"

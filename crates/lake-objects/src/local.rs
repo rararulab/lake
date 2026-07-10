@@ -40,31 +40,34 @@ impl LocalObjectStore {
     pub async fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = std::path::absolute(root.as_ref()).map_err(|source| ObjectError::Io {
             action: "absolutizing".to_owned(),
-            path:   root.as_ref().to_path_buf(),
+            path: root.as_ref().to_path_buf(),
             source,
         })?;
         tokio::fs::create_dir_all(&root)
             .await
             .map_err(|source| ObjectError::Io {
                 action: "creating".to_owned(),
-                path:   root.clone(),
+                path: root.clone(),
                 source,
             })?;
         Ok(Self { root })
     }
 
-    /// Stream a local file into the managed prefix and return its immutable identity.
+    /// Stream a local file into the managed prefix and return its immutable
+    /// identity.
     pub async fn put_file(
         &self,
         source: impl AsRef<Path>,
         content_type: impl Into<String>,
     ) -> Result<DataLocation> {
         let source = source.as_ref();
-        let mut input = File::open(source).await.map_err(|source_error| ObjectError::Io {
-            action: "opening".to_owned(),
-            path:   source.to_path_buf(),
-            source: source_error,
-        })?;
+        let mut input = File::open(source)
+            .await
+            .map_err(|source_error| ObjectError::Io {
+                action: "opening".to_owned(),
+                path:   source.to_path_buf(),
+                source: source_error,
+            })?;
         let destination = self.root.join(uuid::Uuid::now_v7().to_string());
         let mut output = OpenOptions::new()
             .write(true)
@@ -81,11 +84,14 @@ impl LocalObjectStore {
         let mut size_bytes = 0_u64;
         let mut buffer = [0; COPY_BUFFER_BYTES];
         loop {
-            let read = input.read(&mut buffer).await.map_err(|source_error| ObjectError::Io {
-                action: "reading".to_owned(),
-                path:   source.to_path_buf(),
-                source: source_error,
-            })?;
+            let read = input
+                .read(&mut buffer)
+                .await
+                .map_err(|source_error| ObjectError::Io {
+                    action: "reading".to_owned(),
+                    path:   source.to_path_buf(),
+                    source: source_error,
+                })?;
             if read == 0 {
                 break;
             }
@@ -100,11 +106,14 @@ impl LocalObjectStore {
                 })?;
             size_bytes = size_bytes.saturating_add(read as u64);
         }
-        output.flush().await.map_err(|source_error| ObjectError::Io {
-            action: "flushing".to_owned(),
-            path:   destination.clone(),
-            source: source_error,
-        })?;
+        output
+            .flush()
+            .await
+            .map_err(|source_error| ObjectError::Io {
+                action: "flushing".to_owned(),
+                path:   destination.clone(),
+                source: source_error,
+            })?;
 
         let uri = Url::from_file_path(&destination)
             .map_err(|()| ObjectError::FileUri {

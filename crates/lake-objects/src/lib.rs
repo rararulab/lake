@@ -66,8 +66,7 @@ pub fn data_location_array(locations: &[DataLocation]) -> StructArray {
     let content_type =
         StringArray::from_iter_values(locations.iter().map(|value| value.content_type.as_str()));
     let size_bytes = UInt64Array::from_iter_values(locations.iter().map(|value| value.size_bytes));
-    let sha256 =
-        StringArray::from_iter_values(locations.iter().map(|value| value.sha256.as_str()));
+    let sha256 = StringArray::from_iter_values(locations.iter().map(|value| value.sha256.as_str()));
     StructArray::new(
         data_location_fields(),
         vec![
@@ -156,7 +155,9 @@ mod tests {
         tokio::fs::write(&source, &bytes).await.unwrap();
 
         let destination_dir = tempdir().unwrap();
-        let store = LocalObjectStore::open(destination_dir.path()).await.unwrap();
+        let store = LocalObjectStore::open(destination_dir.path())
+            .await
+            .unwrap();
         let location = store.put_file(&source, "video/mp4").await.unwrap();
 
         assert_eq!(location.content_type, "video/mp4");

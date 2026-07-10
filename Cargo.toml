@@ -10,6 +10,7 @@ members = [
     "crates/lake-metasrv",
     "crates/lake-cli",
     "crates/lake-objects",
+    "crates/lake-sdk",
 ]
 
 [workspace.package]
@@ -62,6 +63,7 @@ lake-engine-lance = { path = "crates/lake-engine-lance" }
 lake-catalog = { path = "crates/lake-catalog" }
 lake-objects = { path = "crates/lake-objects" }
 lake-query = { path = "crates/lake-query" }
+lake-sdk = { path = "crates/lake-sdk" }
 lake-metasrv = { path = "crates/lake-metasrv" }
 
 [workspace.lints.rust]

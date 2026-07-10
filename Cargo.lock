@@ -4268,6 +4268,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "lake-sdk"
+version = "0.0.1"
+dependencies = [
+ "datafusion",
+ "futures",
+ "lake-common",
+ "lake-engine",
+ "lake-engine-lance",
+ "lake-meta",
+ "lake-metasrv",
+ "lake-objects",
+ "lake-query",
+ "snafu",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "lance"
 version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
