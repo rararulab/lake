@@ -140,7 +140,7 @@ mod tests {
             .sha256("7f83b1657ff1fc53b92dc18148a1d65dfa135014")
             .build();
 
-        let array = data_location_array(&[location.clone()]);
+        let array = data_location_array(std::slice::from_ref(&location));
 
         assert_eq!(data_location_from_array(&array, 0).unwrap(), location);
     }

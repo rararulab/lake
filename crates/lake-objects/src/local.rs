@@ -82,7 +82,7 @@ impl LocalObjectStore {
 
         let mut hasher = Sha256::new();
         let mut size_bytes = 0_u64;
-        let mut buffer = [0; COPY_BUFFER_BYTES];
+        let mut buffer = vec![0; COPY_BUFFER_BYTES];
         loop {
             let read = input
                 .read(&mut buffer)
