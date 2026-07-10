@@ -26,9 +26,9 @@
 
 //! [`election`] adds the lease-in-KV leader election that gives this tier HA
 //! (leader + standby) over the [`MetaStore`](lake_meta::MetaStore) CAS
-//! primitive — no self-built consensus. [`control`] wraps the authority in an
+//! primitive — no self-built consensus. `control` wraps the authority in an
 //! Arrow Flight `DoAction` wire surface, and [`serve`] runs it alongside a
-//! background [`leadership`] campaign so writes gate on the lease.
+//! background `leadership` campaign so writes gate on the lease.
 
 pub mod election;
 

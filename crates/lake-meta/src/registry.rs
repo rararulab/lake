@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Lake's db→table registry, layered on the [`MetaStore`](crate::MetaStore).
+//! Lake's db→table registry, layered on the [`MetaStore`].
 //!
 //! This is the metadata authority's durable state: which tables exist, where
 //! they live, which engine backs them, and their current version. Entries
@@ -62,7 +62,7 @@ pub async fn register(
 }
 
 /// Remove the exact registration previously resolved by the caller.
-/// A replacement generation produces [`MetaError::Conflict`] rather than
+/// A replacement generation produces [`crate::MetaError::Conflict`] rather than
 /// being removed by a stale drop.
 pub async fn delete(
     meta: &dyn MetaStore,
@@ -113,7 +113,7 @@ pub async fn list_namespaces(meta: &dyn MetaStore) -> Result<Vec<Namespace>> {
 }
 
 /// Advance a table's current-version pointer, CAS-guarded on the expected
-/// prior registration. Losers of the race get [`MetaError::Conflict`].
+/// prior registration. Losers of the race get [`crate::MetaError::Conflict`].
 pub async fn set_version(
     meta: &dyn MetaStore,
     table: &TableRef,

@@ -18,6 +18,10 @@ bun  = "1.3.14"        # runs scripts/*.ts
 uv   = "0.11.26"       # uvx runs the code-review-graph MCP server (.mcp.json)
 "ubi:j178/prek" = "0.4.8"     # quality gate runner (.pre-commit-config.yaml)
 "cargo:agent-spec" = "0.3.0"  # lane-1 BDD gate (spec-lint / spec-lifecycle)
+# Prebuilt LocalStack integration test runner.
+"github:nextest-rs/nextest" = "cargo-nextest-0.9.140"
+# Protocol Buffer compiler required by Lance build scripts.
+"aqua:protocolbuffers/protobuf/protoc" = "35.1"
 
 [env]
 # CARGO_INCREMENTAL deliberately NOT disabled here: local gates rely on

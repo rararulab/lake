@@ -23,7 +23,7 @@
 //! filesystem. On object stores without atomic put-if-not-exists (S3),
 //! [`LanceEngine::with_manifest_store`] routes the manifest pointer through a
 //! [`MetaManifestStore`] backed by our `MetaStore`, giving Lance the
-//! put-if-not-exists it needs for concurrent commits — see [`manifest_store`].
+//! put-if-not-exists it needs for concurrent commits — see `manifest_store`.
 
 use std::{collections::HashMap, sync::Arc};
 
