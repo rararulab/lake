@@ -31,8 +31,9 @@ first.
 ## Tool Version Rules
 
 - Pin CI-critical tools to concrete versions in `mise.toml`. Do not use
-  `latest` for `bun`, `uv`, `jj`, `gh`, `prek`, or `agent-spec` unless the PR
-  is explicitly a toolchain refresh and records the reason.
+  `latest` for `bun`, `uv`, `jj`, `gh`, `prek`, `agent-spec`, or
+  `cargo-nextest` unless the PR is explicitly a toolchain refresh and records
+  the reason.
 - Top-level `[tools]` is the base developer environment. Do not put deploy-only
   tools (cloud emulators, load-test tools) there; attach them to the deploy tasks
   that need them.
@@ -97,7 +98,7 @@ first.
 ## GitHub Actions Rules
 
 - Use `jdx/mise-action` to install mise-managed tools in CI. Do not hand-install
-  Bun, uv, agent-spec, prek, jj, or gh in workflow YAML.
+  Bun, uv, agent-spec, cargo-nextest, prek, jj, or gh in workflow YAML.
 - Install Rust toolchains before `Swatinem/rust-cache`, because the cache key
   depends on the active Rust version.
 - CI steps should call `mise run ci`, `mise run check-commits`, or another
