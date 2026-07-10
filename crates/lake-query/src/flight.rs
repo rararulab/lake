@@ -47,12 +47,13 @@ pub struct FlightSqlServiceImpl {
 }
 
 impl FlightSqlServiceImpl {
-    /// Refresh the catalog and plan `sql`, returning only its Arrow schema.
+    /// Ensure the bounded-staleness catalog and plan `sql`, returning only its
+    /// Arrow schema.
     ///
     /// Used by `GetFlightInfo` to advertise the result schema without
     /// materializing any rows.
     async fn plan_schema(&self, sql: &str) -> std::result::Result<Schema, Status> {
-        self.engine.refresh().await.map_err(to_status)?;
+        self.engine.refresh_if_stale().await.map_err(to_status)?;
         let df = self.engine.context().sql(sql).await.map_err(to_status)?;
         Ok(df.schema().as_arrow().clone())
     }
@@ -110,7 +111,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let sql = String::from_utf8(ticket.statement_handle.to_vec())
             .map_err(|e| Status::invalid_argument(format!("ticket is not utf-8: {e}")))?;
 
-        self.engine.refresh().await.map_err(to_status)?;
+        self.engine.refresh_if_stale().await.map_err(to_status)?;
         let df = self.engine.context().sql(&sql).await.map_err(to_status)?;
         let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
         let batches = df.collect().await.map_err(to_status)?;

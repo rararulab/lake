@@ -10,8 +10,9 @@ The query layer: stateless SQL compute. `QueryEngine` wires a DataFusion
   load balancer. All persistence is in the metastore + object storage.
 - Reads go directly to storage (disaggregated compute/storage) — the query
   layer never asks a datanode.
-- Caches the catalog and calls `refresh()` before executing so new tables
-  are visible; this is the shield that keeps the metadata authority cold.
+- Caches the catalog with a bounded-staleness refresh window; concurrent
+  refreshes coalesce and the server refreshes in the background so metadata
+  scans stay off the per-query hot path.
 
 ## Layout
 

@@ -16,11 +16,11 @@ lake-engine = { workspace = true }
 lake-meta = { workspace = true }
 moka = { workspace = true }
 snafu = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 lake-engine-lance = { workspace = true }
 tempfile = "3"
-tokio = { workspace = true }
 
 [lints]
 workspace = true

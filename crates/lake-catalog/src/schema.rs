@@ -70,7 +70,12 @@ impl SchemaProvider for LakeSchema {
 
     async fn table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
         let table = self.table_ref(name);
-        let Some(reg) = self.state.registration(&table).await else {
+        let Some(reg) = self
+            .state
+            .registration(&table)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+        else {
             return Ok(None);
         };
         let handle = self

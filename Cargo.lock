@@ -4218,6 +4218,7 @@ dependencies = [
  "futures",
  "lake-catalog",
  "lake-engine",
+ "lake-engine-lance",
  "lake-meta",
  "prost",
  "snafu",

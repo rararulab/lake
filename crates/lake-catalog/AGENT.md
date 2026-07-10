@@ -11,6 +11,8 @@ authority.
   panics inside the async runtime). Refresh the snapshot with
   `LakeCatalog::refresh`.
 - Per-table lookups hit the moka cache before the registry.
+- Listing and registration caches have bounded staleness; refreshes coalesce
+  so concurrent queries cannot stampede the metastore.
 - Read-only over the engine; table creation is an explicit `ops::create_table`
   call the metadata layer makes.
 
