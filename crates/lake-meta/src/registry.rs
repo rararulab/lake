@@ -61,9 +61,24 @@ pub async fn register(
     Ok(())
 }
 
-/// Remove a table's registration. Idempotent.
-pub async fn delete(meta: &dyn MetaStore, table: &TableRef) -> Result<()> {
-    meta.delete(&key(table)).await
+/// Remove the exact registration previously resolved by the caller.
+/// A replacement generation produces [`MetaError::Conflict`] rather than
+/// being removed by a stale drop.
+pub async fn delete(
+    meta: &dyn MetaStore,
+    table: &TableRef,
+    expected: &TableRegistration,
+) -> Result<()> {
+    let k = key(table);
+    let expected_bytes = serde_json::to_vec(expected).context(CorruptEntrySnafu { key: &k })?;
+    let deleted = meta.delete(&k, &expected_bytes).await?;
+    ensure!(
+        deleted,
+        ConflictSnafu {
+            table: table.to_string(),
+        }
+    );
+    Ok(())
 }
 
 /// Look up a table's registration.
@@ -165,5 +180,30 @@ mod tests {
             set_version(&meta, &t, &reg(1), Version(3)).await.is_err(),
             "stale expected must conflict"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_delete_cannot_remove_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = RocksMeta::open(dir.path()).unwrap();
+        let table = TableRef::new("robots", "arm_left");
+        let original = reg(1);
+        let replacement = TableRegistration {
+            location: TableLocation::new("mem://replacement"),
+            current_version: Version(7),
+            ..original.clone()
+        };
+
+        register(&meta, &table, &original).await.unwrap();
+        let stale_observation = get(&meta, &table).await.unwrap().unwrap();
+
+        delete(&meta, &table, &original).await.unwrap();
+        register(&meta, &table, &replacement).await.unwrap();
+
+        // A delayed drop that resolved `original` before the replacement was
+        // registered must not remove the new generation.
+        assert!(delete(&meta, &table, &stale_observation).await.is_err());
+        assert_eq!(stale_observation, original);
+        assert_eq!(get(&meta, &table).await.unwrap(), Some(replacement));
     }
 }

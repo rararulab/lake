@@ -216,16 +216,29 @@ impl MetaStore for DynamoMeta {
         Ok(out)
     }
 
-    async fn delete(&self, key: &str) -> Result<()> {
-        // Unconditional delete — DynamoDB's DeleteItem is idempotent (deleting
-        // an absent key succeeds).
-        self.client
+    async fn delete(&self, key: &str, expected: &[u8]) -> Result<bool> {
+        let result = self
+            .client
             .delete_item()
             .table_name(&self.table)
             .key("pk", AttributeValue::S(key.to_owned()))
+            .condition_expression("val = :expected")
+            .expression_attribute_values(
+                ":expected",
+                AttributeValue::B(Blob::new(expected.to_vec())),
+            )
             .send()
-            .await
-            .map_err(dynamo_err(format!("delete_item on '{key}'")))?;
-        Ok(())
+            .await;
+        match result {
+            Ok(_) => Ok(true),
+            Err(err)
+                if err
+                    .as_service_error()
+                    .is_some_and(|e| e.is_conditional_check_failed_exception()) =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(dynamo_err(format!("delete_item on '{key}'"))(err)),
+        }
     }
 }

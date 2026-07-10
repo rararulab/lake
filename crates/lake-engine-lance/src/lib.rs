@@ -397,7 +397,7 @@ mod tests {
             "snapshot",
             reopened.table_provider(Version(1)).await.unwrap(),
         )
-            .unwrap();
+        .unwrap();
         let rows = ctx
             .sql("SELECT count(*) AS n FROM snapshot")
             .await
@@ -433,7 +433,11 @@ mod tests {
 
         // Maintenance runs cleanly and is safe to repeat.
         let before = engine.open(&loc).await.unwrap().unwrap().current_version();
-        let after = engine.maintain(&loc, before).await.unwrap().unwrap_or(before);
+        let after = engine
+            .maintain(&loc, before)
+            .await
+            .unwrap()
+            .unwrap_or(before);
         engine.maintain(&loc, after).await.unwrap();
 
         // The table is still openable and its rows survive compaction.

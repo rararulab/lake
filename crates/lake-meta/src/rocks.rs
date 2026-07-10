@@ -82,8 +82,14 @@ impl MetaStore for RocksMeta {
         Ok(out)
     }
 
-    async fn delete(&self, key: &str) -> Result<()> {
-        self.db.delete(key).context(BackendSnafu { key })
+    async fn delete(&self, key: &str, expected: &[u8]) -> Result<bool> {
+        let _guard = self.lock();
+        let current = self.db.get(key).context(BackendSnafu { key })?;
+        if current.as_deref() != Some(expected) {
+            return Ok(false);
+        }
+        self.db.delete(key).context(BackendSnafu { key })?;
+        Ok(true)
     }
 }
 

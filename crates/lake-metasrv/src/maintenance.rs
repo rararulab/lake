@@ -81,28 +81,26 @@ async fn sweep(metasrv: &Metasrv) {
 
         for name in tables {
             let table = TableRef::new(namespace.0.clone(), name.0);
+            let _guard = metasrv.lock_table(&table).await;
             match metasrv.resolve(&table).await {
                 Ok(Some(reg)) => match metasrv
                     .engine()
                     .maintain(&reg.location, reg.current_version)
                     .await
                 {
-                    Ok(Some(version)) => match registry::set_version(
-                        metasrv.meta().as_ref(),
-                        &table,
-                        &reg,
-                        version,
-                    )
-                    .await
-                    {
-                        Ok(()) => tracing::debug!(%table, %version, "maintained table"),
-                        Err(MetaError::Conflict { .. }) => {
-                            tracing::debug!(%table, %version, "maintenance result lost registry CAS")
+                    Ok(Some(version)) => {
+                        match registry::set_version(metasrv.meta().as_ref(), &table, &reg, version)
+                            .await
+                        {
+                            Ok(()) => tracing::debug!(%table, %version, "maintained table"),
+                            Err(MetaError::Conflict { .. }) => {
+                                tracing::debug!(%table, %version, "maintenance result lost registry CAS")
+                            }
+                            Err(err) => {
+                                tracing::warn!(%table, error = %err, "publishing maintenance failed")
+                            }
                         }
-                        Err(err) => {
-                            tracing::warn!(%table, error = %err, "publishing maintenance failed")
-                        }
-                    },
+                    }
                     Ok(None) => tracing::debug!(%table, "table needs no maintenance"),
                     Err(err) => {
                         tracing::warn!(%table, error = %err, "maintenance failed for table");
@@ -150,7 +148,8 @@ mod tests {
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
         let metasrv = Metasrv::new(meta, engine.clone());
         let table = TableRef::new("robots", "episodes");
-        let location = TableLocation::new(table_dir.path().join("episodes.lance").to_string_lossy());
+        let location =
+            TableLocation::new(table_dir.path().join("episodes.lance").to_string_lossy());
 
         metasrv
             .create_table(&table, location.clone(), batch().schema())
@@ -165,9 +164,19 @@ mod tests {
             metasrv.append(&table, stream).await.unwrap();
         }
 
-        let before = metasrv.resolve(&table).await.unwrap().unwrap().current_version;
+        let before = metasrv
+            .resolve(&table)
+            .await
+            .unwrap()
+            .unwrap()
+            .current_version;
         sweep(&metasrv).await;
-        let after = metasrv.resolve(&table).await.unwrap().unwrap().current_version;
+        let after = metasrv
+            .resolve(&table)
+            .await
+            .unwrap()
+            .unwrap()
+            .current_version;
         let engine_version = engine
             .open(&location)
             .await
@@ -175,7 +184,13 @@ mod tests {
             .unwrap()
             .current_version();
 
-        assert!(engine_version > before, "compaction must create a new version");
-        assert_eq!(after, engine_version, "registry must publish maintenance commit");
+        assert!(
+            engine_version > before,
+            "compaction must create a new version"
+        );
+        assert_eq!(
+            after, engine_version,
+            "registry must publish maintenance commit"
+        );
     }
 }

@@ -206,7 +206,7 @@ async fn lance_engine_on_s3_with_dynamo_external_manifest() {
             .await
             .expect("open appended snapshot"),
     )
-        .expect("register lance provider");
+    .expect("register lance provider");
     let rows = ctx
         .sql("SELECT count(*) AS n FROM tbl")
         .await

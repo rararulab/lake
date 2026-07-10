@@ -36,7 +36,7 @@ mod control;
 mod leadership;
 mod maintenance;
 
-use std::{net::AddrParseError, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::AddrParseError, sync::Arc, time::Duration};
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use datafusion::{arrow::datatypes::SchemaRef, execution::SendableRecordBatchStream};
@@ -45,6 +45,7 @@ use lake_common::{Namespace, TableLocation, TableName, TableRef, Version};
 use lake_engine::TableEngineRef;
 use lake_meta::{MetaStoreRef, registry, registry::TableRegistration};
 use snafu::{OptionExt, ResultExt, Snafu};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tonic::transport::Server;
 
 use crate::{
@@ -83,14 +84,42 @@ pub type Result<T> = std::result::Result<T, MetasrvError>;
 
 /// The registry authority. Holds the durable metastore and the storage
 /// engine used to materialize new tables.
+struct MetasrvInner {
+    meta:        MetaStoreRef,
+    engine:      TableEngineRef,
+    /// One coordinator per table. Metadata writes are rare and the catalog's
+    /// design ceiling is ~10^4 tables, so retaining these locks is bounded.
+    table_locks: Mutex<HashMap<TableRef, Arc<Mutex<()>>>>,
+}
+
 #[derive(Clone)]
+/// Cloneable handle to the registry authority and its per-table write
+/// coordinators.
 pub struct Metasrv {
-    meta:   MetaStoreRef,
-    engine: TableEngineRef,
+    inner: Arc<MetasrvInner>,
 }
 
 impl Metasrv {
-    pub fn new(meta: MetaStoreRef, engine: TableEngineRef) -> Self { Self { meta, engine } }
+    pub fn new(meta: MetaStoreRef, engine: TableEngineRef) -> Self {
+        Self {
+            inner: Arc::new(MetasrvInner {
+                meta,
+                engine,
+                table_locks: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    pub(crate) async fn lock_table(&self, table: &TableRef) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.inner.table_locks.lock().await;
+            locks
+                .entry(table.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
 
     /// Create a table: materialize the dataset via the engine, then register
     /// it (dataset-first, so a registry entry never points at nothing).
@@ -100,7 +129,8 @@ impl Metasrv {
         location: TableLocation,
         schema: SchemaRef,
     ) -> Result<()> {
-        create_table(&self.meta, &self.engine, table, location, schema)
+        let _guard = self.lock_table(table).await;
+        create_table(self.meta(), self.engine(), table, location, schema)
             .await
             .context(CreateSnafu)
     }
@@ -114,10 +144,12 @@ impl Metasrv {
         table: &TableRef,
         batches: SendableRecordBatchStream,
     ) -> Result<Version> {
+        let _guard = self.lock_table(table).await;
         let reg = self.resolve(table).await?.context(NotFoundSnafu {
             table: table.to_string(),
         })?;
         let handle = self
+            .inner
             .engine
             .open(&reg.location)
             .await
@@ -126,7 +158,7 @@ impl Metasrv {
                 table: table.to_string(),
             })?;
         let new_version = handle.append(batches).await.context(EngineSnafu)?;
-        registry::set_version(self.meta.as_ref(), table, &reg, new_version)
+        registry::set_version(self.meta().as_ref(), table, &reg, new_version)
             .await
             .context(RegistrySnafu)?;
         Ok(new_version)
@@ -141,14 +173,16 @@ impl Metasrv {
     /// gone, so `open` returns `None`) and refresh drops it from listings; a
     /// push-based cache invalidation across instances is a v2 concern.
     pub async fn drop_table(&self, table: &TableRef) -> Result<()> {
+        let _guard = self.lock_table(table).await;
         let Some(reg) = self.resolve(table).await? else {
             return Ok(());
         };
-        self.engine
+        self.inner
+            .engine
             .remove(&reg.location)
             .await
             .context(EngineSnafu)?;
-        registry::delete(self.meta.as_ref(), table)
+        registry::delete(self.meta().as_ref(), table, &reg)
             .await
             .context(RegistrySnafu)?;
         Ok(())
@@ -156,28 +190,28 @@ impl Metasrv {
 
     /// Resolve a table to its current registration.
     pub async fn resolve(&self, table: &TableRef) -> Result<Option<TableRegistration>> {
-        registry::get(self.meta.as_ref(), table)
+        registry::get(self.meta().as_ref(), table)
             .await
             .context(RegistrySnafu)
     }
 
     /// List the tables in a namespace.
     pub async fn list_tables(&self, namespace: &Namespace) -> Result<Vec<TableName>> {
-        registry::list(self.meta.as_ref(), namespace)
+        registry::list(self.meta().as_ref(), namespace)
             .await
             .context(RegistrySnafu)
     }
 
     /// List all namespaces.
     pub async fn list_namespaces(&self) -> Result<Vec<Namespace>> {
-        registry::list_namespaces(self.meta.as_ref())
+        registry::list_namespaces(self.meta().as_ref())
             .await
             .context(RegistrySnafu)
     }
 
-    pub fn meta(&self) -> &MetaStoreRef { &self.meta }
+    pub fn meta(&self) -> &MetaStoreRef { &self.inner.meta }
 
-    pub fn engine(&self) -> &TableEngineRef { &self.engine }
+    pub fn engine(&self) -> &TableEngineRef { &self.inner.engine }
 }
 
 /// Run the metadata server: the Arrow Flight control plane plus a background
@@ -219,4 +253,102 @@ pub async fn serve(metasrv: Arc<Metasrv>, addr: &str) -> Result<()> {
         .await
         .context(ServeSnafu)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use async_trait::async_trait;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use lake_engine::{Result as EngineResult, TableEngine, TableEngineRef, TableHandleRef};
+    use lake_engine_lance::LanceEngine;
+    use lake_meta::RocksMeta;
+    use tokio::sync::Notify;
+
+    use super::*;
+
+    struct PausedRemoveEngine {
+        inner:          LanceEngine,
+        remove_started: Arc<Notify>,
+        resume_remove:  Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl TableEngine for PausedRemoveEngine {
+        fn kind(&self) -> &'static str { self.inner.kind() }
+
+        async fn create(
+            &self,
+            location: &TableLocation,
+            schema: SchemaRef,
+        ) -> EngineResult<TableHandleRef> {
+            self.inner.create(location, schema).await
+        }
+
+        async fn open(&self, location: &TableLocation) -> EngineResult<Option<TableHandleRef>> {
+            self.inner.open(location).await
+        }
+
+        async fn remove(&self, location: &TableLocation) -> EngineResult<()> {
+            self.remove_started.notify_one();
+            self.resume_remove.notified().await;
+            self.inner.remove(location).await
+        }
+
+        async fn maintain(
+            &self,
+            location: &TableLocation,
+            version: Version,
+        ) -> EngineResult<Option<Version>> {
+            self.inner.maintain(location, version).await
+        }
+    }
+
+    #[tokio::test]
+    async fn create_waits_for_inflight_drop_of_same_table() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let table_dir = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let engine = Arc::new(PausedRemoveEngine {
+            inner:          LanceEngine::new(),
+            remove_started: Arc::new(Notify::new()),
+            resume_remove:  Arc::new(Notify::new()),
+        });
+        let engine_ref: TableEngineRef = engine.clone();
+        let metasrv = Arc::new(Metasrv::new(meta, engine_ref));
+        let table = TableRef::new("robots", "arm");
+        let schema = Arc::new(Schema::new(vec![Field::new("ep", DataType::Int64, false)]));
+        let original = TableLocation::new(table_dir.path().join("old.lance").to_string_lossy());
+        let replacement = TableLocation::new(table_dir.path().join("new.lance").to_string_lossy());
+
+        metasrv
+            .create_table(&table, original, schema.clone())
+            .await
+            .unwrap();
+
+        let drop_task = tokio::spawn({
+            let metasrv = metasrv.clone();
+            let table = table.clone();
+            async move { metasrv.drop_table(&table).await }
+        });
+        engine.remove_started.notified().await;
+
+        let mut create_task = tokio::spawn({
+            let metasrv = metasrv.clone();
+            let table = table.clone();
+            async move { metasrv.create_table(&table, replacement, schema).await }
+        });
+        tokio::select! {
+            result = &mut create_task => {
+                panic!("same-table create completed before drop released: {result:?}");
+            }
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+
+        engine.resume_remove.notify_one();
+        drop_task.await.unwrap().unwrap();
+        create_task.await.unwrap().unwrap();
+        assert!(metasrv.resolve(&table).await.unwrap().is_some());
+    }
 }

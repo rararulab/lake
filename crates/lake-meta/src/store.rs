@@ -34,6 +34,7 @@ pub trait MetaStore: Send + Sync {
     /// List keys under a prefix, prefix stripped.
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>>;
 
-    /// Delete a key. Idempotent — deleting an absent key is not an error.
-    async fn delete(&self, key: &str) -> Result<()>;
+    /// Delete `key` only when its current value exactly matches `expected`.
+    /// Returns false when the key is absent or has changed.
+    async fn delete(&self, key: &str, expected: &[u8]) -> Result<bool>;
 }
