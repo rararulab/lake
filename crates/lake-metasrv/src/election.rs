@@ -15,7 +15,7 @@
 //! Lease-in-KV leader election for the metadata tier.
 //!
 //! This gives the stateful metadata tier HA (leader + standby) without any
-//! self-built consensus: it rides entirely on the [`MetaStore`] CAS
+//! self-built consensus: it rides entirely on the [`lake_meta::MetaStore`] CAS
 //! primitive, adapting the GreptimeDB election pattern to our KV. See the HA
 //! section of `docs/architecture.md` and the election study in
 //! `docs/design/meta-server.md`.

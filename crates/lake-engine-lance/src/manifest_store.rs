@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A Lance [`ExternalManifestStore`] backed by lake's [`MetaStore`].
+//! A Lance [`ExternalManifestStore`] backed by lake's [`lake_meta::MetaStore`].
 //!
 //! On object stores without atomic put-if-not-exists (S3), Lance cannot race
 //! concurrent writers safely with its default commit. Lance's answer is the

@@ -22,7 +22,7 @@
 //! metadata authority from the per-query hot path.
 //!
 //! `execute_sql` runs SQL in-process; [`serve`] exposes the same engine over
-//! the Arrow Flight SQL wire (see [`flight`]).
+//! the Arrow Flight SQL wire (see `flight`).
 
 mod flight;
 
