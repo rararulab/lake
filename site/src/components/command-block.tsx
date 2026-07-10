@@ -16,18 +16,18 @@ export function CommandBlock() {
           <IconTerminal2 size={14} stroke={1.6} />
           from file to SQL
         </span>
-        <span className="font-mono text-[0.6rem] text-white/30">local / S3</span>
+        <span className="font-mono text-[0.6rem] text-white/60">local / S3</span>
       </div>
       <div className="divide-y divide-white/[0.07]">
         {commands.map(([number, command, arguments_]) => (
           <div key={number} className="grid grid-cols-[2rem_1fr] gap-2 px-4 py-4 font-mono text-[0.73rem] sm:grid-cols-[2.5rem_8rem_1fr] sm:px-5">
-            <span className="select-none text-white/22">{number}</span>
+            <span className="select-none text-white/60">{number}</span>
             <span className="text-[var(--signal)]">{command}</span>
             <span className="col-start-2 break-all text-white/62 sm:col-start-auto">{arguments_}</span>
           </div>
         ))}
       </div>
-      <div className="border-t border-white/10 bg-white/[0.025] px-4 py-3 font-mono text-[0.61rem] text-white/35 sm:px-5">
+      <div className="border-t border-white/10 bg-white/[0.025] px-4 py-3 font-mono text-[0.61rem] text-white/60 sm:px-5">
         immutable snapshot committed · query resolves exact version
       </div>
     </div>

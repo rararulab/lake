@@ -32,7 +32,7 @@ MCP 工具（索引：`mise run codegraph`）。
 
 ```bash
 mise run doctor          # 新会话第一步：环境健康检查
-mise run gate            # 质量门禁：hooks + test + e2e
+mise run gate            # 质量门禁：hooks + Rust tests + e2e + site
 mise run e2e             # 端到端自检：ingest -> commit -> SQL
 mise run spec-lifecycle specs/issue-N-<slug>.spec.md   # lane-1 BDD 验证
 mise tasks               # 全部任务列表（定义在 mise.toml）

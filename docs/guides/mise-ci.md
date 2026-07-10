@@ -47,14 +47,17 @@ first.
 - `mise run doctor` is the first command in a new session. It may warn about
   optional GitHub workflow gaps, but it must fail for missing required tools or
   a broken Rust build.
-- `mise run gate` is the fast local push gate. It must include hooks, tests,
-  and the e2e self-check.
+- `mise run gate` is the fast local push gate. It must include hooks, Rust
+  tests, the e2e self-check, and `site-check` for the marketing site.
 - `mise run ci` is the full CI gate. It must include `gate`, Rustdoc warnings,
   and spec tooling self-tests.
 - If a CI check protects a repo invariant, expose it as a `mise` task and run
   it from `ci`; include it in `gate` only when it belongs in the fast local
   loop.
 - Lane-1 work also runs `mise run spec-lifecycle <spec>`.
+- `site-check` must start from `bun install --frozen-lockfile`, then typecheck,
+  test, and build the production artifact. This keeps local and Pages builds
+  on the same dependency graph.
 - Task names are part of the agent contract. Rename a task only with matching
   updates to `AGENT.md`, `CLAUDE.md`, workflow docs, hooks, and CI.
 - Parameterized tasks use mise's `usage` field and `${usage_name?}`

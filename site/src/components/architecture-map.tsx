@@ -40,7 +40,7 @@ export function ArchitectureMap() {
           <span className="size-1.5 rounded-full bg-[var(--signal)] shadow-[0_0_14px_var(--signal)]" />
           System path
         </div>
-        <span className="font-mono text-[0.62rem] text-white/35">read / write</span>
+        <span className="font-mono text-[0.62rem] text-white/60">read / write</span>
       </div>
       <div className="space-y-2.5 p-3 sm:p-4">
         {layers.map((layer, index) => {
@@ -61,7 +61,7 @@ export function ArchitectureMap() {
                   <span className="block text-sm font-medium text-[var(--paper)]">{layer.label}</span>
                   <span className="mt-0.5 block text-xs leading-5 text-[var(--muted)]">{layer.detail}</span>
                 </span>
-                <span className="hidden rounded-full border border-white/10 px-2 py-1 font-mono text-[0.58rem] uppercase tracking-[0.08em] text-white/40 sm:block">
+                <span className="hidden rounded-full border border-white/10 px-2 py-1 font-mono text-[0.58rem] uppercase tracking-[0.08em] text-white/60 sm:block">
                   {layer.note}
                 </span>
               </div>

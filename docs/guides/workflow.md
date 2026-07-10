@@ -168,7 +168,7 @@ runs automatically at commit time. Running the gate before push is the
 implementer's responsibility:
 
 ```bash
-mise run gate        # hooks + test + e2e
+mise run gate        # hooks + Rust tests + e2e + site
 ```
 
 `mise run hooks` runs prek against all files:

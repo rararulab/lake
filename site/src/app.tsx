@@ -112,7 +112,7 @@ export function App() {
                   </a>
                 </Button>
               </div>
-              <div className="mt-10 flex flex-wrap gap-x-6 gap-y-2 font-mono text-[0.66rem] uppercase tracking-[0.1em] text-white/38">
+              <div className="mt-10 flex flex-wrap gap-x-6 gap-y-2 font-mono text-[0.66rem] uppercase tracking-[0.1em] text-white/60">
                 <span>DataFusion SQL</span>
                 <span>Arrow Flight</span>
                 <span>S3 compatible</span>
@@ -123,7 +123,7 @@ export function App() {
             <div className="relative mx-auto w-full max-w-[38rem] lg:max-w-none">
               <div className="hero-orbit" aria-hidden="true" />
               <ArchitectureMap />
-              <div className="absolute -bottom-5 -left-3 hidden items-center gap-2 rounded-md border border-white/12 bg-[var(--ink-soft)] px-3 py-2 font-mono text-[0.62rem] text-white/48 shadow-xl sm:flex">
+              <div className="absolute -bottom-5 -left-3 hidden items-center gap-2 rounded-md border border-white/12 bg-[var(--ink-soft)] px-3 py-2 font-mono text-[0.62rem] text-white/60 shadow-xl sm:flex">
                 <span className="size-1.5 animate-pulse rounded-full bg-[var(--signal)]" />
                 metadata shielded by cache
               </div>
@@ -172,7 +172,7 @@ export function App() {
                   const Icon = item.icon;
                   return (
                     <article key={item.index} className="workflow-row">
-                      <span className="font-mono text-xs text-white/28">{item.index}</span>
+                      <span className="font-mono text-xs text-white/60">{item.index}</span>
                       <Icon className="mt-0.5 text-[var(--signal)]" size={21} stroke={1.5} />
                       <div>
                         <h3 className="text-xl font-medium tracking-[-0.025em]">{item.title}</h3>
@@ -218,7 +218,7 @@ export function App() {
                 <p className="mt-3 text-sm text-[var(--muted)]">episodes held across immutable table versions</p>
               </div>
             </div>
-            <div className="mt-5 flex items-center gap-3 font-mono text-[0.65rem] uppercase tracking-[0.1em] text-white/32">
+            <div className="mt-5 flex items-center gap-3 font-mono text-[0.65rem] uppercase tracking-[0.1em] text-white/60">
               <IconBraces size={15} stroke={1.5} />
               Read fan-out should grow query compute, not metadata traffic
             </div>
@@ -260,7 +260,7 @@ export function App() {
                 >
                   <div className="flex items-center justify-between gap-5">
                     <h3 className="text-base font-medium tracking-[-0.015em]">{title}</h3>
-                    <span className="font-mono text-[0.62rem] text-white/25">0{index + 1}</span>
+                    <span className="font-mono text-[0.62rem] text-white/60">0{index + 1}</span>
                   </div>
                   <p className="mt-3 max-w-[28rem] text-sm leading-6 text-[var(--muted)]">{body}</p>
                 </article>
@@ -284,7 +284,7 @@ export function App() {
                   <IconArrowUpRight />
                 </a>
               </Button>
-              <span className="font-mono text-[0.68rem] uppercase tracking-[0.1em] text-white/35">
+              <span className="font-mono text-[0.68rem] uppercase tracking-[0.1em] text-white/60">
                 Rust · DataFusion · Arrow · Lance
               </span>
             </div>
@@ -293,7 +293,7 @@ export function App() {
       </main>
 
       <Separator />
-      <footer className="site-container flex flex-col gap-4 py-8 text-xs text-white/38 sm:flex-row sm:items-center sm:justify-between">
+      <footer className="site-container flex flex-col gap-4 py-8 text-xs text-white/60 sm:flex-row sm:items-center sm:justify-between">
         <LakeWordmark className="opacity-75" />
         <span>Open infrastructure for embodied-AI data.</span>
         <a className="footer-link" href={repositoryUrl} target="_blank" rel="noreferrer">

@@ -104,7 +104,7 @@ run = "bun scripts/test-integration.ts"
 # Slow passes (cargo doc warnings, spec-selftest tooling lock) run in CI
 # via `mise run ci`.
 [tasks.gate]
-description = "fast local quality gate: hooks + test + e2e"
+description = "fast local quality gate: hooks + Rust tests + e2e + marketing site"
 depends = ["hooks", "test", "e2e", "site-check"]
 
 [tasks.doc]
