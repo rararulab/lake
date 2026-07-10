@@ -228,12 +228,9 @@ impl Metasrv {
 pub async fn serve(metasrv: Arc<Metasrv>, addr: &str) -> Result<()> {
     let election = LeaseElection::new(metasrv.meta().clone(), addr, Duration::from_secs(10));
     let leadership = Arc::new(Leadership::new());
-    // The maintenance sweep gates on the same leader flag the campaign loop
-    // publishes, so only the current leader does housekeeping.
-    tokio::spawn(run_maintenance_loop(
-        metasrv.clone(),
-        leadership.is_leader_flag(),
-    ));
+    // The maintenance sweep gates on the same deadline-aware leadership state
+    // as writes, so an expired local lease cannot authorize housekeeping.
+    tokio::spawn(run_maintenance_loop(metasrv.clone(), leadership.clone()));
     tokio::spawn(run_campaign_loop(election, leadership.clone()));
 
     let svc = MetasrvFlightService {

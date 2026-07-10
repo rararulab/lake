@@ -22,18 +22,12 @@
 //! reclaim old versions). The sweep is best-effort: a single table's failure
 //! is logged and the sweep moves on, so one bad table never stalls the rest.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use lake_common::TableRef;
 use lake_meta::{MetaError, registry};
 
-use crate::Metasrv;
+use crate::{Metasrv, leadership::Leadership};
 
 /// How often the maintenance loop wakes to consider a sweep.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_mins(1);
@@ -43,10 +37,10 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_mins(1);
 /// Sleeps [`MAINTENANCE_INTERVAL`] between rounds. A round is skipped entirely
 /// unless this node currently holds leadership, so standbys stay idle and only
 /// the leader does housekeeping.
-pub(crate) async fn run_maintenance_loop(metasrv: Arc<Metasrv>, is_leader: Arc<AtomicBool>) {
+pub(crate) async fn run_maintenance_loop(metasrv: Arc<Metasrv>, leadership: Arc<Leadership>) {
     loop {
         tokio::time::sleep(MAINTENANCE_INTERVAL).await;
-        if !is_leader.load(Ordering::Relaxed) {
+        if !leadership.is_leader() {
             continue;
         }
         sweep(&metasrv).await;

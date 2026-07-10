@@ -118,6 +118,10 @@ impl LeaseElection {
     #[must_use]
     pub fn node_id(&self) -> &str { &self.node_id }
 
+    /// Configured lease lifetime.
+    #[must_use]
+    pub(crate) fn ttl(&self) -> Duration { self.ttl }
+
     /// Read and decode the current lease, if any.
     async fn read_lease(&self) -> Result<Option<LeaseValue>> {
         match self.meta.get(LEASE_KEY).await.context(StoreSnafu)? {
