@@ -100,7 +100,7 @@ run = "bun scripts/test-env.ts down"
 description = "run the LocalStack integration tests (up -> ignored tests -> down)"
 run = "bun scripts/test-integration.ts"
 
-# ponytail: gate = the FAST local loop (hooks, cargo test, e2e).
+# ponytail: gate = the FAST local loop (hooks, cargo test, e2e, marketing site).
 # Slow passes (cargo doc warnings, spec-selftest tooling lock) run in CI
 # via `mise run ci`.
 [tasks.gate]
