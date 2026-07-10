@@ -67,8 +67,11 @@ pub trait TableHandle: Send + Sync {
     /// The current (latest) committed version.
     fn current_version(&self) -> Version;
 
-    /// A DataFusion table at a specific snapshot — how the query layer reads.
-    fn table_provider(&self, version: Version) -> Arc<dyn TableProvider>;
+    /// A DataFusion table pinned to `version` — how the query layer reads.
+    ///
+    /// Implementations must not silently substitute their latest version: the
+    /// registry pointer is lake's visibility boundary.
+    async fn table_provider(&self, version: Version) -> Result<Arc<dyn TableProvider>>;
 
     /// Append rows, producing a new immutable version. The engine performs
     /// its own manifest-first-then-pointer commit; lake's registry pointer

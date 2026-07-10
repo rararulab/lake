@@ -199,7 +199,13 @@ async fn lance_engine_on_s3_with_dynamo_external_manifest() {
     );
 
     let ctx = SessionContext::new();
-    ctx.register_table("tbl", reopened.table_provider(appended))
+    ctx.register_table(
+        "tbl",
+        reopened
+            .table_provider(appended)
+            .await
+            .expect("open appended snapshot"),
+    )
         .expect("register lance provider");
     let rows = ctx
         .sql("SELECT count(*) AS n FROM tbl")

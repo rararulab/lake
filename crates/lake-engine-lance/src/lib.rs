@@ -290,11 +290,17 @@ impl TableHandle for LanceTable {
 
     fn current_version(&self) -> Version { Version(self.dataset.version().version) }
 
-    fn table_provider(&self, _version: Version) -> Arc<dyn TableProvider> {
-        // ponytail: v0 always serves the version this handle was opened at.
-        // Snapshot-pinned reads (Dataset::checkout_version) land when
-        // cross-version isolation matters — see architecture.md.
-        Arc::new(LanceTableProvider::new(self.dataset.clone(), false, false))
+    async fn table_provider(&self, version: Version) -> Result<Arc<dyn TableProvider>> {
+        let dataset = self
+            .dataset
+            .checkout_version(version.0)
+            .await
+            .map_err(EngineError::backend)?;
+        Ok(Arc::new(LanceTableProvider::new(
+            Arc::new(dataset),
+            false,
+            false,
+        )))
     }
 
     async fn append(&self, batches: SendableRecordBatchStream) -> Result<Version> {
@@ -357,6 +363,46 @@ mod tests {
         ));
         let v = h.append(stream).await.unwrap();
         assert!(v.0 > 1, "append advances the version");
+    }
+
+    #[tokio::test]
+    async fn table_provider_reads_requested_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let loc = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
+        let engine = LanceEngine::new();
+
+        let h = engine.create(&loc, batch().schema()).await.unwrap();
+        let b = batch();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            b.schema(),
+            futures::stream::iter(vec![Ok::<_, DataFusionError>(b)]),
+        ));
+        let appended = h.append(stream).await.unwrap();
+        assert!(appended.0 > 1);
+
+        let reopened = engine.open(&loc).await.unwrap().expect("table exists");
+        assert_eq!(reopened.current_version(), appended);
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table(
+            "snapshot",
+            reopened.table_provider(Version(1)).await.unwrap(),
+        )
+            .unwrap();
+        let rows = ctx
+            .sql("SELECT count(*) AS n FROM snapshot")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let count = rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(count, 0, "v1 is the empty snapshot created before append");
     }
 
     #[tokio::test]

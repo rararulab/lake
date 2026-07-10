@@ -79,7 +79,14 @@ impl SchemaProvider for LakeSchema {
             .open(&reg.location)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        Ok(handle.map(|h| h.table_provider(reg.current_version)))
+        let Some(handle) = handle else {
+            return Ok(None);
+        };
+        handle
+            .table_provider(reg.current_version)
+            .await
+            .map(Some)
+            .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 
     fn table_exist(&self, name: &str) -> bool {
