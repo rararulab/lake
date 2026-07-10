@@ -5,3 +5,5 @@
 .worktrees/
 .jj/
 .codegraph/
+site/node_modules/
+site/dist/

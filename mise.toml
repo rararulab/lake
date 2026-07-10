@@ -79,6 +79,15 @@ run = "cargo test --workspace --all-targets"
 description = "end-to-end self-check: create -> ingest -> SQL query"
 run = "cargo run -p lake-cli -- selftest"
 
+[tasks.site-install]
+description = "install frozen dependencies for the GitHub Pages marketing site"
+run = "bun install --cwd site --frozen-lockfile"
+
+[tasks.site-check]
+description = "install, typecheck, test, and build the GitHub Pages marketing site"
+depends = ["site-install"]
+run = "bun run --cwd site check"
+
 [tasks.test-env-up]
 description = "start portless local integration deps: checkout-scoped localstack (Docker)"
 run = "bun scripts/test-env.ts up"
@@ -96,7 +105,7 @@ run = "bun scripts/test-integration.ts"
 # via `mise run ci`.
 [tasks.gate]
 description = "fast local quality gate: hooks + test + e2e"
-depends = ["hooks", "test", "e2e"]
+depends = ["hooks", "test", "e2e", "site-check"]
 
 [tasks.doc]
 description = "cargo doc with -D warnings (slow; CI and on demand)"
