@@ -9,6 +9,7 @@ publish.workspace = true
 description = "Shared newtypes and identifiers used across the lake workspace"
 
 [dependencies]
+bon = { workspace = true }
 serde = { workspace = true }
 
 [lints]

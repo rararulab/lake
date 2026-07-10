@@ -1203,6 +1203,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "bon"
+version = "3.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a602c73c7b0148ec6d12af6fd5cc7a46e2eacc8878271a999abac56eed12f561"
+dependencies = [
+ "bon-macros",
+ "rustversion",
+]
+
+[[package]]
+name = "bon-macros"
+version = "3.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dee98b0db6a962de883bf5d20362dee4d7ca0d12fe39a7c6c73c844e1cd7c1f"
+dependencies = [
+ "darling",
+ "ident_case",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "rustversion",
+ "syn",
+]
+
+[[package]]
 name = "brotli"
 version = "8.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4132,6 +4157,7 @@ dependencies = [
 name = "lake-common"
 version = "0.0.1"
 dependencies = [
+ "bon",
  "serde",
 ]
 
@@ -4206,6 +4232,20 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+]
+
+[[package]]
+name = "lake-objects"
+version = "0.0.1"
+dependencies = [
+ "datafusion",
+ "lake-common",
+ "sha2 0.10.9",
+ "snafu",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
 ]
 
 [[package]]
