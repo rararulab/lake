@@ -14,7 +14,7 @@
 
 //! Managed large-object values and their Arrow representation.
 
-use std::{path::PathBuf, pin::Pin, sync::Arc};
+use std::{ops::Range, path::PathBuf, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::arrow::{
@@ -79,6 +79,16 @@ pub enum ObjectError {
 
     #[snafu(display("reading the object source failed"))]
     Read { source: std::io::Error },
+
+    #[snafu(display(
+        "byte range {start}..{end} is invalid for DataLocation '{uri}' with size {size_bytes}"
+    ))]
+    InvalidRange {
+        uri:        String,
+        start:      u64,
+        end:        u64,
+        size_bytes: u64,
+    },
 }
 
 /// The result type for managed-object operations.
@@ -96,6 +106,18 @@ pub trait ManagedObjectStore: Send + Sync {
     /// Open a direct reader after validating the location belongs to this
     /// managed stage.
     async fn open_reader(&self, location: &DataLocation) -> Result<ObjectReader>;
+}
+
+fn validate_range(location: &DataLocation, range: &Range<u64>) -> Result<u64> {
+    if range.start >= range.end || range.end > location.size_bytes {
+        return Err(ObjectError::InvalidRange {
+            uri:        location.uri.clone(),
+            start:      range.start,
+            end:        range.end,
+            size_bytes: location.size_bytes,
+        });
+    }
+    Ok(range.end - range.start)
 }
 
 /// Arrow field encoding a logical SQL `FILE` table column as `DataLocation`.
@@ -176,6 +198,7 @@ mod tests {
     use lake_common::DataLocation;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
+    use tokio::io::AsyncReadExt;
 
     use crate::{
         LocalObjectStore, ObjectError, S3ObjectStore, data_location_array, data_location_from_array,
@@ -216,6 +239,48 @@ mod tests {
         assert!(location.uri.starts_with("file://"));
         let path = location.uri.strip_prefix("file://").unwrap();
         assert_eq!(tokio::fs::read(path).await.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn local_range_reader_returns_exact_interval() {
+        let managed_dir = tempdir().unwrap();
+        let store = LocalObjectStore::open(managed_dir.path()).await.unwrap();
+        let location = store
+            .put_reader(
+                std::io::Cursor::new(b"0123456789"),
+                "application/octet-stream",
+            )
+            .await
+            .unwrap();
+
+        let mut reader = store.open_range(&location, 2..7).await.unwrap();
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).await.unwrap();
+
+        assert_eq!(actual, b"23456");
+    }
+
+    #[tokio::test]
+    async fn range_reader_rejects_empty_reversed_and_out_of_bounds_ranges() {
+        let managed_dir = tempdir().unwrap();
+        let store = LocalObjectStore::open(managed_dir.path()).await.unwrap();
+        let missing = DataLocation::builder()
+            .uri(
+                url::Url::from_file_path(managed_dir.path().join("missing"))
+                    .unwrap()
+                    .to_string(),
+            )
+            .content_type("application/octet-stream")
+            .size_bytes(10)
+            .sha256("unused")
+            .build();
+
+        for range in [0..0, 8..4, 0..11] {
+            assert!(matches!(
+                store.open_range(&missing, range).await,
+                Err(ObjectError::InvalidRange { .. })
+            ));
+        }
     }
 
     #[tokio::test]
