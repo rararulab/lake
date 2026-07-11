@@ -32,7 +32,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use url::Url;
 
 use crate::{
-    ManagedObjectStore, ObjectError, ObjectReader, Result,
+    DeleteOutcome, InventoryPage, InventoryRequest, ManagedObjectDeleter, ManagedObjectInventory,
+    ManagedObjectStore, ObjectCandidate, ObjectError, ObjectReader, Result,
     checkpoint::{
         CheckpointBinding, CheckpointLock, CheckpointPart, SourceIdentity, UploadCheckpointV1,
     },
@@ -686,6 +687,103 @@ impl ManagedObjectStore for S3ObjectStore {
 
     async fn open_range(&self, location: &DataLocation, range: Range<u64>) -> Result<ObjectReader> {
         S3ObjectStore::open_range(self, location, range).await
+    }
+}
+
+#[async_trait]
+impl ManagedObjectInventory for S3ObjectStore {
+    fn managed_uri_prefix(&self) -> String { format!("s3://{}/{}/", self.bucket, self.prefix) }
+
+    async fn inventory_page(&self, request: InventoryRequest) -> Result<InventoryPage> {
+        let (cursor, max_items) = request.into_parts();
+        let listing_prefix = format!("{}/", self.prefix);
+        let output = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&listing_prefix)
+            .delimiter("/")
+            .max_keys(i32::try_from(max_items).expect("inventory page limit fits i32"))
+            .set_continuation_token(cursor)
+            .send()
+            .await
+            .map_err(|error| ObjectError::S3 {
+                action:  "list_objects_v2",
+                message: error.to_string(),
+            })?;
+        let mut candidates = Vec::with_capacity(output.contents().len());
+        for object in output.contents() {
+            let key = object.key().ok_or_else(|| ObjectError::S3 {
+                action:  "list_objects_v2",
+                message: "S3 inventory entry omitted key".to_owned(),
+            })?;
+            if key == listing_prefix {
+                continue;
+            }
+            let size_bytes = u64::try_from(object.size().ok_or_else(|| ObjectError::S3 {
+                action:  "list_objects_v2",
+                message: format!("S3 inventory entry '{key}' omitted size"),
+            })?)
+            .map_err(|_| ObjectError::S3 {
+                action:  "list_objects_v2",
+                message: format!("S3 inventory entry '{key}' has negative size"),
+            })?;
+            let modified = object.last_modified().ok_or_else(|| ObjectError::S3 {
+                action:  "list_objects_v2",
+                message: format!("S3 inventory entry '{key}' omitted last_modified"),
+            })?;
+            let last_modified_ms =
+                u64::try_from(modified.as_nanos() / 1_000_000).map_err(|_| ObjectError::S3 {
+                    action:  "list_objects_v2",
+                    message: format!("S3 inventory entry '{key}' has invalid last_modified"),
+                })?;
+            candidates.push(ObjectCandidate {
+                uri: format!("s3://{}/{key}", self.bucket),
+                size_bytes,
+                last_modified_ms,
+            });
+        }
+        if !candidates.windows(2).all(|pair| pair[0].uri < pair[1].uri) {
+            return Err(ObjectError::GcInputUnsorted {
+                input: "S3 inventory page",
+            });
+        }
+        let next_cursor = if output.is_truncated() == Some(true) {
+            Some(
+                output
+                    .next_continuation_token()
+                    .ok_or_else(|| ObjectError::S3 {
+                        action:  "list_objects_v2",
+                        message: "truncated S3 inventory omitted continuation token".to_owned(),
+                    })?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        Ok(InventoryPage::new(candidates, next_cursor))
+    }
+}
+
+#[async_trait]
+impl ManagedObjectDeleter for S3ObjectStore {
+    fn managed_uri_prefix(&self) -> String {
+        <Self as ManagedObjectInventory>::managed_uri_prefix(self)
+    }
+
+    async fn delete_candidate(&self, candidate: &ObjectCandidate) -> Result<DeleteOutcome> {
+        let key = self.managed_key(&candidate.uri)?;
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|error| ObjectError::S3 {
+                action:  "delete_object",
+                message: error.to_string(),
+            })?;
+        Ok(DeleteOutcome::DeletedOrAbsent)
     }
 }
 

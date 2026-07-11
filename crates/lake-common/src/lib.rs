@@ -24,6 +24,7 @@ mod file_write;
 mod ids;
 mod location;
 mod managed_stage;
+mod object_reference;
 
 pub use data_location::DataLocation;
 pub use file_write::{FILE_APPEND_TYPE_URL, FileAppendRequest};
@@ -33,6 +34,7 @@ pub use managed_stage::{
     MANAGED_STAGE_DISCOVERY_ACTION, MANAGED_STAGE_PROTOCOL_VERSION, ManagedStageBackend,
     ManagedStageDescriptor, ManagedStageError,
 };
+pub use object_reference::{ObjectIdentity, ObjectReferenceDelta, ObjectReferenceError};
 
 #[cfg(test)]
 mod managed_stage_contract_tests {

@@ -25,21 +25,29 @@
 //! [`MetaManifestStore`] backed by our `MetaStore`, giving Lance the
 //! put-if-not-exists it needs for concurrent commits — see `manifest_store`.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use datafusion::{
     arrow::{
-        array::{RecordBatch, RecordBatchIterator},
-        datatypes::SchemaRef,
+        array::{Array, RecordBatch, RecordBatchIterator, StringArray, StructArray, UInt64Array},
+        datatypes::{DataType, SchemaRef},
         error::ArrowError,
     },
     catalog::TableProvider,
+    error::DataFusionError,
     execution::SendableRecordBatchStream,
+    physical_plan::stream::RecordBatchStreamAdapter,
 };
 use futures::{StreamExt, TryStreamExt};
-use lake_common::{TableLocation, Version};
-use lake_engine::{EngineError, Result, TableEngine, TableHandle, TableHandleRef};
+use lake_common::{ObjectIdentity, ObjectReferenceDelta, TableLocation, Version};
+use lake_engine::{
+    EngineError, ObjectReferencePage, ObjectReferenceRequest, Result, TableEngine, TableHandle,
+    TableHandleRef,
+};
 use lake_meta::MetaStoreRef;
 use lance::{
     Dataset,
@@ -57,6 +65,7 @@ use lance_table::io::commit::{
     CommitHandler,
     external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
 };
+use object_store::{ObjectStoreExt, PutMode};
 
 mod manifest_store;
 pub use manifest_store::MetaManifestStore;
@@ -170,6 +179,12 @@ fn external_handler(meta: MetaStoreRef) -> Arc<dyn CommitHandler> {
 // it), which is not wired up yet.
 const RETAIN_VERSIONS: usize = 10;
 
+#[cfg(not(test))]
+const REFERENCE_CHUNK_SIZE: usize = 4_096;
+#[cfg(test)]
+const REFERENCE_CHUNK_SIZE: usize = 2;
+const MAX_REFERENCES_PER_APPEND: usize = 1_000_000;
+
 #[async_trait]
 impl TableEngine for LanceEngine {
     fn kind(&self) -> &'static str { "lance" }
@@ -189,12 +204,20 @@ impl TableEngine for LanceEngine {
         )
         .await
         .map_err(EngineError::backend)?;
-        Ok(LanceTable::handle(dataset, self.config.clone()))
+        Ok(LanceTable::handle(
+            dataset,
+            self.config.clone(),
+            location.clone(),
+        ))
     }
 
     async fn open(&self, location: &TableLocation) -> Result<Option<TableHandleRef>> {
         match self.config.open_dataset(location.as_str()).await {
-            Ok(dataset) => Ok(Some(LanceTable::handle(dataset, self.config.clone()))),
+            Ok(dataset) => Ok(Some(LanceTable::handle(
+                dataset,
+                self.config.clone(),
+                location.clone(),
+            ))),
             Err(lance::Error::DatasetNotFound { .. }) => Ok(None),
             Err(e) => Err(EngineError::backend(e)),
         }
@@ -240,6 +263,16 @@ impl TableEngine for LanceEngine {
             .await
             .map_err(EngineError::backend)?;
         let maintained_version = Version(dataset.version().version);
+        if maintained_version != version {
+            persist_reference_chunks(
+                &self.config,
+                location,
+                version,
+                maintained_version,
+                Vec::new(),
+            )
+            .await?;
+        }
         let policy = CleanupPolicyBuilder::default()
             .error_if_tagged_old_versions(false)
             .retain_n_versions(&dataset, RETAIN_VERSIONS)
@@ -251,6 +284,41 @@ impl TableEngine for LanceEngine {
             .await
             .map_err(EngineError::backend)?;
         Ok((maintained_version != version).then_some(maintained_version))
+    }
+
+    async fn retained_object_references(
+        &self,
+        location: &TableLocation,
+        request: ObjectReferenceRequest,
+    ) -> Result<ObjectReferencePage> {
+        let root = request.root_version();
+        let (mut version, mut chunk) = match request.cursor() {
+            Some(cursor) => parse_reference_cursor(location, root, cursor.as_str())?,
+            None => (root, 0),
+        };
+        let mut deltas = Vec::with_capacity(request.limit());
+        while version.0 > 1 && deltas.len() < request.limit() {
+            let delta = load_reference_delta(&self.config, location, version, chunk).await?;
+            let parent = delta.parent_version();
+            let next_chunk =
+                chunk
+                    .checked_add(1)
+                    .ok_or_else(|| EngineError::ReferenceLineageUnavailable {
+                        location: location.clone(),
+                        reason:   "reference chunk index overflowed".to_owned(),
+                    })?;
+            if next_chunk < delta.chunk_count() {
+                chunk = next_chunk;
+            } else {
+                version = parent;
+                chunk = 0;
+            }
+            deltas.push(delta);
+        }
+        let next_cursor = (version.0 > 1).then(|| {
+            lake_engine::ObjectReferenceCursor::new(format!("r{}:v{}:c{chunk}", root.0, version.0))
+        });
+        Ok(ObjectReferencePage::new(deltas, next_cursor))
     }
 }
 
@@ -276,21 +344,243 @@ fn dataset_url(location: &TableLocation) -> Result<url::Url> {
     }
 }
 
+async fn persist_reference_delta(
+    config: &WriteConfig,
+    location: &TableLocation,
+    delta: &ObjectReferenceDelta,
+) -> Result<()> {
+    let url = dataset_url(location)?;
+    let (store, root) = object_store::parse_url_opts(&url, config.storage_options.clone())
+        .map_err(EngineError::backend)?;
+    let sidecar = root
+        .join("_lake")
+        .join("object_refs")
+        .join(delta.table_version().0.to_string())
+        .join(format!("{}.json", delta.chunk_index()));
+    let encoded = delta.encode().map_err(EngineError::backend)?;
+    match store
+        .put_opts(&sidecar, encoded.clone().into(), PutMode::Create.into())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            let existing = store
+                .get(&sidecar)
+                .await
+                .map_err(EngineError::backend)?
+                .bytes()
+                .await
+                .map_err(EngineError::backend)?;
+            let existing = ObjectReferenceDelta::decode(&existing).map_err(EngineError::backend)?;
+            if existing == *delta {
+                Ok(())
+            } else {
+                Err(EngineError::ReferenceLineageUnavailable {
+                    location: location.clone(),
+                    reason:   format!(
+                        "reference sidecar for {} already contains a different delta",
+                        delta.table_version()
+                    ),
+                })
+            }
+        }
+        Err(error) => Err(EngineError::backend(error)),
+    }
+}
+
+async fn persist_reference_chunks(
+    config: &WriteConfig,
+    location: &TableLocation,
+    parent_version: Version,
+    table_version: Version,
+    added: Vec<ObjectIdentity>,
+) -> Result<()> {
+    let chunk_count = added.len().max(1).div_ceil(REFERENCE_CHUNK_SIZE);
+    let chunk_count = u32::try_from(chunk_count).map_err(EngineError::backend)?;
+    if added.is_empty() {
+        let delta = ObjectReferenceDelta::try_new_chunk(
+            parent_version,
+            table_version,
+            0,
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+        .map_err(EngineError::backend)?;
+        return persist_reference_delta(config, location, &delta).await;
+    }
+    for (index, chunk) in added.chunks(REFERENCE_CHUNK_SIZE).enumerate() {
+        let delta = ObjectReferenceDelta::try_new_chunk(
+            parent_version,
+            table_version,
+            u32::try_from(index).map_err(EngineError::backend)?,
+            chunk_count,
+            chunk.to_vec(),
+            Vec::new(),
+        )
+        .map_err(EngineError::backend)?;
+        persist_reference_delta(config, location, &delta).await?;
+    }
+    Ok(())
+}
+
+async fn load_reference_delta(
+    config: &WriteConfig,
+    location: &TableLocation,
+    version: Version,
+    chunk: u32,
+) -> Result<ObjectReferenceDelta> {
+    let url = dataset_url(location)?;
+    let (store, root) = object_store::parse_url_opts(&url, config.storage_options.clone())
+        .map_err(EngineError::backend)?;
+    let sidecar = root
+        .join("_lake")
+        .join("object_refs")
+        .join(version.0.to_string())
+        .join(format!("{chunk}.json"));
+    let bytes = store
+        .get(&sidecar)
+        .await
+        .map_err(|error| EngineError::ReferenceLineageUnavailable {
+            location: location.clone(),
+            reason:   format!("cannot read reference chunk {version}/{chunk}: {error}"),
+        })?
+        .bytes()
+        .await
+        .map_err(|error| EngineError::ReferenceLineageUnavailable {
+            location: location.clone(),
+            reason:   format!("cannot stream reference chunk {version}/{chunk}: {error}"),
+        })?;
+    let delta = ObjectReferenceDelta::decode(&bytes).map_err(|error| {
+        EngineError::ReferenceLineageUnavailable {
+            location: location.clone(),
+            reason:   format!("invalid reference chunk {version}/{chunk}: {error}"),
+        }
+    })?;
+    if delta.table_version() != version || delta.chunk_index() != chunk {
+        return Err(EngineError::ReferenceLineageUnavailable {
+            location: location.clone(),
+            reason:   format!("reference chunk identity mismatch at {version}/{chunk}"),
+        });
+    }
+    Ok(delta)
+}
+
+fn parse_reference_cursor(
+    location: &TableLocation,
+    expected_root: Version,
+    cursor: &str,
+) -> Result<(Version, u32)> {
+    let invalid = || EngineError::ReferenceLineageUnavailable {
+        location: location.clone(),
+        reason:   "invalid or root-mismatched reference cursor".to_owned(),
+    };
+    let mut parts = cursor.split(':');
+    let root = parts
+        .next()
+        .and_then(|value| value.strip_prefix('r'))
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(&invalid)?;
+    let version = parts
+        .next()
+        .and_then(|value| value.strip_prefix('v'))
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(&invalid)?;
+    let chunk = parts
+        .next()
+        .and_then(|value| value.strip_prefix('c'))
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(&invalid)?;
+    if root != expected_root.0 || parts.next().is_some() || version > root || version <= 1 {
+        return Err(invalid());
+    }
+    Ok((Version(version), chunk))
+}
+
+fn object_identities(batch: &RecordBatch) -> std::io::Result<Vec<ObjectIdentity>> {
+    let mut identities = Vec::new();
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        if !is_data_location(field.data_type()) {
+            continue;
+        }
+        let values = column
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| invalid_reference("FILE column is not a StructArray"))?;
+        let uri = string_child(values, "uri")?;
+        let content_type = string_child(values, "content_type")?;
+        let size_bytes = values
+            .column_by_name("size_bytes")
+            .and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| invalid_reference("FILE size_bytes child is not UInt64"))?;
+        let sha256 = string_child(values, "sha256")?;
+        for row in 0..values.len() {
+            if values.is_null(row)
+                || uri.is_null(row)
+                || content_type.is_null(row)
+                || size_bytes.is_null(row)
+                || sha256.is_null(row)
+            {
+                return Err(invalid_reference("FILE identity contains null values"));
+            }
+            identities.push(ObjectIdentity {
+                uri:          uri.value(row).to_owned(),
+                content_type: content_type.value(row).to_owned(),
+                size_bytes:   size_bytes.value(row),
+                sha256:       sha256.value(row).to_owned(),
+            });
+        }
+    }
+    Ok(identities)
+}
+
+fn string_child<'a>(array: &'a StructArray, name: &str) -> std::io::Result<&'a StringArray> {
+    array
+        .column_by_name(name)
+        .and_then(|child| child.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| invalid_reference(&format!("FILE {name} child is not Utf8")))
+}
+
+fn is_data_location(data_type: &DataType) -> bool {
+    let DataType::Struct(fields) = data_type else {
+        return false;
+    };
+    let expected = [
+        ("uri", DataType::Utf8),
+        ("content_type", DataType::Utf8),
+        ("size_bytes", DataType::UInt64),
+        ("sha256", DataType::Utf8),
+    ];
+    fields.len() == expected.len()
+        && fields
+            .iter()
+            .zip(expected)
+            .all(|(field, (name, data_type))| {
+                field.name() == name && field.data_type() == &data_type
+            })
+}
+
+fn invalid_reference(message: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
 /// A handle to one open Lance dataset.
 struct LanceTable {
-    dataset: Arc<Dataset>,
-    schema:  SchemaRef,
-    config:  WriteConfig,
+    dataset:  Arc<Dataset>,
+    schema:   SchemaRef,
+    config:   WriteConfig,
+    location: TableLocation,
 }
 
 impl LanceTable {
-    fn handle(dataset: Dataset, config: WriteConfig) -> TableHandleRef {
+    fn handle(dataset: Dataset, config: WriteConfig, location: TableLocation) -> TableHandleRef {
         let dataset = Arc::new(dataset);
         let provider = LanceTableProvider::new(dataset.clone(), false, false);
         Arc::new(Self {
             schema: provider.schema(),
             dataset,
             config,
+            location,
         })
     }
 }
@@ -315,13 +605,56 @@ impl TableHandle for LanceTable {
     }
 
     async fn append(&self, batches: SendableRecordBatchStream) -> Result<Version> {
+        let parent_version = Version(
+            self.config
+                .open_dataset(self.location.as_str())
+                .await
+                .map_err(EngineError::backend)?
+                .version()
+                .version,
+        );
+        let references = Arc::new(Mutex::new(BTreeSet::new()));
+        let observed = references.clone();
+        let schema = batches.schema();
+        let batches = batches.map(move |result| {
+            result.and_then(|batch| {
+                let identities = object_identities(&batch)
+                    .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+                let mut observed = observed.lock().expect("object reference mutex poisoned");
+                observed.extend(identities);
+                if observed.len() > MAX_REFERENCES_PER_APPEND {
+                    return Err(DataFusionError::Execution(format!(
+                        "append contains more than {MAX_REFERENCES_PER_APPEND} distinct FILE \
+                         references"
+                    )));
+                }
+                Ok(batch)
+            })
+        });
+        let batches: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, batches));
         let params = self.config.write_params(WriteMode::Append);
         let dataset = InsertBuilder::new(self.dataset.clone())
             .with_params(&params)
             .execute_stream(batches)
             .await
             .map_err(EngineError::backend)?;
-        Ok(Version(dataset.version().version))
+        let table_version = Version(dataset.version().version);
+        let added = references
+            .lock()
+            .expect("object reference mutex poisoned")
+            .iter()
+            .cloned()
+            .collect();
+        persist_reference_chunks(
+            &self.config,
+            &self.location,
+            parent_version,
+            table_version,
+            added,
+        )
+        .await?;
+        Ok(table_version)
     }
 }
 
@@ -331,8 +664,10 @@ mod tests {
 
     use datafusion::{
         arrow::{
-            array::{Array, ArrayRef, Int64Array, RecordBatch},
-            datatypes::{DataType, Field, Schema},
+            array::{
+                Array, ArrayRef, Int64Array, RecordBatch, StringArray, StructArray, UInt64Array,
+            },
+            datatypes::{DataType, Field, Fields, Schema},
         },
         error::DataFusionError,
         physical_plan::stream::RecordBatchStreamAdapter,
@@ -343,6 +678,41 @@ mod tests {
     fn batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("ep", DataType::Int64, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap()
+    }
+
+    fn file_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new(
+            "video",
+            DataType::Struct(Fields::from(vec![
+                Field::new("uri", DataType::Utf8, false),
+                Field::new("content_type", DataType::Utf8, false),
+                Field::new("size_bytes", DataType::UInt64, false),
+                Field::new("sha256", DataType::Utf8, false),
+            ])),
+            false,
+        )]))
+    }
+
+    fn file_array(index: usize) -> ArrayRef {
+        Arc::new(StructArray::new(
+            match file_schema().field(0).data_type() {
+                DataType::Struct(fields) => fields.clone(),
+                _ => unreachable!(),
+            },
+            vec![
+                Arc::new(StringArray::from(vec![format!(
+                    "s3://lake/objects/{index}"
+                )])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["video/mp4"])),
+                Arc::new(UInt64Array::from(vec![42])),
+                Arc::new(StringArray::from(vec![format!("sha-{index}")])),
+            ],
+            None,
+        ))
+    }
+
+    fn file_batch(index: usize) -> RecordBatch {
+        RecordBatch::try_new(file_schema(), vec![file_array(index)]).unwrap()
     }
 
     #[tokio::test]
@@ -365,11 +735,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_releases_consumed_batches_before_stream_end() {
+    async fn append_writes_object_reference_delta_without_retaining_batches() {
         let dir = tempfile::tempdir().unwrap();
         let loc = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
         let engine = LanceEngine::new();
-        let schema = batch().schema();
+        let schema = file_schema();
         let h = engine.create(&loc, schema.clone()).await.unwrap();
 
         type State = (usize, Option<Weak<dyn Array>>, bool);
@@ -389,7 +759,7 @@ mod tests {
                     ));
                 }
 
-                let array: ArrayRef = Arc::new(Int64Array::from(vec![index as i64]));
+                let array = file_array(index);
                 let weak = Arc::downgrade(&array);
                 let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
                 Some((Ok(batch), (index + 1, Some(weak), false)))
@@ -397,9 +767,81 @@ mod tests {
         });
         let stream = Box::pin(RecordBatchStreamAdapter::new(h.schema(), batches));
 
-        h.append(stream)
+        let version = h
+            .append(stream)
             .await
             .expect("streaming append must release each consumed input batch");
+        let mut added = Vec::new();
+        for chunk_index in 0..2 {
+            let sidecar = dir.path().join(format!(
+                "t.lance/_lake/object_refs/{}/{chunk_index}.json",
+                version.0
+            ));
+            let delta = ObjectReferenceDelta::decode(
+                &tokio::fs::read(sidecar)
+                    .await
+                    .expect("append publishes bounded object-reference chunks"),
+            )
+            .expect("valid sidecar chunk");
+            assert_eq!(delta.parent_version(), Version(1));
+            assert_eq!(delta.table_version(), version);
+            assert_eq!(delta.chunk_index(), chunk_index);
+            assert_eq!(delta.chunk_count(), 2);
+            assert!(delta.removed().is_empty());
+            added.extend_from_slice(delta.added());
+        }
+        assert_eq!(added.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn retained_object_references_follow_version_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
+        let engine = LanceEngine::new();
+        let handle = engine.create(&location, file_schema()).await.unwrap();
+        for index in 0..3 {
+            let batch = file_batch(index);
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                batch.schema(),
+                futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
+            ));
+            handle.append(stream).await.unwrap();
+        }
+        let before = engine
+            .open(&location)
+            .await
+            .unwrap()
+            .unwrap()
+            .current_version();
+        let root = engine
+            .maintain(&location, before)
+            .await
+            .unwrap()
+            .unwrap_or(before);
+
+        let mut cursor = None;
+        let mut deltas = Vec::new();
+        loop {
+            let request = ObjectReferenceRequest::try_new(root, cursor, 1).unwrap();
+            let page = engine
+                .retained_object_references(&location, request)
+                .await
+                .expect("complete retained lineage");
+            assert!(page.deltas().len() <= 1);
+            deltas.extend_from_slice(page.deltas());
+            cursor = page.next_cursor().cloned();
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        let added = deltas
+            .iter()
+            .flat_map(ObjectReferenceDelta::added)
+            .map(|identity| identity.uri.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(added.len(), 3);
+        assert!(deltas.iter().any(|delta| delta.table_version() == root));
     }
 
     #[tokio::test]

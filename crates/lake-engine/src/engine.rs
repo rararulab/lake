@@ -20,12 +20,85 @@ use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::SchemaRef, catalog::TableProvider, execution::SendableRecordBatchStream,
 };
-use lake_common::{TableLocation, Version};
+use lake_common::{ObjectReferenceDelta, TableLocation, Version};
 
-use crate::error::Result;
+use crate::error::{EngineError, Result};
 
 pub type TableEngineRef = Arc<dyn TableEngine>;
 pub type TableHandleRef = Arc<dyn TableHandle>;
+pub const MAX_REFERENCE_PAGE_DELTAS: usize = 1_024;
+
+/// Opaque continuation owned and interpreted by one engine implementation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectReferenceCursor(String);
+
+impl ObjectReferenceCursor {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self { Self(value.into()) }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+/// One bounded request rooted at the registry-visible table version.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectReferenceRequest {
+    root_version: Version,
+    cursor:       Option<ObjectReferenceCursor>,
+    limit:        usize,
+}
+
+impl ObjectReferenceRequest {
+    pub fn try_new(
+        root_version: Version,
+        cursor: Option<ObjectReferenceCursor>,
+        limit: usize,
+    ) -> Result<Self> {
+        if limit == 0 || limit > MAX_REFERENCE_PAGE_DELTAS {
+            return Err(EngineError::InvalidReferencePageSize { size: limit });
+        }
+        Ok(Self {
+            root_version,
+            cursor,
+            limit,
+        })
+    }
+
+    #[must_use]
+    pub const fn root_version(&self) -> Version { self.root_version }
+
+    #[must_use]
+    pub fn cursor(&self) -> Option<&ObjectReferenceCursor> { self.cursor.as_ref() }
+
+    #[must_use]
+    pub const fn limit(&self) -> usize { self.limit }
+}
+
+/// One deterministic page of live managed-object identities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectReferencePage {
+    deltas:      Vec<ObjectReferenceDelta>,
+    next_cursor: Option<ObjectReferenceCursor>,
+}
+
+impl ObjectReferencePage {
+    #[must_use]
+    pub fn new(
+        deltas: Vec<ObjectReferenceDelta>,
+        next_cursor: Option<ObjectReferenceCursor>,
+    ) -> Self {
+        Self {
+            deltas,
+            next_cursor,
+        }
+    }
+
+    #[must_use]
+    pub fn deltas(&self) -> &[ObjectReferenceDelta] { &self.deltas }
+
+    #[must_use]
+    pub fn next_cursor(&self) -> Option<&ObjectReferenceCursor> { self.next_cursor.as_ref() }
+}
 
 /// A storage engine: creates and opens tables at a [`TableLocation`].
 ///
@@ -58,6 +131,14 @@ pub trait TableEngine: Send + Sync {
     /// before readers may observe it.
     async fn maintain(&self, location: &TableLocation, version: Version)
     -> Result<Option<Version>>;
+
+    /// Enumerate object identities reachable from the registry root and every
+    /// engine-retained snapshot, without scanning table RecordBatches.
+    async fn retained_object_references(
+        &self,
+        location: &TableLocation,
+        request: ObjectReferenceRequest,
+    ) -> Result<ObjectReferencePage>;
 }
 
 /// A handle to one table backed by an engine. Resolves to DataFusion for
@@ -80,4 +161,45 @@ pub trait TableHandle: Send + Sync {
     /// its own manifest-first-then-pointer commit; lake's registry pointer
     /// update happens separately in the metadata layer.
     async fn append(&self, batches: SendableRecordBatchStream) -> Result<Version>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_reference_requests_are_bounded() {
+        assert!(matches!(
+            ObjectReferenceRequest::try_new(Version(7), None, 0),
+            Err(EngineError::InvalidReferencePageSize { size: 0 })
+        ));
+        assert!(matches!(
+            ObjectReferenceRequest::try_new(Version(7), None, 1_025),
+            Err(EngineError::InvalidReferencePageSize { size: 1_025 })
+        ));
+        let request = ObjectReferenceRequest::try_new(
+            Version(7),
+            Some(ObjectReferenceCursor::new("v7:page-2")),
+            512,
+        )
+        .unwrap();
+        assert_eq!(request.root_version(), Version(7));
+        assert_eq!(request.limit(), 512);
+        assert_eq!(request.cursor().unwrap().as_str(), "v7:page-2");
+
+        let delta = ObjectReferenceDelta::try_new(
+            Version(7),
+            Version(8),
+            vec![lake_common::ObjectIdentity {
+                uri:          "s3://lake/objects/a".to_owned(),
+                content_type: "video/mp4".to_owned(),
+                size_bytes:   1,
+                sha256:       "aa".to_owned(),
+            }],
+            Vec::new(),
+        )
+        .unwrap();
+        let page = ObjectReferencePage::new(vec![delta.clone()], None);
+        assert_eq!(page.deltas(), &[delta]);
+    }
 }

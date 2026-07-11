@@ -24,6 +24,7 @@
 //!   `LAKE_S3_ENDPOINT` and the standard `AWS_*` variables.
 
 pub mod client;
+pub mod gc;
 pub mod ingest;
 mod limits;
 mod security;

@@ -26,8 +26,18 @@ use snafu::{OptionExt, Snafu};
 use tokio::io::AsyncRead;
 
 mod checkpoint;
+mod gc;
+mod gc_apply;
+mod gc_plan;
+mod inventory;
 mod local;
+mod reference_index;
+pub use gc::{GcPlanPage, GcPlanner, ObjectCandidate};
+pub use gc_apply::{DeleteOutcome, GcApplyProgress, GcPlanApplier, ManagedObjectDeleter};
+pub use gc_plan::{GcPlan, GcPlanWriter};
+pub use inventory::{InventoryPage, InventoryRequest, ManagedObjectInventory};
 pub use local::LocalObjectStore;
+pub use reference_index::{LiveReferenceIndex, LiveReferenceIndexBuild, LiveReferenceIndexBuilder};
 mod s3;
 pub use s3::S3ObjectStore;
 
@@ -102,6 +112,71 @@ pub enum ObjectError {
 
     #[snafu(display("this managed object store does not support resumable uploads"))]
     ResumeUnsupported,
+
+    #[snafu(display("object GC cannot plan while retained reference lineage is incomplete"))]
+    GcLineageIncomplete,
+
+    #[snafu(display("invalid object GC configuration: {message}"))]
+    InvalidGcConfig { message: String },
+
+    #[snafu(display("GC candidate '{uri}' is outside managed stage '{stage}'"))]
+    GcCandidateOutsideStage { uri: String, stage: String },
+
+    #[snafu(display("object GC {input} input is not strictly URI-sorted"))]
+    GcInputUnsorted { input: &'static str },
+
+    #[snafu(display("object GC reference index I/O failed while {action} {path:?}"))]
+    GcReferenceIndexIo {
+        action: &'static str,
+        path:   PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("object GC reference index {path:?} is corrupt"))]
+    GcReferenceIndexCorrupt {
+        path:   PathBuf,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display("object URI '{uri}' has conflicting immutable identities"))]
+    GcIdentityConflict { uri: String },
+
+    #[snafu(display(
+        "object GC refuses reference removals until retained-snapshot removal semantics exist"
+    ))]
+    GcReferenceRemovalsUnsupported,
+
+    #[snafu(display("object GC plan I/O failed while {action} {path:?}"))]
+    GcPlanIo {
+        action: &'static str,
+        path:   PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("object GC plan document {path:?} is corrupt"))]
+    GcPlanCorrupt {
+        path:   PathBuf,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display("object GC plan does not match {field}"))]
+    GcPlanMismatch { field: &'static str },
+
+    #[snafu(display("object GC apply checkpoint I/O failed while {action} {path:?}"))]
+    GcApplyCheckpointIo {
+        action: &'static str,
+        path:   PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("object GC apply checkpoint {path:?} is corrupt"))]
+    GcApplyCheckpointCorrupt {
+        path:   PathBuf,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display("object GC apply checkpoint does not match {field}"))]
+    GcApplyCheckpointMismatch { field: &'static str },
 
     #[snafu(display(
         "byte range {start}..{end} is invalid for DataLocation '{uri}' with size {size_bytes}"
@@ -258,8 +333,8 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     use crate::{
-        LocalObjectStore, ManagedObjectStore, ObjectError, S3ObjectStore, data_location_array,
-        data_location_from_array,
+        InventoryRequest, LocalObjectStore, ManagedObjectInventory, ManagedObjectStore,
+        ObjectError, S3ObjectStore, data_location_array, data_location_from_array,
     };
 
     #[test]
@@ -297,6 +372,47 @@ mod tests {
         assert!(location.uri.starts_with("file://"));
         let path = location.uri.strip_prefix("file://").unwrap();
         assert_eq!(tokio::fs::read(path).await.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn local_inventory_is_bounded_sorted_and_excludes_uploads() {
+        let managed_dir = tempdir().unwrap();
+        let store = LocalObjectStore::open(managed_dir.path()).await.unwrap();
+        for value in [b"third".as_slice(), b"first", b"second"] {
+            store
+                .put_reader(std::io::Cursor::new(value), "application/octet-stream")
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(managed_dir.path().join(".stale.uploading"), b"partial")
+            .await
+            .unwrap();
+
+        let first = store
+            .inventory_page(InventoryRequest::try_new(None, 2).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(first.candidates().len(), 2);
+        let second = store
+            .inventory_page(
+                InventoryRequest::try_new(first.next_cursor().map(ToOwned::to_owned), 2).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.candidates().len(), 1);
+        assert!(second.next_cursor().is_none());
+
+        let candidates = first
+            .candidates()
+            .iter()
+            .chain(second.candidates())
+            .collect::<Vec<_>>();
+        assert!(candidates.windows(2).all(|pair| pair[0].uri < pair[1].uri));
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| !candidate.uri.contains("uploading"))
+        );
     }
 
     #[tokio::test]

@@ -15,9 +15,11 @@
 //! Local-filesystem storage for managed objects in development.
 
 use std::{
+    collections::BTreeMap,
     io::SeekFrom,
     ops::Range,
     path::{Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 
 use async_trait::async_trait;
@@ -29,7 +31,10 @@ use tokio::{
 };
 use url::Url;
 
-use crate::{ManagedObjectStore, ObjectError, ObjectReader, Result, validate_range};
+use crate::{
+    DeleteOutcome, InventoryPage, InventoryRequest, ManagedObjectDeleter, ManagedObjectInventory,
+    ManagedObjectStore, ObjectCandidate, ObjectError, ObjectReader, Result, validate_range,
+};
 
 /// Bounded copy chunk, chosen to keep multi-gigabyte uploads off the heap.
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
@@ -258,5 +263,152 @@ impl ManagedObjectStore for LocalObjectStore {
         Ok(Box::pin(
             LocalObjectStore::open_range(self, location, range).await?,
         ))
+    }
+}
+
+#[async_trait]
+impl ManagedObjectInventory for LocalObjectStore {
+    fn managed_uri_prefix(&self) -> String {
+        Url::from_directory_path(&self.root)
+            .expect("canonical absolute directory forms a file URI")
+            .to_string()
+    }
+
+    async fn inventory_page(&self, request: InventoryRequest) -> Result<InventoryPage> {
+        let prefix = <Self as ManagedObjectInventory>::managed_uri_prefix(self);
+        let (cursor, max_items) = request.into_parts();
+        if cursor
+            .as_deref()
+            .is_some_and(|cursor| !cursor.starts_with(&prefix))
+        {
+            return Err(ObjectError::GcCandidateOutsideStage {
+                uri:   cursor.expect("cursor was checked"),
+                stage: prefix,
+            });
+        }
+
+        // Local storage is a development backend. Re-scan its flat directory
+        // for each page while retaining only the next bounded set, so memory
+        // does not grow with the number of objects.
+        let mut entries =
+            tokio::fs::read_dir(&self.root)
+                .await
+                .map_err(|source| ObjectError::Io {
+                    action: "listing".to_owned(),
+                    path: self.root.clone(),
+                    source,
+                })?;
+        let mut selected = BTreeMap::new();
+        let mut has_more = false;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| ObjectError::Io {
+                action: "reading directory entry in".to_owned(),
+                path: self.root.clone(),
+                source,
+            })?
+        {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let file_type = entry.file_type().await.map_err(|source| ObjectError::Io {
+                action: "reading file type for".to_owned(),
+                path: entry.path(),
+                source,
+            })?;
+            if !file_type.is_file() {
+                continue;
+            }
+            let uri = Url::from_file_path(entry.path())
+                .map_err(|()| ObjectError::FileUri { path: entry.path() })?
+                .to_string();
+            if cursor
+                .as_deref()
+                .is_some_and(|cursor| uri.as_str() <= cursor)
+            {
+                continue;
+            }
+            let metadata = entry.metadata().await.map_err(|source| ObjectError::Io {
+                action: "reading metadata for".to_owned(),
+                path: entry.path(),
+                source,
+            })?;
+            let modified = metadata
+                .modified()
+                .and_then(|modified| {
+                    modified
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(std::io::Error::other)
+                })
+                .map_err(|source| ObjectError::Io {
+                    action: "reading modification time for".to_owned(),
+                    path: entry.path(),
+                    source,
+                })?;
+            selected.insert(
+                uri.clone(),
+                ObjectCandidate {
+                    uri,
+                    size_bytes: metadata.len(),
+                    last_modified_ms: u64::try_from(modified.as_millis()).map_err(|_| {
+                        ObjectError::InvalidGcConfig {
+                            message: "object modification time exceeds u64 milliseconds".to_owned(),
+                        }
+                    })?,
+                },
+            );
+            if selected.len() > max_items {
+                selected.pop_last();
+                has_more = true;
+            }
+        }
+        let candidates = selected.into_values().collect::<Vec<_>>();
+        let next_cursor = has_more.then(|| {
+            candidates
+                .last()
+                .expect("non-empty bounded page")
+                .uri
+                .clone()
+        });
+        Ok(InventoryPage::new(candidates, next_cursor))
+    }
+}
+
+#[async_trait]
+impl ManagedObjectDeleter for LocalObjectStore {
+    fn managed_uri_prefix(&self) -> String {
+        <Self as ManagedObjectInventory>::managed_uri_prefix(self)
+    }
+
+    async fn delete_candidate(&self, candidate: &ObjectCandidate) -> Result<DeleteOutcome> {
+        let path = Url::parse(&candidate.uri)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+            .ok_or_else(|| ObjectError::InvalidLocalUri {
+                uri: candidate.uri.clone(),
+            })?;
+        let is_direct_object = path.parent() == Some(self.root.as_path())
+            && path
+                .file_name()
+                .is_some_and(|name| !name.to_string_lossy().starts_with('.'));
+        if !is_direct_object {
+            return Err(ObjectError::OutsideManagedPrefix {
+                path,
+                root: self.root.clone(),
+            });
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(DeleteOutcome::Deleted),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                Ok(DeleteOutcome::AlreadyAbsent)
+            }
+            Err(source) => Err(ObjectError::Io {
+                action: "deleting".to_owned(),
+                path,
+                source,
+            }),
+        }
     }
 }

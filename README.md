@@ -152,8 +152,51 @@ discovers an `s3://` stage. Non-empty S3 objects stream through
 bounded 5 MiB multipart parts, with incremental SHA-256 and abort-on-error.
 The query service forwards only the Arrow row to the metadata leader;
 video/model bytes travel directly between the SDK and the managed stage.
-Presigned browser access, tenant authorization, and object garbage collection
-remain outside this Rust API.
+Presigned browser access and tenant authorization remain outside this Rust API.
+
+## Managed-object garbage collection
+
+Every version-producing Lance operation writes an immutable reference-delta
+sidecar before its version can become registry-visible. `lake gc` traverses
+those sidecars, not table rows, and externally sorts the live URI set with
+bounded memory. Inventory is paginated for S3 and bounded for local storage.
+
+Planning is always the default and never deletes objects. Choose a safety age
+longer than the maximum upload-to-INSERT/retry interval and a new plan path:
+
+```bash
+lake --data-dir ./data gc \
+  --plan ./gc-plans/2026-07-11 \
+  --safety-age-secs 86400 \
+  --json
+```
+
+The resulting directory is an immutable, content-addressed plan. Its manifest
+is published only after every lineage page, inventory entry, age check, and
+candidate page has been validated. Review the candidate/byte totals, then
+apply that exact plan explicitly:
+
+```bash
+lake --data-dir ./data gc \
+  --plan ./gc-plans/2026-07-11 \
+  --apply \
+  --checkpoint ./gc-plans/2026-07-11.apply.json \
+  --json
+```
+
+Apply fsyncs progress after each bounded page and resumes without replaying
+completed pages. Already-absent S3/local objects are successful idempotent
+outcomes. The plan binds the managed stage and registry roots; a table create,
+drop, append, or maintenance commit makes it stale and GC fails closed. Run
+apply in a write-quiescent window. The safety age is also a protocol
+requirement: an object older than it must never become newly referenced; retry
+such an abandoned workflow by uploading a fresh object.
+
+Cloud mode uses the same `LAKE_S3_*`, `LAKE_DYNAMODB_*`, and AWS workload
+credentials as the other CLI commands. GC is a separate worker; it does not
+start Query or Metasrv. On a versioned S3 bucket, `DeleteObject` creates a
+delete marker rather than reclaiming old versions, so configure an S3
+noncurrent-version lifecycle policy when physical byte reclamation is required.
 
 For a local deployment, start metadata and query separately. The query process
 is told where metadata lives; clients are not:
