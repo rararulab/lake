@@ -8,13 +8,17 @@ write path — create tables, resolve/list, and the append commit protocol.
 - **Stateful, bounded.** Not a fan-out tier — the query layer shields it via
   cache, so it sees only cache-miss and write traffic. HA is leader + standby
   (lease-in-KV election), not free replication. (Election is v2.)
-- Writes go through here to be serialized. The append commit protocol is
-  engine-writes-new-version-then-CAS-registry-pointer; a lost race is a
-  registry conflict the caller retries.
+- Writes are per-table serialized and durably fenced. Identical operation
+  replays converge on one engine version; changed digests conflict.
+- Registry publication follows complete engine manifest/reference lineage;
+  ambiguous results and leader failover reconcile from HA-KV plus history.
+- Operation records bind the table incarnation and fail closed after a
+  same-name drop/recreate.
 - Never bypass the engine trait — table creation/append delegate to
   `TableEngine`, so the storage engine stays swappable.
 - FILE `DoPut` contains Arrow `DataLocation` rows only. Followers forward the
-  stream to the observed leader; metasrv never accepts the object payload.
+  authenticated tenant scope and stream to the observed leader; metasrv never
+  accepts the object payload. Buffered control streams are bounded.
 - Production inbound RPCs and follower-to-leader forwarding share the
   `lake-flight` TLS/auth boundary; a follower must never downgrade to anonymous
   hard-coded HTTP.
@@ -23,3 +27,4 @@ write path — create tables, resolve/list, and the append commit protocol.
 
 - `lib.rs` — `Metasrv`, `MetasrvServerConfig`, and server lifecycle
 - `control.rs` — Flight actions, FILE append decoding, and follower forwarding
+- `operation.rs` / `maintenance.rs` — durable state machine and bounded GC

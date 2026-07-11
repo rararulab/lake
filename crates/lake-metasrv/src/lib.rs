@@ -31,13 +31,19 @@ pub mod election;
 mod control;
 mod leadership;
 mod maintenance;
+mod operation;
 
-use std::{collections::HashMap, net::AddrParseError, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::AddrParseError,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use datafusion::{arrow::datatypes::SchemaRef, execution::SendableRecordBatchStream};
 use lake_catalog::create_table;
-use lake_common::{Namespace, TableLocation, TableName, TableRef, Version};
+use lake_common::{AppendOperation, Namespace, TableLocation, TableName, TableRef, Version};
 use lake_engine::TableEngineRef;
 use lake_flight::{ClientSecurity, ServerSecurity};
 use lake_meta::{MetaStoreRef, registry, registry::TableRegistration};
@@ -51,7 +57,13 @@ use crate::{
     election::LeaseElection,
     leadership::{Leadership, run_campaign_loop_until},
     maintenance::run_maintenance_loop_until,
+    operation::{AppendRecord, AppendState, active_key, operation_key},
 };
+
+/// Production default for replay protection and durable operation records.
+pub const DEFAULT_APPEND_OPERATION_RETENTION: Duration = Duration::from_hours(7 * 24);
+const DEFAULT_OPERATION_GC_PAGE_SIZE: usize = 128;
+const MAX_APPEND_OPERATION_CLOCK_SKEW: Duration = Duration::from_mins(5);
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -64,6 +76,27 @@ pub enum MetasrvError {
 
     #[snafu(display("engine error"))]
     Engine { source: lake_engine::EngineError },
+
+    #[snafu(display("append operation '{operation_id}' conflicts with its durable payload"))]
+    OperationConflict { operation_id: String },
+
+    #[snafu(display("append operation '{operation_id}' is older than the retention window"))]
+    OperationExpired { operation_id: String },
+
+    #[snafu(display("append operation '{operation_id}' timestamp is too far in the future"))]
+    OperationFromFuture { operation_id: String },
+
+    #[snafu(display("append operation '{operation_id}' belongs to a dropped table incarnation"))]
+    OperationTableRecreated { operation_id: String },
+
+    #[snafu(display("append operation '{operation_id}' has corrupt durable state"))]
+    CorruptOperationState { operation_id: String },
+
+    #[snafu(display("table '{table}' is coordinated by another durable append operation"))]
+    OperationInProgress { table: String },
+
+    #[snafu(display("append operation '{operation_id}' conflicts with registry state"))]
+    OperationRecoveryConflict { operation_id: String },
 
     #[snafu(display("table '{table}' not found"))]
     NotFound { table: String },
@@ -94,13 +127,63 @@ pub enum MetasrvError {
 
 pub type Result<T> = std::result::Result<T, MetasrvError>;
 
+/// Deterministic post-commit response gate for cross-crate crash tests.
+#[cfg(feature = "test")]
+#[derive(Debug, Default)]
+pub struct AppendResultGate {
+    armed:   std::sync::atomic::AtomicBool,
+    fail:    std::sync::atomic::AtomicBool,
+    blocked: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test")]
+impl AppendResultGate {
+    /// Create a gate that blocks the first committed append response.
+    #[must_use]
+    pub fn armed() -> Self {
+        Self {
+            armed:   std::sync::atomic::AtomicBool::new(true),
+            fail:    std::sync::atomic::AtomicBool::new(false),
+            blocked: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Wait until a response is blocked after its append committed.
+    pub async fn wait_until_blocked(&self) { self.blocked.notified().await; }
+
+    /// Disable the fault and release a currently blocked response.
+    pub fn disable(&self) {
+        self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.release.notify_one();
+    }
+
+    /// Release the blocked post-commit request as a lost-response failure.
+    pub fn fail_blocked(&self) {
+        self.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release.notify_one();
+    }
+
+    pub(crate) async fn block_first(&self) -> bool {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.blocked.notify_one();
+            self.release.notified().await;
+            return self.fail.load(std::sync::atomic::Ordering::SeqCst);
+        }
+        false
+    }
+}
+
 /// Network security for one Metasrv node and its follower-to-leader hop.
 #[derive(Clone, Debug)]
 pub struct MetasrvServerConfig {
-    server_security: ServerSecurity,
-    peer_security:   ClientSecurity,
-    allow_insecure:  bool,
-    shutdown_grace:  Duration,
+    server_security:    ServerSecurity,
+    peer_security:      ClientSecurity,
+    allow_insecure:     bool,
+    shutdown_grace:     Duration,
+    #[cfg(feature = "test")]
+    append_result_gate: Option<Arc<AppendResultGate>>,
 }
 
 impl MetasrvServerConfig {
@@ -109,9 +192,11 @@ impl MetasrvServerConfig {
     pub fn new() -> Self {
         Self {
             server_security: ServerSecurity::insecure(),
-            peer_security:   ClientSecurity::new(),
-            allow_insecure:  false,
-            shutdown_grace:  Duration::from_secs(30),
+            peer_security: ClientSecurity::new(),
+            allow_insecure: false,
+            shutdown_grace: Duration::from_secs(30),
+            #[cfg(feature = "test")]
+            append_result_gate: None,
         }
     }
 
@@ -143,6 +228,14 @@ impl MetasrvServerConfig {
         self.shutdown_grace = grace;
         self
     }
+
+    /// Block the first post-commit result for deterministic crash testing.
+    #[cfg(feature = "test")]
+    #[must_use]
+    pub fn with_append_result_gate(mut self, gate: Arc<AppendResultGate>) -> Self {
+        self.append_result_gate = Some(gate);
+        self
+    }
 }
 
 impl Default for MetasrvServerConfig {
@@ -152,11 +245,14 @@ impl Default for MetasrvServerConfig {
 /// The registry authority. Holds the durable metastore and the storage
 /// engine used to materialize new tables.
 struct MetasrvInner {
-    meta:        MetaStoreRef,
-    engine:      TableEngineRef,
+    meta:                   MetaStoreRef,
+    engine:                 TableEngineRef,
     /// One coordinator per table. Metadata writes are rare and the catalog's
     /// design ceiling is ~10^4 tables, so retaining these locks is bounded.
-    table_locks: Mutex<HashMap<TableRef, Arc<Mutex<()>>>>,
+    table_locks:            Mutex<HashMap<TableRef, Arc<Mutex<()>>>>,
+    operation_retention:    Duration,
+    operation_gc_page_size: usize,
+    operation_gc_cursor:    Mutex<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -168,11 +264,44 @@ pub struct Metasrv {
 
 impl Metasrv {
     pub fn new(meta: MetaStoreRef, engine: TableEngineRef) -> Self {
+        Self::with_operation_policy(
+            meta,
+            engine,
+            DEFAULT_APPEND_OPERATION_RETENTION,
+            DEFAULT_OPERATION_GC_PAGE_SIZE,
+        )
+    }
+
+    /// Construct an authority with an explicit deployment-visible replay
+    /// retention horizon.
+    pub fn with_operation_retention(
+        meta: MetaStoreRef,
+        engine: TableEngineRef,
+        operation_retention: Duration,
+    ) -> Self {
+        Self::with_operation_policy(
+            meta,
+            engine,
+            operation_retention,
+            DEFAULT_OPERATION_GC_PAGE_SIZE,
+        )
+    }
+
+    /// Construct an authority with explicit retention and bounded GC page size.
+    pub fn with_operation_policy(
+        meta: MetaStoreRef,
+        engine: TableEngineRef,
+        operation_retention: Duration,
+        operation_gc_page_size: usize,
+    ) -> Self {
         Self {
             inner: Arc::new(MetasrvInner {
                 meta,
                 engine,
                 table_locks: Mutex::new(HashMap::new()),
+                operation_retention,
+                operation_gc_page_size: operation_gc_page_size.max(1),
+                operation_gc_cursor: Mutex::new(None),
             }),
         }
     }
@@ -209,23 +338,253 @@ impl Metasrv {
     pub async fn append(
         &self,
         table: &TableRef,
+        operation: &AppendOperation,
         batches: SendableRecordBatchStream,
     ) -> Result<Version> {
         let _guard = self.lock_table(table).await;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after Unix epoch")
+            .as_secs();
+        let operation_time = operation.operation_id().unix_seconds();
+        if operation_time > now.saturating_add(MAX_APPEND_OPERATION_CLOCK_SKEW.as_secs()) {
+            return Err(MetasrvError::OperationFromFuture {
+                operation_id: operation.operation_id().to_string(),
+            });
+        }
+        if now.saturating_sub(operation_time) > self.inner.operation_retention.as_secs() {
+            return Err(MetasrvError::OperationExpired {
+                operation_id: operation.operation_id().to_string(),
+            });
+        }
         let reg = self.resolve(table).await?.context(NotFoundSnafu {
+            table: table.to_string(),
+        })?;
+        let reg = registry::ensure_incarnation(self.meta().as_ref(), table, &reg)
+            .await
+            .context(RegistrySnafu)?;
+        let table_incarnation = reg
+            .incarnation_id()
+            .expect("ensured table registration has an incarnation");
+        let key = operation_key(operation, table);
+        let active = active_key(operation, table);
+        let active_value = key.as_bytes();
+        let mut record = AppendRecord::reserved(
+            operation,
+            table,
+            table_incarnation,
+            reg.current_version,
+            now,
+        );
+        let mut encoded = record.encode()?;
+        let mut created_record = false;
+        loop {
+            match self.meta().get(&key).await.context(RegistrySnafu)? {
+                Some(existing) => {
+                    record = AppendRecord::decode(operation.operation_id().as_str(), &existing)?;
+                    record.validate(operation, table, table_incarnation)?;
+                    encoded = existing;
+                    if record.state == AppendState::Committed {
+                        let version = record.result_version.ok_or_else(|| {
+                            MetasrvError::CorruptOperationState {
+                                operation_id: operation.operation_id().to_string(),
+                            }
+                        })?;
+                        // A crash after terminal publication but before fence
+                        // cleanup must not permanently block the table.
+                        let _ = self
+                            .meta()
+                            .delete(&active, active_value)
+                            .await
+                            .context(RegistrySnafu)?;
+                        return Ok(version);
+                    }
+                    break;
+                }
+                None => {
+                    if self
+                        .meta()
+                        .cas(&key, None, &encoded)
+                        .await
+                        .context(RegistrySnafu)?
+                    {
+                        created_record = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Reserve the operation record first. A crash can then leave an inert,
+        // recoverable record, never an ownerless fence that blocks the table.
+        let owns_fence = self
+            .meta()
+            .cas(&active, None, active_value)
+            .await
+            .context(RegistrySnafu)?
+            || self
+                .meta()
+                .get(&active)
+                .await
+                .context(RegistrySnafu)?
+                .as_deref()
+                == Some(active_value);
+        if !owns_fence {
+            if created_record {
+                let _ = self
+                    .meta()
+                    .delete(&key, &encoded)
+                    .await
+                    .context(RegistrySnafu)?;
+            }
+            return Err(MetasrvError::OperationInProgress {
+                table: table.to_string(),
+            });
+        }
+
+        // Another request for this same identity may have advanced the record
+        // while this request acquired the shared exact-value fence.
+        if let Some(current_record) = self.meta().get(&key).await.context(RegistrySnafu)? {
+            record = AppendRecord::decode(operation.operation_id().as_str(), &current_record)?;
+            record.validate(operation, table, table_incarnation)?;
+            encoded = current_record;
+        }
+
+        let current = self.resolve(table).await?.context(NotFoundSnafu {
             table: table.to_string(),
         })?;
         let handle = self
             .inner
             .engine
-            .open(&reg.location)
+            .open(&current.location)
             .await
             .context(EngineSnafu)?
             .context(NotFoundSnafu {
                 table: table.to_string(),
             })?;
-        let new_version = handle.append(batches).await.context(EngineSnafu)?;
-        registry::set_version(self.meta().as_ref(), table, &reg, new_version)
+        let reconciled = if record.result_version.is_none() && !created_record {
+            handle
+                .reconcile_append(operation)
+                .await
+                .context(EngineSnafu)?
+        } else {
+            None
+        };
+        if record.state == AppendState::Reserved
+            && reconciled.is_none()
+            && record.base_version != current.current_version
+        {
+            let mut refreshed = record.clone();
+            refreshed.base_version = current.current_version;
+            refreshed.updated_at = now;
+            let updated = refreshed.encode()?;
+            if self
+                .meta()
+                .cas(&key, Some(&encoded), &updated)
+                .await
+                .context(RegistrySnafu)?
+            {
+                record = refreshed;
+                encoded = updated;
+            } else if let Some(current_record) =
+                self.meta().get(&key).await.context(RegistrySnafu)?
+            {
+                record = AppendRecord::decode(operation.operation_id().as_str(), &current_record)?;
+                record.validate(operation, table, table_incarnation)?;
+                encoded = current_record;
+            }
+        }
+        let new_version = match record.result_version {
+            Some(version) => version,
+            None => match reconciled {
+                Some(version) => version,
+                None => handle
+                    .append_reserved(operation, batches)
+                    .await
+                    .context(EngineSnafu)?,
+            },
+        };
+        if record.result_version != Some(new_version) || record.state == AppendState::Reserved {
+            let mut engine_committed = record.clone();
+            engine_committed.result_version = Some(new_version);
+            engine_committed.state = AppendState::EngineCommitted;
+            engine_committed.updated_at = now;
+            let updated = engine_committed.encode()?;
+            if self
+                .meta()
+                .cas(&key, Some(&encoded), &updated)
+                .await
+                .context(RegistrySnafu)?
+            {
+                record = engine_committed;
+                encoded = updated;
+            } else {
+                let current = self
+                    .meta()
+                    .get(&key)
+                    .await
+                    .context(RegistrySnafu)?
+                    .ok_or_else(|| MetasrvError::CorruptOperationState {
+                        operation_id: operation.operation_id().to_string(),
+                    })?;
+                let converged = AppendRecord::decode(operation.operation_id().as_str(), &current)?;
+                converged.validate(operation, table, table_incarnation)?;
+                if converged.result_version != Some(new_version)
+                    || converged.state == AppendState::Reserved
+                {
+                    return Err(MetasrvError::OperationRecoveryConflict {
+                        operation_id: operation.operation_id().to_string(),
+                    });
+                }
+                record = converged;
+                encoded = current;
+            }
+        }
+
+        let current = self.resolve(table).await?.context(NotFoundSnafu {
+            table: table.to_string(),
+        })?;
+        if current.current_version == record.base_version {
+            registry::set_version(self.meta().as_ref(), table, &current, new_version)
+                .await
+                .context(RegistrySnafu)?;
+        } else if current.current_version != new_version {
+            return Err(MetasrvError::OperationRecoveryConflict {
+                operation_id: operation.operation_id().to_string(),
+            });
+        }
+
+        let mut committed = record;
+        committed.state = AppendState::Committed;
+        committed.updated_at = now;
+        let terminal = committed.encode()?;
+        if !self
+            .meta()
+            .cas(&key, Some(&encoded), &terminal)
+            .await
+            .context(RegistrySnafu)?
+        {
+            let current = self
+                .meta()
+                .get(&key)
+                .await
+                .context(RegistrySnafu)?
+                .ok_or_else(|| MetasrvError::CorruptOperationState {
+                    operation_id: operation.operation_id().to_string(),
+                })?;
+            let converged = AppendRecord::decode(operation.operation_id().as_str(), &current)?;
+            converged.validate(operation, table, table_incarnation)?;
+            if converged.state != AppendState::Committed
+                || converged.result_version != Some(new_version)
+            {
+                return Err(MetasrvError::OperationRecoveryConflict {
+                    operation_id: operation.operation_id().to_string(),
+                });
+            }
+        }
+        let _ = self
+            .meta()
+            .delete(&active, active_value)
             .await
             .context(RegistrySnafu)?;
         Ok(new_version)
@@ -316,6 +675,36 @@ pub async fn serve_with_config_and_shutdown<F>(
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    serve_with_config_and_termination(metasrv, addr, config, shutdown, false).await
+}
+
+/// Run until `crash` fires, then drop RPCs and campaigns without resigning.
+///
+/// This test-only entry point models process death: the durable lease remains
+/// until TTL expiry and accepted connections receive no graceful response.
+#[cfg(feature = "test")]
+pub async fn serve_with_config_and_crash<F>(
+    metasrv: Arc<Metasrv>,
+    addr: &str,
+    config: MetasrvServerConfig,
+    crash: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    serve_with_config_and_termination(metasrv, addr, config, crash, true).await
+}
+
+async fn serve_with_config_and_termination<F>(
+    metasrv: Arc<Metasrv>,
+    addr: &str,
+    config: MetasrvServerConfig,
+    shutdown: F,
+    crash: bool,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let socket = addr.parse().context(AddressSnafu { addr })?;
     config
         .server_security
@@ -346,6 +735,8 @@ where
         leadership,
         own_addr: addr.to_string(),
         peer_security: config.peer_security,
+        #[cfg(feature = "test")]
+        append_result_gate: config.append_result_gate,
     };
 
     tracing::info!(
@@ -371,9 +762,13 @@ where
         () = shutdown.as_mut() => {
             maintenance_shutdown.cancel();
             server_shutdown.cancel();
-            match tokio::time::timeout(config.shutdown_grace, server.as_mut()).await {
-                Ok(result) => result.context(ServeSnafu),
-                Err(_) => Err(MetasrvError::DrainTimeout { grace: config.shutdown_grace }),
+            if crash {
+                Ok(())
+            } else {
+                match tokio::time::timeout(config.shutdown_grace, server.as_mut()).await {
+                    Ok(result) => result.context(ServeSnafu),
+                    Err(_) => Err(MetasrvError::DrainTimeout { grace: config.shutdown_grace }),
+                }
             }
         }
     };
@@ -381,6 +776,13 @@ where
     // Dropping the server first guarantees no accepted write can outlive the
     // leadership lease. Only then may the campaign resign.
     drop(server);
+    if crash {
+        maintenance.abort();
+        campaign.abort();
+        let _ = maintenance.await;
+        let _ = campaign.await;
+        return server_result;
+    }
     maintenance_shutdown.cancel();
     campaign_shutdown.cancel();
     let maintenance_result = maintenance

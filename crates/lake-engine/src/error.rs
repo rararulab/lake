@@ -14,7 +14,7 @@
 
 //! Engine error type.
 
-use lake_common::TableLocation;
+use lake_common::{AppendOperationId, TableLocation};
 use snafu::Snafu;
 
 /// Errors an engine implementation may surface. Kept engine-agnostic:
@@ -36,6 +36,9 @@ pub enum EngineError {
         location: TableLocation,
         reason:   String,
     },
+
+    #[snafu(display("append operation '{operation_id}' was already used with another payload"))]
+    IdempotencyConflict { operation_id: AppendOperationId },
 
     #[snafu(display("engine backend failed: {message}"))]
     Backend {

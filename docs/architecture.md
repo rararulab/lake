@@ -29,12 +29,12 @@ Query layer   (lake-query)     STATELESS — fan out freely
     ▼
 Metadata layer (lake-metasrv)  STATEFUL — bounded, leader-elected
     - authority for the db→table registry and current versions
-    - serialize writes / commit coordination
+    - serialize writes / durable idempotent commit coordination
     - background coordination (GC, compaction scheduling)
     │
     ▼
 Metastore     (lake-meta)      HA KV: DynamoDB (prod) / RocksDB (dev)
-    - registry entries + version pointers (durable, HA)
+    - registry pointers + compact operation records (durable, HA)
     ▼
 Storage engine (lake-engine + lake-engine-lance)
     - per-table datasets on object storage (immutable, cacheable)
@@ -96,8 +96,14 @@ pub trait TableHandle: Send + Sync {
     /// A DataFusion table at a specific snapshot — this is how the query
     /// layer reads.
     async fn table_provider(&self, version: Version) -> Result<Arc<dyn TableProvider>>;
-    /// Append rows, producing a new immutable version.
-    async fn append(&self, batches: SendableRecordBatchStream) -> Result<Version>;
+    /// Append one identified operation, producing one immutable version.
+    async fn append(
+        &self,
+        operation: &AppendOperation,
+        batches: SendableRecordBatchStream,
+    ) -> Result<Version>;
+    /// Discover an earlier commit after a lost response or failover.
+    async fn reconcile_append(&self, operation: &AppendOperation) -> Result<Option<Version>>;
 }
 ```
 
@@ -109,14 +115,20 @@ the same trait over its own format, using `lake-meta`'s CAS directly.
 
 ## Metadata: two levels, not one
 
-There are two distinct pieces of metadata, owned by different layers:
+There are three distinct pieces of metadata, owned by different layers:
 
 1. **Registry** (lake's, in `lake-meta`): which tables exist and where —
-   `tbl/<namespace>/<name> → { location, current_version, engine, schema_ipc? }`.
+   `tbl/<namespace>/<name> → { incarnation_id, location, current_version,
+   engine, schema_ipc? }`. The incarnation changes on every successful create,
+   so retained operation records cannot cross a drop/recreate boundary.
    The optional opaque Arrow IPC schema keeps old JSON readable while allowing
    Query to answer schema-inclusive Flight SQL discovery locally. Tiny (~10⁴
    entries), fully cacheable, the metadata layer is its authority.
-2. **Per-table manifest** (the engine's): the file list, schema, and
+2. **Operation coordination** (lake's, in `lake-meta`): compact CAS records
+   keyed by tenant, table, and UUIDv7 operation identity. They contain only a
+   payload digest, base/result versions, state, and timestamps. Arrow rows,
+   object bytes, credentials, and signed URLs are forbidden.
+3. **Per-table manifest** (the engine's): the file list, schema, and
    version history of one table. For Lance this is the Lance dataset
    manifest; lake does not reimplement it.
 
@@ -127,15 +139,40 @@ process-local generation and performs no request-path authority lookup.
 
 ## Commit protocol
 
-Writes go through the metadata layer's leader to serialize per-table
-commits, then delegate the data commit to the engine:
+Writes go through the metadata layer's leader to serialize per-table commits,
+then delegate the data commit to the engine. One logical append is identified
+by `(authenticated tenant, table, UUIDv7 operation ID)` and a verified SHA-256
+digest of its ordered Flight control payload:
 
-1. Writer submits an append for `<namespace>/<name>` to the metadata leader.
-2. Engine writes the new immutable version (Lance: stage manifest under a
-   UUID → put-if-not-exists to the external store → finalize). This is the
-   manifest-first-then-pointer discipline, implemented by the engine.
-3. Metadata layer CAS-updates the registry's `current_version` pointer.
-   Losers of the race fail cleanly and retry.
+1. The SDK uploads object bytes directly to managed storage, encodes only
+   `DataLocation` rows, and generates the operation ID once. Ambiguous Flight
+   failures reuse the same encoded messages, identity, and digest for a
+   30-second bounded window, longer than the 10-second metadata lease. If that
+   window expires ambiguously, the error returns a `PendingAppend`; callers can
+   resume it throughout operation retention with the same identity and without
+   uploading the object again.
+2. Metasrv authenticates the tenant, verifies the digest, claims a durable
+   per-table fence, and CAS-creates a compact `reserved` operation record.
+3. The engine writes the new immutable version. Lance disables automatic
+   append rebase and stores tenant, operation ID, digest, and reference-stage
+   identity in transaction properties. Object-reference chunks are staged
+   before the manifest is visible.
+   A freshly reserved operation takes a no-eager-scan engine path; full
+   transaction history is consulted only for replay/recovery or commit
+   collision, not for every healthy append.
+4. Metasrv records `engine_committed`, CAS-advances the registry pointer only
+   after reference lineage is complete, and records the terminal version.
+5. A replay or replacement leader loads the durable record and reconciles
+   Lance transaction history. An identical replay returns the original
+   version; a changed digest conflicts; corrupt or missing recovery evidence
+   fails closed.
+
+Terminal coordination records have a configurable retention horizon (seven
+days by default). Leader-only cleanup scans bounded metastore pages; pending
+records are reconciled before deletion. IDs older than retention fail closed,
+and timestamps more than five minutes in the future are rejected. A FILE
+Flight control stream is capped at 64 MiB because multi-GB video/model bytes
+belong in object storage, not in Query or Metasrv memory.
 
 Readers (through the query layer's cache) never observe a half-written
 version: the pointer only ever advances to a fully-written one. Consistency
@@ -149,7 +186,9 @@ resolve the exact registry version and stream its files directly from S3; SQL
 text cannot register arbitrary object-store locations. The one typed write
 surface is a Flight `DoPut` command for already-uploaded SQL `FILE` rows:
 the SDK sends `DataLocation` Arrow values to query, query proxies the stream
-without persisting it, and the metadata leader performs append + registry CAS.
+without persisting it, and the metadata leader performs the idempotent append
+protocol above. Query forwards tenant scope derived from its authenticated
+principal; a caller-supplied tenant string is never trusted.
 The original object bytes never enter query or metadata.
 
 After a query node receives the metadata leader's append acknowledgement, it

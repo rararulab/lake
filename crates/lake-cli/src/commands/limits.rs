@@ -17,9 +17,43 @@
 use std::{str::FromStr, time::Duration};
 
 use anyhow::Context as _;
+use lake_metasrv::DEFAULT_APPEND_OPERATION_RETENTION;
 use lake_query::QueryLimits;
 
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+const DEFAULT_OPERATION_GC_PAGE_SIZE: usize = 128;
+const MAX_OPERATION_GC_PAGE_SIZE: usize = 10_000;
+
+pub(crate) fn operation_policy_from_env() -> anyhow::Result<(Duration, usize)> {
+    let retention = env_value("LAKE_APPEND_OPERATION_RETENTION_SECS")?;
+    let page_size = env_value("LAKE_APPEND_OPERATION_GC_PAGE_SIZE")?;
+    operation_policy_from_values(retention.as_deref(), page_size.as_deref())
+}
+
+fn operation_policy_from_values(
+    retention_secs: Option<&str>,
+    page_size: Option<&str>,
+) -> anyhow::Result<(Duration, usize)> {
+    let retention_secs = parse_or(
+        "LAKE_APPEND_OPERATION_RETENTION_SECS",
+        retention_secs,
+        DEFAULT_APPEND_OPERATION_RETENTION.as_secs(),
+    )?;
+    let page_size = parse_or(
+        "LAKE_APPEND_OPERATION_GC_PAGE_SIZE",
+        page_size,
+        DEFAULT_OPERATION_GC_PAGE_SIZE,
+    )?;
+    anyhow::ensure!(
+        retention_secs > 0,
+        "LAKE_APPEND_OPERATION_RETENTION_SECS must be greater than zero"
+    );
+    anyhow::ensure!(
+        (1..=MAX_OPERATION_GC_PAGE_SIZE).contains(&page_size),
+        "LAKE_APPEND_OPERATION_GC_PAGE_SIZE must be within 1..={MAX_OPERATION_GC_PAGE_SIZE}"
+    );
+    Ok((Duration::from_secs(retention_secs), page_size))
+}
 
 pub(crate) fn shutdown_grace_from_env() -> anyhow::Result<Duration> {
     shutdown_grace_from_value(env_value("LAKE_SHUTDOWN_GRACE_MS")?.as_deref())
@@ -113,7 +147,20 @@ fn env_value(name: &str) -> anyhow::Result<Option<String>> {
 mod tests {
     use std::time::Duration;
 
-    use super::{query_limits_from_values, shutdown_grace_from_value};
+    use super::{
+        operation_policy_from_values, query_limits_from_values, shutdown_grace_from_value,
+    };
+
+    #[test]
+    fn append_operation_policy_values_are_validated_before_serving() {
+        let (retention, page_size) =
+            operation_policy_from_values(Some("86400"), Some("64")).expect("valid policy");
+        assert_eq!(retention, Duration::from_hours(24));
+        assert_eq!(page_size, 64);
+        assert!(operation_policy_from_values(Some("0"), None).is_err());
+        assert!(operation_policy_from_values(None, Some("0")).is_err());
+        assert!(operation_policy_from_values(Some("forever"), None).is_err());
+    }
 
     #[test]
     fn query_limit_values_are_validated_before_serving() {

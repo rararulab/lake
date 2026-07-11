@@ -49,7 +49,7 @@ use lake_common::{
     FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION,
     ManagedStageDescriptor, Principal, PrincipalRole,
 };
-use lake_flight::{ClientSecurity, DELEGATED_NAMESPACE_HEADER};
+use lake_flight::{ClientSecurity, DELEGATED_NAMESPACE_HEADER, DELEGATED_TENANT_HEADER};
 use prost::Message;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
@@ -99,6 +99,28 @@ struct AdmittedFlightStream {
     inner:    Option<<FlightSqlServiceImpl as FlightService>::DoGetStream>,
     deadline: Pin<Box<Sleep>>,
     permit:   Option<OwnedSemaphorePermit>,
+}
+
+fn apply_delegated_append_scope(
+    metadata: &mut tonic::metadata::MetadataMap,
+    principal: &Principal,
+    namespace: &str,
+) -> std::result::Result<(), Status> {
+    metadata.insert(
+        DELEGATED_NAMESPACE_HEADER,
+        namespace
+            .parse()
+            .map_err(|_| Status::internal("authorized namespace is not valid metadata"))?,
+    );
+    metadata.insert(
+        DELEGATED_TENANT_HEADER,
+        principal
+            .tenant()
+            .as_str()
+            .parse()
+            .map_err(|_| Status::internal("authenticated tenant is not valid metadata"))?,
+    );
+    Ok(())
 }
 
 impl AdmittedFlightStream {
@@ -416,15 +438,11 @@ impl FlightSqlService for FlightSqlServiceImpl {
         self.metadata_security
             .apply_to_flight_client(&mut client)
             .map_err(|error| Status::internal(error.to_string()))?;
-        client.metadata_mut().insert(
-            DELEGATED_NAMESPACE_HEADER,
-            append
-                .table()
-                .namespace
-                .0
-                .parse()
-                .map_err(|_| Status::internal("authorized namespace is not valid metadata"))?,
-        );
+        apply_delegated_append_scope(
+            client.metadata_mut(),
+            &principal,
+            &append.table().namespace.0,
+        )?;
         let results = client
             .do_put(request.into_inner().map(|item| {
                 item.map_err(|error| arrow_flight::error::FlightError::protocol(error.to_string()))
@@ -1214,5 +1232,38 @@ mod tests {
         };
         assert_eq!(ticket_error.code(), tonic::Code::ResourceExhausted);
         assert_eq!(meta.scans.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn delegated_append_scope_headers_are_tenant_scoped() {
+        let principal = |id: &str, tenant: &str| {
+            Principal::try_new(
+                PrincipalId::try_new(id).unwrap(),
+                TenantId::try_new(tenant).unwrap(),
+                PrincipalRole::User,
+                ["robots"],
+            )
+            .unwrap()
+        };
+        let mut first = tonic::metadata::MetadataMap::new();
+        let mut second = tonic::metadata::MetadataMap::new();
+
+        apply_delegated_append_scope(&mut first, &principal("first", "tenant-a"), "robots")
+            .unwrap();
+        apply_delegated_append_scope(&mut second, &principal("second", "tenant-b"), "robots")
+            .unwrap();
+
+        assert_eq!(
+            first.get(lake_flight::DELEGATED_TENANT_HEADER).unwrap(),
+            "tenant-a"
+        );
+        assert_eq!(
+            second.get(lake_flight::DELEGATED_TENANT_HEADER).unwrap(),
+            "tenant-b"
+        );
+        assert_eq!(
+            first.get(DELEGATED_NAMESPACE_HEADER),
+            second.get(DELEGATED_NAMESPACE_HEADER)
+        );
     }
 }

@@ -47,6 +47,11 @@ tables. clap derive, thin `main.rs`, one handler module per command.
 
 All values are positive integers parsed once before serving.
 
+## Append operation policy
+
+- `LAKE_APPEND_OPERATION_RETENTION_SECS` (default 604800)
+- `LAKE_APPEND_OPERATION_GC_PAGE_SIZE` (default 128, maximum 10000)
+
 ## Layout
 
 - `main.rs` — clap `Cli` + dispatch

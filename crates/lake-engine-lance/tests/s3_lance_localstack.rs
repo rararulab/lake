@@ -53,7 +53,10 @@ use datafusion::{
     physical_plan::stream::RecordBatchStreamAdapter,
     prelude::SessionContext,
 };
-use lake_common::{ObjectReferenceDelta, TableLocation};
+use lake_common::{
+    AppendOperation, AppendOperationId, AppendPayloadDigest, ObjectReferenceDelta, TableLocation,
+    TenantId,
+};
 use lake_engine::TableEngine;
 use lake_engine_lance::LanceEngine;
 use lake_meta::{DynamoMeta, MetaStoreRef};
@@ -65,6 +68,19 @@ fn unique_suffix() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock after epoch")
         .as_nanos()
+}
+
+fn append_operation() -> AppendOperation {
+    AppendOperation::builder()
+        .tenant(TenantId::try_new("integration").expect("valid tenant"))
+        .operation_id(AppendOperationId::generate())
+        .payload_digest(
+            AppendPayloadDigest::parse(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("valid digest"),
+        )
+        .build()
 }
 
 /// Read a credential from the environment, defaulting to localstack's `test`.
@@ -178,7 +194,7 @@ async fn lance_engine_on_s3_with_dynamo_external_manifest() {
     )
     .expect("build append batch");
     let appended = handle
-        .append(one_batch_stream(schema.clone(), batch))
+        .append(&append_operation(), one_batch_stream(schema.clone(), batch))
         .await
         .expect("engine append on s3");
     assert!(

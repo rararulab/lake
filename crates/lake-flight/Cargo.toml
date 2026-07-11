@@ -12,6 +12,7 @@ description = "Shared Flight TLS and RPC authentication primitives"
 arrow-flight.workspace = true
 lake-common.workspace = true
 rustls.workspace = true
+sha2.workspace = true
 snafu.workspace = true
 subtle.workspace = true
 tonic.workspace = true

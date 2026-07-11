@@ -29,17 +29,17 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_flight::{
-    Action, FlightClient, FlightDescriptor, decode::FlightRecordBatchStream,
+    Action, FlightClient, FlightData, FlightDescriptor, PutResult, decode::FlightRecordBatchStream,
     encode::FlightDataEncoderBuilder, sql::client::FlightSqlServiceClient,
 };
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
 use futures::TryStreamExt;
 use lake_common::{
-    DataLocation, FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION,
-    ManagedStageBackend, ManagedStageDescriptor, TableRef, Version,
+    AppendOperationId, DataLocation, FILE_APPEND_TYPE_URL, FileAppendRequest,
+    MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageBackend, ManagedStageDescriptor, TableRef, Version,
 };
-use lake_flight::ClientSecurity;
+use lake_flight::{ClientSecurity, append_flight_payload_digest};
 use lake_objects::{
     LocalObjectStore, ManagedObjectStore, ObjectReader, S3ObjectStore, data_location_array,
     data_location_field, data_location_from_array,
@@ -51,12 +51,76 @@ use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::io::AsyncRead;
 use tonic::transport::Channel;
 
+const APPEND_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+const APPEND_RETRY_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+const APPEND_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn ambiguous_append_error(error: &SdkError) -> bool {
+    match error {
+        SdkError::MissingAppendResult => true,
+        SdkError::Flight {
+            source: arrow_flight::error::FlightError::Tonic(status),
+        } => matches!(
+            status.code(),
+            tonic::Code::Cancelled
+                | tonic::Code::Unknown
+                | tonic::Code::DeadlineExceeded
+                | tonic::Code::Internal
+                | tonic::Code::Unavailable
+        ),
+        SdkError::Flight {
+            source: arrow_flight::error::FlightError::ExternalError(_),
+        } => true,
+        _ => false,
+    }
+}
+
+#[derive(Debug)]
+enum AppendRetryFailure {
+    Sdk(SdkError),
+    Expired,
+}
+
+async fn retry_ambiguous_append_with_window<F, Fut>(
+    mut attempt: F,
+    window: std::time::Duration,
+) -> std::result::Result<PutResult, AppendRetryFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<PutResult>>,
+{
+    tokio::time::timeout(window, async {
+        let mut backoff = APPEND_RETRY_INITIAL_BACKOFF;
+        loop {
+            match attempt().await {
+                Ok(result) => return Ok(result),
+                Err(error) if ambiguous_append_error(&error) => {
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2).min(APPEND_RETRY_MAX_BACKOFF);
+                }
+                Err(error) => return Err(AppendRetryFailure::Sdk(error)),
+            }
+        }
+    })
+    .await
+    .map_err(|_| AppendRetryFailure::Expired)?
+}
+
 /// Errors raised by the typed Rust SDK.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum SdkError {
     #[snafu(display("unsupported INSERT SQL: {message}"))]
     InvalidSql { message: String },
+
+    #[snafu(display(
+        "ambiguous FILE append did not converge within {window:?}; resume the returned pending \
+         append"
+    ))]
+    AppendRetryExpired {
+        window:  std::time::Duration,
+        pending: PendingAppend,
+    },
 
     #[snafu(display("INSERT binds {actual} values but SQL declares {expected} placeholders"))]
     ParameterCount { expected: usize, actual: usize },
@@ -136,6 +200,35 @@ pub enum SdkError {
 
 /// The result type for Rust SDK operations.
 pub type Result<T> = std::result::Result<T, SdkError>;
+
+/// A prepared append whose uploaded objects and operation identity are stable.
+///
+/// When an ambiguous append exhausts the automatic transport retry window,
+/// [`SdkError::AppendRetryExpired`] returns this value. Passing it to
+/// [`LakeClient::resume_append`] continues the same logical append without
+/// uploading objects again or allocating a new idempotency identity.
+#[derive(Clone, Debug)]
+pub struct PendingAppend {
+    operation_id: AppendOperationId,
+    messages:     Vec<FlightData>,
+}
+
+impl PendingAppend {
+    /// Return the durable identity reused by every retry of this append.
+    #[must_use]
+    pub fn operation_id(&self) -> &AppendOperationId { &self.operation_id }
+}
+
+impl SdkError {
+    /// Recover the pending append from an exhausted ambiguous retry window.
+    #[must_use]
+    pub fn into_pending_append(self) -> Option<PendingAppend> {
+        match self {
+            Self::AppendRetryExpired { pending, .. } => Some(pending),
+            _ => None,
+        }
+    }
+}
 
 /// An SDK upload source bound to a SQL `FILE` value.
 ///
@@ -321,6 +414,38 @@ impl LakeClient {
     /// Execute a parameterized, single-row INSERT with typed scalar/`FILE`
     /// values.
     pub async fn insert(&self, sql: &str, values: Vec<InsertValue>) -> Result<Version> {
+        let pending = self.prepare_insert(sql, values).await?;
+        self.resume_append(pending).await
+    }
+
+    /// Resume a prepared or ambiguously timed-out append with the same
+    /// operation identity and already-uploaded object references.
+    pub async fn resume_append(&self, pending: PendingAppend) -> Result<Version> {
+        self.resume_append_with_window(pending, APPEND_RETRY_WINDOW)
+            .await
+    }
+
+    async fn resume_append_with_window(
+        &self,
+        pending: PendingAppend,
+        window: std::time::Duration,
+    ) -> Result<Version> {
+        let result = retry_ambiguous_append_with_window(
+            || self.put_append_once(pending.messages.clone()),
+            window,
+        )
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(AppendRetryFailure::Sdk(error)) => return Err(error),
+            Err(AppendRetryFailure::Expired) => {
+                return Err(SdkError::AppendRetryExpired { window, pending });
+            }
+        };
+        serde_json::from_slice(&result.app_metadata).context(InvalidAppendResultSnafu)
+    }
+
+    async fn prepare_insert(&self, sql: &str, values: Vec<InsertValue>) -> Result<PendingAppend> {
         let insert = parse_insert(sql)?;
         if insert.columns.len() != values.len() {
             return Err(SdkError::ParameterCount {
@@ -346,7 +471,18 @@ impl LakeClient {
             arrays.push(self.upload_and_encode(field.data_type(), value).await?);
         }
         let batch = RecordBatch::try_new(schema, arrays).context(ArrowSnafu)?;
-        let append = FileAppendRequest::new(insert.table);
+        let mut messages = FlightDataEncoderBuilder::new()
+            .with_schema(batch.schema())
+            .build(futures::stream::iter(vec![Ok(batch)]))
+            .try_collect::<Vec<_>>()
+            .await
+            .context(FlightSnafu)?;
+        let operation_id = AppendOperationId::generate();
+        let append = FileAppendRequest::new(
+            insert.table,
+            operation_id.clone(),
+            append_flight_payload_digest(&messages),
+        );
         let descriptor = FlightDescriptor::new_cmd(
             Any {
                 type_url: FILE_APPEND_TYPE_URL.to_owned(),
@@ -354,23 +490,30 @@ impl LakeClient {
             }
             .encode_to_vec(),
         );
-        let stream = FlightDataEncoderBuilder::new()
-            .with_schema(batch.schema())
-            .with_flight_descriptor(Some(descriptor))
-            .build(futures::stream::iter(vec![Ok(batch)]));
+        messages
+            .first_mut()
+            .expect("Flight encoder emits a schema message")
+            .flight_descriptor = Some(descriptor);
+        Ok(PendingAppend {
+            operation_id,
+            messages,
+        })
+    }
+
+    async fn put_append_once(&self, messages: Vec<FlightData>) -> Result<PutResult> {
+        let stream = futures::stream::iter(messages.into_iter().map(Ok));
         let mut client = FlightClient::new(self.query.clone());
         self.security
             .apply_to_flight_client(&mut client)
             .context(SecuritySnafu)?;
-        let result = client
+        client
             .do_put(stream)
             .await
             .context(FlightSnafu)?
             .try_next()
             .await
             .context(FlightSnafu)?
-            .context(MissingAppendResultSnafu)?;
-        serde_json::from_slice(&result.app_metadata).context(InvalidAppendResultSnafu)
+            .context(MissingAppendResultSnafu)
     }
 
     /// Execute read-only SQL through the query endpoint and stream Arrow
@@ -687,7 +830,10 @@ mod tests {
         io,
         path::PathBuf,
         pin::Pin,
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         task::{Context, Poll},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
@@ -701,13 +847,16 @@ mod tests {
     use futures::TryStreamExt;
     use lake_common::{
         ManagedStageDescriptor, Principal, PrincipalId, PrincipalRole, TableLocation, TableRef,
-        TenantId,
+        TenantId, Version,
     };
     use lake_engine::TableEngineRef;
     use lake_engine_lance::LanceEngine;
     use lake_flight::{BearerPrincipalBinding, ClientSecurity, ServerSecurity};
     use lake_meta::{MetaStoreRef, RocksMeta};
-    use lake_metasrv::{Metasrv, MetasrvServerConfig};
+    use lake_metasrv::{
+        AppendResultGate, Metasrv, MetasrvServerConfig, election::LeaseElection,
+        serve_with_config_and_crash,
+    };
     use lake_objects::{
         LocalObjectStore, ManagedObjectStore, ObjectReader, Result as ObjectResult, S3ObjectStore,
         data_location_field, data_location_from_array,
@@ -718,7 +867,307 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
-    use crate::{FileUpload, InsertValue, LakeClient, data_location};
+    use crate::{
+        APPEND_RETRY_WINDOW, FileUpload, InsertValue, LakeClient, SdkError, data_location,
+        retry_ambiguous_append_with_window,
+    };
+
+    #[tokio::test]
+    async fn sdk_retries_lost_put_result_without_reupload_or_duplicate() {
+        let root = tempdir().unwrap();
+        let (client, metasrv, table, _meta, _engine) = setup_client(root.path()).await;
+        let source = root.path().join("episode.mp4");
+        tokio::fs::write(&source, b"one uploaded video")
+            .await
+            .unwrap();
+        let pending = client
+            .prepare_insert(
+                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    InsertValue::Utf8("episode-lost-result".to_owned()),
+                    InsertValue::File(FileUpload::from_path(&source, "video/mp4")),
+                ],
+            )
+            .await
+            .expect("prepare and upload once");
+        assert_eq!(object_count(&root.path().join("objects")).await, 1);
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let result = retry_ambiguous_append_with_window(
+            || {
+                let attempts = attempts.clone();
+                let messages = pending.messages.clone();
+                let attempt_client = client.clone();
+                async move {
+                    let committed = attempt_client.put_append_once(messages).await?;
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(SdkError::Flight {
+                            source: arrow_flight::error::FlightError::Tonic(Box::new(
+                                tonic::Status::unavailable("response lost after commit"),
+                            )),
+                        })
+                    } else {
+                        Ok(committed)
+                    }
+                }
+            },
+            APPEND_RETRY_WINDOW,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            serde_json::from_slice::<Version>(&result.app_metadata).unwrap(),
+            Version(2)
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(2)
+        );
+        let mut rows = client
+            .query(
+                "SELECT episode_id FROM lake.robots.episodes WHERE episode_id = \
+                 'episode-lost-result'",
+            )
+            .await
+            .unwrap();
+        let mut row_count = 0;
+        while let Some(batch) = rows.try_next().await.unwrap() {
+            row_count += batch.num_rows();
+        }
+        assert_eq!(row_count, 1);
+        assert_eq!(object_count(&root.path().join("objects")).await, 1);
+    }
+
+    #[tokio::test]
+    async fn sdk_resumes_same_operation_after_retry_horizon() {
+        let root = tempdir().unwrap();
+        let (client, metasrv, table, _meta, _engine) = setup_client(root.path()).await;
+        let source = root.path().join("episode.mp4");
+        tokio::fs::write(&source, b"one recoverable video")
+            .await
+            .unwrap();
+        let pending = client
+            .prepare_insert(
+                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    InsertValue::Utf8("episode-recovered".to_owned()),
+                    InsertValue::File(FileUpload::from_path(&source, "video/mp4")),
+                ],
+            )
+            .await
+            .unwrap();
+        let operation_id = pending.operation_id().clone();
+        let broken = LakeClient {
+            query:                 tonic::transport::Endpoint::from_static("http://127.0.0.1:9")
+                .connect_lazy(),
+            objects:               client.objects.clone(),
+            security:              client.security.clone(),
+            upload_checkpoint_dir: client.upload_checkpoint_dir.clone(),
+        };
+
+        let error = broken
+            .resume_append_with_window(pending, Duration::from_millis(5))
+            .await
+            .unwrap_err();
+        let recovered = error
+            .into_pending_append()
+            .expect("retry expiry returns a recoverable append");
+        assert_eq!(recovered.operation_id(), &operation_id);
+        assert_eq!(object_count(&root.path().join("objects")).await, 1);
+
+        assert_eq!(client.resume_append(recovered).await.unwrap(), Version(2));
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(2)
+        );
+        assert_eq!(object_count(&root.path().join("objects")).await, 1);
+    }
+
+    #[tokio::test]
+    async fn sdk_retries_same_insert_through_ungraceful_leader_failover() {
+        let root = tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::with_manifest_store(meta.clone()));
+        let table = TableRef::new("robots", "episodes");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("episode_id", DataType::Utf8, false),
+            data_location_field("video", false),
+        ]));
+        let bootstrap = Metasrv::new(meta.clone(), engine.clone());
+        bootstrap
+            .create_table(
+                &table,
+                TableLocation::new(root.path().join("tables/episodes.lance").to_string_lossy()),
+                schema,
+            )
+            .await
+            .unwrap();
+
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+        let gate_a = Arc::new(AppendResultGate::armed());
+        let gate_b = Arc::new(AppendResultGate::armed());
+        let (crash_a_tx, crash_a_rx) = tokio::sync::oneshot::channel();
+        let (crash_b_tx, crash_b_rx) = tokio::sync::oneshot::channel();
+        let mut crash_a_tx = Some(crash_a_tx);
+        let mut crash_b_tx = Some(crash_b_tx);
+        let server_a = tokio::spawn({
+            let node = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
+            let addr = addr_a.clone();
+            let gate = gate_a.clone();
+            async move {
+                serve_with_config_and_crash(
+                    node,
+                    &addr,
+                    MetasrvServerConfig::new().with_append_result_gate(gate),
+                    async move {
+                        let _ = crash_a_rx.await;
+                    },
+                )
+                .await
+            }
+        });
+        let server_b = tokio::spawn({
+            let node = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
+            let addr = addr_b.clone();
+            let gate = gate_b.clone();
+            async move {
+                serve_with_config_and_crash(
+                    node,
+                    &addr,
+                    MetasrvServerConfig::new().with_append_result_gate(gate),
+                    async move {
+                        let _ = crash_b_rx.await;
+                    },
+                )
+                .await
+            }
+        });
+        let mut server_a = Some(server_a);
+        let mut server_b = Some(server_b);
+        let observer = LeaseElection::new(meta.clone(), "observer", Duration::from_secs(10));
+        let leader = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Some(leader) = observer.current_leader().await.unwrap()
+                    && (leader == addr_a || leader == addr_b)
+                {
+                    break leader;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("metadata leader elected");
+        let (follower, leader_gate) = if leader == addr_a {
+            gate_b.disable();
+            (addr_b.clone(), gate_a.clone())
+        } else {
+            gate_a.disable();
+            (addr_a.clone(), gate_b.clone())
+        };
+
+        let query_addr = free_addr();
+        tokio::spawn({
+            let query = Arc::new(QueryEngine::new(meta.clone(), engine.clone()));
+            let addr = query_addr.clone();
+            let metadata = format!("http://{follower}");
+            async move { lake_query::serve_with_metadata(query, &addr, &metadata).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let objects = DelegatingStore(
+            LocalObjectStore::open(root.path().join("objects"))
+                .await
+                .unwrap(),
+        );
+        let client = LakeClient::connect_with_store(format!("http://{query_addr}"), objects)
+            .await
+            .unwrap();
+        let source = root.path().join("failover.mp4");
+        tokio::fs::write(&source, b"survives leader death")
+            .await
+            .unwrap();
+        let insert_client = client.clone();
+        let insert = tokio::spawn(async move {
+            insert_client
+                .insert(
+                    "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                    vec![
+                        InsertValue::Utf8("episode-failover".to_owned()),
+                        InsertValue::File(FileUpload::from_path(&source, "video/mp4")),
+                    ],
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), leader_gate.wait_until_blocked())
+            .await
+            .expect("leader committed and blocked its first result");
+
+        if leader == addr_a {
+            crash_a_tx.take().unwrap().send(()).unwrap();
+            server_a.take().unwrap().await.unwrap().unwrap();
+        } else {
+            crash_b_tx.take().unwrap().send(()).unwrap();
+            server_b.take().unwrap().await.unwrap().unwrap();
+        }
+        leader_gate.fail_blocked();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if observer.current_leader().await.unwrap().as_deref() == Some(&follower) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("standby acquires the expired lease");
+        let version = tokio::time::timeout(Duration::from_secs(25), insert)
+            .await
+            .expect("SDK retry spans lease expiry")
+            .unwrap()
+            .unwrap();
+        assert_eq!(version, Version(2));
+        assert_eq!(object_count(&root.path().join("objects")).await, 1);
+        let mut rows = client
+            .query(
+                "SELECT episode_id FROM lake.robots.episodes WHERE episode_id = 'episode-failover'",
+            )
+            .await
+            .unwrap();
+        let mut row_count = 0;
+        while let Some(batch) = rows.try_next().await.unwrap() {
+            row_count += batch.num_rows();
+        }
+        assert_eq!(row_count, 1);
+
+        if leader == addr_a {
+            crash_b_tx.take().unwrap().send(()).unwrap();
+            server_b.take().unwrap().await.unwrap().unwrap();
+        } else {
+            crash_a_tx.take().unwrap().send(()).unwrap();
+            server_a.take().unwrap().await.unwrap().unwrap();
+        }
+    }
+
+    async fn object_count(path: &std::path::Path) -> usize {
+        let mut entries = tokio::fs::read_dir(path).await.unwrap();
+        let mut count = 0;
+        while entries.next_entry().await.unwrap().is_some() {
+            count += 1;
+        }
+        count
+    }
 
     #[tokio::test]
     async fn unreachable_query_endpoint_fails_connect() {

@@ -22,13 +22,20 @@
 //! reclaim old versions). The sweep is best-effort: a single table's failure
 //! is logged and the sweep moves on, so one bad table never stalls the rest.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use lake_common::TableRef;
 use lake_meta::{MetaError, registry};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Metasrv, leadership::Leadership};
+use crate::{
+    Metasrv, MetasrvError,
+    leadership::Leadership,
+    operation::{AppendRecord, AppendState, OPERATION_PREFIX, active_key},
+};
 
 /// How often the maintenance loop wakes to consider a sweep.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_mins(1);
@@ -65,6 +72,16 @@ pub(crate) async fn run_maintenance_loop_until(
 /// Each step degrades gracefully: a failed listing logs and moves on, and a
 /// per-table `maintain` error is logged and skipped so the sweep continues.
 async fn sweep(metasrv: &Metasrv) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_secs();
+    let operation_gc = sweep_operations_at(metasrv, now).await;
+    tracing::debug!(
+        scanned = operation_gc.scanned,
+        deleted = operation_gc.deleted,
+        "append operation maintenance page complete"
+    );
     let namespaces = match metasrv.list_namespaces().await {
         Ok(namespaces) => namespaces,
         Err(err) => {
@@ -123,6 +140,156 @@ async fn sweep(metasrv: &Metasrv) {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct OperationGcStats {
+    scanned: usize,
+    deleted: usize,
+}
+
+async fn sweep_operations_at(metasrv: &Metasrv, now: u64) -> OperationGcStats {
+    let cursor = metasrv.inner.operation_gc_cursor.lock().await.clone();
+    let page = match metasrv
+        .meta()
+        .scan_prefix_page(
+            OPERATION_PREFIX,
+            cursor.as_deref(),
+            metasrv.inner.operation_gc_page_size,
+        )
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => {
+            tracing::warn!(%error, "append operation GC page scan failed");
+            return OperationGcStats::default();
+        }
+    };
+    let (entries, continuation) = page.into_parts();
+    *metasrv.inner.operation_gc_cursor.lock().await = continuation;
+    let mut stats = OperationGcStats {
+        scanned: entries.len(),
+        deleted: 0,
+    };
+    for (stripped, bytes) in entries {
+        let key = format!("{OPERATION_PREFIX}{stripped}");
+        let record = match AppendRecord::decode(&stripped, &bytes) {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(%error, key, "append operation GC found corrupt state");
+                continue;
+            }
+        };
+        if now.saturating_sub(record.updated_at) <= metasrv.inner.operation_retention.as_secs() {
+            continue;
+        }
+        match reconcile_and_delete_expired(metasrv, &key, &bytes, record).await {
+            Ok(true) => stats.deleted += 1,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, key, "append operation GC reconciliation failed");
+            }
+        }
+    }
+    stats
+}
+
+async fn reconcile_and_delete_expired(
+    metasrv: &Metasrv,
+    key: &str,
+    encoded: &[u8],
+    record: AppendRecord,
+) -> crate::Result<bool> {
+    let (table, operation) = record.identity()?;
+    let _guard = metasrv.lock_table(&table).await;
+    if record.state != AppendState::Committed {
+        let Some(registration) = metasrv.resolve(&table).await? else {
+            return delete_operation_record(metasrv, key, encoded, &table, &operation).await;
+        };
+        if registration.incarnation_id() != Some(record.table_incarnation.as_str()) {
+            // The expired operation cannot legally target this replacement,
+            // and the server rejects its UUID before record creation. Removing
+            // its exact record/fence is therefore both safe and leak-free.
+            return delete_operation_record(metasrv, key, encoded, &table, &operation).await;
+        }
+        let handle = metasrv
+            .engine()
+            .open(&registration.location)
+            .await
+            .map_err(|source| MetasrvError::Engine { source })?
+            .ok_or_else(|| MetasrvError::NotFound {
+                table: table.to_string(),
+            })?;
+        let result_version = match record.state {
+            AppendState::Reserved => match handle
+                .reconcile_append(&operation)
+                .await
+                .map_err(|source| MetasrvError::Engine { source })?
+            {
+                Some(version) => version,
+                None if registration.current_version == record.base_version => {
+                    return delete_operation_record(metasrv, key, encoded, &table, &operation)
+                        .await;
+                }
+                None => {
+                    return Err(MetasrvError::OperationRecoveryConflict {
+                        operation_id: record.operation_id,
+                    });
+                }
+            },
+            AppendState::EngineCommitted => {
+                record
+                    .result_version
+                    .ok_or_else(|| MetasrvError::CorruptOperationState {
+                        operation_id: record.operation_id.clone(),
+                    })?
+            }
+            AppendState::Committed => unreachable!(),
+        };
+        if record
+            .result_version
+            .is_some_and(|version| version != result_version)
+        {
+            return Err(MetasrvError::OperationRecoveryConflict {
+                operation_id: record.operation_id,
+            });
+        }
+        if registration.current_version == record.base_version {
+            registry::set_version(
+                metasrv.meta().as_ref(),
+                &table,
+                &registration,
+                result_version,
+            )
+            .await
+            .map_err(|source| MetasrvError::Registry { source })?;
+        } else if registration.current_version != result_version {
+            return Err(MetasrvError::OperationRecoveryConflict {
+                operation_id: record.operation_id,
+            });
+        }
+    }
+    delete_operation_record(metasrv, key, encoded, &table, &operation).await
+}
+
+async fn delete_operation_record(
+    metasrv: &Metasrv,
+    key: &str,
+    encoded: &[u8],
+    table: &TableRef,
+    operation: &lake_common::AppendOperation,
+) -> crate::Result<bool> {
+    let active = active_key(operation, table);
+    let _ = metasrv
+        .meta()
+        .delete(&active, key.as_bytes())
+        .await
+        .map_err(|source| MetasrvError::Registry { source })?;
+    metasrv
+        .meta()
+        .delete(key, encoded)
+        .await
+        .map_err(|source| MetasrvError::Registry { source })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -135,16 +302,32 @@ mod tests {
         error::DataFusionError,
         physical_plan::stream::RecordBatchStreamAdapter,
     };
-    use lake_common::{TableLocation, TableRef};
+    use lake_common::{
+        AppendOperation, AppendOperationId, AppendPayloadDigest, TableLocation, TableRef, TenantId,
+    };
     use lake_engine::TableEngineRef;
     use lake_engine_lance::LanceEngine;
     use lake_meta::{MetaStoreRef, RocksMeta};
 
     use super::*;
+    use crate::operation::operation_key;
 
     fn batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("ep", DataType::Int64, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap()
+    }
+
+    fn operation() -> AppendOperation {
+        AppendOperation::builder()
+            .tenant(TenantId::try_new("tenant-a").unwrap())
+            .operation_id(AppendOperationId::generate())
+            .payload_digest(
+                AppendPayloadDigest::parse(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            )
+            .build()
     }
 
     #[tokio::test]
@@ -168,7 +351,7 @@ mod tests {
                 b.schema(),
                 futures::stream::iter(vec![Ok::<_, DataFusionError>(b)]),
             ));
-            metasrv.append(&table, stream).await.unwrap();
+            metasrv.append(&table, &operation(), stream).await.unwrap();
         }
 
         let before = metasrv
@@ -199,5 +382,98 @@ mod tests {
             after, engine_version,
             "registry must publish maintenance commit"
         );
+    }
+
+    #[tokio::test]
+    async fn operation_gc_is_bounded_and_expired_replay_fails_closed() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv =
+            Metasrv::with_operation_policy(meta.clone(), engine, Duration::from_secs(1), 2);
+        let table = TableRef::new("robots", "episodes");
+        let location = TableLocation::new(meta_dir.path().join("episodes.lance").to_string_lossy());
+        metasrv
+            .create_table(&table, location, batch().schema())
+            .await
+            .unwrap();
+        let incarnation = metasrv
+            .resolve(&table)
+            .await
+            .unwrap()
+            .unwrap()
+            .incarnation_id()
+            .unwrap()
+            .to_owned();
+        let tenant = TenantId::try_new("tenant-a").unwrap();
+        let mut operations = Vec::new();
+        let sweep_now = u64::MAX / 2;
+        for (suffix, state, updated_at) in [
+            ("000000000011", AppendState::Committed, 1),
+            ("000000000012", AppendState::Committed, 1),
+            ("000000000013", AppendState::Reserved, 1),
+            ("000000000014", AppendState::Committed, sweep_now),
+        ] {
+            let operation = AppendOperation::builder()
+                .tenant(tenant.clone())
+                .operation_id(
+                    AppendOperationId::parse(format!("0197f0f4-7b2a-7000-8000-{suffix}")).unwrap(),
+                )
+                .payload_digest(
+                    AppendPayloadDigest::parse(
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    )
+                    .unwrap(),
+                )
+                .build();
+            let mut record = AppendRecord::reserved(
+                &operation,
+                &table,
+                &incarnation,
+                lake_common::Version(1),
+                1,
+            );
+            record.state = state;
+            record.updated_at = updated_at;
+            if state == AppendState::Committed {
+                record.result_version = Some(lake_common::Version(2));
+            }
+            let key = operation_key(&operation, &table);
+            assert!(
+                meta.cas(&key, None, &record.encode().unwrap())
+                    .await
+                    .unwrap()
+            );
+            if state == AppendState::Reserved {
+                assert!(
+                    meta.cas(&active_key(&operation, &table), None, key.as_bytes())
+                        .await
+                        .unwrap()
+                );
+            }
+            operations.push(operation);
+        }
+
+        let first = sweep_operations_at(&metasrv, sweep_now).await;
+        assert!(
+            first.scanned <= 2,
+            "one sweep is limited to one metadata page"
+        );
+        let second = sweep_operations_at(&metasrv, sweep_now).await;
+        assert!(second.scanned <= 2, "the continuation remains page bounded");
+        let remaining = meta.scan_prefix(OPERATION_PREFIX).await.unwrap();
+        assert_eq!(remaining.len(), 1, "recent operation records remain");
+        assert!(remaining[0].0.ends_with("000000000014"));
+
+        let expired = &operations[0];
+        let batch = batch();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
+        ));
+        assert!(matches!(
+            metasrv.append(&table, expired, stream).await,
+            Err(crate::MetasrvError::OperationExpired { .. })
+        ));
     }
 }
