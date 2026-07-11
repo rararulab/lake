@@ -19,6 +19,8 @@ Lance dataset.
   CASes latest; legacy per-version-only datasets scan once to install latest.
 - Drop fences the fixed key through durable `deleting` and `deleted` markers;
   recreate replaces `deleted`, so stale migration cannot win an ABA CAS.
+- Historical record creation is atomically guarded by the exact fixed-pointer
+  bytes, preventing a writer that read before drop from publishing afterward.
 
 ## Layout
 

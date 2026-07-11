@@ -121,6 +121,9 @@ Drop never returns the fixed key to an absent state: it CASes current to
 `deleting`, clears immutable history, then CASes to a durable `deleted` marker.
 Recreate replaces only `deleted`. This tombstone prevents a migration that
 read legacy history before drop from winning an ABA `None` CAS afterward.
+Every history-key creation is a guarded transaction whose guard is the exact
+fixed-pointer bytes observed by that writer, so a writer paused before drop
+cannot add history after the deletion fence is installed.
 
 The fixed pointer is a commit-protocol boundary. A pre-pointer binary can write
 a newer per-version record without advancing it, so commit-capable binaries on

@@ -45,7 +45,7 @@
 use std::cmp::Ordering;
 
 use async_trait::async_trait;
-use lake_meta::{MetaError, MetaStoreRef};
+use lake_meta::{GuardedMutation, MetaError, MetaStoreRef};
 use lance::{Error, Result};
 use lance_table::io::commit::external_manifest::ExternalManifestStore;
 use serde::{Deserialize, Serialize};
@@ -201,7 +201,18 @@ impl MetaManifestStore {
     async fn archive_latest(&self, base_uri: &str, latest: &LatestState) -> Result<()> {
         let key = Self::version_key(base_uri, latest.pointer.version);
         let value = encode(&latest.pointer.path)?;
-        if self.meta.cas(&key, None, &value).await.map_err(store_err)? {
+        let latest_key = Self::latest_key(base_uri);
+        if self
+            .meta
+            .guarded_mutate(GuardedMutation::create(
+                &latest_key,
+                &latest.bytes,
+                &key,
+                &value,
+            ))
+            .await
+            .map_err(store_err)?
+        {
             return Ok(());
         }
         match self.meta.get(&key).await.map_err(store_err)? {
@@ -340,7 +351,17 @@ impl ExternalManifestStore for MetaManifestStore {
             LatestResolution::Present(latest) if version < latest.pointer.version => {
                 let key = Self::version_key(base_uri, version);
                 let value = encode(path)?;
-                if self.meta.cas(&key, None, &value).await.map_err(store_err)? {
+                if self
+                    .meta
+                    .guarded_mutate(GuardedMutation::create(
+                        &latest_key,
+                        &latest.bytes,
+                        &key,
+                        &value,
+                    ))
+                    .await
+                    .map_err(store_err)?
+                {
                     Ok(())
                 } else {
                     Err(Error::io(format!(
@@ -526,7 +547,7 @@ mod tests {
 
     use lake_meta::{MetaStore, RocksMeta};
     use tempfile::tempdir;
-    use tokio::sync::Notify;
+    use tokio::sync::{Notify, Semaphore};
 
     use super::*;
 
@@ -558,6 +579,10 @@ mod tests {
             self.inner.cas(key, expected, new).await
         }
 
+        async fn guarded_mutate(&self, mutation: GuardedMutation<'_>) -> lake_meta::Result<bool> {
+            self.inner.guarded_mutate(mutation).await
+        }
+
         async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
             self.lists.fetch_add(1, Ordering::SeqCst);
             self.inner.list_prefix(prefix).await
@@ -579,13 +604,20 @@ mod tests {
     }
 
     struct BlockingMeta {
-        inner:                 RocksMeta,
-        block_migration_cas:   AtomicBool,
-        migration_cas_entered: Notify,
-        migration_cas_release: Notify,
-        block_history_list:    AtomicBool,
-        history_list_entered:  Notify,
-        history_list_release:  Notify,
+        inner:                  RocksMeta,
+        block_migration_cas:    AtomicBool,
+        migration_cas_entered:  Notify,
+        migration_cas_release:  Notify,
+        block_history_list:     AtomicBool,
+        history_list_entered:   Notify,
+        history_list_release:   Notify,
+        block_history_create:   AtomicBool,
+        history_create_entered: Notify,
+        history_create_release: Notify,
+        block_finalize_cas:     AtomicBool,
+        finalize_cas_arrivals:  AtomicUsize,
+        finalize_cas_entered:   Notify,
+        finalize_cas_release:   Semaphore,
     }
 
     #[async_trait]
@@ -610,7 +642,30 @@ mod tests {
                 self.migration_cas_entered.notify_one();
                 self.migration_cas_release.notified().await;
             }
+            if expected.is_some()
+                && new
+                    .windows(b"final.manifest".len())
+                    .any(|part| part == b"final.manifest")
+                && self.block_finalize_cas.load(Ordering::SeqCst)
+            {
+                if self.finalize_cas_arrivals.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                    self.finalize_cas_entered.notify_one();
+                }
+                self.finalize_cas_release
+                    .acquire()
+                    .await
+                    .expect("finalize CAS release")
+                    .forget();
+            }
             self.inner.cas(key, expected, new).await
+        }
+
+        async fn guarded_mutate(&self, mutation: GuardedMutation<'_>) -> lake_meta::Result<bool> {
+            if self.block_history_create.swap(false, Ordering::SeqCst) {
+                self.history_create_entered.notify_one();
+                self.history_create_release.notified().await;
+            }
+            self.inner.guarded_mutate(mutation).await
         }
 
         async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
@@ -631,13 +686,20 @@ mod tests {
     fn blocking_store() -> (MetaManifestStore, Arc<BlockingMeta>, tempfile::TempDir) {
         let dir = tempdir().expect("manifest metadata directory");
         let meta = Arc::new(BlockingMeta {
-            inner:                 RocksMeta::open(dir.path()).expect("RocksMeta"),
-            block_migration_cas:   AtomicBool::new(false),
-            migration_cas_entered: Notify::new(),
-            migration_cas_release: Notify::new(),
-            block_history_list:    AtomicBool::new(false),
-            history_list_entered:  Notify::new(),
-            history_list_release:  Notify::new(),
+            inner:                  RocksMeta::open(dir.path()).expect("RocksMeta"),
+            block_migration_cas:    AtomicBool::new(false),
+            migration_cas_entered:  Notify::new(),
+            migration_cas_release:  Notify::new(),
+            block_history_list:     AtomicBool::new(false),
+            history_list_entered:   Notify::new(),
+            history_list_release:   Notify::new(),
+            block_history_create:   AtomicBool::new(false),
+            history_create_entered: Notify::new(),
+            history_create_release: Notify::new(),
+            block_finalize_cas:     AtomicBool::new(false),
+            finalize_cas_arrivals:  AtomicUsize::new(0),
+            finalize_cas_entered:   Notify::new(),
+            finalize_cas_release:   Semaphore::new(0),
         });
         (MetaManifestStore::new(meta.clone()), meta, dir)
     }
@@ -781,39 +843,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_create_is_guarded_by_exact_latest() {
+        let (store, meta, _dir) = blocking_store();
+        let store = Arc::new(store);
+
+        store
+            .put_if_not_exists("archive-race", 1, "v1.manifest", 4, None)
+            .await
+            .expect("claim archive source");
+        meta.block_history_create.store(true, Ordering::SeqCst);
+        let advancing = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .put_if_not_exists("archive-race", 2, "v2.staging", 4, None)
+                    .await
+            })
+        };
+        meta.history_create_entered.notified().await;
+        store
+            .delete("archive-race")
+            .await
+            .expect("delete fences archive");
+        meta.history_create_release.notify_one();
+        assert!(
+            advancing.await.expect("advance task").is_err(),
+            "stale archive must fail its latest guard"
+        );
+        assert!(
+            meta.list_prefix(&MetaManifestStore::base_prefix("archive-race"))
+                .await
+                .expect("archive history")
+                .is_empty()
+        );
+
+        store
+            .put_if_not_exists("backfill-race", 1, "v1.manifest", 4, None)
+            .await
+            .expect("claim v1");
+        store
+            .put_if_not_exists("backfill-race", 2, "v2.manifest", 4, None)
+            .await
+            .expect("claim v2");
+        meta.block_history_create.store(true, Ordering::SeqCst);
+        let backfilling = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .put_if_not_exists("backfill-race", 0, "v0.manifest", 4, None)
+                    .await
+            })
+        };
+        meta.history_create_entered.notified().await;
+        store
+            .delete("backfill-race")
+            .await
+            .expect("delete fences backfill");
+        meta.history_create_release.notify_one();
+        assert!(
+            backfilling.await.expect("backfill task").is_err(),
+            "stale backfill must fail its latest guard"
+        );
+        assert!(
+            meta.list_prefix(&MetaManifestStore::base_prefix("backfill-race"))
+                .await
+                .expect("backfill history")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_finalize_converges_on_same_path() {
         async fn finalize_twice(
             store: Arc<MetaManifestStore>,
+            meta: Arc<BlockingMeta>,
             dataset: &'static str,
             version: u64,
+            left_path: &'static str,
+            right_path: &'static str,
+            expect_both: bool,
         ) {
+            meta.finalize_cas_arrivals.store(0, Ordering::SeqCst);
+            meta.block_finalize_cas.store(true, Ordering::SeqCst);
             let left = {
                 let store = store.clone();
                 tokio::spawn(async move {
                     store
-                        .put_if_exists(dataset, version, "final.manifest", 4, None)
+                        .put_if_exists(dataset, version, left_path, 4, None)
                         .await
                 })
             };
             let right = tokio::spawn(async move {
                 store
-                    .put_if_exists(dataset, version, "final.manifest", 4, None)
+                    .put_if_exists(dataset, version, right_path, 4, None)
                     .await
             });
-            left.await.expect("left finalizer").expect("left converges");
-            right
-                .await
-                .expect("right finalizer")
-                .expect("right converges");
+            meta.finalize_cas_entered.notified().await;
+            meta.block_finalize_cas.store(false, Ordering::SeqCst);
+            meta.finalize_cas_release.add_permits(2);
+            let results = [
+                left.await.expect("left finalizer"),
+                right.await.expect("right finalizer"),
+            ];
+            let successes = results.iter().filter(|result| result.is_ok()).count();
+            assert_eq!(successes, if expect_both { 2 } else { 1 });
         }
 
-        let (store, _dir) = store();
+        let (store, meta, _dir) = blocking_store();
         let store = Arc::new(store);
         store
             .put_if_not_exists("current", 1, "staging.manifest", 4, None)
             .await
             .expect("current staging");
-        finalize_twice(store.clone(), "current", 1).await;
+        finalize_twice(
+            store.clone(),
+            meta.clone(),
+            "current",
+            1,
+            "final.manifest",
+            "final.manifest",
+            true,
+        )
+        .await;
 
         store
             .put_if_not_exists("historical", 1, "staging.manifest", 4, None)
@@ -823,21 +974,52 @@ mod tests {
             .put_if_not_exists("historical", 2, "v2.staging", 4, None)
             .await
             .expect("archive staging v1");
-        finalize_twice(store.clone(), "historical", 1).await;
+        finalize_twice(
+            store.clone(),
+            meta.clone(),
+            "historical",
+            1,
+            "final.manifest",
+            "final.manifest",
+            true,
+        )
+        .await;
 
-        let (legacy, meta, _dir) = counting_store();
-        let legacy = Arc::new(legacy);
         let key = MetaManifestStore::version_key("legacy-finalize", 1);
         assert!(
             meta.cas(&key, None, &encode("staging.manifest").expect("pointer"))
                 .await
                 .expect("legacy staging")
         );
-        legacy
+        store
             .get_latest_version("legacy-finalize")
             .await
             .expect("migrate legacy latest");
-        finalize_twice(legacy, "legacy-finalize", 1).await;
+        finalize_twice(
+            store.clone(),
+            meta.clone(),
+            "legacy-finalize",
+            1,
+            "final.manifest",
+            "final.manifest",
+            true,
+        )
+        .await;
+
+        store
+            .put_if_not_exists("different-finalize", 1, "staging.manifest", 4, None)
+            .await
+            .expect("different-target staging");
+        finalize_twice(
+            store,
+            meta,
+            "different-finalize",
+            1,
+            "final.manifest",
+            "other-final.manifest",
+            false,
+        )
+        .await;
     }
 
     #[tokio::test]

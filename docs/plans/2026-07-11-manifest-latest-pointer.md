@@ -22,6 +22,8 @@ version reads remain available.
 6. Delete fences fixed latest as `deleting`, removes immutable history, and
    leaves a durable `deleted` marker that recreate replaces. This prevents
    stale legacy migration from reviving a pointer through an ABA `None` CAS.
+7. Every history create is atomically guarded by the exact latest bytes read by
+   the writer, preventing pre-fence writers from publishing after drop.
 
 ## Rollout
 

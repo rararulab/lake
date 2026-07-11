@@ -33,6 +33,9 @@ may scan once to install the pointer; steady-state reads may not scan.
 - Drop transitions fixed latest through durable `deleting` and `deleted`
   markers. Recreate replaces `deleted`; the key never becomes absent, so stale
   migration cannot revive a dropped pointer through an ABA CAS.
+- Archive and historical-backfill creation atomically guard on the exact fixed
+  latest bytes observed by the writer, so a pre-fence writer cannot publish
+  history after drop.
 - If latest is absent but legacy history exists, scan once, CAS-install the
   maximum record, and let racing migrators converge on the installed value.
 - This commit-protocol boundary is not mixed-writer compatible: pre-#41
@@ -122,6 +125,14 @@ Scenario: Concurrent finalizers converge
   Given current, historical, or migrated staging pointers
   When two finalizers install the same final path concurrently
   Then both calls succeed and observe the same installed path
+
+Scenario: History creation cannot cross the delete fence
+  Test:
+    Package: lake-engine-lance
+    Filter: history_create_is_guarded_by_exact_latest
+  Given archive or historical backfill has read the old fixed pointer
+  When drop installs its deletion fence before history creation
+  Then the guarded history transaction fails and deletion leaves no old history
 
 ## Out of Scope
 

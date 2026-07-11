@@ -22,19 +22,23 @@ Issue: #41
   migration and deletion to prove the durable deletion marker defeats ABA and
   excludes recreate until cleanup completes.
 - `concurrent_finalize_converges_on_same_path` covers current, historical, and
-  migrated duplicate staging records; both same-target finalizers succeed.
+  migrated duplicate staging records with a forced CAS barrier; same-target
+  finalizers both succeed while different targets conflict.
+- `history_create_is_guarded_by_exact_latest` pauses archive and backfill after
+  reading latest, lets drop finish, then proves their guarded transactions fail
+  without recreating old-incarnation history.
 - Exact current/historical reads, historical backfill, delete, and recreate
   scenarios pass.
-- `cargo test -p lake-engine-lance --lib`: 20/20 PASS.
+- `cargo test -p lake-engine-lance --lib`: 21/21 PASS.
 - Real LocalStack S3 + Dynamo test
   `lance_engine_on_s3_with_dynamo_external_manifest`: PASS; Dynamo contains a
   fixed v2 latest record plus immutable v1 history; drop clears live state and
   history while retaining only the durable `deleted` fence.
 - `cargo clippy -p lake-engine-lance --all-targets -- -D warnings`: PASS.
 - `mise run spec-lifecycle specs/issue-41-manifest-latest-pointer.spec.md`:
-  8/8 PASS with every selector matching a real test.
-- Post-review `mise run gate`: PASS (format, clippy, workspace tests, e2e
-  self-check, and site checks); 96.89s after the concurrency repair.
+  9/9 PASS with every selector matching a real test.
+- Final post-review `mise run gate`: PASS (format, clippy, workspace tests,
+  e2e self-check, and site checks); 83.74s after guarded history creation.
 
 ## Rollout
 
