@@ -21,13 +21,16 @@
 //! *follower's* Flight address and assert it succeeds — which can only happen
 //! if the follower forwarded the write to the leader (a write served locally on
 //! a follower would fail `unavailable`). We then confirm the table is really
-//! registered, and that remote destructive drop fails closed on either node
-//! until durable tombstones are available.
+//! registered, and that remote destructive drop is forwarded through the
+//! durable tombstone protocol.
 //!
 //! Hermetic: no external services, only two loopback ports and two tempdirs.
 
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -35,29 +38,31 @@ use arrow_flight::{
     Action, FlightDescriptor, encode::FlightDataEncoderBuilder,
     flight_service_client::FlightServiceClient,
 };
+use async_trait::async_trait;
 use datafusion::arrow::{
     array::{Float64Array, Int64Array},
-    datatypes::{DataType, Field, Schema},
+    datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
 use futures::TryStreamExt;
-use lake_common::{
-    AppendOperationId, FILE_APPEND_TYPE_URL, FileAppendRequest, TableLocation, TableRef, Version,
+use lake_common::{AppendOperationId, FILE_APPEND_TYPE_URL, FileAppendRequest, TableRef, Version};
+use lake_engine::{
+    ObjectReferencePage, ObjectReferenceRequest, Result as EngineResult, TableEngine,
+    TableEngineRef, TableHandleRef,
 };
-use lake_engine::TableEngineRef;
 use lake_engine_lance::LanceEngine;
 use lake_flight::{ClientSecurity, ServerSecurity, append_flight_payload_digest};
 use lake_meta::{MetaStoreRef, RocksMeta, registry};
 use lake_metasrv::{
     Metasrv, MetasrvServerConfig, TablePlacement,
-    election::{LEASE_KEY, LeaseValue},
+    election::{LEASE_KEY, LeaseElection, LeaseStatus, LeaseValue},
     serve_with_config, serve_with_config_and_shutdown,
 };
 use prost::Message;
 use prost_types::Any;
 use rcgen::generate_simple_self_signed;
 use serde_json::json;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tonic::{Code, Request, Status, transport::Channel};
 
 /// Grab a currently-free loopback address by binding an ephemeral port and
@@ -76,6 +81,59 @@ fn now_ms() -> u64 {
             .as_millis(),
     )
     .expect("millis fit u64")
+}
+
+struct PauseFirstRemoveEngine {
+    inner:   LanceEngine,
+    first:   AtomicBool,
+    started: Notify,
+    resume:  Notify,
+}
+
+#[async_trait]
+impl TableEngine for PauseFirstRemoveEngine {
+    fn kind(&self) -> &'static str { self.inner.kind() }
+
+    async fn create(
+        &self,
+        location: &lake_common::TableLocation,
+        schema: SchemaRef,
+    ) -> EngineResult<TableHandleRef> {
+        self.inner.create(location, schema).await
+    }
+
+    async fn open(
+        &self,
+        location: &lake_common::TableLocation,
+    ) -> EngineResult<Option<TableHandleRef>> {
+        self.inner.open(location).await
+    }
+
+    async fn remove(&self, location: &lake_common::TableLocation) -> EngineResult<()> {
+        if self.first.swap(false, Ordering::SeqCst) {
+            self.started.notify_one();
+            self.resume.notified().await;
+        }
+        self.inner.remove(location).await
+    }
+
+    async fn maintain(
+        &self,
+        location: &lake_common::TableLocation,
+        version: Version,
+    ) -> EngineResult<Option<Version>> {
+        self.inner.maintain(location, version).await
+    }
+
+    async fn retained_object_references(
+        &self,
+        location: &lake_common::TableLocation,
+        request: ObjectReferenceRequest,
+    ) -> EngineResult<ObjectReferencePage> {
+        self.inner
+            .retained_object_references(location, request)
+            .await
+    }
 }
 
 /// Open a fresh Flight client to `addr`.
@@ -289,21 +347,162 @@ async fn follower_forwards_write_to_leader() {
         .expect("table remains registered");
     assert!(after_append.current_version > before_append);
 
-    // Remote destructive drop is intentionally unavailable until a durable
-    // tombstone can recover storage deletion across leader failure.
+    // Destructive drop follows the same follower-to-leader path and converges
+    // only after the durable tombstone cleanup finishes.
     let drop_body = json!({ "namespace": "robots", "name": "arm" });
     let dropped = forward_with_retry(&follower, "drop_table", drop_body).await;
-    assert_eq!(
-        dropped.expect_err("remote drop must fail closed").code(),
-        Code::FailedPrecondition
-    );
+    dropped.expect("remote drop through follower");
     let reg_after = registry::get(meta.as_ref(), &table)
         .await
         .expect("registry get after drop");
+    assert!(reg_after.is_none(), "durable drop must detach robots.arm");
+}
+
+#[tokio::test]
+async fn remote_drop_is_idempotent_across_leader_handoff() {
+    let meta_dir = tempfile::tempdir().expect("meta tempdir");
+    let table_dir = tempfile::tempdir().expect("table tempdir");
+    let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).expect("open RocksMeta"));
+    let pausing_engine = Arc::new(PauseFirstRemoveEngine {
+        inner:   LanceEngine::with_manifest_store(meta.clone()),
+        first:   AtomicBool::new(true),
+        started: Notify::new(),
+        resume:  Notify::new(),
+    });
+    let engine: TableEngineRef = pausing_engine.clone();
+    let addr_a = free_addr();
+    let addr_b = free_addr();
+    let (shutdown_a_tx, shutdown_a_rx) = oneshot::channel();
+    let (shutdown_b_tx, shutdown_b_rx) = oneshot::channel();
+    let mut shutdown_a_tx = Some(shutdown_a_tx);
+    let mut shutdown_b_tx = Some(shutdown_b_tx);
+    let placement = TablePlacement::local(table_dir.path().to_path_buf());
+
+    let server_a = tokio::spawn({
+        let node = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
+        let addr = addr_a.clone();
+        let placement = placement.clone();
+        async move {
+            serve_with_config_and_shutdown(
+                node,
+                &addr,
+                MetasrvServerConfig::new()
+                    .with_table_placement(placement)
+                    .with_shutdown_grace(Duration::from_secs(1)),
+                async move {
+                    let _ = shutdown_a_rx.await;
+                },
+            )
+            .await
+        }
+    });
+    let server_b = tokio::spawn({
+        let node = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
+        let addr = addr_b.clone();
+        async move {
+            serve_with_config_and_shutdown(
+                node,
+                &addr,
+                MetasrvServerConfig::new()
+                    .with_table_placement(placement)
+                    .with_shutdown_grace(Duration::from_secs(1)),
+                async move {
+                    let _ = shutdown_b_rx.await;
+                },
+            )
+            .await
+        }
+    });
+    let mut server_a = Some(server_a);
+    let mut server_b = Some(server_b);
+
+    wait_serving(&addr_a).await;
+    wait_serving(&addr_b).await;
+    let leader = wait_for_leader(&meta, &[&addr_a, &addr_b]).await;
+    let standby = if leader == addr_a {
+        addr_b.clone()
+    } else {
+        addr_a.clone()
+    };
+    let table = TableRef::new("robots", "drop_handoff");
+    forward_with_retry(
+        &leader,
+        "create_table",
+        json!({
+            "namespace": "robots",
+            "name": "drop_handoff",
+            "columns": ["ts:i64"],
+        }),
+    )
+    .await
+    .expect("leader creates table");
+    let location = registry::get(meta.as_ref(), &table)
+        .await
+        .expect("registry get")
+        .expect("created registration")
+        .location;
+    let first_drop = tokio::spawn({
+        let leader = leader.clone();
+        async move {
+            do_action(
+                &leader,
+                "drop_table",
+                json!({ "namespace": "robots", "name": "drop_handoff" }),
+            )
+            .await
+        }
+    });
+    pausing_engine.started.notified().await;
     assert!(
-        reg_after.is_some(),
-        "drop rejection must preserve robots.arm"
+        registry::get(meta.as_ref(), &table)
+            .await
+            .unwrap()
+            .is_none()
     );
+    assert_eq!(meta.list_prefix("drop/").await.unwrap().len(), 1);
+
+    let forced = LeaseElection::new(meta.clone(), standby.clone(), Duration::from_secs(10))
+        .campaign_at(now_ms().saturating_add(20_000))
+        .await
+        .expect("force standby takeover during drop");
+    assert!(matches!(forced, LeaseStatus::Leader { .. }));
+    pausing_engine.resume.notify_one();
+    first_drop
+        .await
+        .unwrap()
+        .expect_err("former leader cannot finalize the tombstone");
+    assert_eq!(wait_for_leader(&meta, &[&standby]).await, standby);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match do_action(
+            &standby,
+            "drop_table",
+            json!({ "namespace": "robots", "name": "drop_handoff" }),
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(error) if Instant::now() < deadline => {
+                tracing::debug!(%error, "waiting for standby local authority");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(error) => panic!("successor did not resume remote drop: {error}"),
+        }
+    }
+
+    assert!(
+        registry::get(meta.as_ref(), &table)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(engine.open(&location).await.unwrap().is_none());
+    assert!(meta.list_prefix("drop/").await.unwrap().is_empty());
+
+    shutdown_a_tx.take().unwrap().send(()).unwrap();
+    shutdown_b_tx.take().unwrap().send(()).unwrap();
+    server_a.take().unwrap().await.unwrap().unwrap();
+    server_b.take().unwrap().await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -366,11 +565,6 @@ async fn committed_replay_survives_graceful_leader_handoff() {
     } else {
         addr_a.clone()
     };
-    let location = table_dir
-        .path()
-        .join("robots/failover_arm.lance")
-        .to_string_lossy()
-        .into_owned();
     forward_with_retry(
         &leader,
         "create_table",
@@ -384,6 +578,11 @@ async fn committed_replay_survives_graceful_leader_handoff() {
     .expect("leader creates table");
 
     let table = TableRef::new("robots", "failover_arm");
+    let location = registry::get(meta.as_ref(), &table)
+        .await
+        .expect("registry get")
+        .expect("created registration")
+        .location;
     let messages = file_append_messages(table.clone(), AppendOperationId::generate()).await;
     let committed = do_file_append_messages(&leader, messages.clone())
         .await
@@ -432,7 +631,7 @@ async fn committed_replay_survives_graceful_leader_handoff() {
     assert_eq!(registered.current_version, committed);
     assert_eq!(
         engine
-            .open(&TableLocation::new(location))
+            .open(&location)
             .await
             .expect("open table")
             .expect("table exists")

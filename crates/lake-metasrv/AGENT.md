@@ -14,14 +14,17 @@ write path — create tables, resolve/list, and the append commit protocol.
   ambiguous results and leader failover reconcile from HA-KV plus history.
 - Operation records bind the table incarnation and fail closed after a
   same-name drop/recreate.
+- Drop publishes an incarnation-bound tombstone before registry or object
+  deletion. Server placement gives every incarnation a unique object prefix,
+  so delayed old-leader cleanup cannot touch a replacement.
 - Never bypass the engine trait — table creation/append delegate to
   `TableEngine`, so the storage engine stays swappable.
 - FILE `DoPut` contains Arrow `DataLocation` rows only. Followers forward the
   authenticated tenant scope and stream to the observed leader; metasrv never
   accepts the object payload. Buffered control streams are bounded.
-- Remote DDL never accepts a dataset URI. `TablePlacement` derives every new
-  table location from trusted server configuration after validating both
-  identifier path segments.
+- Remote DDL never accepts a dataset URI. `TablePlacement` derives a unique
+  generation-qualified location from trusted server configuration after
+  validating both identifier path segments.
 - Production inbound RPCs and follower-to-leader forwarding share the
   `lake-flight` TLS/auth boundary; a follower must never downgrade to anonymous
   hard-coded HTTP.

@@ -460,14 +460,20 @@ impl MetasrvFlightService {
         Ok(Response::new(stream))
     }
 
-    /// Reject remote destructive drop until the durable tombstone protocol can
-    /// recover object deletion across leader failure. Local administrative
-    /// drop remains available through [`Metasrv::drop_table`].
+    /// Durably tombstone, detach, and clean one table incarnation. Repeated
+    /// requests converge after crashes because [`Metasrv::drop_table`] resumes
+    /// any existing tombstone before inspecting the current registration.
     async fn action_drop_table(&self, action: Action) -> Result<Response<ActionStream>, Status> {
-        let _: TableIdent = parse_body(&action.body)?;
-        Err(Status::failed_precondition(
-            "remote drop requires durable tombstone support",
-        ))
+        let req: TableIdent = parse_body(&action.body)?;
+        if let Some(forwarded) = self.maybe_forward(&action, &req.namespace).await? {
+            return Ok(forwarded);
+        }
+        let table = TableRef::new(req.namespace, req.name);
+        self.metasrv
+            .drop_table(&table)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(Box::pin(futures::stream::empty())))
     }
 
     /// `resolve`: return the table's registration as one JSON result, or
@@ -681,8 +687,8 @@ impl FlightService for MetasrvFlightService {
             },
             ActionType {
                 r#type:      "drop_table".to_string(),
-                description: "Unavailable until durable tombstones are implemented; returns \
-                              FailedPrecondition. Body JSON: {namespace, name}"
+                description: "Durably tombstone, deregister, and clean one table incarnation \
+                              (leader only). Body JSON: {namespace, name}"
                     .to_string(),
             },
             ActionType {
@@ -1843,7 +1849,7 @@ mod table_placement_tests {
     }
 
     #[tokio::test]
-    async fn remote_drop_requires_durable_tombstone() {
+    async fn remote_drop_removes_dataset_and_is_idempotent() {
         let root = tempfile::tempdir().expect("temporary root");
         let service = service(&root);
         service
@@ -1862,17 +1868,17 @@ mod table_placement_tests {
             .unwrap()
             .expect("created registration");
 
-        let error = match service
+        service
             .action_drop_table(drop_action("robots", "episodes"))
             .await
-        {
-            Ok(_) => panic!("remote drop must wait for durable tombstones"),
-            Err(error) => error,
-        };
-        assert_eq!(error.code(), Code::FailedPrecondition);
+            .expect("durable remote drop");
+        service
+            .action_drop_table(drop_action("robots", "episodes"))
+            .await
+            .expect("idempotent repeated drop");
         assert!(
-            service.metasrv.resolve(&table).await.unwrap().is_some(),
-            "drop rejection must happen before registry or engine mutation"
+            service.metasrv.resolve(&table).await.unwrap().is_none(),
+            "drop must detach the registry"
         );
         assert!(
             service
@@ -1881,8 +1887,8 @@ mod table_placement_tests {
                 .open(&registration.location)
                 .await
                 .unwrap()
-                .is_some(),
-            "drop rejection must leave the underlying dataset intact"
+                .is_none(),
+            "drop must remove the old dataset"
         );
     }
 
@@ -1905,12 +1911,14 @@ mod table_placement_tests {
             .await
             .expect("resolve table")
             .expect("table is registered");
+        let location = std::path::Path::new(registration.location.as_str());
         assert_eq!(
-            registration.location.as_str(),
-            root.path()
-                .join("tables/robots/episodes.lance")
-                .to_str()
-                .expect("UTF-8 temporary path")
+            location.parent(),
+            Some(root.path().join("tables/robots/episodes").as_path())
+        );
+        assert_eq!(
+            location.extension().and_then(std::ffi::OsStr::to_str),
+            Some("lance")
         );
     }
 
@@ -1946,7 +1954,7 @@ mod table_placement_tests {
     async fn remote_create_rejects_overlong_dataset_segment_before_mutation() {
         let root = tempfile::tempdir().expect("temporary root");
         let service = service(&root);
-        let name = "x".repeat(250);
+        let name = "x".repeat(256);
         let result = service
             .action_create_table(create_action(json!({
                 "namespace": "bounds",
@@ -1955,7 +1963,7 @@ mod table_placement_tests {
             })))
             .await;
         let error = match result {
-            Ok(_) => panic!("overlong dataset segment must fail before storage"),
+            Ok(_) => panic!("overlong table directory segment must fail before storage"),
             Err(error) => error,
         };
 
