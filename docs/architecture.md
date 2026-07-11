@@ -74,6 +74,11 @@ pointer after the complete scan, so an in-flight response cannot combine two
 generations and request startup does not deep-clone the full catalog. Flight
 table discovery applies catalog/schema/table/type filters before schema
 resolution and row allocation, so filtered requests pay for matching rows.
+Schema and table discovery share the replica Query admission semaphore and
+hold a permit until the Flight stream completes or is dropped. Responses are
+built lazily in fixed-size batches (256 rows by default); the first match after
+the configured 10,000-row default maximum terminates the stream with
+`ResourceExhausted`.
 
 ### Why the tiers scale differently
 

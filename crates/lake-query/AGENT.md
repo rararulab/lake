@@ -29,7 +29,8 @@ The query layer: stateless SQL compute. `QueryEngine` wires a DataFusion
 - Flight schema/table discovery pins one immutable catalog generation, so
   names and schemas share a publication boundary and requests avoid a full
   listing deep clone. Table filters run before schema resolution and row
-  allocation.
+  allocation. Discovery shares Query admission, emits lazy bounded batches,
+  and rejects matches beyond its configured row maximum.
 - `QueryLimits` bounds concurrency, queue wait, execution duration, and SQL
   bytes per replica. A DoGet permit lives until its stream completes, expires,
   or is dropped; admission never calls the metadata tier.
