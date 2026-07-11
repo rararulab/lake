@@ -253,29 +253,40 @@ async fn lance_engine_on_s3_with_dynamo_external_manifest() {
         .value(0);
     assert_eq!(count, 3, "reads back exactly the 3 rows written");
 
-    // 7. Prove the commit pointer really lives in DynamoDB (not just S3): the
-    //    external store recorded a `lance-manifest/<base_uri>/<version>` key per
-    //    commit.
-    let listed = meta
+    // 7. Prove the current pointer really lives in DynamoDB (not just S3). Latest
+    //    is one fixed point key; advancing to v2 archived v1 under the immutable
+    //    history prefix.
+    let history = meta
         .list_prefix("lance-manifest/")
         .await
-        .expect("list manifest pointers in dynamodb");
+        .expect("list manifest history in dynamodb");
     assert!(
-        !listed.is_empty(),
-        "commit went through the external store: expected lance-manifest/* keys in dynamodb"
+        history.iter().any(|key| key.ends_with("/1")),
+        "advancing latest archived v1; got {history:?}"
     );
-    let latest_key = listed
+    assert!(
+        !history.iter().any(|key| key.ends_with("/2")),
+        "the current version belongs only in the fixed pointer; got {history:?}"
+    );
+    let latest = meta
+        .list_prefix("lance-manifest-latest/")
+        .await
+        .expect("list latest manifest pointers in dynamodb");
+    let latest_key = latest
         .iter()
-        .find(|k| k.ends_with(&format!("/{}", appended.0)) && k.contains("tbl"))
-        .unwrap_or_else(|| panic!("no manifest pointer for {appended}; got {listed:?}"));
+        .find(|key| key.contains("tbl"))
+        .unwrap_or_else(|| panic!("no fixed manifest pointer for {appended}; got {latest:?}"));
     let pointer = meta
-        .get(&format!("lance-manifest/{latest_key}"))
+        .get(&format!("lance-manifest-latest/{latest_key}"))
         .await
         .expect("get manifest pointer from dynamodb")
         .expect("manifest pointer present in dynamodb");
-    assert!(
-        pointer.starts_with(b"{"),
-        "manifest pointer is the JSON value written by MetaManifestStore"
+    let pointer: serde_json::Value =
+        serde_json::from_slice(&pointer).expect("latest pointer is JSON");
+    assert_eq!(
+        pointer["version"].as_u64(),
+        Some(appended.0),
+        "fixed pointer names the appended version"
     );
 
     // 8. Drop the table: `remove` must delete every S3 object under the dataset
@@ -309,7 +320,26 @@ async fn lance_engine_on_s3_with_dynamo_external_manifest() {
         .expect("list manifest pointers after remove");
     assert!(
         stale_manifests.is_empty(),
-        "remove must clear external manifest pointers; got {stale_manifests:?}"
+        "remove must clear external manifest history; got {stale_manifests:?}"
+    );
+    let stale_latest = meta
+        .list_prefix("lance-manifest-latest/")
+        .await
+        .expect("list latest manifest pointers after remove");
+    assert_eq!(
+        stale_latest.len(),
+        1,
+        "remove retains only its durable anti-ABA deletion marker; got {stale_latest:?}"
+    );
+    let deleted = meta
+        .get(&format!("lance-manifest-latest/{}", stale_latest[0]))
+        .await
+        .expect("read durable deletion marker")
+        .expect("durable deletion marker exists");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&deleted).expect("marker JSON")["state"],
+        "deleted",
+        "remove must replace the live pointer with a durable deleted marker"
     );
 
     let recreated = engine

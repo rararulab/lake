@@ -14,8 +14,21 @@ Lance dataset.
   digest, and reference-stage identity in Lance transaction properties.
 - Reference lineage is staged before manifest visibility and repaired from
   transaction history before a recovered version is returned.
+- The external manifest store resolves current state through one fixed
+  `{version,path}` pointer. Advancing it archives the exact prior pointer, then
+  CASes latest; legacy per-version-only datasets scan once to install latest.
+- Drop fences the fixed key through durable `deleting` and `deleted` markers;
+  recreate replaces `deleted`, so stale migration cannot win an ABA CAS.
+- Historical record creation is atomically guarded by the exact fixed-pointer
+  bytes, preventing a writer that read before drop from publishing afterward.
+- Fixed pointers and delete markers carry a UUIDv7 incarnation. Recreate gets a
+  new one, so identical version/path bytes cannot produce cross-cycle ABA.
+- Historical records carry the same incarnation (legacy path-only records are
+  upgraded lazily), so finalize convergence cannot cross a recreate boundary.
 
 ## Layout
 
 - `lib.rs` — `LanceEngine` + `LanceTable` handle (create/open/append/version,
   `LanceTableProvider` for reads)
+- `manifest_store.rs` — generic MetaStore-backed Lance commit arbitration,
+  O(1) latest pointer, immutable historical version records
