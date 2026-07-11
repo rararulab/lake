@@ -22,7 +22,10 @@ registry scan API already shared by catalog refresh.
 2. Build its deterministic `BTreeMap` from `registry::scan_tables`.
 3. Update planning and apply call sites without changing their validation
    order or fingerprint representation.
-4. Run both bound tests and confirm GREEN.
+4. Add destructive-path regressions proving registry changes before apply and
+   between bounded pages stop deletion, plus legacy traversal fingerprint
+   parity.
+5. Run all bound tests and confirm GREEN.
 
 ## Task 3: Document and verify
 

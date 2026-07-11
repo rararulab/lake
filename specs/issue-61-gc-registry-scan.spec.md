@@ -62,8 +62,24 @@ Scenario: GC snapshots the complete registry with one backend scan
 Scenario: Local planning and apply remain fail-closed and serverless
   Test:
     Package: lake-cli
+    Filter: local_gc_apply_rejects_changed_registry_without_deleting
+  Given a dry-run plan for an old unreferenced managed object
+  When the registry changes before explicit apply
+  Then apply rejects before deleting the object
+
+Scenario: Apply revalidates the registry before every bounded page
+  Test:
+    Package: lake-cli
+    Filter: gc_apply_revalidates_registry_between_pages
+  Given a fingerprint-bound two-page plan and a stable registry at apply start
+  When the registry changes while the first page is consumed
+  Then the second page is rejected and none of its candidates are deleted
+
+Scenario: Stable local planning and apply use no server
+  Test:
+    Package: lake-cli
     Filter: local_gc_dry_run_then_apply_uses_no_server
-  Given an old unreferenced managed object and a local registry
+  Given an old unreferenced managed object and an unchanged local registry
   When a dry-run plan is created and explicitly applied
   Then dry-run does not mutate storage and apply consumes the fingerprint-bound plan
 

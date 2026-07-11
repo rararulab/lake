@@ -241,7 +241,10 @@ fn write_inventory_page(writer: &mut BufWriter<File>, page: &InventoryPage) -> a
     Ok(())
 }
 
-async fn apply(ctx: &Context, store: &GcStore, command: GcCmd) -> anyhow::Result<()> {
+async fn apply<D>(ctx: &Context, store: &D, command: GcCmd) -> anyhow::Result<()>
+where
+    D: ManagedObjectDeleter + ?Sized,
+{
     let checkpoint = command
         .checkpoint
         .context("--checkpoint is required with --apply")?;
@@ -442,8 +445,8 @@ mod tests {
     use std::{
         fs::FileTimes,
         sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -459,6 +462,12 @@ mod tests {
         scan_calls: AtomicUsize,
         list_calls: AtomicUsize,
         get_calls:  AtomicUsize,
+    }
+
+    struct RegistryMutatingDeleter {
+        meta:    MetaStoreRef,
+        changed: AtomicBool,
+        seen:    Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -492,6 +501,51 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ManagedObjectDeleter for RegistryMutatingDeleter {
+        fn managed_uri_prefix(&self) -> String { "s3://lake/managed/".to_owned() }
+
+        async fn delete_candidate(
+            &self,
+            candidate: &ObjectCandidate,
+        ) -> lake_objects::Result<DeleteOutcome> {
+            self.seen.lock().unwrap().push(candidate.uri.clone());
+            if !self.changed.swap(true, Ordering::SeqCst) {
+                registry::register(
+                    self.meta.as_ref(),
+                    &TableRef::new("changed", "during_apply"),
+                    &TableRegistration::new(
+                        TableLocation::new("mem://changed/during_apply"),
+                        "lance",
+                        Version(1),
+                        Vec::new(),
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+            Ok(DeleteOutcome::Deleted)
+        }
+    }
+
+    async fn legacy_registry_snapshot(
+        meta: &dyn MetaStore,
+    ) -> BTreeMap<TableRef, TableRegistration> {
+        let mut snapshot = BTreeMap::new();
+        for namespace in registry::list_namespaces(meta).await.unwrap() {
+            for name in registry::list(meta, &namespace).await.unwrap() {
+                let table = TableRef {
+                    namespace: namespace.clone(),
+                    name,
+                };
+                if let Some(registration) = registry::get(meta, &table).await.unwrap() {
+                    snapshot.insert(table, registration);
+                }
+            }
+        }
+        snapshot
+    }
+
     #[tokio::test]
     async fn gc_registry_snapshot_uses_single_scan() {
         let temp = tempfile::tempdir().unwrap();
@@ -523,10 +577,79 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(registry_snapshot(&meta).await.unwrap(), registrations);
+        let snapshot = registry_snapshot(&meta).await.unwrap();
+        assert_eq!(snapshot, registrations);
         assert_eq!(meta.scan_calls.load(Ordering::SeqCst), 1);
         assert_eq!(meta.list_calls.load(Ordering::SeqCst), 0);
         assert_eq!(meta.get_calls.load(Ordering::SeqCst), 0);
+        let legacy = legacy_registry_snapshot(meta.inner.as_ref()).await;
+        assert_eq!(
+            registry_fingerprint(&snapshot).unwrap(),
+            registry_fingerprint(&legacy).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_apply_revalidates_registry_between_pages() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = Context::open(temp.path().join("data").to_str().unwrap())
+            .await
+            .unwrap();
+        let plan = temp.path().join("plan");
+        let checkpoint = temp.path().join("apply.json");
+        let root_fingerprint =
+            registry_fingerprint(&registry_snapshot(ctx.meta.as_ref()).await.unwrap()).unwrap();
+        let pages = GcPlanner::try_new("s3://lake/managed/", 100, 1, true)
+            .unwrap()
+            .plan(
+                vec![
+                    ObjectCandidate {
+                        uri:              "s3://lake/managed/a".to_owned(),
+                        size_bytes:       1,
+                        last_modified_ms: 1,
+                    },
+                    ObjectCandidate {
+                        uri:              "s3://lake/managed/b".to_owned(),
+                        size_bytes:       1,
+                        last_modified_ms: 1,
+                    },
+                ],
+                Vec::<lake_common::ObjectIdentity>::new(),
+            );
+        GcPlanWriter::try_new(&plan, "s3://lake/managed/", 100, 1)
+            .unwrap()
+            .with_source_fingerprint(root_fingerprint)
+            .write(pages)
+            .unwrap();
+        let deleter = RegistryMutatingDeleter {
+            meta:    ctx.meta.clone(),
+            changed: AtomicBool::new(false),
+            seen:    Mutex::new(Vec::new()),
+        };
+
+        let error = apply(
+            &ctx,
+            &deleter,
+            GcCmd {
+                plan,
+                safety_age_secs: None,
+                apply: true,
+                checkpoint: Some(checkpoint),
+                json: true,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("registry changed during GC apply")
+        );
+        assert_eq!(
+            deleter.seen.lock().unwrap().as_slice(),
+            &["s3://lake/managed/a"]
+        );
     }
 
     #[tokio::test]
@@ -574,5 +697,67 @@ mod tests {
         .await
         .unwrap();
         assert!(!orphan.exists());
+    }
+
+    #[tokio::test]
+    async fn local_gc_apply_rejects_changed_registry_without_deleting() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let ctx = Context::open(data_dir.to_str().unwrap()).await.unwrap();
+        let managed = data_dir.join("managed-objects");
+        std::fs::create_dir_all(&managed).unwrap();
+        let orphan = managed.join("old-orphan");
+        std::fs::write(&orphan, b"orphan").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&orphan)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))
+            .unwrap();
+        let plan = temp.path().join("plan");
+
+        run(
+            &ctx,
+            GcCmd {
+                plan:            plan.clone(),
+                safety_age_secs: Some(1),
+                apply:           false,
+                checkpoint:      None,
+                json:            true,
+            },
+        )
+        .await
+        .unwrap();
+        registry::register(
+            ctx.meta.as_ref(),
+            &TableRef::new("changed", "after_plan"),
+            &TableRegistration::new(
+                TableLocation::new("mem://changed/after_plan"),
+                "lance",
+                Version(1),
+                Vec::new(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let error = run(
+            &ctx,
+            GcCmd {
+                plan,
+                safety_age_secs: None,
+                apply: true,
+                checkpoint: Some(temp.path().join("apply.json")),
+                json: true,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("registry no longer matches"));
+        assert!(
+            orphan.exists(),
+            "changed registry must reject before deletion"
+        );
     }
 }
