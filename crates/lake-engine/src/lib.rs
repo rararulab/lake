@@ -22,5 +22,8 @@
 mod engine;
 mod error;
 
-pub use engine::{TableEngine, TableEngineRef, TableHandle, TableHandleRef};
+pub use engine::{
+    ObjectReferenceCursor, ObjectReferencePage, ObjectReferenceRequest, TableEngine,
+    TableEngineRef, TableHandle, TableHandleRef,
+};
 pub use error::{EngineError, Result};

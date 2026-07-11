@@ -407,7 +407,10 @@ mod tests {
 
     use async_trait::async_trait;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-    use lake_engine::{Result as EngineResult, TableEngine, TableEngineRef, TableHandleRef};
+    use lake_engine::{
+        ObjectReferencePage, ObjectReferenceRequest, Result as EngineResult, TableEngine,
+        TableEngineRef, TableHandleRef,
+    };
     use lake_engine_lance::LanceEngine;
     use lake_meta::RocksMeta;
     use tokio::sync::{Notify, oneshot};
@@ -448,6 +451,16 @@ mod tests {
             version: Version,
         ) -> EngineResult<Option<Version>> {
             self.inner.maintain(location, version).await
+        }
+
+        async fn retained_object_references(
+            &self,
+            location: &TableLocation,
+            request: ObjectReferenceRequest,
+        ) -> EngineResult<ObjectReferencePage> {
+            self.inner
+                .retained_object_references(location, request)
+                .await
         }
     }
 

@@ -39,7 +39,10 @@ use datafusion::{
 };
 use futures::{StreamExt, TryStreamExt};
 use lake_common::{TableLocation, Version};
-use lake_engine::{EngineError, Result, TableEngine, TableHandle, TableHandleRef};
+use lake_engine::{
+    EngineError, ObjectReferencePage, ObjectReferenceRequest, Result, TableEngine, TableHandle,
+    TableHandleRef,
+};
 use lake_meta::MetaStoreRef;
 use lance::{
     Dataset,
@@ -251,6 +254,17 @@ impl TableEngine for LanceEngine {
             .await
             .map_err(EngineError::backend)?;
         Ok((maintained_version != version).then_some(maintained_version))
+    }
+
+    async fn retained_object_references(
+        &self,
+        location: &TableLocation,
+        _request: ObjectReferenceRequest,
+    ) -> Result<ObjectReferencePage> {
+        Err(EngineError::ReferenceLineageUnavailable {
+            location: location.clone(),
+            reason:   "object reference journals have not been initialized".to_owned(),
+        })
     }
 }
 
