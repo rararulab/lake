@@ -65,6 +65,14 @@ Scenario: Cancelled maintenance does not begin another table
   When shutdown is cancelled and the first operation is allowed to finish
   Then the sweep returns without invoking maintenance for the second table
 
+Scenario: Cancelled drop GC does not begin another durable cleanup
+  Test:
+    Package: lake-metasrv
+    Filter: drop_gc_shutdown_stops_before_next_tombstone
+  Given a page with two drop tombstones whose first object cleanup is paused
+  When shutdown is cancelled and the first cleanup is allowed to finish
+  Then drop GC returns without starting cleanup for the second tombstone
+
 ## Out of Scope
 
 - Interrupting a durable engine transaction before the total deadline.
