@@ -25,6 +25,7 @@
 //! the Arrow Flight SQL wire (see `flight`).
 
 mod flight;
+mod telemetry;
 
 use std::{
     path::{Path, PathBuf},
@@ -533,7 +534,14 @@ where
         server = server.tls_config(tls).context(ServeSnafu)?;
     }
 
-    engine.refresh().await?;
+    telemetry::describe();
+    telemetry::ready(false);
+    if let Err(error) = engine.refresh().await {
+        telemetry::catalog_refresh("initial", "error");
+        return Err(error);
+    }
+    telemetry::catalog_refresh("initial", "success");
+    telemetry::ready(true);
     let (health_reporter, health_service) = health_reporter();
     health_reporter
         .set_service_status(FLIGHT_SERVICE_NAME, ServingStatus::Serving)
@@ -574,6 +582,7 @@ where
     let server_result = tokio::select! {
         result = &mut server => result.context(ServeSnafu),
         () = &mut shutdown => {
+            telemetry::ready(false);
             health_reporter
                 .set_service_status(FLIGHT_SERVICE_NAME, ServingStatus::NotServing)
                 .await;
@@ -587,6 +596,7 @@ where
             }
         }
     };
+    telemetry::ready(false);
     cancellation.cancel();
     engine.shutdown_catalog_revalidation().await;
     let refresher_result = background
@@ -631,8 +641,12 @@ async fn run_catalog_refresh_loop(engine: Arc<QueryEngine>, shutdown: Cancellati
                 tokio::select! {
                     () = shutdown.cancelled() => return,
                     result = engine.refresh() => {
-                        if let Err(err) = result {
-                            tracing::warn!(error = %err, "background catalog refresh failed");
+                        match result {
+                            Ok(()) => telemetry::catalog_refresh("background", "success"),
+                            Err(err) => {
+                                telemetry::catalog_refresh("background", "error");
+                                tracing::warn!(error = %err, "background catalog refresh failed");
+                            }
                         }
                     }
                 }

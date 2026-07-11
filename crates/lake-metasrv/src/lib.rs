@@ -35,6 +35,7 @@ mod leadership;
 mod maintenance;
 mod operation;
 mod placement;
+mod telemetry;
 
 use std::{
     collections::HashMap,
@@ -960,6 +961,7 @@ async fn run_health_readiness_until(
     let mut changes = leadership.subscribe_changes();
     loop {
         let readiness = leadership.write_readiness(&own_addr);
+        telemetry::write_ready(readiness.ready);
         let status = if readiness.ready {
             ServingStatus::Serving
         } else {
@@ -987,6 +989,7 @@ async fn run_health_readiness_until(
             }
         }
     }
+    telemetry::write_ready(false);
 }
 
 /// Run until `crash` fires, then drop RPCs and campaigns without resigning.
@@ -1017,6 +1020,8 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let socket = addr.parse().context(AddressSnafu { addr })?;
+    telemetry::describe();
+    telemetry::write_ready(false);
     config
         .server_security
         .validate_exposure(socket, config.allow_insecure)

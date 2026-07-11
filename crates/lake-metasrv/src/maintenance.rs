@@ -35,6 +35,7 @@ use crate::{
     MaintenanceLimits, Metasrv, MetasrvError,
     leadership::Leadership,
     operation::{AppendRecord, AppendState, OPERATION_PREFIX, active_key},
+    telemetry,
 };
 
 const DEFAULT_TABLE_MAINTENANCE_PAGE_SIZE: usize = 128;
@@ -103,6 +104,9 @@ async fn sweep_until_with_page_size(
         completed = drop_gc.completed,
         "drop tombstone maintenance page complete"
     );
+    telemetry::maintenance_page("drop_tombstones");
+    telemetry::maintenance_items("drop_tombstones", "scanned", drop_gc.scanned);
+    telemetry::maintenance_items("drop_tombstones", "completed", drop_gc.completed);
     if shutdown.is_cancelled() {
         return;
     }
@@ -112,6 +116,9 @@ async fn sweep_until_with_page_size(
         deleted = operation_gc.deleted,
         "append operation maintenance page complete"
     );
+    telemetry::maintenance_page("append_operations");
+    telemetry::maintenance_items("append_operations", "scanned", operation_gc.scanned);
+    telemetry::maintenance_items("append_operations", "deleted", operation_gc.deleted);
     if shutdown.is_cancelled() {
         return;
     }
@@ -124,6 +131,12 @@ async fn sweep_until_with_page_size(
         failed = tables.failed,
         "table maintenance page complete"
     );
+    telemetry::maintenance_page("tables");
+    telemetry::maintenance_items("tables", "scanned", tables.scanned);
+    telemetry::maintenance_items("tables", "attempted", tables.attempted);
+    telemetry::maintenance_items("tables", "maintained", tables.maintained);
+    telemetry::maintenance_items("tables", "skipped", tables.skipped);
+    telemetry::maintenance_items("tables", "failed", tables.failed);
 }
 
 #[derive(Clone, Copy, Debug, Default)]

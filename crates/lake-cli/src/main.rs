@@ -20,6 +20,7 @@
 #![allow(clippy::print_stdout)]
 
 mod commands;
+mod metrics;
 mod observability;
 
 use clap::{Parser, Subcommand};

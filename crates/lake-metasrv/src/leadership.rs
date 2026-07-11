@@ -32,7 +32,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::election::{LeaseElection, LeaseGuard, LeaseStatus};
+use crate::{
+    election::{LeaseElection, LeaseGuard, LeaseStatus},
+    telemetry,
+};
 
 /// How often the campaign loop renews the lease. Half the 10s TTL used by
 /// [`serve`](crate::serve), so a renew is attempted well before expiry.
@@ -241,7 +244,7 @@ async fn campaign_once(election: &LeaseElection, leadership: &Leadership) {
     // most another 40% of the lease on store I/O leaves a 10% demotion
     // margin before the previously published deadline.
     let campaign_timeout = election.ttl() * 2 / 5;
-    let (leader, local_authority) =
+    let (leader, local_authority, outcome) =
         match tokio::time::timeout(campaign_timeout, election.campaign()).await {
             Ok(Ok(LeaseStatus::Leader { guard, .. })) => (
                 Some(election.node_id().to_string()),
@@ -249,13 +252,14 @@ async fn campaign_once(election: &LeaseElection, leadership: &Leadership) {
                     deadline: campaign_started + election.ttl(),
                     guard,
                 }),
+                "leader",
             ),
             Ok(Ok(LeaseStatus::Follower { current_holder })) => {
                 // An empty holder means the lease vanished under a lost race;
                 // report "no known leader" so writes fail fast rather than
                 // forwarding to nowhere.
                 let leader = (!current_holder.is_empty()).then_some(current_holder);
-                (leader, None)
+                (leader, None, "follower")
             }
             Ok(Err(err)) => {
                 tracing::warn!(
@@ -263,7 +267,7 @@ async fn campaign_once(election: &LeaseElection, leadership: &Leadership) {
                     error = %err,
                     "leadership campaign failed; treating as not leader this round"
                 );
-                (None, None)
+                (None, None, "error")
             }
             Err(_) => {
                 tracing::warn!(
@@ -271,9 +275,10 @@ async fn campaign_once(election: &LeaseElection, leadership: &Leadership) {
                     timeout_ms = campaign_timeout.as_millis(),
                     "leadership campaign timed out; treating as not leader this round"
                 );
-                (None, None)
+                (None, None, "timeout")
             }
         };
+    telemetry::campaign(outcome);
 
     let now_leader = local_authority
         .as_ref()

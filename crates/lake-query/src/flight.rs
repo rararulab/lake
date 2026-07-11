@@ -62,7 +62,7 @@ use tokio::{
 };
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::{DiscoveryLimits, QueryEngine, QueryLimits};
+use crate::{DiscoveryLimits, QueryEngine, QueryLimits, telemetry};
 
 #[derive(Clone, Debug)]
 pub(crate) struct QueryAdmission {
@@ -78,18 +78,28 @@ impl QueryAdmission {
         }
     }
 
-    async fn acquire(&self) -> std::result::Result<OwnedSemaphorePermit, Status> {
-        tokio::time::timeout(
+    pub(crate) async fn acquire(&self) -> std::result::Result<QueryPermit, Status> {
+        let permit = tokio::time::timeout(
             self.limits.queue_wait(),
             self.semaphore.clone().acquire_owned(),
         )
         .await
-        .map_err(|_| Status::resource_exhausted("query concurrency limit reached"))?
-        .map_err(|_| Status::unavailable("query admission is shutting down"))
+        .map_err(|_| {
+            telemetry::admission("saturated");
+            Status::resource_exhausted("query concurrency limit reached")
+        })?
+        .map_err(|_| {
+            telemetry::admission("shutting_down");
+            Status::unavailable("query admission is shutting down")
+        })?;
+        telemetry::admission("admitted");
+        telemetry::inflight_increment();
+        Ok(QueryPermit { _permit: permit })
     }
 
-    fn validate_sql_size(&self, bytes: &[u8]) -> std::result::Result<(), Status> {
+    pub(crate) fn validate_sql_size(&self, bytes: &[u8]) -> std::result::Result<(), Status> {
         if bytes.len() > self.limits.max_sql_bytes() {
+            telemetry::rejection("sql_too_large");
             return Err(Status::resource_exhausted(
                 "SQL or statement ticket exceeds the configured byte limit",
             ));
@@ -100,10 +110,18 @@ impl QueryAdmission {
     fn execution_deadline(&self) -> Instant { Instant::now() + self.limits.execution_time() }
 }
 
+pub(crate) struct QueryPermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for QueryPermit {
+    fn drop(&mut self) { telemetry::inflight_decrement(); }
+}
+
 struct AdmittedFlightStream {
     inner:    Option<<FlightSqlServiceImpl as FlightService>::DoGetStream>,
     deadline: Pin<Box<Sleep>>,
-    permit:   Option<OwnedSemaphorePermit>,
+    permit:   Option<QueryPermit>,
 }
 
 fn apply_delegated_append_scope(
@@ -460,7 +478,7 @@ impl AdmittedFlightStream {
     fn new(
         inner: <FlightSqlServiceImpl as FlightService>::DoGetStream,
         deadline: Instant,
-        permit: OwnedSemaphorePermit,
+        permit: QueryPermit,
     ) -> Self {
         Self {
             inner:    Some(inner),

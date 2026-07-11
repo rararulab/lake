@@ -304,3 +304,17 @@ window is reported as an error and makes the process exit non-zero.
 
 For the design and invariants, see [managed objects](docs/design/managed-objects.md)
 and [architecture](docs/architecture.md).
+
+## Production telemetry
+
+Query and Metasrv emit structured JSON logs and authenticated standard gRPC
+Health. Set `LAKE_METRICS_ADDR` to a loopback IP socket to add Prometheus
+metrics at `/metrics`; collect it with a localhost sidecar or node agent:
+
+```bash
+LAKE_METRICS_ADDR=127.0.0.1:9090 lake meta --addr 127.0.0.1:50052
+```
+
+Lake rejects non-loopback metrics listeners and never places SQL, tenant,
+table, object URI, operation ID, or credentials in metric labels. See the
+[CLI guide](docs/guides/cli.md#prometheus-metrics) for the exported series.
