@@ -32,8 +32,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use url::Url;
 
 use crate::{
-    InventoryPage, InventoryRequest, ManagedObjectInventory, ManagedObjectStore, ObjectCandidate,
-    ObjectError, ObjectReader, Result,
+    DeleteOutcome, InventoryPage, InventoryRequest, ManagedObjectDeleter, ManagedObjectInventory,
+    ManagedObjectStore, ObjectCandidate, ObjectError, ObjectReader, Result,
     checkpoint::{
         CheckpointBinding, CheckpointLock, CheckpointPart, SourceIdentity, UploadCheckpointV1,
     },
@@ -762,6 +762,28 @@ impl ManagedObjectInventory for S3ObjectStore {
             None
         };
         Ok(InventoryPage::new(candidates, next_cursor))
+    }
+}
+
+#[async_trait]
+impl ManagedObjectDeleter for S3ObjectStore {
+    fn managed_uri_prefix(&self) -> String {
+        <Self as ManagedObjectInventory>::managed_uri_prefix(self)
+    }
+
+    async fn delete_candidate(&self, candidate: &ObjectCandidate) -> Result<DeleteOutcome> {
+        let key = self.managed_key(&candidate.uri)?;
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|error| ObjectError::S3 {
+                action:  "delete_object",
+                message: error.to_string(),
+            })?;
+        Ok(DeleteOutcome::DeletedOrAbsent)
     }
 }
 

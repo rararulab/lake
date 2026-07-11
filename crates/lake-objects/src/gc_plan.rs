@@ -242,6 +242,22 @@ impl GcPlan {
         self.manifest.binding.first_page_hash.as_deref()
     }
 
+    pub(crate) fn expected_page_hash(&self, index: usize) -> Result<Option<String>> {
+        if index > self.page_count() {
+            return Err(ObjectError::GcPlanMismatch {
+                field: "page index",
+            });
+        }
+        let mut expected = self.manifest.binding.first_page_hash.clone();
+        for prior_index in 0..index {
+            let hash = expected.as_deref().ok_or(ObjectError::GcPlanMismatch {
+                field: "page chain length",
+            })?;
+            expected = self.page(prior_index, hash)?.next_page_hash;
+        }
+        Ok(expected)
+    }
+
     fn verify_pages(&self) -> Result<()> {
         if self.manifest.binding.version != PLAN_VERSION {
             return Err(ObjectError::GcPlanMismatch { field: "version" });

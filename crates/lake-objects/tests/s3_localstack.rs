@@ -25,7 +25,8 @@ use aws_sdk_s3::{
     types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart},
 };
 use lake_objects::{
-    InventoryRequest, ManagedObjectInventory, ManagedObjectStore, ObjectError, S3ObjectStore,
+    GcPlanApplier, GcPlanWriter, GcPlanner, InventoryRequest, ManagedObjectInventory,
+    ManagedObjectStore, ObjectCandidate, ObjectError, S3ObjectStore,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
@@ -186,6 +187,88 @@ async fn s3_inventory_is_bounded_sorted_and_stage_scoped_localstack() {
 
 #[test]
 fn s3_inventory_localstack_is_wired() {
+    let integration = include_str!("../../../scripts/test-integration.ts");
+    assert!(integration.contains("lake-objects"));
+    assert!(integration.contains("--run-ignored"));
+}
+
+#[tokio::test]
+#[ignore = "requires LocalStack S3; set LAKE_S3_ENDPOINT and run with --ignored"]
+async fn s3_gc_apply_resumes_from_checkpoint_localstack() {
+    let Some((client, store, bucket)) = stage().await else {
+        return;
+    };
+    for key in [
+        "managed/objects/live",
+        "managed/objects/young",
+        "managed/objects/orphan-a",
+        "managed/objects/orphan-b",
+    ] {
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"gc"))
+            .send()
+            .await
+            .unwrap();
+    }
+    let prefix = format!("s3://{bucket}/managed/objects/");
+    let orphan = |name: &str| ObjectCandidate {
+        uri:              format!("{prefix}{name}"),
+        size_bytes:       2,
+        last_modified_ms: 10,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let plan_path = temp.path().join("plan");
+    let checkpoint = temp.path().join("apply.json");
+    let pages = GcPlanner::try_new(&prefix, 100, 1, true)
+        .unwrap()
+        .plan(vec![orphan("orphan-a"), orphan("orphan-b")], Vec::new());
+    GcPlanWriter::try_new(&plan_path, &prefix, 100, 1)
+        .unwrap()
+        .write(pages)
+        .unwrap();
+
+    let mut first = GcPlanApplier::open(&plan_path, &checkpoint).await.unwrap();
+    let progress = first.apply_next(&store).await.unwrap();
+    assert_eq!(progress.completed_pages(), 1);
+    assert!(!progress.is_complete());
+    drop(first);
+
+    // S3 DeleteObject is idempotent. Make the next planned object absent to
+    // prove a restarted apply still advances its durable checkpoint.
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key("managed/objects/orphan-b")
+        .send()
+        .await
+        .unwrap();
+    let mut resumed = GcPlanApplier::open(&plan_path, &checkpoint).await.unwrap();
+    let progress = resumed.apply_next(&store).await.unwrap();
+    assert!(progress.is_complete());
+    assert_eq!(progress.completed_pages(), 2);
+    assert_eq!(progress.processed_objects(), 2);
+    drop(resumed);
+
+    let checkpoint_json: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(&checkpoint).await.unwrap()).unwrap();
+    assert_eq!(checkpoint_json["complete"], true);
+    assert_eq!(checkpoint_json["next_page_index"], 2);
+    for key in ["managed/objects/live", "managed/objects/young"] {
+        client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .expect("live and young objects remain");
+    }
+}
+
+#[test]
+fn s3_gc_apply_resumes_from_checkpoint_localstack_is_wired() {
     let integration = include_str!("../../../scripts/test-integration.ts");
     assert!(integration.contains("lake-objects"));
     assert!(integration.contains("--run-ignored"));

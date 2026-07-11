@@ -32,8 +32,8 @@ use tokio::{
 use url::Url;
 
 use crate::{
-    InventoryPage, InventoryRequest, ManagedObjectInventory, ManagedObjectStore, ObjectCandidate,
-    ObjectError, ObjectReader, Result, validate_range,
+    DeleteOutcome, InventoryPage, InventoryRequest, ManagedObjectDeleter, ManagedObjectInventory,
+    ManagedObjectStore, ObjectCandidate, ObjectError, ObjectReader, Result, validate_range,
 };
 
 /// Bounded copy chunk, chosen to keep multi-gigabyte uploads off the heap.
@@ -275,7 +275,7 @@ impl ManagedObjectInventory for LocalObjectStore {
     }
 
     async fn inventory_page(&self, request: InventoryRequest) -> Result<InventoryPage> {
-        let prefix = self.managed_uri_prefix();
+        let prefix = <Self as ManagedObjectInventory>::managed_uri_prefix(self);
         let (cursor, max_items) = request.into_parts();
         if cursor
             .as_deref()
@@ -373,5 +373,42 @@ impl ManagedObjectInventory for LocalObjectStore {
                 .clone()
         });
         Ok(InventoryPage::new(candidates, next_cursor))
+    }
+}
+
+#[async_trait]
+impl ManagedObjectDeleter for LocalObjectStore {
+    fn managed_uri_prefix(&self) -> String {
+        <Self as ManagedObjectInventory>::managed_uri_prefix(self)
+    }
+
+    async fn delete_candidate(&self, candidate: &ObjectCandidate) -> Result<DeleteOutcome> {
+        let path = Url::parse(&candidate.uri)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+            .ok_or_else(|| ObjectError::InvalidLocalUri {
+                uri: candidate.uri.clone(),
+            })?;
+        let is_direct_object = path.parent() == Some(self.root.as_path())
+            && path
+                .file_name()
+                .is_some_and(|name| !name.to_string_lossy().starts_with('.'));
+        if !is_direct_object {
+            return Err(ObjectError::OutsideManagedPrefix {
+                path,
+                root: self.root.clone(),
+            });
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(DeleteOutcome::Deleted),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                Ok(DeleteOutcome::AlreadyAbsent)
+            }
+            Err(source) => Err(ObjectError::Io {
+                action: "deleting".to_owned(),
+                path,
+                source,
+            }),
+        }
     }
 }
