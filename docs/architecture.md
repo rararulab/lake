@@ -252,8 +252,19 @@ design-level ones:
   SDK receives only the query endpoint, discovers a credential-free managed
   stage descriptor once, and constructs local/S3 access using process
   credentials; query forwards metadata to the leader-aware metasrv. Browser
-  presigning, authenticated expiring locations, codec indexes, and object GC
-  are deferred.
+  presigning, authenticated expiring locations, and codec indexes are
+  deferred.
+- Managed-object reachability is incremental rather than a table-row scan.
+  Every version-producing Lance commit publishes a canonical chunked
+  reference edge before the registry pointer can advance. The separate
+  `lake gc` worker pages those edges and storage inventory, externally merges
+  live URIs with bounded memory/open files, age-gates candidates, and publishes
+  an immutable content-addressed plan only after full validation. Explicit
+  apply verifies the stage and registry-root fingerprint before each bounded
+  page and fsyncs a resumable checkpoint. Missing lineage, registry movement,
+  stale/corrupt plans, prefix escapes, and future removal deltas all fail
+  closed. The operational safety horizon must exceed upload-to-commit retries;
+  apply runs in a write-quiescent window.
 
 ## Phasing
 

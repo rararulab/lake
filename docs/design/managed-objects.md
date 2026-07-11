@@ -91,8 +91,47 @@ Rust SDK INSERT (logical FILE)
 
 If upload fails, no append is attempted and the table's current version does
 not advance. If a later append CAS loses a race, the uploaded object is
-unreferenced and future object GC can reclaim it. Readers of a committed row
-open its `DataLocation` directly through the SDK.
+unreferenced and object GC can reclaim it after the safety horizon. Readers of
+a committed row open its `DataLocation` directly through the SDK.
+
+## Reference journal and garbage collection
+
+Lance append extracts `DataLocation` identities while consuming RecordBatches
+and releases each consumed batch immediately. Before the new version is
+returned to the registry CAS, the engine writes canonical, chunked
+parent→child reference deltas under the dataset's `_lake/object_refs/`
+namespace. Version-producing maintenance writes the same lineage edge. A
+missing, corrupt, mismatched, or non-monotonic edge makes reference enumeration
+fail closed.
+
+The registry version is the traversal root. The GC worker pages every table's
+retained lineage, spills additions into bounded sorted runs, and performs a
+bounded-fan-in external merge into one globally URI-sorted live index. Current
+tables are append-only; a non-empty removal delta is rejected until
+retained-snapshot-aware row deletion exists. This is conservative: committed
+objects may be retained longer, but cannot be deleted early.
+
+Candidate inventory and the live index are merged in URI order. Only objects
+inside the exact managed stage, older than the configured cutoff, and absent
+from the live index enter draft pages. Draft output never authorizes deletion.
+The writer validates the complete stream, then publishes a content-addressed
+page chain and its manifest last. The manifest binds stage, cutoff, totals,
+and the registry-root fingerprint.
+
+Apply reopens and verifies the full plan before mutation, checks the registry
+fingerprint before each page, validates the next content hash from its durable
+checkpoint, deletes only that bounded page, and atomically fsyncs progress.
+Local `NotFound` and S3's idempotent `DeleteObject` are success. This worker is
+owned by `lake gc`; it never runs in Query or Metasrv maintenance.
+
+The cost is linear in retained reference sidecars plus managed inventory, not
+table row count. Memory is bounded by one reference run, a finite merge fan-in,
+one inventory page, and one deletion page. Temporary disk must hold the live
+index and inventory spool; the immutable plan holds only orphan candidates.
+
+Operationally, the safety horizon must exceed the maximum time from completed
+upload to committed INSERT, including retries. Apply should run in a
+write-quiescent window; any observed registry change invalidates the plan.
 
 ## Boundaries
 
@@ -111,6 +150,6 @@ as sequential reads. They do not introduce a query endpoint, signed URL, or
 arbitrary URI escape hatch.
 
 The current slice does not provide tenant authorization, browser presigning,
-object deduplication, cross-host checkpoint sharing, or garbage collection.
+object deduplication, cross-host upload-checkpoint sharing, or row-level DELETE.
 Those additions must keep the same visibility rule: a SQL-visible
 `DataLocation` always identifies a complete, immutable object.
