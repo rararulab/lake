@@ -43,7 +43,7 @@ use datafusion::{
     physical_plan::stream::RecordBatchStreamAdapter,
 };
 use futures::{StreamExt, TryStreamExt};
-use lake_common::{ObjectIdentity, ObjectReferenceDelta, TableLocation, Version};
+use lake_common::{AppendOperation, ObjectIdentity, ObjectReferenceDelta, TableLocation, Version};
 use lake_engine::{
     EngineError, ObjectReferencePage, ObjectReferenceRequest, Result, TableEngine, TableHandle,
     TableHandleRef,
@@ -57,7 +57,7 @@ use lance::{
         builder::DatasetBuilder,
         cleanup::CleanupPolicyBuilder,
         optimize::{CompactionOptions, compact_files},
-        write::InsertBuilder,
+        write::{CommitBuilder, InsertBuilder},
     },
     io::{ObjectStoreParams, StorageOptionsAccessor},
 };
@@ -184,6 +184,19 @@ const REFERENCE_CHUNK_SIZE: usize = 4_096;
 #[cfg(test)]
 const REFERENCE_CHUNK_SIZE: usize = 2;
 const MAX_REFERENCES_PER_APPEND: usize = 1_000_000;
+const APPEND_TENANT_PROPERTY: &str = "lake.append.tenant";
+const APPEND_OPERATION_PROPERTY: &str = "lake.append.operation_id";
+const APPEND_DIGEST_PROPERTY: &str = "lake.append.payload_sha256";
+const APPEND_REFERENCE_STAGE_PROPERTY: &str = "lake.append.reference_stage";
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct StagedReferenceChunk {
+    format_version: u8,
+    parent_version: Version,
+    chunk_index:    u32,
+    chunk_count:    u32,
+    added:          Vec<ObjectIdentity>,
+}
 
 #[async_trait]
 impl TableEngine for LanceEngine {
@@ -564,6 +577,232 @@ fn invalid_reference(message: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
+fn reference_stage(operation: &AppendOperation) -> String {
+    format!(
+        "{}--{}",
+        operation.tenant().as_str(),
+        operation.operation_id().as_str()
+    )
+}
+
+async fn persist_staged_references(
+    config: &WriteConfig,
+    location: &TableLocation,
+    operation: &AppendOperation,
+    parent_version: Version,
+    added: Vec<ObjectIdentity>,
+) -> Result<String> {
+    let url = dataset_url(location)?;
+    let (store, root) = object_store::parse_url_opts(&url, config.storage_options.clone())
+        .map_err(EngineError::backend)?;
+    let stage = reference_stage(operation);
+    let chunks = added.len().max(1).div_ceil(REFERENCE_CHUNK_SIZE);
+    let chunk_count = u32::try_from(chunks).map_err(EngineError::backend)?;
+    for index in 0..chunks {
+        let start = index * REFERENCE_CHUNK_SIZE;
+        let end = (start + REFERENCE_CHUNK_SIZE).min(added.len());
+        let chunk = StagedReferenceChunk {
+            format_version: 1,
+            parent_version,
+            chunk_index: u32::try_from(index).map_err(EngineError::backend)?,
+            chunk_count,
+            added: if start < end {
+                added[start..end].to_vec()
+            } else {
+                Vec::new()
+            },
+        };
+        let encoded = serde_json::to_vec(&chunk).map_err(EngineError::backend)?;
+        let path = root
+            .clone()
+            .join("_lake")
+            .join("object_refs_staging")
+            .join(stage.as_str())
+            .join(format!("{index}.json"));
+        match store
+            .put_opts(&path, encoded.clone().into(), PutMode::Create.into())
+            .await
+        {
+            Ok(_) => {}
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = store
+                    .get(&path)
+                    .await
+                    .map_err(EngineError::backend)?
+                    .bytes()
+                    .await
+                    .map_err(EngineError::backend)?;
+                if existing.as_ref() != encoded {
+                    return Err(EngineError::IdempotencyConflict {
+                        operation_id: operation.operation_id().clone(),
+                    });
+                }
+            }
+            Err(error) => return Err(EngineError::backend(error)),
+        }
+    }
+    Ok(stage)
+}
+
+async fn finalize_staged_references(
+    config: &WriteConfig,
+    location: &TableLocation,
+    stage: &str,
+    table_version: Version,
+) -> Result<()> {
+    if final_reference_chunks_complete(config, location, table_version).await? {
+        return Ok(());
+    }
+    let url = dataset_url(location)?;
+    let (store, root) = object_store::parse_url_opts(&url, config.storage_options.clone())
+        .map_err(EngineError::backend)?;
+    let first_path = root
+        .clone()
+        .join("_lake")
+        .join("object_refs_staging")
+        .join(stage)
+        .join("0.json");
+    let first = store
+        .get(&first_path)
+        .await
+        .map_err(EngineError::backend)?
+        .bytes()
+        .await
+        .map_err(EngineError::backend)?;
+    let first: StagedReferenceChunk =
+        serde_json::from_slice(&first).map_err(EngineError::backend)?;
+    if first.format_version != 1 || first.chunk_index != 0 || first.chunk_count == 0 {
+        return Err(EngineError::ReferenceLineageUnavailable {
+            location: location.clone(),
+            reason:   "invalid staged reference header".to_owned(),
+        });
+    }
+    for index in 0..first.chunk_count {
+        let chunk = if index == 0 {
+            first.clone()
+        } else {
+            let path = root
+                .clone()
+                .join("_lake")
+                .join("object_refs_staging")
+                .join(stage)
+                .join(format!("{index}.json"));
+            let bytes = store
+                .get(&path)
+                .await
+                .map_err(EngineError::backend)?
+                .bytes()
+                .await
+                .map_err(EngineError::backend)?;
+            serde_json::from_slice(&bytes).map_err(EngineError::backend)?
+        };
+        if chunk.format_version != 1
+            || chunk.chunk_index != index
+            || chunk.chunk_count != first.chunk_count
+            || chunk.parent_version != first.parent_version
+        {
+            return Err(EngineError::ReferenceLineageUnavailable {
+                location: location.clone(),
+                reason:   format!("invalid staged reference chunk {stage}/{index}"),
+            });
+        }
+        let delta = ObjectReferenceDelta::try_new_chunk(
+            chunk.parent_version,
+            table_version,
+            chunk.chunk_index,
+            chunk.chunk_count,
+            chunk.added,
+            Vec::new(),
+        )
+        .map_err(EngineError::backend)?;
+        persist_reference_delta(config, location, &delta).await?;
+    }
+    Ok(())
+}
+
+async fn final_reference_chunks_complete(
+    config: &WriteConfig,
+    location: &TableLocation,
+    table_version: Version,
+) -> Result<bool> {
+    let url = dataset_url(location)?;
+    let (store, root) = object_store::parse_url_opts(&url, config.storage_options.clone())
+        .map_err(EngineError::backend)?;
+    let path = root
+        .join("_lake")
+        .join("object_refs")
+        .join(table_version.0.to_string())
+        .join("0.json");
+    let bytes = match store.get(&path).await {
+        Ok(result) => result.bytes().await.map_err(EngineError::backend)?,
+        Err(object_store::Error::NotFound { .. }) => return Ok(false),
+        Err(error) => return Err(EngineError::backend(error)),
+    };
+    let first = ObjectReferenceDelta::decode(&bytes).map_err(EngineError::backend)?;
+    if first.table_version() != table_version
+        || first.chunk_index() != 0
+        || first.chunk_count() == 0
+    {
+        return Err(EngineError::ReferenceLineageUnavailable {
+            location: location.clone(),
+            reason:   format!("invalid final reference header for {table_version}"),
+        });
+    }
+    for index in 1..first.chunk_count() {
+        let chunk = match load_reference_delta(config, location, table_version, index).await {
+            Ok(chunk) => chunk,
+            Err(EngineError::ReferenceLineageUnavailable { reason, .. })
+                if reason.starts_with("cannot read reference chunk") =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if chunk.parent_version() != first.parent_version()
+            || chunk.chunk_count() != first.chunk_count()
+        {
+            return Err(EngineError::ReferenceLineageUnavailable {
+                location: location.clone(),
+                reason:   format!("inconsistent final reference chunk {table_version}/{index}"),
+            });
+        }
+    }
+    Ok(true)
+}
+
+async fn delete_staged_references(
+    config: &WriteConfig,
+    location: &TableLocation,
+    stage: &str,
+) -> Result<()> {
+    let url = dataset_url(location)?;
+    let (store, root) = object_store::parse_url_opts(&url, config.storage_options.clone())
+        .map_err(EngineError::backend)?;
+    let base = root.join("_lake").join("object_refs_staging").join(stage);
+    let first_path = base.clone().join("0.json");
+    let first = match store.get(&first_path).await {
+        Ok(result) => result.bytes().await.map_err(EngineError::backend)?,
+        Err(object_store::Error::NotFound { .. }) => return Ok(()),
+        Err(error) => return Err(EngineError::backend(error)),
+    };
+    let first: StagedReferenceChunk =
+        serde_json::from_slice(&first).map_err(EngineError::backend)?;
+    if first.format_version != 1 || first.chunk_index != 0 || first.chunk_count == 0 {
+        return Err(EngineError::ReferenceLineageUnavailable {
+            location: location.clone(),
+            reason:   format!("invalid staged reference header {stage}"),
+        });
+    }
+    for index in 0..first.chunk_count {
+        let path = base.clone().join(format!("{index}.json"));
+        match store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => return Err(EngineError::backend(error)),
+        }
+    }
+    Ok(())
+}
+
 /// A handle to one open Lance dataset.
 struct LanceTable {
     dataset:  Arc<Dataset>,
@@ -582,6 +821,56 @@ impl LanceTable {
             config,
             location,
         })
+    }
+
+    async fn find_append(&self, operation: &AppendOperation) -> Result<Option<(Version, String)>> {
+        let dataset = self
+            .config
+            .open_dataset(self.location.as_str())
+            .await
+            .map_err(EngineError::backend)?;
+        let mut versions = dataset.versions().await.map_err(EngineError::backend)?;
+        versions.sort_by_key(|version| version.version);
+        for version in versions.into_iter().rev() {
+            let Some(transaction) = dataset
+                .read_transaction_by_version(version.version)
+                .await
+                .map_err(EngineError::backend)?
+            else {
+                continue;
+            };
+            let Some(properties) = transaction.transaction_properties else {
+                continue;
+            };
+            if properties.get(APPEND_TENANT_PROPERTY).map(String::as_str)
+                != Some(operation.tenant().as_str())
+                || properties
+                    .get(APPEND_OPERATION_PROPERTY)
+                    .map(String::as_str)
+                    != Some(operation.operation_id().as_str())
+            {
+                continue;
+            }
+            if properties.get(APPEND_DIGEST_PROPERTY).map(String::as_str)
+                != Some(operation.payload_digest().as_str())
+            {
+                return Err(EngineError::IdempotencyConflict {
+                    operation_id: operation.operation_id().clone(),
+                });
+            }
+            let stage = properties
+                .get(APPEND_REFERENCE_STAGE_PROPERTY)
+                .cloned()
+                .ok_or_else(|| EngineError::ReferenceLineageUnavailable {
+                    location: self.location.clone(),
+                    reason:   format!(
+                        "append transaction {} has no reference stage",
+                        operation.operation_id()
+                    ),
+                })?;
+            return Ok(Some((Version(version.version), stage)));
+        }
+        Ok(None)
     }
 }
 
@@ -604,7 +893,14 @@ impl TableHandle for LanceTable {
         )))
     }
 
-    async fn append(&self, batches: SendableRecordBatchStream) -> Result<Version> {
+    async fn append(
+        &self,
+        operation: &AppendOperation,
+        batches: SendableRecordBatchStream,
+    ) -> Result<Version> {
+        if let Some(version) = self.reconcile_append(operation).await? {
+            return Ok(version);
+        }
         let parent_version = Version(
             self.config
                 .open_dataset(self.location.as_str())
@@ -633,28 +929,69 @@ impl TableHandle for LanceTable {
         });
         let batches: SendableRecordBatchStream =
             Box::pin(RecordBatchStreamAdapter::new(schema, batches));
-        let params = self.config.write_params(WriteMode::Append);
-        let dataset = InsertBuilder::new(self.dataset.clone())
+        let stage = reference_stage(operation);
+        let properties = HashMap::from([
+            (
+                APPEND_TENANT_PROPERTY.to_owned(),
+                operation.tenant().as_str().to_owned(),
+            ),
+            (
+                APPEND_OPERATION_PROPERTY.to_owned(),
+                operation.operation_id().as_str().to_owned(),
+            ),
+            (
+                APPEND_DIGEST_PROPERTY.to_owned(),
+                operation.payload_digest().as_str().to_owned(),
+            ),
+            (APPEND_REFERENCE_STAGE_PROPERTY.to_owned(), stage.clone()),
+        ]);
+        let params = self
+            .config
+            .write_params(WriteMode::Append)
+            .with_transaction_properties(properties);
+        let transaction = InsertBuilder::new(self.dataset.clone())
             .with_params(&params)
-            .execute_stream(batches)
+            .execute_uncommitted_stream(batches)
             .await
             .map_err(EngineError::backend)?;
-        let table_version = Version(dataset.version().version);
         let added = references
             .lock()
             .expect("object reference mutex poisoned")
             .iter()
             .cloned()
             .collect();
-        persist_reference_chunks(
+        let persisted_stage = persist_staged_references(
             &self.config,
             &self.location,
+            operation,
             parent_version,
-            table_version,
             added,
         )
         .await?;
+        debug_assert_eq!(persisted_stage, stage);
+        let committed = CommitBuilder::new(self.dataset.clone())
+            .with_max_retries(0)
+            .execute(transaction)
+            .await;
+        let table_version = match committed {
+            Ok(dataset) => Version(dataset.version().version),
+            Err(error) => match self.reconcile_append(operation).await? {
+                Some(version) => return Ok(version),
+                None => return Err(EngineError::backend(error)),
+            },
+        };
+        finalize_staged_references(&self.config, &self.location, &stage, table_version).await?;
+        delete_staged_references(&self.config, &self.location, &stage).await?;
         Ok(table_version)
+    }
+
+    async fn reconcile_append(&self, operation: &AppendOperation) -> Result<Option<Version>> {
+        let Some((version, stage)) = self.find_append(operation).await? else {
+            return Ok(None);
+        };
+        finalize_staged_references(&self.config, &self.location, &stage, version).await?;
+        delete_staged_references(&self.config, &self.location, &stage).await?;
+        Ok(Some(version))
     }
 }
 
@@ -674,6 +1011,19 @@ mod tests {
     };
 
     use super::*;
+
+    fn operation() -> AppendOperation {
+        AppendOperation::builder()
+            .tenant(lake_common::TenantId::try_new("tenant-a").unwrap())
+            .operation_id(lake_common::AppendOperationId::generate())
+            .payload_digest(
+                lake_common::AppendPayloadDigest::parse(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            )
+            .build()
+    }
 
     fn batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("ep", DataType::Int64, false)]));
@@ -726,12 +1076,129 @@ mod tests {
         assert!(engine.open(&loc).await.unwrap().is_some());
 
         let b = batch();
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             b.schema(),
             futures::stream::iter(vec![Ok::<_, DataFusionError>(b)]),
         ));
-        let v = h.append(stream).await.unwrap();
+        let v = h.append(&operation(), stream).await.unwrap();
         assert!(v.0 > 1, "append advances the version");
+    }
+
+    #[tokio::test]
+    async fn lance_transaction_history_converges_idempotent_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
+        let engine = LanceEngine::new();
+        let handle = engine.create(&location, batch().schema()).await.unwrap();
+        let operation = operation();
+        let first_batch = batch();
+        let first_stream = Box::pin(RecordBatchStreamAdapter::new(
+            first_batch.schema(),
+            futures::stream::iter(vec![Ok::<_, DataFusionError>(first_batch)]),
+        ));
+        let first = handle.append(&operation, first_stream).await.unwrap();
+        let replay_batch = batch();
+        let replay_stream = Box::pin(RecordBatchStreamAdapter::new(
+            replay_batch.schema(),
+            futures::stream::iter(vec![Ok::<_, DataFusionError>(replay_batch)]),
+        ));
+
+        let replay = handle.append(&operation, replay_stream).await.unwrap();
+
+        assert_eq!(replay, first);
+        assert_eq!(
+            engine
+                .open(&location)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version(),
+            Version(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_idempotent_append_restores_reference_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
+        let engine = LanceEngine::new();
+        let handle = engine.create(&location, file_schema()).await.unwrap();
+        let operation = operation();
+        let input = file_batch(7);
+        let references = object_identities(&input).unwrap();
+        let stage = persist_staged_references(
+            &engine.config,
+            &location,
+            &operation,
+            Version(1),
+            references,
+        )
+        .await
+        .unwrap();
+        let properties = HashMap::from([
+            (
+                APPEND_TENANT_PROPERTY.to_owned(),
+                operation.tenant().as_str().to_owned(),
+            ),
+            (
+                APPEND_OPERATION_PROPERTY.to_owned(),
+                operation.operation_id().as_str().to_owned(),
+            ),
+            (
+                APPEND_DIGEST_PROPERTY.to_owned(),
+                operation.payload_digest().as_str().to_owned(),
+            ),
+            (APPEND_REFERENCE_STAGE_PROPERTY.to_owned(), stage.clone()),
+        ]);
+        let dataset = Arc::new(engine.config.open_dataset(location.as_str()).await.unwrap());
+        let params = engine
+            .config
+            .write_params(WriteMode::Append)
+            .with_transaction_properties(properties);
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            input.schema(),
+            futures::stream::iter(vec![Ok::<_, DataFusionError>(input)]),
+        ));
+        let transaction = InsertBuilder::new(dataset.clone())
+            .with_params(&params)
+            .execute_uncommitted_stream(stream)
+            .await
+            .unwrap();
+        let committed = Version(
+            CommitBuilder::new(dataset)
+                .with_max_retries(0)
+                .execute(transaction)
+                .await
+                .unwrap()
+                .version()
+                .version,
+        );
+        let final_sidecar = dir
+            .path()
+            .join(format!("t.lance/_lake/object_refs/{}/0.json", committed.0));
+        assert!(
+            !final_sidecar.exists(),
+            "the injected crash precedes finalization"
+        );
+
+        let recovered = handle.reconcile_append(&operation).await.unwrap();
+
+        assert_eq!(recovered, Some(committed));
+        let repaired = ObjectReferenceDelta::decode(
+            &tokio::fs::read(&final_sidecar)
+                .await
+                .expect("replay repairs the missing final sidecar"),
+        )
+        .unwrap();
+        assert_eq!(repaired.table_version(), committed);
+        assert_eq!(repaired.added().len(), 1);
+        assert_eq!(repaired.added()[0].uri, "s3://lake/objects/7");
+        assert!(
+            !dir.path()
+                .join(format!("t.lance/_lake/object_refs_staging/{stage}/0.json"))
+                .exists(),
+            "terminal recovery removes the durable staging journal"
+        );
     }
 
     #[tokio::test]
@@ -768,7 +1235,7 @@ mod tests {
         let stream = Box::pin(RecordBatchStreamAdapter::new(h.schema(), batches));
 
         let version = h
-            .append(stream)
+            .append(&operation(), stream)
             .await
             .expect("streaming append must release each consumed input batch");
         let mut added = Vec::new();
@@ -805,7 +1272,7 @@ mod tests {
                 batch.schema(),
                 futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
             ));
-            handle.append(stream).await.unwrap();
+            handle.append(&operation(), stream).await.unwrap();
         }
         let before = engine
             .open(&location)
@@ -856,7 +1323,7 @@ mod tests {
             b.schema(),
             futures::stream::iter(vec![Ok::<_, DataFusionError>(b)]),
         ));
-        let appended = h.append(stream).await.unwrap();
+        let appended = h.append(&operation(), stream).await.unwrap();
         assert!(appended.0 > 1);
 
         let reopened = engine.open(&loc).await.unwrap().expect("table exists");
@@ -898,7 +1365,7 @@ mod tests {
                 b.schema(),
                 futures::stream::iter(vec![Ok::<_, DataFusionError>(b)]),
             ));
-            h.append(stream).await.unwrap();
+            h.append(&operation(), stream).await.unwrap();
         }
 
         // Maintenance runs cleanly and is safe to repeat.

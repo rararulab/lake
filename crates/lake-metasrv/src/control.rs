@@ -45,10 +45,13 @@ use datafusion::{
 };
 use futures::{Stream, StreamExt};
 use lake_common::{
-    FILE_APPEND_TYPE_URL, FileAppendRequest, Namespace, Principal, PrincipalRole, TableLocation,
-    TableRef, Version,
+    AppendOperation, FILE_APPEND_TYPE_URL, FileAppendRequest, Namespace, Principal, PrincipalRole,
+    TableLocation, TableRef, TenantId, Version,
 };
-use lake_flight::{ClientSecurity, DELEGATED_NAMESPACE_HEADER};
+use lake_flight::{
+    ClientSecurity, DELEGATED_NAMESPACE_HEADER, DELEGATED_TENANT_HEADER,
+    append_flight_payload_digest,
+};
 use lake_objects::data_location_field;
 use prost::Message;
 use prost_types::Any;
@@ -90,6 +93,38 @@ fn delegated_namespace<T>(request: &Request<T>) -> Result<Option<String>, Status
         .transpose()
 }
 
+fn delegated_tenant<T>(request: &Request<T>) -> Result<Option<TenantId>, Status> {
+    request
+        .metadata()
+        .get(DELEGATED_TENANT_HEADER)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| Status::permission_denied(RESOURCE_UNAVAILABLE))
+                .and_then(|value| {
+                    TenantId::try_new(value)
+                        .map_err(|_| Status::permission_denied(RESOURCE_UNAVAILABLE))
+                })
+        })
+        .transpose()
+}
+
+fn operation_tenant(
+    principal: &Principal,
+    delegated: Option<TenantId>,
+) -> Result<TenantId, Status> {
+    match principal.role() {
+        PrincipalRole::User if delegated.is_some() => {
+            Err(Status::permission_denied(RESOURCE_UNAVAILABLE))
+        }
+        PrincipalRole::User => Ok(principal.tenant().clone()),
+        PrincipalRole::Admin => Ok(delegated.unwrap_or_else(|| principal.tenant().clone())),
+        PrincipalRole::QueryService | PrincipalRole::MetadataPeer => {
+            delegated.ok_or_else(|| Status::permission_denied(RESOURCE_UNAVAILABLE))
+        }
+    }
+}
+
 fn authorize_namespace(
     principal: &Principal,
     delegated: Option<&str>,
@@ -121,7 +156,30 @@ fn append_request(first: &FlightData) -> Result<FileAppendRequest, Status> {
         .ok_or_else(|| Status::invalid_argument("invalid FILE append descriptor"))
 }
 
-async fn append_file_stream<S, E>(metasrv: &Metasrv, mut input: S) -> Result<Version, Status>
+// FILE rows carry object references and scalar metadata, never the multi-GB
+// object itself. Bounding this buffered control payload prevents one append
+// from exhausting the metadata service while still leaving ample headroom for
+// large Arrow batches of references.
+const MAX_APPEND_FLIGHT_STREAM_BYTES: usize = 64 * 1024 * 1024;
+
+async fn append_file_stream<S, E>(
+    metasrv: &Metasrv,
+    tenant: TenantId,
+    input: S,
+) -> Result<Version, Status>
+where
+    S: Stream<Item = std::result::Result<FlightData, E>> + Send + Unpin + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    append_file_stream_with_limit(metasrv, tenant, input, MAX_APPEND_FLIGHT_STREAM_BYTES).await
+}
+
+async fn append_file_stream_with_limit<S, E>(
+    metasrv: &Metasrv,
+    tenant: TenantId,
+    mut input: S,
+    max_stream_bytes: usize,
+) -> Result<Version, Status>
 where
     S: Stream<Item = std::result::Result<FlightData, E>> + Send + Unpin + 'static,
     E: std::fmt::Display + Send + 'static,
@@ -132,9 +190,39 @@ where
         .ok_or_else(|| Status::invalid_argument("FILE append stream is empty"))?
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let append = append_request(&first)?;
-    let flight_data = futures::stream::once(async move { Ok(first) }).chain(input.map(|item| {
-        item.map_err(|error| arrow_flight::error::FlightError::protocol(error.to_string()))
-    }));
+    let mut stream_bytes = first.encoded_len();
+    if stream_bytes > max_stream_bytes {
+        return Err(Status::resource_exhausted(
+            "FILE append control payload exceeds the server limit",
+        ));
+    }
+    let mut messages = vec![first];
+    while let Some(item) = input.next().await {
+        let item = item.map_err(|error| Status::invalid_argument(error.to_string()))?;
+        stream_bytes = stream_bytes
+            .checked_add(item.encoded_len())
+            .ok_or_else(|| {
+                Status::resource_exhausted("FILE append control payload is too large")
+            })?;
+        if stream_bytes > max_stream_bytes {
+            return Err(Status::resource_exhausted(
+                "FILE append control payload exceeds the server limit",
+            ));
+        }
+        messages.push(item);
+    }
+    let actual_digest = append_flight_payload_digest(&messages);
+    if &actual_digest != append.payload_digest() {
+        return Err(Status::invalid_argument(
+            "FILE append payload digest does not match the Flight messages",
+        ));
+    }
+    let operation = AppendOperation::builder()
+        .tenant(tenant)
+        .operation_id(append.operation_id().clone())
+        .payload_digest(actual_digest)
+        .build();
+    let flight_data = futures::stream::iter(messages.into_iter().map(Ok));
     let mut decoded = FlightRecordBatchStream::new_from_flight_data(flight_data);
     let first_batch = decoded
         .next()
@@ -147,9 +235,23 @@ where
     );
     let stream = Box::pin(RecordBatchStreamAdapter::new(schema, batches));
     metasrv
-        .append(append.table(), stream)
+        .append(append.table(), &operation, stream)
         .await
-        .map_err(|error| Status::internal(error.to_string()))
+        .map_err(|error| match error {
+            crate::MetasrvError::OperationConflict { .. } => {
+                Status::already_exists(error.to_string())
+            }
+            crate::MetasrvError::OperationExpired { .. } => {
+                Status::failed_precondition(error.to_string())
+            }
+            crate::MetasrvError::OperationFromFuture { .. } => {
+                Status::invalid_argument(error.to_string())
+            }
+            crate::MetasrvError::OperationInProgress { .. } => {
+                Status::unavailable(error.to_string())
+            }
+            _ => Status::internal(error.to_string()),
+        })
 }
 
 /// The metadata-layer control-plane Flight service.
@@ -290,6 +392,7 @@ impl MetasrvFlightService {
         &self,
         addr: &str,
         namespace: &str,
+        tenant: &TenantId,
         input: S,
     ) -> Result<Response<BoxStream<PutResult>>, Status>
     where
@@ -311,6 +414,13 @@ impl MetasrvFlightService {
             namespace
                 .parse()
                 .map_err(|_| Status::internal("authorized namespace is not valid metadata"))?,
+        );
+        client.metadata_mut().insert(
+            DELEGATED_TENANT_HEADER,
+            tenant
+                .as_str()
+                .parse()
+                .map_err(|_| Status::internal("authenticated tenant is not valid metadata"))?,
         );
         let results = client
             .do_put(input.map(|item| {
@@ -470,6 +580,7 @@ impl FlightService for MetasrvFlightService {
     ) -> Result<Response<Self::DoPutStream>, Status> {
         let principal = principal(&request)?;
         let delegated = delegated_namespace(&request)?;
+        let tenant = operation_tenant(&principal, delegated_tenant(&request)?)?;
         let mut input = request.into_inner();
         let first = input
             .next()
@@ -482,13 +593,13 @@ impl FlightService for MetasrvFlightService {
         if !self.leadership.is_leader() {
             match self.leadership.leader() {
                 Some(addr) if addr != self.own_addr => {
-                    return self.forward_put(&addr, namespace, input).await;
+                    return self.forward_put(&addr, namespace, &tenant, input).await;
                 }
                 Some(_) => {}
                 None => return Err(Status::unavailable("no leader elected")),
             }
         }
-        let version = append_file_stream(&self.metasrv, input).await?;
+        let version = append_file_stream(&self.metasrv, tenant, input).await?;
         let result = PutResult {
             app_metadata: serde_json::to_vec(&version)
                 .map_err(|error| Status::internal(error.to_string()))?
@@ -587,7 +698,10 @@ impl FlightService for MetasrvFlightService {
 
 #[cfg(test)]
 mod file_append_tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use arrow_flight::{FlightDescriptor, encode::FlightDataEncoderBuilder};
     use datafusion::arrow::{
@@ -595,15 +709,217 @@ mod file_append_tests {
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
     };
-    use lake_common::{FILE_APPEND_TYPE_URL, FileAppendRequest, TableLocation, TableRef};
+    use futures::TryStreamExt;
+    use lake_common::{
+        AppendOperation, AppendOperationId, FILE_APPEND_TYPE_URL, FileAppendRequest, TableLocation,
+        TableRef, TenantId, Version,
+    };
     use lake_engine::TableEngineRef;
     use lake_engine_lance::LanceEngine;
-    use lake_meta::{MetaStoreRef, RocksMeta};
+    use lake_flight::append_flight_payload_digest;
+    use lake_meta::{MetaError, MetaStore, MetaStoreRef, RocksMeta};
     use prost::Message;
     use prost_types::Any;
 
-    use super::append_file_stream;
-    use crate::Metasrv;
+    use super::{append_file_stream, append_file_stream_with_limit};
+    use crate::{
+        Metasrv,
+        operation::{AppendRecord, active_key, operation_key},
+    };
+
+    struct FailOperationReservationMeta {
+        inner:     MetaStoreRef,
+        fail_once: AtomicBool,
+    }
+
+    struct FailOperationTransitionMeta {
+        inner:     MetaStoreRef,
+        needle:    &'static [u8],
+        fail_once: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl MetaStore for FailOperationReservationMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            if key.starts_with(crate::operation::OPERATION_PREFIX)
+                && self.fail_once.swap(false, Ordering::SeqCst)
+            {
+                return Err(MetaError::Dynamo {
+                    message: "injected operation reservation failure".to_owned(),
+                    source:  Box::new(std::io::Error::other("injected")),
+                });
+            }
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn scan_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<(String, Vec<u8>)>> {
+            self.inner.scan_prefix(prefix).await
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MetaStore for FailOperationTransitionMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            if key.starts_with(crate::operation::OPERATION_PREFIX)
+                && new
+                    .windows(self.needle.len())
+                    .any(|window| window == self.needle)
+                && self.fail_once.swap(false, Ordering::SeqCst)
+            {
+                return Err(MetaError::Dynamo {
+                    message: "injected operation transition failure".to_owned(),
+                    source:  Box::new(std::io::Error::other("injected")),
+                });
+            }
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn scan_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<(String, Vec<u8>)>> {
+            self.inner.scan_prefix(prefix).await
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
+        }
+    }
+
+    async fn encoded_append(
+        table: TableRef,
+        schema: Arc<Schema>,
+        batch: RecordBatch,
+        operation_id: AppendOperationId,
+    ) -> (FileAppendRequest, Vec<arrow_flight::FlightData>) {
+        let mut messages = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(futures::stream::iter(vec![Ok(batch)]))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let append =
+            FileAppendRequest::new(table, operation_id, append_flight_payload_digest(&messages));
+        messages[0].flight_descriptor = Some(FlightDescriptor::new_cmd(
+            Any {
+                type_url: FILE_APPEND_TYPE_URL.to_owned(),
+                value:    append.command_payload(),
+            }
+            .encode_to_vec(),
+        ));
+        (append, messages)
+    }
+
+    fn operation(append: &FileAppendRequest, tenant: &TenantId) -> AppendOperation {
+        AppendOperation::builder()
+            .tenant(tenant.clone())
+            .operation_id(append.operation_id().clone())
+            .payload_digest(append.payload_digest().clone())
+            .build()
+    }
+
+    #[tokio::test]
+    async fn oversized_append_metadata_is_rejected_before_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::new(meta, engine);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["episode-42"]))],
+        )
+        .unwrap();
+        let (_append, messages) = encoded_append(
+            TableRef::new("robots", "episodes"),
+            schema,
+            batch,
+            AppendOperationId::generate(),
+        )
+        .await;
+
+        let error = append_file_stream_with_limit(
+            &metasrv,
+            TenantId::try_new("tenant-a").unwrap(),
+            futures::stream::iter(messages.into_iter().map(Ok::<_, String>)),
+            1,
+        )
+        .await
+        .expect_err("metadata larger than the configured limit must fail");
+
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn operation_timestamp_far_in_the_future_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::new(meta, engine);
+        let table = TableRef::new("robots", "episodes");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        metasrv
+            .create_table(
+                &table,
+                TableLocation::new(root.path().join("episodes.lance").to_string_lossy()),
+                schema.clone(),
+            )
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["episode-42"]))],
+        )
+        .unwrap();
+        let future_id = AppendOperationId::parse("ffffffff-ffff-7000-8000-000000000000")
+            .expect("valid far-future UUIDv7");
+        let (_append, messages) = encoded_append(table, schema, batch, future_id).await;
+
+        let error = append_file_stream(
+            &metasrv,
+            TenantId::try_new("tenant-a").unwrap(),
+            futures::stream::iter(messages.into_iter().map(Ok::<_, String>)),
+        )
+        .await
+        .expect_err("a far-future identity must not bypass operation expiry");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
 
     #[tokio::test]
     async fn file_append_commits_decoded_flight_batches() {
@@ -630,20 +946,13 @@ mod file_append_tests {
             vec![Arc::new(StringArray::from(vec!["episode-42"]))],
         )
         .unwrap();
-        let append = FileAppendRequest::new(table.clone());
-        let descriptor = FlightDescriptor::new_cmd(
-            Any {
-                type_url: FILE_APPEND_TYPE_URL.to_owned(),
-                value:    append.command_payload(),
-            }
-            .encode_to_vec(),
-        );
-        let stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .with_flight_descriptor(Some(descriptor))
-            .build(futures::stream::iter(vec![Ok(batch)]));
+        let (_append, messages) =
+            encoded_append(table.clone(), schema, batch, AppendOperationId::generate()).await;
+        let stream = futures::stream::iter(messages.into_iter().map(Ok::<_, String>));
 
-        let version = append_file_stream(&metasrv, stream).await.unwrap();
+        let version = append_file_stream(&metasrv, TenantId::try_new("tenant-a").unwrap(), stream)
+            .await
+            .unwrap();
 
         assert_eq!(
             metasrv
@@ -653,6 +962,571 @@ mod file_append_tests {
                 .unwrap()
                 .current_version,
             version
+        );
+    }
+
+    #[tokio::test]
+    async fn same_operation_replay_returns_original_version() {
+        let root = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::new(meta, engine);
+        let table = TableRef::new("robots", "episodes");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        metasrv
+            .create_table(
+                &table,
+                TableLocation::new(root.path().join("episodes.lance").to_string_lossy()),
+                schema.clone(),
+            )
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["episode-42"]))],
+        )
+        .unwrap();
+        let (append, messages) =
+            encoded_append(table, schema, batch, AppendOperationId::generate()).await;
+
+        let first = append_file_stream(
+            &metasrv,
+            TenantId::try_new("tenant-a").unwrap(),
+            futures::stream::iter(messages.clone().into_iter().map(Ok::<_, String>)),
+        )
+        .await
+        .unwrap();
+        let replay = append_file_stream(
+            &metasrv,
+            TenantId::try_new("tenant-a").unwrap(),
+            futures::stream::iter(messages.into_iter().map(Ok::<_, String>)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(replay, first);
+        assert_eq!(
+            metasrv
+                .resolve(append.table())
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            first
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_replay_clears_stale_active_fence() {
+        let root = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::new(meta.clone(), engine);
+        let table = TableRef::new("robots", "episodes");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        metasrv
+            .create_table(
+                &table,
+                TableLocation::new(root.path().join("episodes.lance").to_string_lossy()),
+                schema.clone(),
+            )
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["episode-42"]))],
+        )
+        .unwrap();
+        let (append, messages) =
+            encoded_append(table, schema, batch, AppendOperationId::generate()).await;
+        let tenant = TenantId::try_new("tenant-a").unwrap();
+        append_file_stream(
+            &metasrv,
+            tenant.clone(),
+            futures::stream::iter(messages.clone().into_iter().map(Ok::<_, String>)),
+        )
+        .await
+        .unwrap();
+        let operation = operation(&append, &tenant);
+        let key = operation_key(&operation, append.table());
+        let active = active_key(&operation, append.table());
+        assert!(meta.cas(&active, None, key.as_bytes()).await.unwrap());
+
+        append_file_stream(
+            &metasrv,
+            tenant,
+            futures::stream::iter(messages.into_iter().map(Ok::<_, String>)),
+        )
+        .await
+        .expect("terminal replay repairs crash-left active fence");
+
+        assert_eq!(meta.get(&active).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn mismatched_flight_payload_digest_is_rejected_before_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::new(meta, engine);
+        let table = TableRef::new("robots", "episodes");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        metasrv
+            .create_table(
+                &table,
+                TableLocation::new(root.path().join("episodes.lance").to_string_lossy()),
+                schema.clone(),
+            )
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["episode-42"]))],
+        )
+        .unwrap();
+        let (_append, mut messages) =
+            encoded_append(table.clone(), schema, batch, AppendOperationId::generate()).await;
+        let mismatched = FileAppendRequest::new(
+            table.clone(),
+            AppendOperationId::generate(),
+            lake_common::AppendPayloadDigest::parse(
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            )
+            .unwrap(),
+        );
+        messages[0].flight_descriptor = Some(FlightDescriptor::new_cmd(
+            Any {
+                type_url: FILE_APPEND_TYPE_URL.to_owned(),
+                value:    mismatched.command_payload(),
+            }
+            .encode_to_vec(),
+        ));
+
+        let error = append_file_stream(
+            &metasrv,
+            TenantId::try_new("tenant-a").unwrap(),
+            futures::stream::iter(messages.into_iter().map(Ok::<_, String>)),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn same_operation_with_different_payload_conflicts() {
+        let root = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::new(meta, engine);
+        let table = TableRef::new("robots", "episodes");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        metasrv
+            .create_table(
+                &table,
+                TableLocation::new(root.path().join("episodes.lance").to_string_lossy()),
+                schema.clone(),
+            )
+            .await
+            .unwrap();
+        let operation_id = AppendOperationId::generate();
+        let first_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["episode-42"]))],
+        )
+        .unwrap();
+        let (_first, first_messages) = encoded_append(
+            table.clone(),
+            schema.clone(),
+            first_batch,
+            operation_id.clone(),
+        )
+        .await;
+        append_file_stream(
+            &metasrv,
+            TenantId::try_new("tenant-a").unwrap(),
+            futures::stream::iter(first_messages.into_iter().map(Ok::<_, String>)),
+        )
+        .await
+        .unwrap();
+        let second_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["episode-99"]))],
+        )
+        .unwrap();
+        let (_second, second_messages) =
+            encoded_append(table.clone(), schema, second_batch, operation_id).await;
+
+        let error = append_file_stream(
+            &metasrv,
+            TenantId::try_new("tenant-a").unwrap(),
+            futures::stream::iter(second_messages.into_iter().map(Ok::<_, String>)),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::AlreadyExists);
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn append_crash_windows_reconcile_without_duplicates() {
+        for transition in [
+            b"\"state\":\"engine_committed\"".as_slice(),
+            b"\"state\":\"committed\"".as_slice(),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let underlying: MetaStoreRef =
+                Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+            let failing: MetaStoreRef = Arc::new(FailOperationTransitionMeta {
+                inner:     underlying.clone(),
+                needle:    transition,
+                fail_once: AtomicBool::new(true),
+            });
+            let engine: TableEngineRef = Arc::new(LanceEngine::new());
+            let first_metasrv = Metasrv::new(failing, engine.clone());
+            let table = TableRef::new("robots", "episodes");
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "episode_id",
+                DataType::Utf8,
+                false,
+            )]));
+            first_metasrv
+                .create_table(
+                    &table,
+                    TableLocation::new(root.path().join("episodes.lance").to_string_lossy()),
+                    schema.clone(),
+                )
+                .await
+                .unwrap();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from(vec!["episode-42"]))],
+            )
+            .unwrap();
+            let (_append, messages) =
+                encoded_append(table.clone(), schema, batch, AppendOperationId::generate()).await;
+            let tenant = TenantId::try_new("tenant-a").unwrap();
+
+            assert!(
+                append_file_stream(
+                    &first_metasrv,
+                    tenant.clone(),
+                    futures::stream::iter(messages.clone().into_iter().map(Ok::<_, String>)),
+                )
+                .await
+                .is_err(),
+                "the injected transition must interrupt the first response"
+            );
+            let recovered = Metasrv::new(underlying, engine);
+            let version = append_file_stream(
+                &recovered,
+                tenant,
+                futures::stream::iter(messages.into_iter().map(Ok::<_, String>)),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(version, Version(2));
+            assert_eq!(
+                recovered
+                    .resolve(&table)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .current_version,
+                Version(2)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_replay_does_not_contend_with_new_active_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::new(meta.clone(), engine);
+        let table = TableRef::new("robots", "episodes");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        metasrv
+            .create_table(
+                &table,
+                TableLocation::new(root.path().join("episodes.lance").to_string_lossy()),
+                schema.clone(),
+            )
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["episode-42"]))],
+        )
+        .unwrap();
+        let (committed, messages) =
+            encoded_append(table.clone(), schema, batch, AppendOperationId::generate()).await;
+        let tenant = TenantId::try_new("tenant-a").unwrap();
+        let first = append_file_stream(
+            &metasrv,
+            tenant.clone(),
+            futures::stream::iter(messages.clone().into_iter().map(Ok::<_, String>)),
+        )
+        .await
+        .unwrap();
+        let other = AppendOperation::builder()
+            .tenant(tenant.clone())
+            .operation_id(AppendOperationId::generate())
+            .payload_digest(committed.payload_digest().clone())
+            .build();
+        let active = active_key(&other, committed.table());
+        let other_key = operation_key(&other, committed.table());
+        assert!(meta.cas(&active, None, other_key.as_bytes()).await.unwrap());
+
+        let replay = append_file_stream(
+            &metasrv,
+            tenant,
+            futures::stream::iter(messages.into_iter().map(Ok::<_, String>)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(replay, first);
+    }
+
+    #[tokio::test]
+    async fn reservation_failure_does_not_leave_orphan_active_fence() {
+        let root = tempfile::tempdir().unwrap();
+        let underlying: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let meta: MetaStoreRef = Arc::new(FailOperationReservationMeta {
+            inner:     underlying.clone(),
+            fail_once: AtomicBool::new(true),
+        });
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::new(meta, engine);
+        let table = TableRef::new("robots", "episodes");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        metasrv
+            .create_table(
+                &table,
+                TableLocation::new(root.path().join("episodes.lance").to_string_lossy()),
+                schema.clone(),
+            )
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["episode-42"]))],
+        )
+        .unwrap();
+        let (append, messages) =
+            encoded_append(table, schema, batch, AppendOperationId::generate()).await;
+        let tenant = TenantId::try_new("tenant-a").unwrap();
+        let append_operation = operation(&append, &tenant);
+
+        let result = append_file_stream(
+            &metasrv,
+            tenant,
+            futures::stream::iter(messages.into_iter().map(Ok::<_, String>)),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "the injected reservation failure must surface"
+        );
+        assert_eq!(
+            underlying
+                .get(&active_key(&append_operation, append.table()))
+                .await
+                .unwrap(),
+            None,
+            "failed reservation must not permanently fence the table"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserved_before_fencing_refreshes_its_base_version() {
+        let root = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::new(meta.clone(), engine);
+        let table = TableRef::new("robots", "episodes");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        metasrv
+            .create_table(
+                &table,
+                TableLocation::new(root.path().join("episodes.lance").to_string_lossy()),
+                schema.clone(),
+            )
+            .await
+            .unwrap();
+        let batch = || {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from(vec!["episode-42"]))],
+            )
+            .unwrap()
+        };
+        let tenant = TenantId::try_new("tenant-a").unwrap();
+        let (stale_append, stale_messages) = encoded_append(
+            table.clone(),
+            schema.clone(),
+            batch(),
+            AppendOperationId::generate(),
+        )
+        .await;
+        let stale_operation = operation(&stale_append, &tenant);
+        let stale_key = operation_key(&stale_operation, &table);
+        let stale_record = AppendRecord::reserved(&stale_operation, &table, Version(1), 1);
+        assert!(
+            meta.cas(&stale_key, None, &stale_record.encode().unwrap())
+                .await
+                .unwrap()
+        );
+
+        let (_other, other_messages) = encoded_append(
+            table.clone(),
+            schema.clone(),
+            batch(),
+            AppendOperationId::generate(),
+        )
+        .await;
+        assert_eq!(
+            append_file_stream(
+                &metasrv,
+                tenant.clone(),
+                futures::stream::iter(other_messages.into_iter().map(Ok::<_, String>)),
+            )
+            .await
+            .unwrap(),
+            Version(2)
+        );
+
+        let recovered = append_file_stream(
+            &metasrv,
+            tenant,
+            futures::stream::iter(stale_messages.into_iter().map(Ok::<_, String>)),
+        )
+        .await
+        .expect("a reservation created before fencing must recover after another commit");
+        assert_eq!(recovered, Version(3));
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_replays_execute_one_engine_append() {
+        let root = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let first_metasrv = Metasrv::new(meta.clone(), engine.clone());
+        let second_metasrv = Metasrv::new(meta, engine);
+        let table = TableRef::new("robots", "episodes");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        first_metasrv
+            .create_table(
+                &table,
+                TableLocation::new(root.path().join("episodes.lance").to_string_lossy()),
+                schema.clone(),
+            )
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["episode-42"]))],
+        )
+        .unwrap();
+        let (_append, messages) =
+            encoded_append(table.clone(), schema, batch, AppendOperationId::generate()).await;
+        let tenant = TenantId::try_new("tenant-a").unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let first_messages = messages.clone();
+        let first_tenant = tenant.clone();
+        let first_barrier = barrier.clone();
+        let first_call = async {
+            first_barrier.wait().await;
+            append_file_stream(
+                &first_metasrv,
+                first_tenant,
+                futures::stream::iter(first_messages.into_iter().map(Ok::<_, String>)),
+            )
+            .await
+        };
+        let second_call = async {
+            barrier.wait().await;
+            append_file_stream(
+                &second_metasrv,
+                tenant,
+                futures::stream::iter(messages.into_iter().map(Ok::<_, String>)),
+            )
+            .await
+        };
+
+        let (first, second) = tokio::join!(first_call, second_call);
+
+        assert_eq!(first.unwrap(), second.unwrap());
+        assert_eq!(
+            first_metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(2)
         );
     }
 }
@@ -676,7 +1550,7 @@ mod authorization_tests {
     use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
     use tonic::Code;
 
-    use super::authorize_namespace;
+    use super::{authorize_namespace, operation_tenant};
 
     fn principal(role: PrincipalRole, namespaces: &[&str]) -> Principal {
         Principal::try_new(
@@ -716,6 +1590,19 @@ mod authorization_tests {
                 .unwrap_err()
                 .code(),
             Code::PermissionDenied
+        );
+
+        assert_eq!(
+            operation_tenant(&user, Some(TenantId::try_new("tenant-b").unwrap()))
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+        assert_eq!(
+            operation_tenant(&query, Some(TenantId::try_new("tenant-b").unwrap()))
+                .unwrap()
+                .as_str(),
+            "tenant-b"
         );
     }
 }

@@ -32,4 +32,4 @@ mod store;
 pub use dynamo::DynamoMeta;
 pub use error::{MetaError, Result};
 pub use rocks::RocksMeta;
-pub use store::{MetaStore, MetaStoreRef};
+pub use store::{MetaScanPage, MetaStore, MetaStoreRef};

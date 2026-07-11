@@ -83,4 +83,27 @@ async fn dynamo_meta_roundtrip() {
             ("b".to_owned(), b"v".to_vec()),
         ]
     );
+    let mut continuation = None;
+    let mut paged = Vec::new();
+    loop {
+        let page = meta
+            .scan_prefix_page("ptr/", continuation.as_deref(), 1)
+            .await
+            .unwrap();
+        assert!(page.entries().len() <= 1, "Dynamo scan page is bounded");
+        let (entries, next) = page.into_parts();
+        paged.extend(entries);
+        continuation = next;
+        if continuation.is_none() {
+            break;
+        }
+    }
+    paged.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(
+        paged,
+        vec![
+            ("a".to_owned(), b"v".to_vec()),
+            ("b".to_owned(), b"v".to_vec()),
+        ]
+    );
 }

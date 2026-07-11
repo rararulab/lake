@@ -10,9 +10,11 @@ Pure abstraction, no implementation.
 - The trait exposes only what the catalog + metadata layers call — keep it
   minimal. Per-table manifest/versioning is the engine's business, not
   exposed here beyond an opaque `Version`.
+- Append and reconciliation receive the authenticated operation identity and
+  digest; engines must converge a replay or return an idempotency conflict.
 
 ## Layout
 
 - `engine.rs` — `TableEngine` (create/open) + `TableHandle`
-  (schema/current_version/table_provider/append)
+  (schema/current_version/table_provider/append/reconcile_append)
 - `error.rs` — `EngineError` + constructors (`backend`, `already_exists`)

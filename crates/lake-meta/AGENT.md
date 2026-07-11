@@ -5,12 +5,13 @@ backend `RocksMeta`, and `MetaError`.
 
 ## Invariants
 
-- The metastore holds ONLY tiny mutable pointers (`ptr/<table>` ->
-  version). If you are storing anything else here, the design is wrong —
-  see `docs/architecture.md`.
+- The metastore holds only tiny registry pointers and compact CAS-managed
+  coordination/manifest records. Data-plane rows, object bytes, credentials,
+  signed URLs, and arbitrary request payloads are forbidden.
 - Backend types (RocksDB today, DynamoDB later) never leak out of this
   crate. Consumers see `MetaStore` / `MetaStoreRef` only.
 - `cas` is the only mutation primitive. No blind puts in the public API.
+- Production prefix scans and leader maintenance are cursor-paged and bounded.
 
 ## Layout
 

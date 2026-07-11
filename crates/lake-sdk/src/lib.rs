@@ -29,17 +29,17 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_flight::{
-    Action, FlightClient, FlightDescriptor, decode::FlightRecordBatchStream,
+    Action, FlightClient, FlightDescriptor, PutResult, decode::FlightRecordBatchStream,
     encode::FlightDataEncoderBuilder, sql::client::FlightSqlServiceClient,
 };
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
 use futures::TryStreamExt;
 use lake_common::{
-    DataLocation, FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION,
-    ManagedStageBackend, ManagedStageDescriptor, TableRef, Version,
+    AppendOperationId, DataLocation, FILE_APPEND_TYPE_URL, FileAppendRequest,
+    MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageBackend, ManagedStageDescriptor, TableRef, Version,
 };
-use lake_flight::ClientSecurity;
+use lake_flight::{ClientSecurity, append_flight_payload_digest};
 use lake_objects::{
     LocalObjectStore, ManagedObjectStore, ObjectReader, S3ObjectStore, data_location_array,
     data_location_field, data_location_from_array,
@@ -50,6 +50,45 @@ use sha2::{Digest, Sha256};
 use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::io::AsyncRead;
 use tonic::transport::Channel;
+
+const APPEND_MAX_ATTEMPTS: usize = 3;
+
+fn ambiguous_append_error(error: &SdkError) -> bool {
+    match error {
+        SdkError::MissingAppendResult => true,
+        SdkError::Flight {
+            source: arrow_flight::error::FlightError::Tonic(status),
+        } => matches!(
+            status.code(),
+            tonic::Code::Cancelled
+                | tonic::Code::Unknown
+                | tonic::Code::DeadlineExceeded
+                | tonic::Code::Internal
+                | tonic::Code::Unavailable
+        ),
+        SdkError::Flight {
+            source: arrow_flight::error::FlightError::ExternalError(_),
+        } => true,
+        _ => false,
+    }
+}
+
+async fn retry_ambiguous_append<F, Fut>(mut attempt: F) -> Result<PutResult>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<PutResult>>,
+{
+    for index in 0..APPEND_MAX_ATTEMPTS {
+        match attempt().await {
+            Ok(result) => return Ok(result),
+            Err(error) if index + 1 < APPEND_MAX_ATTEMPTS && ambiguous_append_error(&error) => {
+                tokio::time::sleep(std::time::Duration::from_millis(50 * (index as u64 + 1))).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("append retry loop always returns")
+}
 
 /// Errors raised by the typed Rust SDK.
 #[derive(Debug, Snafu)]
@@ -346,7 +385,17 @@ impl LakeClient {
             arrays.push(self.upload_and_encode(field.data_type(), value).await?);
         }
         let batch = RecordBatch::try_new(schema, arrays).context(ArrowSnafu)?;
-        let append = FileAppendRequest::new(insert.table);
+        let mut messages = FlightDataEncoderBuilder::new()
+            .with_schema(batch.schema())
+            .build(futures::stream::iter(vec![Ok(batch)]))
+            .try_collect::<Vec<_>>()
+            .await
+            .context(FlightSnafu)?;
+        let append = FileAppendRequest::new(
+            insert.table,
+            AppendOperationId::generate(),
+            append_flight_payload_digest(&messages),
+        );
         let descriptor = FlightDescriptor::new_cmd(
             Any {
                 type_url: FILE_APPEND_TYPE_URL.to_owned(),
@@ -354,22 +403,29 @@ impl LakeClient {
             }
             .encode_to_vec(),
         );
-        let stream = FlightDataEncoderBuilder::new()
-            .with_schema(batch.schema())
-            .with_flight_descriptor(Some(descriptor))
-            .build(futures::stream::iter(vec![Ok(batch)]));
-        let mut client = FlightClient::new(self.query.clone());
-        self.security
-            .apply_to_flight_client(&mut client)
-            .context(SecuritySnafu)?;
-        let result = client
-            .do_put(stream)
-            .await
-            .context(FlightSnafu)?
-            .try_next()
-            .await
-            .context(FlightSnafu)?
-            .context(MissingAppendResultSnafu)?;
+        messages
+            .first_mut()
+            .expect("Flight encoder emits a schema message")
+            .flight_descriptor = Some(descriptor);
+        let result = retry_ambiguous_append(|| {
+            let messages = messages.clone();
+            async {
+                let stream = futures::stream::iter(messages.into_iter().map(Ok));
+                let mut client = FlightClient::new(self.query.clone());
+                self.security
+                    .apply_to_flight_client(&mut client)
+                    .context(SecuritySnafu)?;
+                client
+                    .do_put(stream)
+                    .await
+                    .context(FlightSnafu)?
+                    .try_next()
+                    .await
+                    .context(FlightSnafu)?
+                    .context(MissingAppendResultSnafu)
+            }
+        })
+        .await?;
         serde_json::from_slice(&result.app_metadata).context(InvalidAppendResultSnafu)
     }
 
@@ -687,7 +743,10 @@ mod tests {
         io,
         path::PathBuf,
         pin::Pin,
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         task::{Context, Poll},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
@@ -701,7 +760,7 @@ mod tests {
     use futures::TryStreamExt;
     use lake_common::{
         ManagedStageDescriptor, Principal, PrincipalId, PrincipalRole, TableLocation, TableRef,
-        TenantId,
+        TenantId, Version,
     };
     use lake_engine::TableEngineRef;
     use lake_engine_lance::LanceEngine;
@@ -718,7 +777,52 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
-    use crate::{FileUpload, InsertValue, LakeClient, data_location};
+    use crate::{
+        FileUpload, InsertValue, LakeClient, SdkError, data_location, retry_ambiguous_append,
+    };
+
+    #[tokio::test]
+    async fn sdk_retries_lost_put_result_without_reupload_or_duplicate() {
+        let uploads = Arc::new(AtomicUsize::new(0));
+        uploads.fetch_add(1, Ordering::SeqCst);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let operation_id = lake_common::AppendOperationId::generate();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let result = retry_ambiguous_append(|| {
+            let attempts = attempts.clone();
+            let operation_id = operation_id.clone();
+            let seen = seen.clone();
+            async move {
+                seen.lock()
+                    .expect("seen operation mutex")
+                    .push(operation_id);
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(SdkError::Flight {
+                        source: arrow_flight::error::FlightError::Tonic(Box::new(
+                            tonic::Status::unavailable("response lost after commit"),
+                        )),
+                    })
+                } else {
+                    Ok(arrow_flight::PutResult {
+                        app_metadata: serde_json::to_vec(&Version(2)).unwrap().into(),
+                    })
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            serde_json::from_slice::<Version>(&result.app_metadata).unwrap(),
+            Version(2)
+        );
+        assert_eq!(uploads.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let seen = seen.lock().expect("seen operation mutex");
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0], seen[1]);
+    }
 
     #[tokio::test]
     async fn unreachable_query_endpoint_fails_connect() {

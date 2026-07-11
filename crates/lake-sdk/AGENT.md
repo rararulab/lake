@@ -10,6 +10,8 @@ The Rust SDK's typed write and direct-read surface.
 - Schema and parameter validation complete before the SDK begins an upload.
 - A `DataLocation` row is appended only after every referenced object upload
   succeeds; per-table visibility remains owned by `Metasrv::append`.
+- Ambiguous append retries reuse one UUIDv7 identity, digest, and encoded Arrow
+  payload; uploaded video/model bytes are never uploaded again by that retry.
 - The primary public client receives only a query endpoint, discovers the
   credential-free managed-stage descriptor once, and uses process credentials;
   the production crate must not depend on, construct, or start `lake-metasrv`.

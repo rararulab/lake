@@ -23,6 +23,39 @@ use crate::error::Result;
 
 pub type MetaStoreRef = Arc<dyn MetaStore>;
 
+/// One bounded page from a prefix scan. The continuation token is opaque to
+/// callers and may be passed back only with the same prefix.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetaScanPage {
+    entries:      Vec<(String, Vec<u8>)>,
+    continuation: Option<String>,
+}
+
+impl MetaScanPage {
+    /// Construct a page with backend-opaque continuation state.
+    #[must_use]
+    pub fn new(entries: Vec<(String, Vec<u8>)>, continuation: Option<String>) -> Self {
+        Self {
+            entries,
+            continuation,
+        }
+    }
+
+    /// Borrow the stripped keys and values returned in this page.
+    #[must_use]
+    pub fn entries(&self) -> &[(String, Vec<u8>)] { &self.entries }
+
+    /// Borrow the token to use for the next scan of the same prefix.
+    #[must_use]
+    pub fn continuation(&self) -> Option<&str> { self.continuation.as_deref() }
+
+    /// Consume the page into entries and continuation state.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<(String, Vec<u8>)>, Option<String>) {
+        (self.entries, self.continuation)
+    }
+}
+
 #[async_trait]
 pub trait MetaStore: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
@@ -45,6 +78,30 @@ pub trait MetaStore: Send + Sync {
             }
         }
         Ok(entries)
+    }
+
+    /// Scan at most `limit` entries. Backends override this to avoid loading
+    /// an unbounded prefix; the default preserves compatibility for test
+    /// stores while still presenting the same cursor contract.
+    async fn scan_prefix_page(
+        &self,
+        prefix: &str,
+        continuation: Option<&str>,
+        limit: usize,
+    ) -> Result<MetaScanPage> {
+        if limit == 0 {
+            return Ok(MetaScanPage::new(Vec::new(), None));
+        }
+        let mut entries = self.scan_prefix(prefix).await?;
+        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut eligible = entries.into_iter().filter(|(key, _)| {
+            continuation.is_none_or(|cursor| format!("{prefix}{key}").as_str() > cursor)
+        });
+        let page = eligible.by_ref().take(limit).collect::<Vec<_>>();
+        let next = eligible
+            .next()
+            .and_then(|_| page.last().map(|(key, _)| format!("{prefix}{key}")));
+        Ok(MetaScanPage::new(page, next))
     }
 
     /// Delete `key` only when its current value exactly matches `expected`.

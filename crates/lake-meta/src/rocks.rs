@@ -20,11 +20,12 @@ use std::{
 };
 
 use async_trait::async_trait;
+use rocksdb::{Direction, IteratorMode};
 use snafu::ResultExt;
 
 use crate::{
     error::{BackendSnafu, Result},
-    store::MetaStore,
+    store::{MetaScanPage, MetaStore},
 };
 
 pub struct RocksMeta {
@@ -95,6 +96,44 @@ impl MetaStore for RocksMeta {
         Ok(out)
     }
 
+    async fn scan_prefix_page(
+        &self,
+        prefix: &str,
+        continuation: Option<&str>,
+        limit: usize,
+    ) -> Result<MetaScanPage> {
+        if limit == 0 {
+            return Ok(MetaScanPage::new(Vec::new(), None));
+        }
+        let start = continuation.unwrap_or(prefix);
+        let mut entries = Vec::with_capacity(limit);
+        let mut last_full_key = None;
+        let mut has_more = false;
+        for item in self
+            .db
+            .iterator(IteratorMode::From(start.as_bytes(), Direction::Forward))
+        {
+            let (key, value) = item.context(BackendSnafu { key: prefix })?;
+            let key = String::from_utf8_lossy(&key);
+            if continuation.is_some_and(|cursor| key.as_ref() <= cursor) {
+                continue;
+            }
+            let Some(stripped) = key.strip_prefix(prefix) else {
+                break;
+            };
+            if entries.len() == limit {
+                has_more = true;
+                break;
+            }
+            last_full_key = Some(key.to_string());
+            entries.push((stripped.to_owned(), value.to_vec()));
+        }
+        Ok(MetaScanPage::new(
+            entries,
+            has_more.then(|| last_full_key).flatten(),
+        ))
+    }
+
     async fn delete(&self, key: &str, expected: &[u8]) -> Result<bool> {
         let _guard = self.lock();
         let current = self.db.get(key).context(BackendSnafu { key })?;
@@ -155,5 +194,24 @@ mod tests {
                 ("y".to_owned(), b"schema-y".to_vec()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn prefix_entry_scan_page_is_bounded() {
+        let (_dir, meta) = open_temp();
+        for key in ["op/a", "op/b", "op/c", "other/z"] {
+            assert!(meta.cas(key, None, key.as_bytes()).await.unwrap());
+        }
+
+        let first = meta.scan_prefix_page("op/", None, 2).await.unwrap();
+        assert_eq!(first.entries().len(), 2);
+        assert_eq!(first.entries()[0].0, "a");
+        assert_eq!(first.entries()[1].0, "b");
+        let second = meta
+            .scan_prefix_page("op/", first.continuation(), 2)
+            .await
+            .unwrap();
+        assert_eq!(second.entries(), &[("c".to_owned(), b"op/c".to_vec())]);
+        assert!(second.continuation().is_none());
     }
 }

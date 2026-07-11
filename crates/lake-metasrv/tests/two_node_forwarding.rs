@@ -39,21 +39,24 @@ use datafusion::arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
-use futures::{StreamExt, TryStreamExt};
-use lake_common::{FILE_APPEND_TYPE_URL, FileAppendRequest, TableRef};
+use futures::TryStreamExt;
+use lake_common::{
+    AppendOperationId, FILE_APPEND_TYPE_URL, FileAppendRequest, TableLocation, TableRef, Version,
+};
 use lake_engine::TableEngineRef;
 use lake_engine_lance::LanceEngine;
-use lake_flight::{ClientSecurity, ServerSecurity};
+use lake_flight::{ClientSecurity, ServerSecurity, append_flight_payload_digest};
 use lake_meta::{MetaStoreRef, RocksMeta, registry};
 use lake_metasrv::{
     Metasrv, MetasrvServerConfig,
     election::{LEASE_KEY, LeaseValue},
-    serve, serve_with_config,
+    serve, serve_with_config, serve_with_config_and_shutdown,
 };
 use prost::Message;
 use prost_types::Any;
 use rcgen::generate_simple_self_signed;
 use serde_json::json;
+use tokio::sync::oneshot;
 use tonic::{Code, Request, Status, transport::Channel};
 
 /// Grab a currently-free loopback address by binding an ephemeral port and
@@ -96,8 +99,10 @@ async fn do_action(addr: &str, r#type: &str, body: serde_json::Value) -> Result<
     Ok(())
 }
 
-async fn do_file_append(addr: &str, table: TableRef) -> Result<(), Status> {
-    let mut client = client(addr).await?;
+async fn file_append_messages(
+    table: TableRef,
+    operation_id: AppendOperationId,
+) -> Vec<arrow_flight::FlightData> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("ts", DataType::Int64, false),
         Field::new("reward", DataType::Float64, false),
@@ -110,22 +115,42 @@ async fn do_file_append(addr: &str, table: TableRef) -> Result<(), Status> {
         ],
     )
     .expect("build append batch");
-    let append = FileAppendRequest::new(table);
-    let descriptor = FlightDescriptor::new_cmd(
+    let mut messages = FlightDataEncoderBuilder::new()
+        .with_schema(schema)
+        .build(futures::stream::iter(vec![Ok(batch)]))
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("encode FlightData");
+    let append =
+        FileAppendRequest::new(table, operation_id, append_flight_payload_digest(&messages));
+    messages[0].flight_descriptor = Some(FlightDescriptor::new_cmd(
         Any {
             type_url: FILE_APPEND_TYPE_URL.to_owned(),
             value:    append.command_payload(),
         }
         .encode_to_vec(),
-    );
-    let stream = FlightDataEncoderBuilder::new()
-        .with_schema(schema)
-        .with_flight_descriptor(Some(descriptor))
-        .build(futures::stream::iter(vec![Ok(batch)]));
-    let stream = stream.map(|item| item.expect("encode FlightData"));
+    ));
+    messages
+}
+
+async fn do_file_append_messages(
+    addr: &str,
+    messages: Vec<arrow_flight::FlightData>,
+) -> Result<Version, Status> {
+    let mut client = client(addr).await?;
+    let stream = futures::stream::iter(messages);
     let response = client.do_put(Request::new(stream)).await?;
-    response.into_inner().try_collect::<Vec<_>>().await?;
-    Ok(())
+    let results = response.into_inner().try_collect::<Vec<_>>().await?;
+    let result = results
+        .first()
+        .ok_or_else(|| Status::internal("append returned no result"))?;
+    serde_json::from_slice(&result.app_metadata)
+        .map_err(|error| Status::internal(error.to_string()))
+}
+
+async fn do_file_append(addr: &str, table: TableRef) -> Result<(), Status> {
+    let messages = file_append_messages(table, AppendOperationId::generate()).await;
+    do_file_append_messages(addr, messages).await.map(|_| ())
 }
 
 /// Block until `addr` answers a read (`list_namespaces` is served locally on
@@ -276,6 +301,158 @@ async fn follower_forwards_write_to_leader() {
         reg_after.is_none(),
         "robots.arm still registered after a forwarded drop_table"
     );
+}
+
+#[tokio::test]
+async fn leader_failover_reconciles_inflight_append() {
+    let meta_dir = tempfile::tempdir().expect("meta tempdir");
+    let table_dir = tempfile::tempdir().expect("table tempdir");
+    let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).expect("open RocksMeta"));
+    let engine: TableEngineRef = Arc::new(LanceEngine::with_manifest_store(meta.clone()));
+    let addr_a = free_addr();
+    let addr_b = free_addr();
+    let (shutdown_a_tx, shutdown_a_rx) = oneshot::channel();
+    let (shutdown_b_tx, shutdown_b_rx) = oneshot::channel();
+    let mut shutdown_a_tx = Some(shutdown_a_tx);
+    let mut shutdown_b_tx = Some(shutdown_b_tx);
+
+    let server_a = tokio::spawn({
+        let node = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
+        let addr = addr_a.clone();
+        async move {
+            serve_with_config_and_shutdown(
+                node,
+                &addr,
+                MetasrvServerConfig::new().with_shutdown_grace(Duration::from_secs(1)),
+                async move {
+                    let _ = shutdown_a_rx.await;
+                },
+            )
+            .await
+        }
+    });
+    let server_b = tokio::spawn({
+        let node = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
+        let addr = addr_b.clone();
+        async move {
+            serve_with_config_and_shutdown(
+                node,
+                &addr,
+                MetasrvServerConfig::new().with_shutdown_grace(Duration::from_secs(1)),
+                async move {
+                    let _ = shutdown_b_rx.await;
+                },
+            )
+            .await
+        }
+    });
+    let mut server_a = Some(server_a);
+    let mut server_b = Some(server_b);
+
+    wait_serving(&addr_a).await;
+    wait_serving(&addr_b).await;
+    let leader = wait_for_leader(&meta, &[&addr_a, &addr_b]).await;
+    let standby = if leader == addr_a {
+        addr_b.clone()
+    } else {
+        addr_a.clone()
+    };
+    let location = format!("{}/robots/failover-arm.lance", table_dir.path().display());
+    forward_with_retry(
+        &leader,
+        "create_table",
+        json!({
+            "namespace": "robots",
+            "name": "failover_arm",
+            "columns": ["ts:i64", "reward:f64"],
+            "location": location,
+        }),
+    )
+    .await
+    .expect("leader creates table");
+
+    let table = TableRef::new("robots", "failover_arm");
+    let messages = file_append_messages(table.clone(), AppendOperationId::generate()).await;
+    let committed = do_file_append_messages(&leader, messages.clone())
+        .await
+        .expect("leader commits append");
+    assert_eq!(committed, Version(2));
+
+    if leader == addr_a {
+        shutdown_a_tx
+            .take()
+            .expect("leader A sender")
+            .send(())
+            .expect("stop leader A");
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            server_a.take().expect("leader A task"),
+        )
+        .await
+        .expect("leader A stops")
+        .expect("leader A task joins")
+        .expect("leader A shutdown succeeds");
+    } else {
+        shutdown_b_tx
+            .take()
+            .expect("leader B sender")
+            .send(())
+            .expect("stop leader B");
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            server_b.take().expect("leader B task"),
+        )
+        .await
+        .expect("leader B stops")
+        .expect("leader B task joins")
+        .expect("leader B shutdown succeeds");
+    }
+    assert_eq!(wait_for_leader(&meta, &[&standby]).await, standby);
+
+    let replayed = do_file_append_messages(&standby, messages)
+        .await
+        .expect("new leader reconciles replay");
+    assert_eq!(replayed, committed, "replay must return the first version");
+    let registered = registry::get(meta.as_ref(), &table)
+        .await
+        .expect("registry get")
+        .expect("table remains registered");
+    assert_eq!(registered.current_version, committed);
+    assert_eq!(
+        engine
+            .open(&TableLocation::new(location))
+            .await
+            .expect("open table")
+            .expect("table exists")
+            .current_version(),
+        committed
+    );
+
+    if leader == addr_a {
+        shutdown_b_tx
+            .take()
+            .expect("standby B sender")
+            .send(())
+            .expect("stop standby B");
+        server_b
+            .take()
+            .expect("standby B task")
+            .await
+            .expect("standby B task joins")
+            .expect("standby B shutdown succeeds");
+    } else {
+        shutdown_a_tx
+            .take()
+            .expect("standby A sender")
+            .send(())
+            .expect("stop standby A");
+        server_a
+            .take()
+            .expect("standby A task")
+            .await
+            .expect("standby A task joins")
+            .expect("standby A shutdown succeeds");
+    }
 }
 
 async fn secure_do_action(

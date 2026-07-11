@@ -16,12 +16,17 @@ that lives in `goal.md`.
 
 ### Architecture invariants
 
-- The KV metastore holds only tiny mutable pointers (`ptr/<table>` ->
-  current version). Nothing else is mutable.
+- The KV metastore holds only tiny mutable registry pointers and compact
+  CAS-managed coordination records (operation identity/digest/state/version
+  and engine manifest mappings). Data-plane rows, object bytes, credentials,
+  signed URLs, and arbitrary request payloads are forbidden.
 - Manifests are immutable: written once at
   `<table_root>/<table>/_manifests/v<N>.json`, never rewritten.
-- Commit protocol: write the immutable manifest file first, then CAS the
-  version pointer. Losers of the race fail cleanly and retry.
+- Commit protocol: durably reserve the operation, stage reference lineage,
+  write the immutable manifest, then CAS the version pointer and terminal
+  operation state. Retries with the same authenticated identity and digest
+  converge on the original version; conflicting or unrecoverable state fails
+  closed.
 - Backend types (RocksDB, DynamoDB) never leak outside the `lake-meta`
   crate; everything else programs against the `MetaStore` trait.
 - SQL surface is DataFusion; wire-protocol direction is Arrow Flight SQL.

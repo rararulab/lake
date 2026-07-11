@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
+use lake_common::{AppendOperation, AppendOperationId, AppendPayloadDigest, TenantId};
+use sha2::{Digest, Sha256};
 
 use super::Context;
 use crate::commands::table::parse_table_ref;
@@ -46,9 +48,19 @@ pub async fn run(ctx: &Context, table: &str, file: &str) -> anyhow::Result<()> {
         .execute_stream()
         .await
         .context("executing parquet scan")?;
+    let payload_digest = AppendPayloadDigest::parse(format!(
+        "{:x}",
+        Sha256::digest(format!("lake.ingest.v1\0{table}\0{file}"))
+    ))
+    .expect("SHA-256 produces a valid append digest");
+    let operation = AppendOperation::builder()
+        .tenant(TenantId::try_new("development")?)
+        .operation_id(AppendOperationId::generate())
+        .payload_digest(payload_digest)
+        .build();
     let version = ctx
         .metasrv
-        .append(&table, stream)
+        .append(&table, &operation, stream)
         .await
         .with_context(|| format!("appending to {table}"))?;
     println!("ingested {file} into {table} at {version}");

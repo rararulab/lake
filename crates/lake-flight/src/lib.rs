@@ -16,8 +16,10 @@
 
 use std::{fmt, net::SocketAddr, sync::Arc};
 
-use arrow_flight::{FlightClient, sql::client::FlightSqlServiceClient};
+use arrow_flight::{FlightClient, FlightData, sql::client::FlightSqlServiceClient};
+use lake_common::AppendPayloadDigest;
 pub use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
+use sha2::{Digest, Sha256};
 use snafu::Snafu;
 use subtle::ConstantTimeEq;
 use tonic::{
@@ -30,6 +32,64 @@ use tonic::{
 /// Metadata key used by trusted Query and metadata peers to preserve an
 /// already-authorized namespace across an internal Flight hop.
 pub const DELEGATED_NAMESPACE_HEADER: &str = "x-lake-delegated-namespace";
+/// Internal authenticated header carrying the original principal's tenant.
+pub const DELEGATED_TENANT_HEADER: &str = "x-lake-delegated-tenant";
+
+const APPEND_DIGEST_DOMAIN: &[u8] = b"lake.append.flight-metadata.v1\0";
+
+/// Incrementally hashes the ordered Arrow Flight metadata messages in one
+/// append. The descriptor is excluded because it carries the digest itself;
+/// every message's Arrow header, body, and application metadata are
+/// length-delimited and covered.
+pub struct AppendFlightPayloadHasher {
+    hasher: Sha256,
+}
+
+impl AppendFlightPayloadHasher {
+    /// Start a version-1 append payload digest.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(APPEND_DIGEST_DOMAIN);
+        Self { hasher }
+    }
+
+    /// Include one Flight message in wire order.
+    pub fn update(&mut self, data: &FlightData) {
+        for field in [&data.data_header, &data.data_body, &data.app_metadata] {
+            self.hasher.update((field.len() as u64).to_be_bytes());
+            self.hasher.update(field);
+        }
+    }
+
+    /// Finish and return the lowercase SHA-256 digest.
+    #[must_use]
+    pub fn finalize(self) -> AppendPayloadDigest {
+        use std::fmt::Write as _;
+
+        let digest = self.hasher.finalize();
+        let mut encoded = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        AppendPayloadDigest::parse(encoded)
+            .expect("SHA-256 is a lowercase 64-character hexadecimal digest")
+    }
+}
+
+impl Default for AppendFlightPayloadHasher {
+    fn default() -> Self { Self::new() }
+}
+
+/// Hash an already-buffered append payload using the version-1 algorithm.
+#[must_use]
+pub fn append_flight_payload_digest(messages: &[FlightData]) -> AppendPayloadDigest {
+    let mut hasher = AppendFlightPayloadHasher::new();
+    for message in messages {
+        hasher.update(message);
+    }
+    hasher.finalize()
+}
 
 /// Errors raised while constructing Flight transport security.
 #[derive(Debug, Snafu)]
@@ -450,7 +510,10 @@ mod tests {
     use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
     use tonic::{Request, service::Interceptor};
 
-    use super::{BearerAuthenticator, BearerPrincipalBinding, ClientSecurity, ServerSecurity};
+    use super::{
+        BearerAuthenticator, BearerPrincipalBinding, ClientSecurity, ServerSecurity,
+        append_flight_payload_digest,
+    };
 
     fn request_with_authorization(value: &str) -> Request<()> {
         let mut request = Request::new(());
@@ -599,5 +662,41 @@ mod tests {
         assert_eq!(accepted.extensions().get::<Principal>(), Some(&development));
         let public: SocketAddr = "0.0.0.0:50051".parse().unwrap();
         assert!(security.validate_exposure(public, false).is_err());
+    }
+
+    #[test]
+    fn append_flight_payload_digest_covers_ordered_metadata_messages() {
+        let mut first = arrow_flight::FlightData {
+            data_header: b"schema".to_vec().into(),
+            data_body: b"body-one".to_vec().into(),
+            ..Default::default()
+        };
+        first.flight_descriptor = Some(arrow_flight::FlightDescriptor::new_cmd("descriptor-a"));
+        let second = arrow_flight::FlightData {
+            data_header: b"record-batch".to_vec().into(),
+            data_body: b"body-two".to_vec().into(),
+            app_metadata: b"metadata".to_vec().into(),
+            ..Default::default()
+        };
+        let expected = append_flight_payload_digest(&[first.clone(), second.clone()]);
+
+        first.flight_descriptor = Some(arrow_flight::FlightDescriptor::new_cmd("descriptor-b"));
+        assert_eq!(
+            append_flight_payload_digest(&[first, second.clone()]),
+            expected,
+            "the self-referential command descriptor is excluded"
+        );
+        assert_ne!(
+            append_flight_payload_digest(&[
+                second,
+                arrow_flight::FlightData {
+                    data_header: b"schema".to_vec().into(),
+                    data_body: b"body-one".to_vec().into(),
+                    ..Default::default()
+                }
+            ]),
+            expected,
+            "message order is covered"
+        );
     }
 }

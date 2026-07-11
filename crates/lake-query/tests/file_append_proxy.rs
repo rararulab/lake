@@ -21,9 +21,12 @@ use datafusion::arrow::{
     record_batch::RecordBatch,
 };
 use futures::TryStreamExt;
-use lake_common::{FILE_APPEND_TYPE_URL, FileAppendRequest, TableLocation, TableRef};
+use lake_common::{
+    AppendOperationId, FILE_APPEND_TYPE_URL, FileAppendRequest, TableLocation, TableRef,
+};
 use lake_engine::TableEngineRef;
 use lake_engine_lance::LanceEngine;
+use lake_flight::append_flight_payload_digest;
 use lake_meta::{MetaStoreRef, RocksMeta};
 use lake_metasrv::Metasrv;
 use lake_query::{QueryEngine, serve_with_metadata};
@@ -71,23 +74,30 @@ async fn file_append_is_forwarded_without_payload_proxying() {
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let append = FileAppendRequest::new(table.clone());
-    let descriptor = FlightDescriptor::new_cmd(
-        Any {
-            type_url: FILE_APPEND_TYPE_URL.to_owned(),
-            value:    append.command_payload(),
-        }
-        .encode_to_vec(),
-    );
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(StringArray::from(vec!["episode-42"]))],
     )
     .unwrap();
-    let stream = FlightDataEncoderBuilder::new()
+    let mut messages = FlightDataEncoderBuilder::new()
         .with_schema(schema)
-        .with_flight_descriptor(Some(descriptor))
-        .build(futures::stream::iter(vec![Ok(batch)]));
+        .build(futures::stream::iter(vec![Ok(batch)]))
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let append = FileAppendRequest::new(
+        table.clone(),
+        AppendOperationId::generate(),
+        append_flight_payload_digest(&messages),
+    );
+    messages[0].flight_descriptor = Some(FlightDescriptor::new_cmd(
+        Any {
+            type_url: FILE_APPEND_TYPE_URL.to_owned(),
+            value:    append.command_payload(),
+        }
+        .encode_to_vec(),
+    ));
+    let stream = futures::stream::iter(messages.into_iter().map(Ok));
     let channel = Channel::from_shared(format!("http://{query_addr}"))
         .unwrap()
         .connect()

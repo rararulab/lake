@@ -10,8 +10,10 @@ Lance dataset.
 - All Arrow types come through `datafusion::arrow`, never a direct `arrow`
   dep — the engine and query layer must share one Arrow version (datafusion
   53.1 + lance 8 both resolve to arrow 58).
-- v0 uses Lance's default commit (atomic on local FS). The
-  `ExternalManifestStore` adapter over `MetaStore` (for S3) is v1.
+- Append commits disable automatic rebase and persist tenant, operation ID,
+  digest, and reference-stage identity in Lance transaction properties.
+- Reference lineage is staged before manifest visibility and repaired from
+  transaction history before a recovered version is returned.
 
 ## Layout
 

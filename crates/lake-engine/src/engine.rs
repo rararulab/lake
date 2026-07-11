@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::SchemaRef, catalog::TableProvider, execution::SendableRecordBatchStream,
 };
-use lake_common::{ObjectReferenceDelta, TableLocation, Version};
+use lake_common::{AppendOperation, ObjectReferenceDelta, TableLocation, Version};
 
 use crate::error::{EngineError, Result};
 
@@ -157,10 +157,18 @@ pub trait TableHandle: Send + Sync {
     /// registry pointer is lake's visibility boundary.
     async fn table_provider(&self, version: Version) -> Result<Arc<dyn TableProvider>>;
 
-    /// Append rows, producing a new immutable version. The engine performs
-    /// its own manifest-first-then-pointer commit; lake's registry pointer
-    /// update happens separately in the metadata layer.
-    async fn append(&self, batches: SendableRecordBatchStream) -> Result<Version>;
+    /// Append one idempotent logical operation, producing a new immutable
+    /// version. The operation identity and verified digest must be persisted
+    /// in engine transaction history before the registry pointer advances.
+    async fn append(
+        &self,
+        operation: &AppendOperation,
+        batches: SendableRecordBatchStream,
+    ) -> Result<Version>;
+
+    /// Discover and finish an append already present in engine history.
+    /// Implementations return `None` only when the operation never committed.
+    async fn reconcile_append(&self, operation: &AppendOperation) -> Result<Option<Version>>;
 }
 
 #[cfg(test)]

@@ -41,6 +41,8 @@ use lake_engine_lance::LanceEngine;
 use lake_meta::{DynamoMeta, MetaStoreRef, RocksMeta};
 use lake_metasrv::Metasrv;
 
+use self::limits::operation_policy_from_env;
+
 /// Where table data lives — decides how `location()` names a table.
 enum Storage {
     Local { table_root: PathBuf },
@@ -73,14 +75,14 @@ impl Context {
         let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.join("meta"))?);
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
         let managed_stage = local_managed_stage_descriptor(&root);
-        Ok(Self::wire(
+        Self::wire(
             meta,
             engine,
             Storage::Local {
                 table_root: root.join("tables"),
             },
             managed_stage,
-        ))
+        )
     }
 
     /// Prod path: DynamoDB registry + Lance datasets on S3.
@@ -102,12 +104,7 @@ impl Context {
             std::env::var("AWS_REGION").ok(),
             std::env::var("LAKE_S3_ENDPOINT").ok(),
         );
-        Ok(Self::wire(
-            meta,
-            engine,
-            Storage::S3 { bucket },
-            managed_stage,
-        ))
+        Self::wire(meta, engine, Storage::S3 { bucket }, managed_stage)
     }
 
     fn wire(
@@ -115,15 +112,21 @@ impl Context {
         engine: TableEngineRef,
         storage: Storage,
         managed_stage: ManagedStageDescriptor,
-    ) -> Self {
-        let metasrv = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
-        Self {
+    ) -> anyhow::Result<Self> {
+        let (operation_retention, operation_gc_page_size) = operation_policy_from_env()?;
+        let metasrv = Arc::new(Metasrv::with_operation_policy(
+            meta.clone(),
+            engine.clone(),
+            operation_retention,
+            operation_gc_page_size,
+        ));
+        Ok(Self {
             meta,
             engine,
             metasrv,
             storage,
             managed_stage,
-        }
+        })
     }
 
     /// Credential-free managed `FILE` stage advertised by query.

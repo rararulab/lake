@@ -33,7 +33,7 @@ use snafu::IntoError;
 
 use crate::{
     error::{DynamoSnafu, MetaError, Result},
-    store::MetaStore,
+    store::{MetaScanPage, MetaStore},
 };
 
 /// Wrap any AWS SDK error into a [`MetaError::Dynamo`] carrying `message`.
@@ -243,6 +243,52 @@ impl MetaStore for DynamoMeta {
         }
         out.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         Ok(out)
+    }
+
+    async fn scan_prefix_page(
+        &self,
+        prefix: &str,
+        continuation: Option<&str>,
+        limit: usize,
+    ) -> Result<MetaScanPage> {
+        if limit == 0 {
+            return Ok(MetaScanPage::new(Vec::new(), None));
+        }
+        let start_key = continuation
+            .map(|cursor| HashMap::from([("pk".to_owned(), AttributeValue::S(cursor.to_owned()))]));
+        let response = self
+            .client
+            .scan()
+            .table_name(&self.table)
+            .consistent_read(true)
+            .projection_expression("pk,val")
+            .filter_expression("begins_with(pk, :prefix)")
+            .expression_attribute_values(":prefix", AttributeValue::S(prefix.to_owned()))
+            .set_exclusive_start_key(start_key)
+            .limit(i32::try_from(limit).unwrap_or(i32::MAX))
+            .send()
+            .await
+            .map_err(dynamo_err(format!("scan page for prefix '{prefix}'")))?;
+        let mut entries = Vec::new();
+        for item in response.items() {
+            let (Some(AttributeValue::S(pk)), Some(AttributeValue::B(value))) =
+                (item.get("pk"), item.get("val"))
+            else {
+                continue;
+            };
+            if let Some(stripped) = pk.strip_prefix(prefix) {
+                entries.push((stripped.to_owned(), value.as_ref().to_vec()));
+            }
+        }
+        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let continuation = response
+            .last_evaluated_key()
+            .and_then(|key| key.get("pk"))
+            .and_then(|value| match value {
+                AttributeValue::S(value) => Some(value.clone()),
+                _ => None,
+            });
+        Ok(MetaScanPage::new(entries, continuation))
     }
 
     async fn delete(&self, key: &str, expected: &[u8]) -> Result<bool> {

@@ -12,6 +12,8 @@ The query layer: stateless SQL compute. `QueryEngine` wires a DataFusion
   layer never asks a datanode.
 - Typed SQL `FILE` writes are metadata-only Flight streams proxied to metasrv;
   query does not persist rows or receive the original object bytes.
+- Query derives delegated tenant scope from the authenticated principal and
+  preserves the operation descriptor byte-for-byte while forwarding.
 - Managed-stage discovery returns one versioned, credential-free descriptor;
   it never proxies object bytes or exposes SDK process credentials.
 - Production `serve_with_config` authenticates every inbound Flight RPC and

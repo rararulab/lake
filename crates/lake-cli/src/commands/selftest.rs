@@ -26,7 +26,7 @@ use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter,
 };
-use lake_common::TableRef;
+use lake_common::{AppendOperation, AppendOperationId, AppendPayloadDigest, TableRef, TenantId};
 use lake_query::QueryEngine;
 
 use super::Context;
@@ -63,7 +63,17 @@ pub async fn run(ctx: &Context) -> anyhow::Result<()> {
     )?;
     let stream: SendableRecordBatchStream =
         Box::pin(RecordBatchStreamAdapter::new(schema, futures_iter(batch)));
-    let version = ctx.metasrv.append(&table, stream).await?;
+    let operation = AppendOperation::builder()
+        .tenant(TenantId::try_new("development")?)
+        .operation_id(AppendOperationId::generate())
+        .payload_digest(
+            AppendPayloadDigest::parse(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .expect("valid selftest digest"),
+        )
+        .build();
+    let version = ctx.metasrv.append(&table, &operation, stream).await?;
     println!("committed {table} at {version}");
 
     // 3. Query it back with plain SQL.
