@@ -30,6 +30,9 @@ may scan once to install the pointer; steady-state reads may not scan.
   durably written the staging manifest; readers may finalize that staging path
   using Lance's existing commit handler.
 - Historical backfill writes a version key without regressing latest.
+- Drop transitions fixed latest through durable `deleting` and `deleted`
+  markers. Recreate replaces `deleted`; the key never becomes absent, so stale
+  migration cannot revive a dropped pointer through an ABA CAS.
 - If latest is absent but legacy history exists, scan once, CAS-install the
   maximum record, and let racing migrators converge on the installed value.
 - This commit-protocol boundary is not mixed-writer compatible: pre-#41
@@ -102,7 +105,23 @@ Scenario: Dataset deletion clears both layouts
     Filter: delete_clears_latest_and_history
   Given fixed latest plus archived historical records
   When the external manifest dataset is deleted
-  Then neither latest nor any historical version remains
+  Then no live latest or historical version remains and recreate replaces the durable deleted marker
+
+Scenario: Delete fences migration and recreate races
+  Test:
+    Package: lake-engine-lance
+    Filter: delete_fence_blocks_stale_migration_and_recreate
+  Given migration has read legacy history or recreate races an active drop
+  When deletion owns the fixed-key fence
+  Then neither operation can publish until durable deletion finishes
+
+Scenario: Concurrent finalizers converge
+  Test:
+    Package: lake-engine-lance
+    Filter: concurrent_finalize_converges_on_same_path
+  Given current, historical, or migrated staging pointers
+  When two finalizers install the same final path concurrently
+  Then both calls succeed and observe the same installed path
 
 ## Out of Scope
 

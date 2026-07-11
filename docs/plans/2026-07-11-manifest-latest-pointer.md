@@ -19,8 +19,9 @@ version reads remain available.
    manifest-before-pointer. `put_if_exists` exact-CASes staging to final.
 4. Explicit reads first check immutable history, then exact-match fixed latest.
 5. A missing fixed pointer triggers one legacy max scan and CAS migration.
-6. Delete removes fixed latest and all immutable history, failing if either
-   layout changes concurrently.
+6. Delete fences fixed latest as `deleting`, removes immutable history, and
+   leaves a durable `deleted` marker that recreate replaces. This prevents
+   stale legacy migration from reviving a pointer through an ABA `None` CAS.
 
 ## Rollout
 

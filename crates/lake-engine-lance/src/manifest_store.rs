@@ -38,6 +38,9 @@
 //! writes that staging manifest before calling this adapter, preserving
 //! manifest-before-pointer. Existing per-version-only datasets scan once to
 //! install the fixed pointer; every later latest lookup is one point read.
+//! Drop changes the fixed value to `{"state":"deleting"}` and then a durable
+//! `{"state":"deleted"}` fence. Recreate replaces the latter, avoiding an ABA
+//! window in which a stale legacy migration could reinstall a deleted pointer.
 
 use std::cmp::Ordering;
 
@@ -64,9 +67,31 @@ struct LatestManifestPointer {
     path:    String,
 }
 
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DeleteState {
+    Deleting,
+    Deleted,
+}
+
+#[derive(Deserialize, Serialize)]
+struct DeleteMarker {
+    state: DeleteState,
+}
+
 struct LatestState {
     bytes:   Vec<u8>,
     pointer: LatestManifestPointer,
+}
+
+enum LatestRecord {
+    Pointer(LatestState),
+    Delete { bytes: Vec<u8>, state: DeleteState },
+}
+
+enum LatestResolution {
+    Missing { expected: Option<Vec<u8>> },
+    Present(LatestState),
 }
 
 /// A [`ExternalManifestStore`] whose source of truth is a [`MetaStore`].
@@ -96,7 +121,7 @@ impl MetaManifestStore {
 
     fn latest_key(base_uri: &str) -> String { format!("{LATEST_KEY_PREFIX}/{base_uri}") }
 
-    async fn read_latest(&self, base_uri: &str) -> Result<Option<LatestState>> {
+    async fn read_latest(&self, base_uri: &str) -> Result<Option<LatestRecord>> {
         let Some(bytes) = self
             .meta
             .get(&Self::latest_key(base_uri))
@@ -105,13 +130,38 @@ impl MetaManifestStore {
         else {
             return Ok(None);
         };
-        let pointer = decode_latest(&bytes)?;
-        Ok(Some(LatestState { bytes, pointer }))
+        if let Ok(pointer) = decode_latest(&bytes) {
+            return Ok(Some(LatestRecord::Pointer(LatestState { bytes, pointer })));
+        }
+        let marker = decode_delete_marker(&bytes)?;
+        Ok(Some(LatestRecord::Delete {
+            bytes,
+            state: marker.state,
+        }))
     }
 
-    async fn latest_or_migrate(&self, base_uri: &str) -> Result<Option<LatestState>> {
-        if let Some(latest) = self.read_latest(base_uri).await? {
-            return Ok(Some(latest));
+    fn resolve_record(base_uri: &str, record: Option<LatestRecord>) -> Result<LatestResolution> {
+        match record {
+            Some(LatestRecord::Pointer(latest)) => Ok(LatestResolution::Present(latest)),
+            Some(LatestRecord::Delete {
+                state: DeleteState::Deleted,
+                bytes,
+            }) => Ok(LatestResolution::Missing {
+                expected: Some(bytes),
+            }),
+            Some(LatestRecord::Delete {
+                state: DeleteState::Deleting,
+                ..
+            }) => Err(Error::io(format!(
+                "manifest deletion in progress: {base_uri}"
+            ))),
+            None => Ok(LatestResolution::Missing { expected: None }),
+        }
+    }
+
+    async fn latest_or_migrate(&self, base_uri: &str) -> Result<LatestResolution> {
+        if let Some(record) = self.read_latest(base_uri).await? {
+            return Self::resolve_record(base_uri, Some(record));
         }
 
         let prefix = Self::base_prefix(base_uri);
@@ -121,7 +171,7 @@ impl MetaManifestStore {
             .filter_map(|key| key.parse::<u64>().ok())
             .max()
         else {
-            return Ok(None);
+            return Ok(LatestResolution::Missing { expected: None });
         };
         let Some(history) = self
             .meta
@@ -129,7 +179,7 @@ impl MetaManifestStore {
             .await
             .map_err(store_err)?
         else {
-            return Ok(None);
+            return Ok(LatestResolution::Missing { expected: None });
         };
         let pointer = LatestManifestPointer {
             version,
@@ -143,12 +193,9 @@ impl MetaManifestStore {
             .await
             .map_err(store_err)?
         {
-            return Ok(Some(LatestState { bytes, pointer }));
+            return Ok(LatestResolution::Present(LatestState { bytes, pointer }));
         }
-        self.read_latest(base_uri)
-            .await?
-            .ok_or_else(|| Error::io(format!("manifest latest migration raced: {base_uri}")))
-            .map(Some)
+        Self::resolve_record(base_uri, self.read_latest(base_uri).await?)
     }
 
     async fn archive_latest(&self, base_uri: &str, latest: &LatestState) -> Result<()> {
@@ -229,6 +276,14 @@ fn decode_latest(bytes: &[u8]) -> Result<LatestManifestPointer> {
     serde_json::from_slice(bytes).map_err(|e| Error::invalid_input(e.to_string()))
 }
 
+fn encode_delete_marker(state: DeleteState) -> Result<Vec<u8>> {
+    serde_json::to_vec(&DeleteMarker { state }).map_err(|e| Error::invalid_input(e.to_string()))
+}
+
+fn decode_delete_marker(bytes: &[u8]) -> Result<DeleteMarker> {
+    serde_json::from_slice(bytes).map_err(|e| Error::invalid_input(e.to_string()))
+}
+
 #[async_trait]
 impl ExternalManifestStore for MetaManifestStore {
     async fn get(&self, base_uri: &str, version: u64) -> Result<String> {
@@ -237,16 +292,20 @@ impl ExternalManifestStore for MetaManifestStore {
             return decode(&bytes);
         }
         match self.latest_or_migrate(base_uri).await? {
-            Some(latest) if latest.pointer.version == version => Ok(latest.pointer.path),
+            LatestResolution::Present(latest) if latest.pointer.version == version => {
+                Ok(latest.pointer.path)
+            }
             _ => Err(Error::not_found(format!("{base_uri}@{version}"))),
         }
     }
 
     async fn get_latest_version(&self, base_uri: &str) -> Result<Option<(u64, String)>> {
-        Ok(self
-            .latest_or_migrate(base_uri)
-            .await?
-            .map(|latest| (latest.pointer.version, latest.pointer.path)))
+        match self.latest_or_migrate(base_uri).await? {
+            LatestResolution::Missing { .. } => Ok(None),
+            LatestResolution::Present(latest) => {
+                Ok(Some((latest.pointer.version, latest.pointer.path)))
+            }
+        }
     }
 
     async fn put_if_not_exists(
@@ -264,10 +323,10 @@ impl ExternalManifestStore for MetaManifestStore {
         let next_bytes = encode_latest(&next)?;
         let latest_key = Self::latest_key(base_uri);
         match self.latest_or_migrate(base_uri).await? {
-            None => {
+            LatestResolution::Missing { expected } => {
                 if self
                     .meta
-                    .cas(&latest_key, None, &next_bytes)
+                    .cas(&latest_key, expected.as_deref(), &next_bytes)
                     .await
                     .map_err(store_err)?
                 {
@@ -278,7 +337,7 @@ impl ExternalManifestStore for MetaManifestStore {
                     )))
                 }
             }
-            Some(latest) if version < latest.pointer.version => {
+            LatestResolution::Present(latest) if version < latest.pointer.version => {
                 let key = Self::version_key(base_uri, version);
                 let value = encode(path)?;
                 if self.meta.cas(&key, None, &value).await.map_err(store_err)? {
@@ -289,10 +348,12 @@ impl ExternalManifestStore for MetaManifestStore {
                     )))
                 }
             }
-            Some(latest) if version == latest.pointer.version => Err(Error::io(format!(
-                "manifest version already claimed: {base_uri}@{version}"
-            ))),
-            Some(latest) => {
+            LatestResolution::Present(latest) if version == latest.pointer.version => {
+                Err(Error::io(format!(
+                    "manifest version already claimed: {base_uri}@{version}"
+                )))
+            }
+            LatestResolution::Present(latest) => {
                 let expected = latest.pointer.version.checked_add(1).ok_or_else(|| {
                     Error::invalid_input(format!("manifest version overflow: {base_uri}"))
                 })?;
@@ -327,8 +388,11 @@ impl ExternalManifestStore for MetaManifestStore {
         _size: u64,
         _e_tag: Option<String>,
     ) -> Result<()> {
-        let Some(latest) = self.latest_or_migrate(base_uri).await? else {
-            return Err(Error::not_found(format!("{base_uri}@{version}")));
+        let latest = match self.latest_or_migrate(base_uri).await? {
+            LatestResolution::Present(latest) => latest,
+            LatestResolution::Missing { .. } => {
+                return Err(Error::not_found(format!("{base_uri}@{version}")));
+            }
         };
         match version.cmp(&latest.pointer.version) {
             Ordering::Equal => {
@@ -343,6 +407,12 @@ impl ExternalManifestStore for MetaManifestStore {
                     .cas(&Self::latest_key(base_uri), Some(&latest.bytes), &value)
                     .await
                     .map_err(store_err)?
+                {
+                    return Ok(());
+                }
+                if let Some(LatestRecord::Pointer(installed)) = self.read_latest(base_uri).await?
+                    && installed.pointer.version == version
+                    && installed.pointer.path == path
                 {
                     return Ok(());
                 }
@@ -361,6 +431,9 @@ impl ExternalManifestStore for MetaManifestStore {
                 {
                     return Ok(());
                 }
+                if self.meta.get(&key).await.map_err(store_err)?.as_deref() == Some(&value) {
+                    return Ok(());
+                }
             }
             Ordering::Greater => {
                 return Err(Error::not_found(format!("{base_uri}@{version}")));
@@ -373,16 +446,30 @@ impl ExternalManifestStore for MetaManifestStore {
 
     async fn delete(&self, base_uri: &str) -> Result<()> {
         let latest_key = Self::latest_key(base_uri);
-        if let Some(latest) = self.read_latest(base_uri).await?
-            && !self
-                .meta
-                .delete(&latest_key, &latest.bytes)
-                .await
-                .map_err(store_err)?
-        {
-            return Err(Error::io(format!(
-                "manifest latest changed during delete: {base_uri}"
-            )));
+        let deleting = encode_delete_marker(DeleteState::Deleting)?;
+        let deleted = encode_delete_marker(DeleteState::Deleted)?;
+        match self.read_latest(base_uri).await? {
+            Some(LatestRecord::Delete {
+                state: DeleteState::Deleting,
+                ..
+            }) => {}
+            record => {
+                let expected = match record {
+                    Some(LatestRecord::Pointer(latest)) => Some(latest.bytes),
+                    Some(LatestRecord::Delete { bytes, .. }) => Some(bytes),
+                    None => None,
+                };
+                if !self
+                    .meta
+                    .cas(&latest_key, expected.as_deref(), &deleting)
+                    .await
+                    .map_err(store_err)?
+                {
+                    return Err(Error::io(format!(
+                        "manifest latest changed during delete: {base_uri}"
+                    )));
+                }
+            }
         }
         let prefix = Self::base_prefix(base_uri);
         let versions = self.meta.list_prefix(&prefix).await.map_err(store_err)?;
@@ -398,24 +485,34 @@ impl ExternalManifestStore for MetaManifestStore {
             }
         }
 
-        if self
+        if !self
             .meta
-            .get(&latest_key)
+            .list_prefix(&prefix)
             .await
             .map_err(store_err)?
-            .is_none()
-            && self
-                .meta
-                .list_prefix(&prefix)
-                .await
-                .map_err(store_err)?
-                .is_empty()
+            .is_empty()
         {
-            Ok(())
-        } else {
-            Err(Error::io(format!(
+            return Err(Error::io(format!(
                 "manifest history changed during delete: {base_uri}"
-            )))
+            )));
+        }
+        if self
+            .meta
+            .cas(&latest_key, Some(&deleting), &deleted)
+            .await
+            .map_err(store_err)?
+        {
+            return Ok(());
+        }
+        match self.read_latest(base_uri).await? {
+            Some(LatestRecord::Delete {
+                state: DeleteState::Deleted,
+                ..
+            })
+            | Some(LatestRecord::Pointer(_)) => Ok(()),
+            _ => Err(Error::io(format!(
+                "manifest deletion did not finalize: {base_uri}"
+            ))),
         }
     }
 }
@@ -424,11 +521,12 @@ impl ExternalManifestStore for MetaManifestStore {
 mod tests {
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use lake_meta::{MetaStore, RocksMeta};
     use tempfile::tempdir;
+    use tokio::sync::Notify;
 
     use super::*;
 
@@ -476,6 +574,70 @@ mod tests {
             inner: RocksMeta::open(dir.path()).expect("RocksMeta"),
             gets:  AtomicUsize::new(0),
             lists: AtomicUsize::new(0),
+        });
+        (MetaManifestStore::new(meta.clone()), meta, dir)
+    }
+
+    struct BlockingMeta {
+        inner:                 RocksMeta,
+        block_migration_cas:   AtomicBool,
+        migration_cas_entered: Notify,
+        migration_cas_release: Notify,
+        block_history_list:    AtomicBool,
+        history_list_entered:  Notify,
+        history_list_release:  Notify,
+    }
+
+    #[async_trait]
+    impl MetaStore for BlockingMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            if key.starts_with(LATEST_KEY_PREFIX)
+                && expected.is_none()
+                && new
+                    .windows(b"\"version\"".len())
+                    .any(|part| part == b"\"version\"")
+                && self.block_migration_cas.swap(false, Ordering::SeqCst)
+            {
+                self.migration_cas_entered.notify_one();
+                self.migration_cas_release.notified().await;
+            }
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            if prefix.starts_with(KEY_PREFIX)
+                && self.block_history_list.swap(false, Ordering::SeqCst)
+            {
+                self.history_list_entered.notify_one();
+                self.history_list_release.notified().await;
+            }
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
+        }
+    }
+
+    fn blocking_store() -> (MetaManifestStore, Arc<BlockingMeta>, tempfile::TempDir) {
+        let dir = tempdir().expect("manifest metadata directory");
+        let meta = Arc::new(BlockingMeta {
+            inner:                 RocksMeta::open(dir.path()).expect("RocksMeta"),
+            block_migration_cas:   AtomicBool::new(false),
+            migration_cas_entered: Notify::new(),
+            migration_cas_release: Notify::new(),
+            block_history_list:    AtomicBool::new(false),
+            history_list_entered:  Notify::new(),
+            history_list_release:  Notify::new(),
         });
         (MetaManifestStore::new(meta.clone()), meta, dir)
     }
@@ -550,6 +712,132 @@ mod tests {
         s.put_if_not_exists("ds", 1, "new-v1.manifest", 4, None)
             .await
             .expect("a recreated dataset can claim version one");
+    }
+
+    #[tokio::test]
+    async fn delete_fence_blocks_stale_migration_and_recreate() {
+        let (store, meta, _dir) = blocking_store();
+        let store = Arc::new(store);
+        let legacy_key = MetaManifestStore::version_key("delete-race", 1);
+        assert!(
+            meta.cas(
+                &legacy_key,
+                None,
+                &encode("v1.manifest").expect("legacy pointer")
+            )
+            .await
+            .expect("legacy write")
+        );
+
+        meta.block_migration_cas.store(true, Ordering::SeqCst);
+        let migrating = {
+            let store = store.clone();
+            tokio::spawn(async move { store.get_latest_version("delete-race").await })
+        };
+        meta.migration_cas_entered.notified().await;
+        store.delete("delete-race").await.expect("delete wins race");
+        meta.migration_cas_release.notify_one();
+        assert_eq!(
+            migrating
+                .await
+                .expect("migration task")
+                .expect("migration converges"),
+            None
+        );
+        assert_eq!(
+            store
+                .get_latest_version("delete-race")
+                .await
+                .expect("deleted latest"),
+            None
+        );
+
+        store
+            .put_if_not_exists("delete-race", 1, "new-v1.manifest", 4, None)
+            .await
+            .expect("recreate replaces durable deleted marker");
+        meta.block_history_list.store(true, Ordering::SeqCst);
+        let deleting = {
+            let store = store.clone();
+            tokio::spawn(async move { store.delete("delete-race").await })
+        };
+        meta.history_list_entered.notified().await;
+        assert!(
+            store
+                .put_if_not_exists("delete-race", 1, "racing-v1.manifest", 4, None)
+                .await
+                .is_err(),
+            "recreate cannot cross the deleting fence"
+        );
+        meta.history_list_release.notify_one();
+        deleting
+            .await
+            .expect("delete task")
+            .expect("delete completes");
+        store
+            .put_if_not_exists("delete-race", 1, "final-v1.manifest", 4, None)
+            .await
+            .expect("recreate starts after deletion finalizes");
+    }
+
+    #[tokio::test]
+    async fn concurrent_finalize_converges_on_same_path() {
+        async fn finalize_twice(
+            store: Arc<MetaManifestStore>,
+            dataset: &'static str,
+            version: u64,
+        ) {
+            let left = {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    store
+                        .put_if_exists(dataset, version, "final.manifest", 4, None)
+                        .await
+                })
+            };
+            let right = tokio::spawn(async move {
+                store
+                    .put_if_exists(dataset, version, "final.manifest", 4, None)
+                    .await
+            });
+            left.await.expect("left finalizer").expect("left converges");
+            right
+                .await
+                .expect("right finalizer")
+                .expect("right converges");
+        }
+
+        let (store, _dir) = store();
+        let store = Arc::new(store);
+        store
+            .put_if_not_exists("current", 1, "staging.manifest", 4, None)
+            .await
+            .expect("current staging");
+        finalize_twice(store.clone(), "current", 1).await;
+
+        store
+            .put_if_not_exists("historical", 1, "staging.manifest", 4, None)
+            .await
+            .expect("historical staging");
+        store
+            .put_if_not_exists("historical", 2, "v2.staging", 4, None)
+            .await
+            .expect("archive staging v1");
+        finalize_twice(store.clone(), "historical", 1).await;
+
+        let (legacy, meta, _dir) = counting_store();
+        let legacy = Arc::new(legacy);
+        let key = MetaManifestStore::version_key("legacy-finalize", 1);
+        assert!(
+            meta.cas(&key, None, &encode("staging.manifest").expect("pointer"))
+                .await
+                .expect("legacy staging")
+        );
+        legacy
+            .get_latest_version("legacy-finalize")
+            .await
+            .expect("migrate legacy latest");
+        finalize_twice(legacy, "legacy-finalize", 1).await;
     }
 
     #[tokio::test]

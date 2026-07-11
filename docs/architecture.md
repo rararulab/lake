@@ -117,6 +117,11 @@ maximum record. External history retention is separate from latest resolution:
 cleanup may delete a record only after Lance's tag/branch-aware cleanup proves
 the corresponding manifest object obsolete (#42).
 
+Drop never returns the fixed key to an absent state: it CASes current to
+`deleting`, clears immutable history, then CASes to a durable `deleted` marker.
+Recreate replaces only `deleted`. This tombstone prevents a migration that
+read legacy history before drop from winning an ABA `None` CAS afterward.
+
 The fixed pointer is a commit-protocol boundary. A pre-pointer binary can write
 a newer per-version record without advancing it, so commit-capable binaries on
 both sides must not run concurrently. Deployments drain writes, upgrade every

@@ -18,17 +18,23 @@ Issue: #41
   then point-only latest reads.
 - `legacy_staging_finalize_can_advance` proves a duplicated legacy staging
   record and fixed pointer converge to final before v2 can advance.
+- `delete_fence_blocks_stale_migration_and_recreate` deterministically pauses
+  migration and deletion to prove the durable deletion marker defeats ABA and
+  excludes recreate until cleanup completes.
+- `concurrent_finalize_converges_on_same_path` covers current, historical, and
+  migrated duplicate staging records; both same-target finalizers succeed.
 - Exact current/historical reads, historical backfill, delete, and recreate
   scenarios pass.
-- `cargo test -p lake-engine-lance --lib`: 18/18 PASS.
+- `cargo test -p lake-engine-lance --lib`: 20/20 PASS.
 - Real LocalStack S3 + Dynamo test
   `lance_engine_on_s3_with_dynamo_external_manifest`: PASS; Dynamo contains a
-  fixed v2 latest record plus immutable v1 history, and drop clears both.
+  fixed v2 latest record plus immutable v1 history; drop clears live state and
+  history while retaining only the durable `deleted` fence.
 - `cargo clippy -p lake-engine-lance --all-targets -- -D warnings`: PASS.
 - `mise run spec-lifecycle specs/issue-41-manifest-latest-pointer.spec.md`:
-  6/6 PASS with every selector matching a real test.
-- `mise run gate`: PASS (format, clippy, workspace tests, e2e self-check,
-  and site checks); 245.41s from a cold issue-workspace build.
+  8/8 PASS with every selector matching a real test.
+- Post-review `mise run gate`: PASS (format, clippy, workspace tests, e2e
+  self-check, and site checks); 96.89s after the concurrency repair.
 
 ## Rollout
 

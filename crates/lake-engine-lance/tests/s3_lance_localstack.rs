@@ -326,9 +326,20 @@ async fn lance_engine_on_s3_with_dynamo_external_manifest() {
         .list_prefix("lance-manifest-latest/")
         .await
         .expect("list latest manifest pointers after remove");
-    assert!(
-        stale_latest.is_empty(),
-        "remove must clear fixed manifest pointers; got {stale_latest:?}"
+    assert_eq!(
+        stale_latest.len(),
+        1,
+        "remove retains only its durable anti-ABA deletion marker; got {stale_latest:?}"
+    );
+    let deleted = meta
+        .get(&format!("lance-manifest-latest/{}", stale_latest[0]))
+        .await
+        .expect("read durable deletion marker")
+        .expect("durable deletion marker exists");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&deleted).expect("marker JSON")["state"],
+        "deleted",
+        "remove must replace the live pointer with a durable deleted marker"
     );
 
     let recreated = engine

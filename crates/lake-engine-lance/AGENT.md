@@ -17,6 +17,8 @@ Lance dataset.
 - The external manifest store resolves current state through one fixed
   `{version,path}` pointer. Advancing it archives the exact prior pointer, then
   CASes latest; legacy per-version-only datasets scan once to install latest.
+- Drop fences the fixed key through durable `deleting` and `deleted` markers;
+  recreate replaces `deleted`, so stale migration cannot win an ABA CAS.
 
 ## Layout
 
