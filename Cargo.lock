@@ -4150,6 +4150,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
+ "tracing",
 ]
 
 [[package]]
@@ -4245,6 +4246,7 @@ dependencies = [
  "snafu",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tonic",
  "tracing",
 ]
@@ -4287,6 +4289,7 @@ dependencies = [
  "snafu",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tonic",
  "tracing",
 ]

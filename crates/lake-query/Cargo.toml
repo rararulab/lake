@@ -21,6 +21,7 @@ lake-meta = { workspace = true }
 prost = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
 

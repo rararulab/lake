@@ -26,6 +26,7 @@ use std::{sync::Arc, time::Duration};
 
 use lake_common::TableRef;
 use lake_meta::{MetaError, registry};
+use tokio_util::sync::CancellationToken;
 
 use crate::{Metasrv, leadership::Leadership};
 
@@ -38,8 +39,20 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_mins(1);
 /// unless this node currently holds leadership, so standbys stay idle and only
 /// the leader does housekeeping.
 pub(crate) async fn run_maintenance_loop(metasrv: Arc<Metasrv>, leadership: Arc<Leadership>) {
+    run_maintenance_loop_until(metasrv, leadership, CancellationToken::new()).await;
+}
+
+/// Drive maintenance until shutdown without starting another sweep afterward.
+pub(crate) async fn run_maintenance_loop_until(
+    metasrv: Arc<Metasrv>,
+    leadership: Arc<Leadership>,
+    shutdown: CancellationToken,
+) {
     loop {
-        tokio::time::sleep(MAINTENANCE_INTERVAL).await;
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = tokio::time::sleep(MAINTENANCE_INTERVAL) => {}
+        }
         if !leadership.is_leader() {
             continue;
         }

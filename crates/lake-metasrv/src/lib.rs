@@ -43,13 +43,14 @@ use lake_flight::{ClientSecurity, ServerSecurity};
 use lake_meta::{MetaStoreRef, registry, registry::TableRegistration};
 use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 
 use crate::{
     control::MetasrvFlightService,
     election::LeaseElection,
-    leadership::{Leadership, run_campaign_loop},
-    maintenance::run_maintenance_loop,
+    leadership::{Leadership, run_campaign_loop_until},
+    maintenance::run_maintenance_loop_until,
 };
 
 #[derive(Debug, Snafu)]
@@ -80,6 +81,15 @@ pub enum MetasrvError {
     Security {
         source: lake_flight::FlightSecurityError,
     },
+
+    #[snafu(display("Metasrv Flight connections did not drain within {grace:?}"))]
+    DrainTimeout { grace: Duration },
+
+    #[snafu(display("Metasrv background task '{task}' failed"))]
+    BackgroundTask {
+        task:   &'static str,
+        source: tokio::task::JoinError,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, MetasrvError>;
@@ -90,6 +100,7 @@ pub struct MetasrvServerConfig {
     server_security: ServerSecurity,
     peer_security:   ClientSecurity,
     allow_insecure:  bool,
+    shutdown_grace:  Duration,
 }
 
 impl MetasrvServerConfig {
@@ -100,6 +111,7 @@ impl MetasrvServerConfig {
             server_security: ServerSecurity::insecure(),
             peer_security:   ClientSecurity::new(),
             allow_insecure:  false,
+            shutdown_grace:  Duration::from_secs(30),
         }
     }
 
@@ -122,6 +134,13 @@ impl MetasrvServerConfig {
     #[must_use]
     pub const fn allow_insecure(mut self, allow: bool) -> Self {
         self.allow_insecure = allow;
+        self
+    }
+
+    /// Bound how long existing Flight connections may drain during shutdown.
+    #[must_use]
+    pub const fn with_shutdown_grace(mut self, grace: Duration) -> Self {
+        self.shutdown_grace = grace;
         self
     }
 }
@@ -283,12 +302,44 @@ pub async fn serve_with_config(
     addr: &str,
     config: MetasrvServerConfig,
 ) -> Result<()> {
+    serve_with_config_and_shutdown(metasrv, addr, config, std::future::pending()).await
+}
+
+/// Run Metasrv until `shutdown` fires, drain RPCs, then resign and join all
+/// owned background work before returning.
+pub async fn serve_with_config_and_shutdown<F>(
+    metasrv: Arc<Metasrv>,
+    addr: &str,
+    config: MetasrvServerConfig,
+    shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let socket = addr.parse().context(AddressSnafu { addr })?;
+    config
+        .server_security
+        .validate_exposure(socket, config.allow_insecure)
+        .context(SecuritySnafu)?;
+    let mut server = Server::builder();
+    if let Some(tls) = config.server_security.tls_config() {
+        server = server.tls_config(tls).context(ServeSnafu)?;
+    }
+
     let election = LeaseElection::new(metasrv.meta().clone(), addr, Duration::from_secs(10));
     let leadership = Arc::new(Leadership::new());
-    // The maintenance sweep gates on the same deadline-aware leadership state
-    // as writes, so an expired local lease cannot authorize housekeeping.
-    tokio::spawn(run_maintenance_loop(metasrv.clone(), leadership.clone()));
-    tokio::spawn(run_campaign_loop(election, leadership.clone()));
+    let maintenance_shutdown = CancellationToken::new();
+    let campaign_shutdown = CancellationToken::new();
+    let maintenance = tokio::spawn(run_maintenance_loop_until(
+        metasrv.clone(),
+        leadership.clone(),
+        maintenance_shutdown.clone(),
+    ));
+    let campaign = tokio::spawn(run_campaign_loop_until(
+        election,
+        leadership.clone(),
+        campaign_shutdown.clone(),
+    ));
 
     let svc = MetasrvFlightService {
         metasrv,
@@ -297,27 +348,56 @@ pub async fn serve_with_config(
         peer_security: config.peer_security,
     };
 
-    let socket = addr.parse().context(AddressSnafu { addr })?;
-    config
-        .server_security
-        .validate_exposure(socket, config.allow_insecure)
-        .context(SecuritySnafu)?;
     tracing::info!(
         %addr,
         "metasrv control plane ready (Flight do_action; writes gated on leadership)"
     );
-    let mut server = Server::builder();
-    if let Some(tls) = config.server_security.tls_config() {
-        server = server.tls_config(tls).context(ServeSnafu)?;
-    }
-    server
-        .layer(tonic::service::InterceptorLayer::new(
-            config.server_security.interceptor(),
-        ))
-        .add_service(FlightServiceServer::new(svc))
-        .serve(socket)
+    let server_shutdown = CancellationToken::new();
+    let server_shutdown_waiter = server_shutdown.clone();
+    let mut server = Box::pin(
+        server
+            .layer(tonic::service::InterceptorLayer::new(
+                config.server_security.interceptor(),
+            ))
+            .add_service(FlightServiceServer::new(svc))
+            .serve_with_shutdown(socket, async move {
+                server_shutdown_waiter.cancelled().await;
+            }),
+    );
+    let mut shutdown = Box::pin(shutdown);
+
+    let server_result = tokio::select! {
+        result = server.as_mut() => result.context(ServeSnafu),
+        () = shutdown.as_mut() => {
+            maintenance_shutdown.cancel();
+            server_shutdown.cancel();
+            match tokio::time::timeout(config.shutdown_grace, server.as_mut()).await {
+                Ok(result) => result.context(ServeSnafu),
+                Err(_) => Err(MetasrvError::DrainTimeout { grace: config.shutdown_grace }),
+            }
+        }
+    };
+
+    // Dropping the server first guarantees no accepted write can outlive the
+    // leadership lease. Only then may the campaign resign.
+    drop(server);
+    maintenance_shutdown.cancel();
+    campaign_shutdown.cancel();
+    let maintenance_result = maintenance
         .await
-        .context(ServeSnafu)?;
+        .map_err(|source| MetasrvError::BackgroundTask {
+            task: "maintenance",
+            source,
+        });
+    let campaign_result = campaign
+        .await
+        .map_err(|source| MetasrvError::BackgroundTask {
+            task: "leadership-campaign",
+            source,
+        });
+    server_result?;
+    maintenance_result?;
+    campaign_result?;
     Ok(())
 }
 
@@ -330,7 +410,7 @@ mod tests {
     use lake_engine::{Result as EngineResult, TableEngine, TableEngineRef, TableHandleRef};
     use lake_engine_lance::LanceEngine;
     use lake_meta::RocksMeta;
-    use tokio::sync::Notify;
+    use tokio::sync::{Notify, oneshot};
 
     use super::*;
 
@@ -416,5 +496,55 @@ mod tests {
         drop_task.await.unwrap().unwrap();
         create_task.await.unwrap().unwrap();
         assert!(metasrv.resolve(&table).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn metasrv_shutdown_releases_listener_and_background_tasks() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let meta_dir = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let observer = LeaseElection::new(meta.clone(), "observer", Duration::from_secs(10));
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Arc::new(Metasrv::new(meta, engine));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn({
+            let metasrv = metasrv.clone();
+            async move {
+                serve_with_config_and_shutdown(
+                    metasrv,
+                    &addr.to_string(),
+                    MetasrvServerConfig::new().with_shutdown_grace(Duration::from_millis(500)),
+                    async move {
+                        let _ = shutdown_rx.await;
+                    },
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if observer.current_leader().await.unwrap().as_deref() == Some(&addr.to_string()) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("metasrv binds and acquires leadership");
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("metasrv joins within its grace period")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(observer.current_leader().await.unwrap(), None);
+        assert_eq!(Arc::strong_count(&metasrv), 1);
+        std::net::TcpListener::bind(addr).expect("shutdown releases the listener");
     }
 }

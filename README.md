@@ -175,5 +175,19 @@ the DoGet stream, so completing, timing out, or dropping the stream releases
 capacity. These are per-replica safety limits; tenant quotas and distributed
 fair queuing remain separate policy layers.
 
+`lake query` and `lake meta` handle SIGINT and SIGTERM as graceful shutdowns.
+They stop accepting new Flight connections, allow existing RPCs to drain for
+30 seconds, then close any remaining connections. Override the bound with a
+positive millisecond value:
+
+```bash
+LAKE_SHUTDOWN_GRACE_MS=10000 lake query ...
+```
+
+Both processes join their background tasks before exiting. Metasrv keeps its
+lease while accepted writes drain, then immediately resigns it, so a standby
+can take over without waiting for the 10-second lease TTL. Exceeding the drain
+window is reported as an error and makes the process exit non-zero.
+
 For the design and invariants, see [managed objects](docs/design/managed-objects.md)
 and [architecture](docs/architecture.md).
