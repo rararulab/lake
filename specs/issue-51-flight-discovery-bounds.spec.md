@@ -40,6 +40,7 @@ crates/lake-query/**
 crates/lake-cli/**
 docs/architecture.md
 docs/guides/cli.md
+docs/plans/2026-07-12-flight-discovery-bounds.md
 specs/issue-51-flight-discovery-bounds.spec.md
 verification/issue-51-flight-discovery-bounds.md
 
