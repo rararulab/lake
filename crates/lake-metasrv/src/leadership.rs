@@ -27,7 +27,7 @@ use std::{
 };
 
 use tokio::{
-    sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, watch},
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
@@ -47,6 +47,12 @@ const RENEW_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) struct Leadership {
     state:             Mutex<LeadershipState>,
     authority_barrier: RwLock<()>,
+    changes:           watch::Sender<u64>,
+}
+
+pub(crate) struct WriteReadiness {
+    pub(crate) ready:          bool,
+    pub(crate) local_deadline: Option<Instant>,
 }
 
 struct LeadershipState {
@@ -64,12 +70,14 @@ struct LocalAuthority {
 impl Leadership {
     /// A fresh leadership state: not leading, no known leader yet.
     pub(crate) fn new() -> Self {
+        let (changes, _) = watch::channel(0);
         Self {
-            state:             Mutex::new(LeadershipState {
+            state: Mutex::new(LeadershipState {
                 leader:          None,
                 local_authority: None,
             }),
             authority_barrier: RwLock::new(()),
+            changes,
         }
     }
 
@@ -113,6 +121,32 @@ impl Leadership {
         })
     }
 
+    /// Snapshot whether this process can accept or forward writes. A local
+    /// lease deadline is returned so readiness can be withdrawn even if the
+    /// campaign task stalls before publishing another state transition.
+    pub(crate) fn write_readiness(&self, own_addr: &str) -> WriteReadiness {
+        let state = self.state.lock().expect("leadership mutex poisoned");
+        if let Some(authority) = state
+            .local_authority
+            .as_ref()
+            .filter(|authority| Instant::now() < authority.deadline)
+        {
+            return WriteReadiness {
+                ready:          true,
+                local_deadline: Some(authority.deadline),
+            };
+        }
+        WriteReadiness {
+            ready:          state
+                .leader
+                .as_deref()
+                .is_some_and(|leader| leader != own_addr),
+            local_deadline: None,
+        }
+    }
+
+    pub(crate) fn subscribe_changes(&self) -> watch::Receiver<u64> { self.changes.subscribe() }
+
     /// Atomically publish the observed leader and our local lease deadline.
     fn publish(&self, leader: Option<String>, local_authority: Option<LocalAuthority>) -> bool {
         let mut state = self.state.lock().expect("leadership mutex poisoned");
@@ -122,6 +156,9 @@ impl Leadership {
             .is_some_and(|authority| Instant::now() < authority.deadline);
         state.leader = leader;
         state.local_authority = local_authority;
+        drop(state);
+        self.changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
         was_leader
     }
 
@@ -145,6 +182,11 @@ impl Leadership {
                 guard,
             }),
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assume_follower(&self, leader: &str) {
+        self.publish(Some(leader.to_owned()), None);
     }
 }
 

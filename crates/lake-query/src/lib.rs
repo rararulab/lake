@@ -47,11 +47,13 @@ use lake_flight::{ClientSecurity, ServerSecurity};
 use lake_meta::MetaStoreRef;
 use snafu::{ResultExt, Snafu};
 use tokio_util::sync::CancellationToken;
+use tonic_health::{ServingStatus, server::health_reporter};
 
 use crate::flight::FlightSqlServiceImpl;
 
 /// Maximum age of the in-memory catalog listing used on the query hot path.
 const CATALOG_MAX_AGE: Duration = Duration::from_secs(5);
+const FLIGHT_SERVICE_NAME: &str = "arrow.flight.protocol.FlightService";
 
 fn read_only_sql_options() -> SQLOptions {
     SQLOptions::new()
@@ -532,6 +534,10 @@ where
     }
 
     engine.refresh().await?;
+    let (health_reporter, health_service) = health_reporter();
+    health_reporter
+        .set_service_status(FLIGHT_SERVICE_NAME, ServingStatus::Serving)
+        .await;
     let cancellation = CancellationToken::new();
     let refresher = tokio::spawn(run_catalog_refresh_loop(
         engine.clone(),
@@ -558,6 +564,7 @@ where
             config.server_security.interceptor(),
         ))
         .add_service(service)
+        .add_service(health_service)
         .serve_with_shutdown(socket, async move {
             server_shutdown.cancelled().await;
         });
@@ -567,6 +574,12 @@ where
     let server_result = tokio::select! {
         result = &mut server => result.context(ServeSnafu),
         () = &mut shutdown => {
+            health_reporter
+                .set_service_status(FLIGHT_SERVICE_NAME, ServingStatus::NotServing)
+                .await;
+            health_reporter
+                .set_service_status("", ServingStatus::NotServing)
+                .await;
             cancellation.cancel();
             match tokio::time::timeout(config.shutdown_grace, &mut server).await {
                 Ok(result) => result.context(ServeSnafu),
@@ -660,6 +673,10 @@ mod tests {
     use rcgen::generate_simple_self_signed;
     use tokio::sync::Notify;
     use tonic::Request;
+    use tonic_health::pb::{
+        HealthCheckRequest, health_check_response::ServingStatus as WireServingStatus,
+        health_client::HealthClient,
+    };
 
     use super::*;
 
@@ -971,6 +988,144 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn query_grpc_health_requires_auth_and_reports_serving() {
+        let secret = "query-health-credential";
+        let certified =
+            generate_simple_self_signed(vec!["localhost".to_owned()]).expect("test identity");
+        let certificate = certified.cert.pem();
+        let private_key = certified.key_pair.serialize_pem();
+        let server_security = ServerSecurity::with_bearer_token(secret)
+            .expect("bearer")
+            .with_tls_identity_pem(certificate.as_bytes(), private_key.as_bytes());
+        let engine = Arc::new(QueryEngine::new(
+            Arc::new(CountingMeta::default()),
+            Arc::new(LanceEngine::new()),
+        ));
+        let addr = free_addr();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            serve_with_config_and_shutdown(
+                engine,
+                &addr.to_string(),
+                QueryServerConfig::new().with_server_security(server_security),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+        let endpoint = format!("https://localhost:{}", addr.port());
+        let transport = ClientSecurity::new()
+            .with_ca_certificate_pem(certificate.as_bytes().to_vec())
+            .with_server_name("localhost");
+        let channel = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(channel) = transport.connect(endpoint.clone()).await {
+                    break channel;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Query starts");
+        let error = HealthClient::new(channel)
+            .check(Request::new(HealthCheckRequest {
+                service: String::new(),
+            }))
+            .await
+            .expect_err("anonymous health rejected");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+
+        let authenticated = transport.with_bearer_token(secret).expect("client bearer");
+        let channel = authenticated.connect(endpoint).await.expect("TLS connect");
+        let mut client = HealthClient::new(channel);
+        for service in ["", FLIGHT_SERVICE_NAME] {
+            let response = client
+                .check(
+                    authenticated.authorize_request(Request::new(HealthCheckRequest {
+                        service: service.to_owned(),
+                    })),
+                )
+                .await
+                .expect("authenticated health")
+                .into_inner();
+            assert_eq!(response.status, WireServingStatus::Serving as i32);
+        }
+
+        shutdown_tx.send(()).expect("trigger shutdown");
+        server
+            .await
+            .expect("serve task")
+            .expect("graceful shutdown");
+    }
+
+    #[tokio::test]
+    async fn query_health_watch_observes_not_serving_on_shutdown() {
+        let engine = Arc::new(QueryEngine::new(
+            Arc::new(CountingMeta::default()),
+            Arc::new(LanceEngine::new()),
+        ));
+        let addr = free_addr();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            serve_with_config_and_shutdown(
+                engine,
+                &addr.to_string(),
+                QueryServerConfig::new().with_shutdown_grace(Duration::from_secs(1)),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+        let channel = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(channel) = ClientSecurity::new()
+                    .connect(format!("http://{addr}"))
+                    .await
+                {
+                    break channel;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Query starts");
+        let mut stream = HealthClient::new(channel)
+            .watch(Request::new(HealthCheckRequest {
+                service: FLIGHT_SERVICE_NAME.to_owned(),
+            }))
+            .await
+            .expect("health watch")
+            .into_inner();
+        assert_eq!(
+            stream
+                .message()
+                .await
+                .expect("watch message")
+                .expect("initial")
+                .status,
+            WireServingStatus::Serving as i32
+        );
+
+        shutdown_tx.send(()).expect("trigger shutdown");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), stream.message())
+                .await
+                .expect("withdrawal deadline")
+                .expect("watch message")
+                .expect("withdrawal")
+                .status,
+            WireServingStatus::NotServing as i32
+        );
+        drop(stream);
+        server
+            .await
+            .expect("serve task")
+            .expect("graceful shutdown");
     }
 
     #[tokio::test]

@@ -204,8 +204,9 @@ election, serving writers only. The read path never learns it exists.
 - **Standalone meta-server from day one (greptime's default
   topology).** Adds a process, an availability dependency, and a
   network hop to gain serialization DynamoDB already provides.
-  Greptime needs the process because it manages region placement and
-  node liveness; lake has neither.
+  Greptime needs the process because it manages region placement and a durable
+  node-liveness registry; lake has neither. Lake's standard gRPC Health service
+  is process-local operational signaling and does not add such a registry.
 - **Adopting `KvBackend`'s full surface (txn, batch ops, range
   deletes) into `MetaStore`.** Unused surface invites storing more
   than pointers in the metastore, which `goal.md` explicitly forbids.

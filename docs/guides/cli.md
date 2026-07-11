@@ -54,14 +54,32 @@ returns gRPC `ResourceExhausted` before payload polling.
 
 `LAKE_SHUTDOWN_GRACE_MS` (default `30000`) is the total Metasrv shutdown
 budget, beginning when SIGINT or SIGTERM is received. It covers Flight
-connection drain plus maintenance and leadership-campaign cleanup; unfinished
-owned background tasks are aborted at the deadline and the process returns a
-typed error instead of waiting indefinitely.
+connection drain plus maintenance, leadership-campaign, and health-readiness
+cleanup; unfinished owned background tasks are aborted at the deadline and the
+process returns a typed error instead of waiting indefinitely.
 
 Leader table maintenance uses `LAKE_MAINTENANCE_INTERVAL_SECS` (default `60`)
 and `LAKE_MAINTENANCE_TABLE_PAGE_SIZE` (default `128`, maximum `10000`). Each
 tick reads at most one registry page and resumes from a process-local cursor;
 invalid or zero values fail before the Metasrv listener binds.
+
+## gRPC health checks
+
+Query and Metasrv register the standard `grpc.health.v1.Health` service on the
+same port as Flight. Probes therefore use the same TLS trust roots and
+`authorization: Bearer <token>` metadata as every other RPC; there is no
+anonymous probe endpoint.
+
+- Check service `""` for process liveness.
+- Check service `"arrow.flight.protocol.FlightService"` for traffic readiness.
+- Query readiness becomes `SERVING` only after the initial catalog refresh.
+- Metasrv readiness is `SERVING` only with a live local lease or a known remote
+  leader that can receive forwarded writes.
+
+Use any generated gRPC Health client to call `Check` for polling or `Watch` for
+streaming transitions. During graceful shutdown both service names publish
+`NOT_SERVING` before Tonic begins connection drain, so a watcher can remove the
+node before the process exits.
 
 ## Process logging
 
