@@ -4126,7 +4126,6 @@ dependencies = [
  "lake-meta",
  "moka",
  "snafu",
- "tempfile",
  "tokio",
 ]
 
@@ -4135,12 +4134,10 @@ name = "lake-cli"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "arrow",
  "arrow-flight",
  "clap",
  "datafusion",
  "futures",
- "lake-catalog",
  "lake-common",
  "lake-engine",
  "lake-engine-lance",
@@ -4148,7 +4145,6 @@ dependencies = [
  "lake-metasrv",
  "lake-objects",
  "lake-query",
- "prost",
  "serde_json",
  "tokio",
  "tonic",
@@ -4176,7 +4172,6 @@ dependencies = [
 name = "lake-engine-lance"
 version = "0.0.1"
 dependencies = [
- "arrow",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
@@ -4190,7 +4185,6 @@ dependencies = [
  "object_store",
  "serde",
  "serde_json",
- "snafu",
  "tempfile",
  "tokio",
  "url",

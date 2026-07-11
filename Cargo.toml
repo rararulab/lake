@@ -13,6 +13,12 @@ members = [
     "crates/lake-sdk",
 ]
 
+[workspace.metadata.cargo-shear]
+# lake-sdk is the public entry crate; it is intentionally declared as a
+# workspace dependency for version unification even though no internal member
+# depends on it yet.
+ignored = ["lake-sdk"]
+
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
@@ -38,7 +44,6 @@ aws-sdk-s3 = "^1.60"
 datafusion = "^53.0"
 futures = "^0.3"
 lance = "^8.0"
-lance-datafusion = "^8.0"
 lance-table = "^8.0"
 moka = { version = "^0.12", features = ["future"] }
 object_store = "^0.13"
