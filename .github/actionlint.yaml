@@ -1,0 +1,5 @@
+# Declare the Namespace runner label so actionlint does not flag
+# `runs-on: namespace-profile-rara` as an unknown runner.
+self-hosted-runner:
+  labels:
+    - namespace-profile-rara

@@ -36,7 +36,7 @@ jobs:
   # main always run the full gate.
   changes:
     name: Detect changes
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-rara
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       site: ${{ steps.filter.outputs.site }}
@@ -73,13 +73,13 @@ jobs:
               - 'Cargo.lock'
               - 'deny.toml'
 
-  # One check per job so they run in parallel on separate GitHub-hosted runners
-  # (public repo => free, unlimited, ~20 concurrent).
+  # One check per job so they run in parallel on separate Namespace runners
+  # (fast CPUs + persistent cache volumes for the big Rust dependency tree).
   rust:
     name: ${{ matrix.name }}
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'push' }}
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-rara
     strategy:
       fail-fast: false
       matrix:
@@ -108,7 +108,7 @@ jobs:
     name: Integration (LocalStack)
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'push' }}
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-rara
     services:
       localstack:
         # Community edition; `:latest` now requires a LOCALSTACK_AUTH_TOKEN.
@@ -147,7 +147,7 @@ jobs:
     name: Spec selftest
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.specs == 'true' || github.event_name == 'push' }}
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-rara
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -163,7 +163,7 @@ jobs:
     name: Site
     needs: changes
     if: ${{ needs.changes.outputs.site == 'true' || github.event_name == 'push' }}
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-rara
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -178,7 +178,7 @@ jobs:
   commits:
     name: Conventional Commits
     if: ${{ github.event_name == 'pull_request' }}
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-rara
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -196,7 +196,7 @@ jobs:
     name: Cargo Deny
     needs: changes
     if: ${{ needs.changes.outputs.cargo_deps == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-rara
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -211,7 +211,7 @@ jobs:
     name: Cargo Shear
     needs: changes
     if: ${{ needs.changes.outputs.cargo_deps == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-rara
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -232,7 +232,7 @@ jobs:
     name: CI OK
     if: always()
     needs: [changes, rust, integration, spec, site, commits]
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-rara
     steps:
       - name: verify no job failed
         if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
