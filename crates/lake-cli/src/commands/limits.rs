@@ -17,7 +17,7 @@
 use std::{path::PathBuf, str::FromStr, time::Duration};
 
 use anyhow::Context as _;
-use lake_metasrv::{AppendLimits, DEFAULT_APPEND_OPERATION_RETENTION};
+use lake_metasrv::{AppendLimits, DEFAULT_APPEND_OPERATION_RETENTION, MaintenanceLimits};
 use lake_query::{DiscoveryLimits, QueryLimits, QueryResources};
 
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
@@ -41,6 +41,31 @@ pub(crate) fn append_limits_from_env() -> anyhow::Result<AppendLimits> {
         max_stream_bytes.as_deref(),
         max_buffered_bytes.as_deref(),
     )
+}
+
+pub(crate) fn maintenance_limits_from_env() -> anyhow::Result<MaintenanceLimits> {
+    let interval_secs = env_value("LAKE_MAINTENANCE_INTERVAL_SECS")?;
+    let table_page_size = env_value("LAKE_MAINTENANCE_TABLE_PAGE_SIZE")?;
+    maintenance_limits_from_values(interval_secs.as_deref(), table_page_size.as_deref())
+}
+
+fn maintenance_limits_from_values(
+    interval_secs: Option<&str>,
+    table_page_size: Option<&str>,
+) -> anyhow::Result<MaintenanceLimits> {
+    let defaults = MaintenanceLimits::default();
+    let interval_secs = parse_or(
+        "LAKE_MAINTENANCE_INTERVAL_SECS",
+        interval_secs,
+        defaults.interval().as_secs(),
+    )?;
+    let table_page_size = parse_or(
+        "LAKE_MAINTENANCE_TABLE_PAGE_SIZE",
+        table_page_size,
+        defaults.table_page_size(),
+    )?;
+    MaintenanceLimits::try_new(Duration::from_secs(interval_secs), table_page_size)
+        .context("invalid Metasrv maintenance limits")
 }
 
 fn append_limits_from_values(
@@ -256,8 +281,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        append_limits_from_values, discovery_limits_from_values, operation_policy_from_values,
-        query_limits_from_values, query_resources_from_values, shutdown_grace_from_value,
+        append_limits_from_values, discovery_limits_from_values, maintenance_limits_from_values,
+        operation_policy_from_values, query_limits_from_values, query_resources_from_values,
+        shutdown_grace_from_value,
     };
 
     #[test]
@@ -269,6 +295,18 @@ mod tests {
         assert!(operation_policy_from_values(Some("0"), None).is_err());
         assert!(operation_policy_from_values(None, Some("0")).is_err());
         assert!(operation_policy_from_values(Some("forever"), None).is_err());
+    }
+
+    #[test]
+    fn maintenance_limit_values_are_validated_before_serving() {
+        assert!(maintenance_limits_from_values(Some("0"), None).is_err());
+        assert!(maintenance_limits_from_values(Some("often"), None).is_err());
+        assert!(maintenance_limits_from_values(None, Some("0")).is_err());
+        assert!(maintenance_limits_from_values(None, Some("10001")).is_err());
+
+        let limits = maintenance_limits_from_values(Some("15"), Some("512")).expect("valid limits");
+        assert_eq!(limits.interval(), Duration::from_secs(15));
+        assert_eq!(limits.table_page_size(), 512);
     }
 
     #[test]

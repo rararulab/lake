@@ -24,7 +24,7 @@
 
 use std::{
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use lake_common::TableRef;
@@ -32,22 +32,26 @@ use lake_meta::{MetaError, registry};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Metasrv, MetasrvError,
+    MaintenanceLimits, Metasrv, MetasrvError,
     leadership::Leadership,
     operation::{AppendRecord, AppendState, OPERATION_PREFIX, active_key},
 };
 
-/// How often the maintenance loop wakes to consider a sweep.
-const MAINTENANCE_INTERVAL: Duration = Duration::from_mins(1);
 const DEFAULT_TABLE_MAINTENANCE_PAGE_SIZE: usize = 128;
 
 /// Drive periodic maintenance forever, running a sweep only while `is_leader`.
 ///
-/// Sleeps [`MAINTENANCE_INTERVAL`] between rounds. A round is skipped entirely
-/// unless this node currently holds leadership, so standbys stay idle and only
-/// the leader does housekeeping.
+/// Sleeps for the configured interval between rounds. A round is skipped
+/// entirely unless this node currently holds leadership, so standbys stay idle
+/// and only the leader does housekeeping.
 pub(crate) async fn run_maintenance_loop(metasrv: Arc<Metasrv>, leadership: Arc<Leadership>) {
-    run_maintenance_loop_until(metasrv, leadership, CancellationToken::new()).await;
+    run_maintenance_loop_until(
+        metasrv,
+        leadership,
+        CancellationToken::new(),
+        MaintenanceLimits::default(),
+    )
+    .await;
 }
 
 /// Drive maintenance until shutdown without starting another sweep afterward.
@@ -55,16 +59,17 @@ pub(crate) async fn run_maintenance_loop_until(
     metasrv: Arc<Metasrv>,
     leadership: Arc<Leadership>,
     shutdown: CancellationToken,
+    limits: MaintenanceLimits,
 ) {
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return,
-            () = tokio::time::sleep(MAINTENANCE_INTERVAL) => {}
+            () = tokio::time::sleep(limits.interval()) => {}
         }
         if !leadership.is_leader() {
             continue;
         }
-        sweep_until(&metasrv, &shutdown).await;
+        sweep_until_with_page_size(&metasrv, &shutdown, limits.table_page_size()).await;
     }
 }
 
@@ -77,6 +82,14 @@ pub(crate) async fn sweep(metasrv: &Metasrv) {
 }
 
 async fn sweep_until(metasrv: &Metasrv, shutdown: &CancellationToken) {
+    sweep_until_with_page_size(metasrv, shutdown, DEFAULT_TABLE_MAINTENANCE_PAGE_SIZE).await;
+}
+
+async fn sweep_until_with_page_size(
+    metasrv: &Metasrv,
+    shutdown: &CancellationToken,
+    table_page_size: usize,
+) {
     if shutdown.is_cancelled() {
         return;
     }
@@ -102,7 +115,7 @@ async fn sweep_until(metasrv: &Metasrv, shutdown: &CancellationToken) {
     if shutdown.is_cancelled() {
         return;
     }
-    let tables = sweep_table_page(metasrv, shutdown, DEFAULT_TABLE_MAINTENANCE_PAGE_SIZE).await;
+    let tables = sweep_table_page(metasrv, shutdown, table_page_size).await;
     tracing::debug!(
         scanned = tables.scanned,
         attempted = tables.attempted,
@@ -453,9 +466,12 @@ async fn delete_operation_record(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        sync::{
+            Arc, Mutex as StdMutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
 
     use async_trait::async_trait;

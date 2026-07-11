@@ -58,6 +58,11 @@ connection drain plus maintenance and leadership-campaign cleanup; unfinished
 owned background tasks are aborted at the deadline and the process returns a
 typed error instead of waiting indefinitely.
 
+Leader table maintenance uses `LAKE_MAINTENANCE_INTERVAL_SECS` (default `60`)
+and `LAKE_MAINTENANCE_TABLE_PAGE_SIZE` (default `128`, maximum `10000`). Each
+tick reads at most one registry page and resumes from a process-local cursor;
+invalid or zero values fail before the Metasrv listener binds.
+
 ## Async Runtime
 
 - The CLI is async-first. Use `#[tokio::main]` at the binary boundary and keep

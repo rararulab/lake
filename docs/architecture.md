@@ -422,6 +422,10 @@ design-level ones:
   worst-case buffered control bytes before reading a request. A follower and
   leader each enforce their own local ceiling while one forwarded upload is in
   flight; per-tenant and distributed write quotas remain policy work.
+- Leader maintenance consumes one bounded registry-registration page per tick,
+  rather than listing every namespace and table. Its process-local opaque
+  cursor wraps after the final page; every candidate is point-read again under
+  its table lock so drop/recreate cannot expose a stale scanned generation.
 - Query's DataFusion runtime is also process-bounded: all concurrent operators
   share one fair execution-memory pool and one aggregate size-limited spill
   manager under an operator-owned local directory. Spill is ephemeral replica
