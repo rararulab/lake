@@ -2157,8 +2157,6 @@ checksum = "8de6ac0df1662b9148ad3c987978b32cbec7c772f199b1d53520c8fa764a87ee"
 [[package]]
 name = "datafusion-execution"
 version = "53.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c03c7fbdaefcca4ef6ffe425a5fc2325763bfb426599bb0bf4536466efabe709"
 dependencies = [
  "arrow",
  "arrow-buffer",

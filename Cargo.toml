@@ -13,6 +13,7 @@ members = [
     "crates/lake-sdk",
     "crates/lake-flight",
 ]
+exclude = ["third_party/datafusion-execution"]
 
 [workspace.metadata.cargo-shear]
 # lake-sdk is the public entry crate; it is intentionally declared as a
@@ -76,6 +77,13 @@ lake-query = { path = "crates/lake-query" }
 lake-sdk = { path = "crates/lake-sdk" }
 lake-metasrv = { path = "crates/lake-metasrv" }
 lake-flight = { path = "crates/lake-flight" }
+
+[patch.crates-io]
+# DataFusion 53.1 increments global spill accounting before enforcing its disk
+# ceiling and fails to roll the increment back. Keep this narrow backport until
+# Lance can move to a DataFusion release whose spill writer reserves quota
+# atomically (upstream refactored this path after 54).
+datafusion-execution = { path = "third_party/datafusion-execution" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -24,6 +24,9 @@ The query layer: stateless SQL compute. `QueryEngine` wires a DataFusion
 - `QueryLimits` bounds concurrency, queue wait, execution duration, and SQL
   bytes per replica. A DoGet permit lives until its stream completes, expires,
   or is dropped; admission never calls the metadata tier.
+- `QueryResources` gives the replica one shared DataFusion `FairSpillPool` and
+  one size-limited local spill manager. Every constructor is bounded; the CLI
+  validates deployment overrides before binding Flight.
 
 ## Layout
 

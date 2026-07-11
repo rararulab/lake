@@ -42,3 +42,11 @@ port). `mise run test-env-down` removes that checkout's container.
 
 The community image `localstack/localstack:3` is pinned deliberately —
 `:latest` now requires a `LOCALSTACK_AUTH_TOKEN` and exits without one.
+
+Query execution defaults to a 1 GiB process-wide DataFusion memory pool and
+an 8 GiB aggregate spill budget. Production deployments should mount fast
+ephemeral storage and set `LAKE_QUERY_MEMORY_BYTES`,
+`LAKE_QUERY_SPILL_BYTES`, and `LAKE_QUERY_SPILL_DIR` for the node size. Both
+byte budgets must be at least 16 MiB. The spill root is not durable state:
+DataFusion creates a randomized child directory per Query runtime and removes
+its files when operators and the runtime are dropped.

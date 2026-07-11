@@ -331,6 +331,11 @@ design-level ones:
   deadline, and pre-planning SQL/ticket size checks. This protects one replica
   without adding metadata traffic. Tenant quotas, fair queuing, and distributed
   admission remain production policy work.
+- Query's DataFusion runtime is also process-bounded: all concurrent operators
+  share one fair execution-memory pool and one aggregate size-limited spill
+  manager under an operator-owned local directory. Spill is ephemeral replica
+  state and is deleted with its DataFusion runtime; it never becomes table or
+  query-result durability.
 - Query and Metasrv expose injected shutdown futures; the CLI maps SIGINT and
   SIGTERM into them. Tonic stops accepting connections and drains existing
   Flight RPCs within a finite deployment-configured grace period. Query joins
