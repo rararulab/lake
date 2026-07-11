@@ -14,12 +14,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
-arrow = { workspace = true }
 arrow-flight = { workspace = true }
 clap = { version = "^4.5", features = ["derive"] }
 datafusion = { workspace = true }
 futures = { workspace = true }
-lake-catalog = { workspace = true }
 lake-common = { workspace = true }
 lake-engine = { workspace = true }
 lake-engine-lance = { workspace = true }
@@ -27,7 +25,6 @@ lake-meta = { workspace = true }
 lake-metasrv = { workspace = true }
 lake-objects.workspace = true
 lake-query = { workspace = true }
-prost = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }

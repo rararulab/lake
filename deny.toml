@@ -1,0 +1,50 @@
+# cargo-deny configuration. Runs in CI only when the dependency graph changes
+# (see the `cargo_deps` path filter in .github/workflows/ci.yml). Triage new
+# findings here with a per-entry reason rather than softening the whole check.
+
+[advisories]
+version = 2
+# All transitive-only, pulled in via the aws-sdk / datafusion / lance / arrow
+# dependency trees — lake has no direct use of the affected code paths.
+# Revisit (and drop) each as upstream bumps the offending crate.
+ignore = [
+  "RUSTSEC-2026-0204", # crossbeam-epoch: invalid ptr deref in a Debug/Pointer impl
+  "RUSTSEC-2024-0436", # paste: unmaintained (build-time proc-macro only)
+  "RUSTSEC-2026-0194", # quick-xml: quadratic parse on duplicate attribute names
+  "RUSTSEC-2026-0195", # quick-xml: NsReader namespace-declaration alloc DoS
+  "RUSTSEC-2023-0071", # rsa: Marvin timing sidechannel (no direct RSA use)
+  "RUSTSEC-2026-0098", # rustls-webpki: URI name-constraint incorrectly accepted
+  "RUSTSEC-2026-0099", # rustls-webpki: wildcard name-constraint incorrectly accepted
+  "RUSTSEC-2026-0104", # rustls-webpki: reachable panic parsing a CRL
+]
+
+[bans]
+# Large dependency trees (arrow / datafusion / lance) legitimately pull several
+# versions of some crates; keep this a warning, not a hard failure.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "MPL-2.0",
+  "CC0-1.0",
+  "OpenSSL",
+  "BSL-1.0",             # Boost Software License 1.0 (transitive)
+  "CDLA-Permissive-2.0", # Community Data License Agreement Permissive 2.0 (transitive, arrow/parquet test data tooling)
+  "bzip2-1.0.6",        # bzip2 / libbzip2 license (transitive, via bzip2-sys)
+]
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
