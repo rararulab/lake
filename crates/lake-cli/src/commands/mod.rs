@@ -39,24 +39,18 @@ use lake_common::{ManagedStageDescriptor, TableLocation, TableRef};
 use lake_engine::TableEngineRef;
 use lake_engine_lance::LanceEngine;
 use lake_meta::{DynamoMeta, MetaStoreRef, RocksMeta};
-use lake_metasrv::Metasrv;
+use lake_metasrv::{Metasrv, TablePlacement};
 
 use self::limits::operation_policy_from_env;
-
-/// Where table data lives — decides how `location()` names a table.
-enum Storage {
-    Local { table_root: PathBuf },
-    S3 { bucket: String },
-}
 
 /// Shared, process-wide handles. Built from `--data-dir` (local) or the
 /// `LAKE_S3_BUCKET`/`LAKE_DYNAMODB_*`/`AWS_*` environment (cloud).
 pub struct Context {
-    pub meta:      MetaStoreRef,
-    pub engine:    TableEngineRef,
-    pub metasrv:   Arc<Metasrv>,
-    storage:       Storage,
-    managed_stage: ManagedStageDescriptor,
+    pub meta:        MetaStoreRef,
+    pub engine:      TableEngineRef,
+    pub metasrv:     Arc<Metasrv>,
+    table_placement: TablePlacement,
+    managed_stage:   ManagedStageDescriptor,
 }
 
 impl Context {
@@ -78,9 +72,7 @@ impl Context {
         Self::wire(
             meta,
             engine,
-            Storage::Local {
-                table_root: root.join("tables"),
-            },
+            TablePlacement::local(root.join("tables")),
             managed_stage,
         )
     }
@@ -96,6 +88,7 @@ impl Context {
             meta.clone(),
             s3_storage_options(),
         ));
+        let table_prefix = std::env::var("LAKE_TABLE_PREFIX").unwrap_or_default();
         let managed_prefix = std::env::var("LAKE_MANAGED_OBJECT_PREFIX")
             .unwrap_or_else(|_| "managed-objects".to_owned());
         let managed_stage = s3_managed_stage_descriptor(
@@ -104,13 +97,14 @@ impl Context {
             std::env::var("AWS_REGION").ok(),
             std::env::var("LAKE_S3_ENDPOINT").ok(),
         );
-        Self::wire(meta, engine, Storage::S3 { bucket }, managed_stage)
+        let table_placement = TablePlacement::s3(&bucket, table_prefix)?;
+        Self::wire(meta, engine, table_placement, managed_stage)
     }
 
     fn wire(
         meta: MetaStoreRef,
         engine: TableEngineRef,
-        storage: Storage,
+        table_placement: TablePlacement,
         managed_stage: ManagedStageDescriptor,
     ) -> anyhow::Result<Self> {
         let (operation_retention, operation_gc_page_size) = operation_policy_from_env()?;
@@ -124,7 +118,7 @@ impl Context {
             meta,
             engine,
             metasrv,
-            storage,
+            table_placement,
             managed_stage,
         })
     }
@@ -132,20 +126,12 @@ impl Context {
     /// Credential-free managed `FILE` stage advertised by query.
     pub fn managed_stage(&self) -> &ManagedStageDescriptor { &self.managed_stage }
 
+    /// Trusted placement policy shared with the metadata control plane.
+    pub fn table_placement(&self) -> &TablePlacement { &self.table_placement }
+
     /// The Lance dataset location for a table (local path or `s3://` URI).
-    pub fn location(&self, table: &TableRef) -> TableLocation {
-        match &self.storage {
-            Storage::Local { table_root } => {
-                let path = table_root
-                    .join(&table.namespace.0)
-                    .join(format!("{}.lance", table.name.0));
-                TableLocation::new(path.to_string_lossy().to_string())
-            }
-            Storage::S3 { bucket } => TableLocation::new(format!(
-                "s3://{bucket}/{}/{}.lance",
-                table.namespace.0, table.name.0
-            )),
-        }
+    pub fn location(&self, table: &TableRef) -> anyhow::Result<TableLocation> {
+        Ok(self.table_placement.place(table)?)
     }
 }
 

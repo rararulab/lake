@@ -19,6 +19,9 @@ write path — create tables, resolve/list, and the append commit protocol.
 - FILE `DoPut` contains Arrow `DataLocation` rows only. Followers forward the
   authenticated tenant scope and stream to the observed leader; metasrv never
   accepts the object payload. Buffered control streams are bounded.
+- Remote DDL never accepts a dataset URI. `TablePlacement` derives every new
+  table location from trusted server configuration after validating both
+  identifier path segments.
 - Production inbound RPCs and follower-to-leader forwarding share the
   `lake-flight` TLS/auth boundary; a follower must never downgrade to anonymous
   hard-coded HTTP.
@@ -26,5 +29,6 @@ write path — create tables, resolve/list, and the append commit protocol.
 ## Layout
 
 - `lib.rs` — `Metasrv`, `MetasrvServerConfig`, and server lifecycle
+- `placement.rs` — trusted local/S3 placement and path-segment validation
 - `control.rs` — Flight actions, FILE append decoding, and follower forwarding
 - `operation.rs` / `maintenance.rs` — durable state machine and bounded GC

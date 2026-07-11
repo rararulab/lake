@@ -91,6 +91,14 @@ impl Leadership {
         state.local_deadline = local_deadline;
         was_leader
     }
+
+    #[cfg(test)]
+    pub(crate) fn assume_leader(&self, addr: &str) {
+        self.publish(
+            Some(addr.to_owned()),
+            Some(Instant::now() + Duration::from_mins(1)),
+        );
+    }
 }
 
 /// Drive `election` forever, publishing each round's outcome into `leadership`.

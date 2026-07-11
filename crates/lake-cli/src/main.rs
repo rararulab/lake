@@ -113,6 +113,43 @@ mod tests {
     use clap::Parser;
 
     use super::{Cli, Command};
+    use crate::commands::client::ClientCmd;
+
+    #[test]
+    fn remote_create_table_has_no_location_argument() {
+        let cli = Cli::try_parse_from([
+            "lake",
+            "client",
+            "create-table",
+            "robots.episodes",
+            "--column",
+            "episode_id:utf8",
+        ])
+        .expect("remote create-table does not require a storage location");
+        let Command::Client { command, .. } = cli.command else {
+            panic!("expected client command");
+        };
+        let ClientCmd::CreateTable { table, columns, .. } = command else {
+            panic!("expected create-table command");
+        };
+        assert_eq!(table, "robots.episodes");
+        assert_eq!(columns, ["episode_id:utf8"]);
+
+        assert!(
+            Cli::try_parse_from([
+                "lake",
+                "client",
+                "create-table",
+                "robots.episodes",
+                "--column",
+                "episode_id:utf8",
+                "--location",
+                "s3://caller/selected.lance",
+            ])
+            .is_err(),
+            "legacy caller-selected placement must be rejected"
+        );
+    }
 
     #[test]
     fn query_accepts_metadata_address() {

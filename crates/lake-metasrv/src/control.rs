@@ -46,7 +46,7 @@ use datafusion::{
 use futures::{Stream, StreamExt};
 use lake_common::{
     AppendOperation, FILE_APPEND_TYPE_URL, FileAppendRequest, Namespace, Principal, PrincipalRole,
-    TableLocation, TableRef, TenantId, Version,
+    TableRef, TenantId, Version,
 };
 use lake_flight::{
     ClientSecurity, DELEGATED_NAMESPACE_HEADER, DELEGATED_TENANT_HEADER,
@@ -58,7 +58,7 @@ use prost_types::Any;
 use serde::{Serialize, de::DeserializeOwned};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::{Metasrv, leadership::Leadership};
+use crate::{Metasrv, TablePlacement, leadership::Leadership};
 
 /// The [`Status`] message returned by every unsupported Flight method.
 const UNSUPPORTED: &str = "metasrv control plane only serves actions and FILE append do_put";
@@ -271,20 +271,20 @@ pub(crate) struct MetasrvFlightService {
     pub(crate) own_addr:           String,
     /// TLS and service identity for forwarding writes to the elected leader.
     pub(crate) peer_security:      ClientSecurity,
+    /// Trusted policy used to derive every remotely-created table location.
+    pub(crate) table_placement:    Option<TablePlacement>,
     #[cfg(feature = "test")]
     pub(crate) append_result_gate: Option<Arc<crate::AppendResultGate>>,
 }
 
 /// `create_table` action body: the table to materialize and register.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateTableReq {
     namespace: String,
     name:      String,
     /// Columns as `name:type` (types: `i64`, `f64`, `utf8`, `bool`).
     columns:   Vec<String>,
-    /// Storage URI for the dataset. Required: the metasrv does not own the
-    /// data-dir layout the way the CLI does, so the caller must supply it.
-    location:  Option<String>,
 }
 
 /// `resolve` action body: a fully-qualified table reference.
@@ -444,13 +444,16 @@ impl MetasrvFlightService {
         if let Some(forwarded) = self.maybe_forward(&action, &req.namespace).await? {
             return Ok(forwarded);
         }
-        let location = req
-            .location
-            .ok_or_else(|| Status::invalid_argument("create_table requires a 'location' field"))?;
         let schema = build_schema(&req.columns)?;
         let table = TableRef::new(req.namespace, req.name);
+        let location = self
+            .table_placement
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("remote table placement is not configured"))?
+            .place(&table)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         self.metasrv
-            .create_table(&table, TableLocation::new(location), schema)
+            .create_table(&table, location, schema)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         let stream: ActionStream = Box::pin(futures::stream::empty());
@@ -678,8 +681,8 @@ impl FlightService for MetasrvFlightService {
         let actions = [
             ActionType {
                 r#type:      "create_table".to_string(),
-                description: "Create and register a table (leader only). Body JSON: {namespace, \
-                              name, columns:[\"name:type\"], location}"
+                description: "Create and register a server-placed table (leader only). Body JSON: \
+                              {namespace, name, columns:[\"name:type\"]}"
                     .to_string(),
             },
             ActionType {
@@ -1660,6 +1663,135 @@ mod schema_tests {
         let schema = build_schema(&["video:file".to_owned()]).unwrap();
 
         assert_eq!(schema.field(0), &data_location_field("video", false));
+    }
+}
+
+#[cfg(test)]
+mod table_placement_tests {
+    use std::sync::Arc;
+
+    use arrow_flight::Action;
+    use lake_common::TableRef;
+    use lake_engine::TableEngineRef;
+    use lake_engine_lance::LanceEngine;
+    use lake_flight::ClientSecurity;
+    use lake_meta::{MetaStoreRef, RocksMeta};
+    use serde_json::json;
+    use tonic::Code;
+
+    use super::MetasrvFlightService;
+    use crate::{Metasrv, TablePlacement, leadership::Leadership};
+
+    fn service(root: &tempfile::TempDir) -> MetasrvFlightService {
+        let meta: MetaStoreRef =
+            Arc::new(RocksMeta::open(root.path().join("meta")).expect("open metastore"));
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let leadership = Arc::new(Leadership::new());
+        leadership.assume_leader("127.0.0.1:50052");
+        MetasrvFlightService {
+            metasrv: Arc::new(Metasrv::new(meta, engine)),
+            leadership,
+            own_addr: "127.0.0.1:50052".to_owned(),
+            peer_security: ClientSecurity::new(),
+            table_placement: Some(TablePlacement::local(root.path().join("tables"))),
+            #[cfg(feature = "test")]
+            append_result_gate: None,
+        }
+    }
+
+    fn create_action(body: serde_json::Value) -> Action {
+        Action {
+            r#type: "create_table".to_owned(),
+            body:   serde_json::to_vec(&body).expect("serialize action").into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_create_uses_server_table_placement() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let service = service(&root);
+        service
+            .action_create_table(create_action(json!({
+                "namespace": "robots",
+                "name": "episodes",
+                "columns": ["episode_id:utf8"]
+            })))
+            .await
+            .expect("server-derived create succeeds");
+
+        let registration = service
+            .metasrv
+            .resolve(&TableRef::new("robots", "episodes"))
+            .await
+            .expect("resolve table")
+            .expect("table is registered");
+        assert_eq!(
+            registration.location.as_str(),
+            root.path()
+                .join("tables/robots/episodes.lance")
+                .to_str()
+                .expect("UTF-8 temporary path")
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_create_rejects_caller_location() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let service = service(&root);
+        let result = service
+            .action_create_table(create_action(json!({
+                "namespace": "robots",
+                "name": "episodes",
+                "columns": ["episode_id:utf8"],
+                "location": root.path().join("caller-selected.lance")
+            })))
+            .await;
+        let error = match result {
+            Ok(_) => panic!("legacy caller-selected locations must fail closed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(
+            service
+                .metasrv
+                .resolve(&TableRef::new("robots", "episodes"))
+                .await
+                .expect("resolve table")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_create_rejects_overlong_dataset_segment_before_mutation() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let service = service(&root);
+        let name = "x".repeat(250);
+        let result = service
+            .action_create_table(create_action(json!({
+                "namespace": "bounds",
+                "name": name,
+                "columns": ["episode_id:utf8"]
+            })))
+            .await;
+        let error = match result {
+            Ok(_) => panic!("overlong dataset segment must fail before storage"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(
+            service
+                .metasrv
+                .resolve(&TableRef::new("bounds", name))
+                .await
+                .expect("resolve table")
+                .is_none()
+        );
+        assert!(
+            !root.path().join("tables/bounds").exists(),
+            "placement rejection must happen before engine filesystem mutation"
+        );
     }
 }
 

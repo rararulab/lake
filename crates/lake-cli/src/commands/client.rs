@@ -43,15 +43,11 @@ pub enum ClientCmd {
     /// Create and register a table on the remote metasrv.
     CreateTable {
         /// `<namespace>.<name>`, e.g. `robots.arm_left`.
-        table:    String,
+        table:   String,
         /// Columns as `name:type` (types: i64, f64, utf8, bool, file).
         /// Repeatable.
         #[arg(long = "column", value_name = "name:type", required = true)]
-        columns:  Vec<String>,
-        /// Storage URI for the dataset. Required: the remote metasrv does not
-        /// own the data-dir layout, so the caller must supply it.
-        #[arg(long, required = true)]
-        location: String,
+        columns: Vec<String>,
     },
     /// Drop a table on the remote metasrv: delete its data and deregister it.
     DropTable {
@@ -74,11 +70,9 @@ pub enum ClientCmd {
 pub async fn run(addr: &str, cmd: ClientCmd) -> anyhow::Result<()> {
     let mut client = connect(addr).await?;
     match cmd {
-        ClientCmd::CreateTable {
-            table,
-            columns,
-            location,
-        } => create_table(&mut client, &table, &columns, &location).await,
+        ClientCmd::CreateTable { table, columns } => {
+            create_table(&mut client, &table, &columns).await
+        }
         ClientCmd::DropTable { table } => drop_table(&mut client, &table).await,
         ClientCmd::Resolve { table } => resolve(&mut client, &table).await,
         ClientCmd::List { namespace } => list(&mut client, namespace.as_deref()).await,
@@ -149,14 +143,12 @@ async fn create_table(
     client: &mut MetasrvClient,
     table: &str,
     columns: &[String],
-    location: &str,
 ) -> anyhow::Result<()> {
     let table = parse_table_ref(table)?;
     let body = json!({
         "namespace": table.namespace.0,
         "name": table.name.0,
         "columns": columns,
-        "location": location,
     });
     do_action(client, action("create_table", &body)?).await?;
     println!("created {table}");

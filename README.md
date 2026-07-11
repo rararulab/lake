@@ -133,6 +133,17 @@ lake table create robots.episodes \
   --column video:file
 ```
 
+Remote administration sends only the table identifier and schema. Metasrv
+derives the dataset location from its own local `--data-dir` or trusted
+`LAKE_S3_BUCKET` and optional `LAKE_TABLE_PREFIX` configuration; clients cannot
+select an arbitrary storage URI:
+
+```bash
+lake client --addr 127.0.0.1:50052 create-table robots.episodes \
+  --column episode_id:utf8 \
+  --column video:file
+```
+
 Its essential write path is:
 
 ```rust
@@ -244,6 +255,11 @@ is told where metadata lives; clients are not:
 lake meta --addr 127.0.0.1:50052
 lake query --addr 127.0.0.1:50051 --metadata-addr http://127.0.0.1:50052
 ```
+
+In cloud mode, `lake meta` and local administrative commands derive table
+datasets as `s3://$LAKE_S3_BUCKET/$LAKE_TABLE_PREFIX/<namespace>/<table>.lance`.
+`LAKE_TABLE_PREFIX` defaults to the bucket root for compatibility. It is
+process configuration, never a Flight DDL field.
 
 Plaintext anonymous serving is allowed only on loopback and receives the named
 development principal. A non-loopback Query or Metasrv listener requires either

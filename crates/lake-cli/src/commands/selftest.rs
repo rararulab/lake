@@ -40,7 +40,7 @@ pub async fn run(ctx: &Context) -> anyhow::Result<()> {
     ]));
 
     // 1. Create the table (idempotent for repeat runs: ignore "exists").
-    let location = ctx.location(&table);
+    let location = ctx.location(&table)?;
     if ctx
         .metasrv
         .create_table(&table, location, schema.clone())

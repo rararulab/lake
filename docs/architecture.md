@@ -137,6 +137,21 @@ single `tbl/<namespace>/…` prefix, while each Query replica refreshes its whol
 table/name/schema snapshot with one `tbl/` scan. Discovery reads that immutable
 process-local generation and performs no request-path authority lookup.
 
+### Server-authoritative table placement
+
+Remote DDL carries only a table identifier and Arrow schema. The metadata
+server derives `TableLocation` from a trusted `TablePlacement`: a local table
+root in development, or an S3 bucket plus optional key prefix in production.
+Namespace and table names must be safe single path segments before the engine
+or registry is touched. Legacy location-bearing requests fail closed; the
+server never ignores and never consumes a caller-selected URI.
+
+The policy lives in `lake-metasrv`, above the engine boundary. Engines still
+receive an ordinary storage-neutral `TableLocation`, so placement authority
+does not couple the metadata or query tiers to Lance. Each HA replica must use
+the same placement configuration; only the elected leader materializes a new
+table.
+
 ## Commit protocol
 
 Writes go through the metadata layer's leader to serialize per-table commits,
@@ -214,7 +229,7 @@ security boundary are in
 | `lake-engine-lance` | Lance impl; the ONLY crate that names `lance::` | storage |
 | `lake-catalog` | db→table registry logic, DataFusion `CatalogProvider`, moka cache | query + metadata |
 | `lake-query` | stateless query-layer server (Flight SQL, DataFusion execution) | query |
-| `lake-metasrv` | stateful metadata-layer server (registry authority, write coordination, leader election) | metadata |
+| `lake-metasrv` | stateful metadata-layer server (registry and table-placement authority, write coordination, leader election) | metadata |
 | `lake-cli` | thin `clap` binary: subcommands to run each server + client | — |
 | `lake-sdk` | Rust streaming SQL query, parameterized `FILE` INSERT, `DataLocation` decoding, and direct reader | client |
 
