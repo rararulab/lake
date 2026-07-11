@@ -46,8 +46,9 @@ use lake_objects::{
 };
 use prost::Message;
 use prost_types::Any;
+use sha2::{Digest, Sha256};
 use snafu::{OptionExt, ResultExt, Snafu};
-use tokio::{fs::File, io::AsyncRead};
+use tokio::io::AsyncRead;
 use tonic::transport::Channel;
 
 /// Errors raised by the typed Rust SDK.
@@ -199,19 +200,28 @@ pub enum InsertValue {
 /// A Rust SDK client connected to the stateless query endpoint.
 #[derive(Clone)]
 pub struct LakeClient {
-    query:    Channel,
-    objects:  Arc<dyn ManagedObjectStore>,
-    security: ClientSecurity,
+    query:                 Channel,
+    objects:               Arc<dyn ManagedObjectStore>,
+    security:              ClientSecurity,
+    upload_checkpoint_dir: Option<PathBuf>,
 }
 
 /// Builder for authenticated and TLS-verified SDK connections.
 #[derive(Clone, Debug)]
 pub struct LakeClientBuilder {
-    query_endpoint: String,
-    security:       ClientSecurity,
+    query_endpoint:        String,
+    security:              ClientSecurity,
+    upload_checkpoint_dir: Option<PathBuf>,
 }
 
 impl LakeClientBuilder {
+    /// Persist resumable path-upload checkpoints in this local directory.
+    #[must_use]
+    pub fn with_upload_checkpoint_dir(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.upload_checkpoint_dir = Some(directory.into());
+        self
+    }
+
     /// Attach the bearer credential sent on every Query Flight RPC.
     pub fn with_bearer_token(mut self, value: impl Into<String>) -> Result<Self> {
         self.security = self
@@ -244,6 +254,7 @@ impl LakeClientBuilder {
 
     /// Connect and discover the managed `FILE` stage once.
     pub async fn connect(self) -> Result<LakeClient> {
+        prepare_checkpoint_dir(self.upload_checkpoint_dir.as_deref()).await?;
         let query = self
             .security
             .connect(self.query_endpoint)
@@ -255,6 +266,7 @@ impl LakeClientBuilder {
             query,
             objects,
             security: self.security,
+            upload_checkpoint_dir: self.upload_checkpoint_dir,
         })
     }
 
@@ -263,6 +275,7 @@ impl LakeClientBuilder {
     where
         S: ManagedObjectStore + 'static,
     {
+        prepare_checkpoint_dir(self.upload_checkpoint_dir.as_deref()).await?;
         let query = self
             .security
             .connect(self.query_endpoint)
@@ -272,6 +285,7 @@ impl LakeClientBuilder {
             query,
             objects: Arc::new(objects),
             security: self.security,
+            upload_checkpoint_dir: self.upload_checkpoint_dir,
         })
     }
 }
@@ -280,8 +294,9 @@ impl LakeClient {
     /// Configure an authenticated and optionally TLS-verified Query connection.
     pub fn builder(query_endpoint: impl Into<String>) -> LakeClientBuilder {
         LakeClientBuilder {
-            query_endpoint: query_endpoint.into(),
-            security:       ClientSecurity::new(),
+            query_endpoint:        query_endpoint.into(),
+            security:              ClientSecurity::new(),
+            upload_checkpoint_dir: None,
         }
     }
 
@@ -419,19 +434,20 @@ impl LakeClient {
             (data_type, InsertValue::File(file))
                 if data_type == data_location_field("ignored", false).data_type() =>
             {
-                let reader = match file.source {
-                    ObjectSource::Path(path) => Box::pin(
-                        File::open(&path)
+                let location = match file.source {
+                    ObjectSource::Path(path) => {
+                        let checkpoint = self.checkpoint_path(&path).await?;
+                        self.objects
+                            .put_path(path, file.content_type, checkpoint)
                             .await
-                            .map_err(|source| SdkError::SourceFile { path, source })?,
-                    ) as ObjectReader,
-                    ObjectSource::Reader(reader) => Box::into_pin(reader),
+                    }
+                    ObjectSource::Reader(reader) => {
+                        self.objects
+                            .put_reader(Box::into_pin(reader), file.content_type)
+                            .await
+                    }
                 };
-                let location = self
-                    .objects
-                    .put_reader(reader, file.content_type)
-                    .await
-                    .context(ObjectSnafu)?;
+                let location = location.context(ObjectSnafu)?;
                 Ok(Arc::new(data_location_array(&[location])))
             }
             (..) => Err(SdkError::TypeMismatch {
@@ -439,6 +455,37 @@ impl LakeClient {
             }),
         }
     }
+
+    async fn checkpoint_path(&self, source: &Path) -> Result<Option<PathBuf>> {
+        let Some(directory) = &self.upload_checkpoint_dir else {
+            return Ok(None);
+        };
+        let canonical = tokio::fs::canonicalize(source)
+            .await
+            .map_err(|source_error| SdkError::SourceFile {
+                path:   source.to_path_buf(),
+                source: source_error,
+            })?;
+        let mut hasher = Sha256::new();
+        hasher.update(self.objects.stage_identity());
+        hasher.update([0]);
+        hasher.update(canonical.as_os_str().as_encoded_bytes());
+        Ok(Some(
+            directory.join(format!("{:x}.upload.json", hasher.finalize())),
+        ))
+    }
+}
+
+async fn prepare_checkpoint_dir(directory: Option<&Path>) -> Result<()> {
+    if let Some(directory) = directory {
+        tokio::fs::create_dir_all(directory)
+            .await
+            .map_err(|source| SdkError::SourceFile {
+                path: directory.to_path_buf(),
+                source,
+            })?;
+    }
+    Ok(())
 }
 
 async fn discover_managed_stage(
@@ -638,6 +685,7 @@ fn duplicate(values: &[String]) -> bool {
 mod tests {
     use std::{
         io,
+        path::PathBuf,
         pin::Pin,
         sync::Arc,
         task::{Context, Poll},
@@ -727,6 +775,47 @@ mod tests {
         let mut actual = Vec::new();
         reader.read_to_end(&mut actual).await.unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn sdk_resumable_file_insert_uses_checkpoint_directory() {
+        let root = tempdir().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let objects = PathRecordingStore {
+            inner: LocalObjectStore::open(root.path().join("objects"))
+                .await
+                .unwrap(),
+            seen:  seen.clone(),
+        };
+        let (mut client, _metasrv, _table, _meta, _engine) =
+            setup_client_with_store(root.path(), objects).await;
+        let checkpoints = root.path().join("checkpoints");
+        tokio::fs::create_dir_all(&checkpoints).await.unwrap();
+        client.upload_checkpoint_dir = Some(checkpoints.clone());
+        let source = root.path().join("episode.mp4");
+        tokio::fs::write(&source, b"resumable path bytes")
+            .await
+            .unwrap();
+
+        client
+            .insert(
+                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    InsertValue::Utf8("episode-resume".to_owned()),
+                    InsertValue::File(FileUpload::from_path(&source, "video/mp4")),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let checkpoint = seen
+            .lock()
+            .expect("recording mutex")
+            .clone()
+            .expect("path upload receives a checkpoint");
+        assert_eq!(checkpoint.parent(), Some(checkpoints.as_path()));
+        assert!(checkpoint.extension().is_some_and(|value| value == "json"));
+        assert!(!checkpoint.exists());
     }
 
     #[tokio::test]
@@ -1146,7 +1235,8 @@ mod tests {
     fn managed_file_example_queries_through_sdk() {
         let example = include_str!("../examples/managed_file.rs");
 
-        assert!(example.contains("LakeClient::connect("));
+        assert!(example.contains("LakeClient::builder("));
+        assert!(example.contains(".with_upload_checkpoint_dir("));
         assert!(!example.contains("connect_with_store"));
         assert!(example.contains(".query("));
         assert!(example.contains("data_location("));
@@ -1330,6 +1420,55 @@ mod tests {
     }
 
     struct DelegatingStore(LocalObjectStore);
+
+    struct PathRecordingStore {
+        inner: LocalObjectStore,
+        seen:  Arc<std::sync::Mutex<Option<PathBuf>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ManagedObjectStore for PathRecordingStore {
+        fn stage_identity(&self) -> String { "recording://stage".to_owned() }
+
+        async fn put_reader(
+            &self,
+            input: ObjectReader,
+            content_type: String,
+        ) -> ObjectResult<lake_common::DataLocation> {
+            self.inner.put_reader(input, content_type).await
+        }
+
+        async fn put_path(
+            &self,
+            path: PathBuf,
+            content_type: String,
+            checkpoint: Option<PathBuf>,
+        ) -> ObjectResult<lake_common::DataLocation> {
+            *self.seen.lock().expect("recording mutex") = checkpoint.clone();
+            <LocalObjectStore as ManagedObjectStore>::put_path(
+                &self.inner,
+                path,
+                content_type,
+                checkpoint,
+            )
+            .await
+        }
+
+        async fn open_reader(
+            &self,
+            location: &lake_common::DataLocation,
+        ) -> ObjectResult<ObjectReader> {
+            Ok(Box::pin(self.inner.open_reader(location).await?))
+        }
+
+        async fn open_range(
+            &self,
+            location: &lake_common::DataLocation,
+            range: std::ops::Range<u64>,
+        ) -> ObjectResult<ObjectReader> {
+            Ok(Box::pin(self.inner.open_range(location, range).await?))
+        }
+    }
 
     #[async_trait::async_trait]
     impl ManagedObjectStore for DelegatingStore {

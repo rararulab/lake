@@ -98,6 +98,10 @@ lake table create robots.episodes \
 Its essential write path is:
 
 ```rust
+let client = LakeClient::builder(query_endpoint)
+    .with_upload_checkpoint_dir("/var/lib/lake/upload-checkpoints")
+    .connect()
+    .await?;
 client.insert(
     "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
     vec![
@@ -106,6 +110,15 @@ client.insert(
     ],
 ).await?;
 ```
+
+The checkpoint directory makes path-backed S3 uploads restart-resumable. Lake
+stores a credential-free, versioned checkpoint after every completed 5 MiB
+part. A retry locks and validates the checkpoint, reconciles it with S3,
+rehashes the completed local prefix, and uploads only missing parts. Changed
+source files or stage identities fail closed. Checkpoints disappear only after
+verified multipart completion; `ManagedObjectStore::cancel_upload` explicitly
+aborts an abandoned upload. Reader-backed uploads remain one-shot because an
+arbitrary stream cannot be replayed after process restart.
 
 Query results stream back through the same SDK connection. Decode the logical
 `FILE` value into its stable `DataLocation`, then open the object directly:
@@ -139,8 +152,8 @@ discovers an `s3://` stage. Non-empty S3 objects stream through
 bounded 5 MiB multipart parts, with incremental SHA-256 and abort-on-error.
 The query service forwards only the Arrow row to the metadata leader;
 video/model bytes travel directly between the SDK and the managed stage.
-Presigned browser access, resumable uploads, tenant authorization, and object
-garbage collection remain outside this first Rust API.
+Presigned browser access, tenant authorization, and object garbage collection
+remain outside this Rust API.
 
 For a local deployment, start metadata and query separately. The query process
 is told where metadata lives; clients are not:

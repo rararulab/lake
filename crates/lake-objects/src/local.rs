@@ -242,6 +242,8 @@ impl LocalObjectStore {
 
 #[async_trait]
 impl ManagedObjectStore for LocalObjectStore {
+    fn stage_identity(&self) -> String { format!("file://{}", self.root.display()) }
+
     async fn put_reader(&self, input: ObjectReader, content_type: String) -> Result<DataLocation> {
         LocalObjectStore::put_reader(self, input, content_type).await
     }

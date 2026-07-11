@@ -243,14 +243,17 @@ design-level ones:
   `INSERT ... VALUES (?, ?)` binds `InsertValue::File(FileUpload)`, streams it
   into either a local or S3 Lake-owned managed stage, and stores an immutable
   `DataLocation` physical representation in Lance. S3 uses bounded multipart
-  upload with abort-on-error and exact bucket/prefix validation for direct
-  reads. Sequential and half-open byte-range readers share the same SDK/storage
+  upload and exact bucket/prefix validation for direct reads. SDK-configured
+  local checkpoints make path-backed multipart writes resumable across process
+  restarts: source/stage identity and per-part hashes are revalidated against
+  paginated S3 state before only the missing suffix is sent. Sequential and
+  half-open byte-range readers share the same SDK/storage
   boundary; local ranges seek + limit and S3 ranges issue one bounded GET. The
   SDK receives only the query endpoint, discovers a credential-free managed
   stage descriptor once, and constructs local/S3 access using process
-  credentials; query forwards metadata to the leader-aware metasrv. Resumable
-  uploads, browser presigning, authenticated
-  expiring locations, codec indexes, and object GC are deferred.
+  credentials; query forwards metadata to the leader-aware metasrv. Browser
+  presigning, authenticated expiring locations, codec indexes, and object GC
+  are deferred.
 
 ## Phasing
 

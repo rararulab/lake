@@ -65,10 +65,20 @@ backend publishes `file://` locations after an atomic rename. The production
 S3 backend uses the discovered Lake-owned bucket/prefix and an AWS SDK client
 configured from the descriptor plus the process credential chain. It uses
 multipart upload for non-empty objects, keeps at most one 5 MiB part plus a
-small read buffer in memory, and incrementally computes size and SHA-256. Any
-source, part, or completion failure triggers
-`AbortMultipartUpload`; only a successful completion produces the returned
-`DataLocation`. Empty objects use one ordinary `PutObject`.
+small read buffer in memory, and incrementally computes size and SHA-256.
+Reader-backed uploads abort on failure. Path-backed uploads become resumable
+when `LakeClientBuilder::with_upload_checkpoint_dir` is configured: a
+credential-free versioned checkpoint records the random managed key, upload
+id, source identity, and each part's ETag/checksum/SHA-256 after an atomic
+fsync+rename. A retry takes an OS file lock, reconciles paginated S3
+`ListParts`, rereads and verifies completed local parts while rebuilding the
+whole-file SHA-256 state, then overwrites at most one uncheckpointed remote
+suffix part and uploads only what remains. Explicit cancellation aborts the
+exact upload and removes its checkpoint. If multipart completion succeeds but
+its response is lost, the retry streams the random destination once and
+requires its size and SHA-256 to match before clearing the checkpoint. Only
+verified completion produces a `DataLocation`; empty objects use one ordinary
+`PutObject`.
 
 ```text
 Rust SDK INSERT (logical FILE)
@@ -100,7 +110,7 @@ Range reads use the same containment check and process credentials
 as sequential reads. They do not introduce a query endpoint, signed URL, or
 arbitrary URI escape hatch.
 
-The current slice does not provide multipart resume across SDK restarts,
-tenant authorization, browser presigning, object deduplication, or garbage
-collection. Those additions must keep the same visibility rule: a SQL-visible
+The current slice does not provide tenant authorization, browser presigning,
+object deduplication, cross-host checkpoint sharing, or garbage collection.
+Those additions must keep the same visibility rule: a SQL-visible
 `DataLocation` always identifies a complete, immutable object.
