@@ -21,6 +21,8 @@ Lance dataset.
   recreate replaces `deleted`, so stale migration cannot win an ABA CAS.
 - Historical record creation is atomically guarded by the exact fixed-pointer
   bytes, preventing a writer that read before drop from publishing afterward.
+- Fixed pointers and delete markers carry a UUIDv7 incarnation. Recreate gets a
+  new one, so identical version/path bytes cannot produce cross-cycle ABA.
 
 ## Layout
 

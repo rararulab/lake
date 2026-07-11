@@ -28,7 +28,7 @@
 //! One fixed current pointer plus immutable historical entries:
 //!
 //! ```text
-//! lance-manifest-latest/<base_uri>     ->  {"version": 7, "path": "..."}
+//! lance-manifest-latest/<base_uri>     ->  {"incarnation":"...","version":7,"path":"..."}
 //! lance-manifest/<base_uri>/<version>  ->  {"path": "..."}
 //! ```
 //!
@@ -38,9 +38,9 @@
 //! writes that staging manifest before calling this adapter, preserving
 //! manifest-before-pointer. Existing per-version-only datasets scan once to
 //! install the fixed pointer; every later latest lookup is one point read.
-//! Drop changes the fixed value to `{"state":"deleting"}` and then a durable
-//! `{"state":"deleted"}` fence. Recreate replaces the latter, avoiding an ABA
-//! window in which a stale legacy migration could reinstall a deleted pointer.
+//! Drop changes the fixed value to an incarnation-bound `deleting` and then
+//! durable `deleted` fence. Recreate generates a new incarnation, avoiding ABA
+//! windows even if version and manifest path repeat at the same base URI.
 
 use std::cmp::Ordering;
 
@@ -49,6 +49,7 @@ use lake_meta::{GuardedMutation, MetaError, MetaStoreRef};
 use lance::{Error, Result};
 use lance_table::io::commit::external_manifest::ExternalManifestStore;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// KV key namespace for Lance manifest pointers.
 const KEY_PREFIX: &str = "lance-manifest";
@@ -63,8 +64,9 @@ struct ManifestPointer {
 /// The mutable current-version claim read on every dataset open.
 #[derive(Serialize, Deserialize)]
 struct LatestManifestPointer {
-    version: u64,
-    path:    String,
+    incarnation: String,
+    version:     u64,
+    path:        String,
 }
 
 #[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
@@ -76,7 +78,8 @@ enum DeleteState {
 
 #[derive(Deserialize, Serialize)]
 struct DeleteMarker {
-    state: DeleteState,
+    state:       DeleteState,
+    incarnation: String,
 }
 
 struct LatestState {
@@ -86,7 +89,11 @@ struct LatestState {
 
 enum LatestRecord {
     Pointer(LatestState),
-    Delete { bytes: Vec<u8>, state: DeleteState },
+    Delete {
+        bytes:       Vec<u8>,
+        state:       DeleteState,
+        incarnation: String,
+    },
 }
 
 enum LatestResolution {
@@ -137,6 +144,7 @@ impl MetaManifestStore {
         Ok(Some(LatestRecord::Delete {
             bytes,
             state: marker.state,
+            incarnation: marker.incarnation,
         }))
     }
 
@@ -146,6 +154,7 @@ impl MetaManifestStore {
             Some(LatestRecord::Delete {
                 state: DeleteState::Deleted,
                 bytes,
+                ..
             }) => Ok(LatestResolution::Missing {
                 expected: Some(bytes),
             }),
@@ -182,6 +191,7 @@ impl MetaManifestStore {
             return Ok(LatestResolution::Missing { expected: None });
         };
         let pointer = LatestManifestPointer {
+            incarnation: Uuid::now_v7().to_string(),
             version,
             path: decode(&history)?,
         };
@@ -287,8 +297,12 @@ fn decode_latest(bytes: &[u8]) -> Result<LatestManifestPointer> {
     serde_json::from_slice(bytes).map_err(|e| Error::invalid_input(e.to_string()))
 }
 
-fn encode_delete_marker(state: DeleteState) -> Result<Vec<u8>> {
-    serde_json::to_vec(&DeleteMarker { state }).map_err(|e| Error::invalid_input(e.to_string()))
+fn encode_delete_marker(state: DeleteState, incarnation: &str) -> Result<Vec<u8>> {
+    serde_json::to_vec(&DeleteMarker {
+        state,
+        incarnation: incarnation.to_owned(),
+    })
+    .map_err(|e| Error::invalid_input(e.to_string()))
 }
 
 fn decode_delete_marker(bytes: &[u8]) -> Result<DeleteMarker> {
@@ -327,14 +341,14 @@ impl ExternalManifestStore for MetaManifestStore {
         _size: u64,
         _e_tag: Option<String>,
     ) -> Result<()> {
-        let next = LatestManifestPointer {
-            version,
-            path: path.to_owned(),
-        };
-        let next_bytes = encode_latest(&next)?;
         let latest_key = Self::latest_key(base_uri);
         match self.latest_or_migrate(base_uri).await? {
             LatestResolution::Missing { expected } => {
+                let next_bytes = encode_latest(&LatestManifestPointer {
+                    incarnation: Uuid::now_v7().to_string(),
+                    version,
+                    path: path.to_owned(),
+                })?;
                 if self
                     .meta
                     .cas(&latest_key, expected.as_deref(), &next_bytes)
@@ -385,6 +399,11 @@ impl ExternalManifestStore for MetaManifestStore {
                     )));
                 }
                 self.archive_latest(base_uri, &latest).await?;
+                let next_bytes = encode_latest(&LatestManifestPointer {
+                    incarnation: latest.pointer.incarnation.clone(),
+                    version,
+                    path: path.to_owned(),
+                })?;
                 if self
                     .meta
                     .cas(&latest_key, Some(&latest.bytes), &next_bytes)
@@ -420,6 +439,7 @@ impl ExternalManifestStore for MetaManifestStore {
                 self.finalize_latest_archive_if_present(base_uri, &latest, path)
                     .await?;
                 let value = encode_latest(&LatestManifestPointer {
+                    incarnation: latest.pointer.incarnation.clone(),
                     version,
                     path: path.to_owned(),
                 })?;
@@ -467,19 +487,23 @@ impl ExternalManifestStore for MetaManifestStore {
 
     async fn delete(&self, base_uri: &str) -> Result<()> {
         let latest_key = Self::latest_key(base_uri);
-        let deleting = encode_delete_marker(DeleteState::Deleting)?;
-        let deleted = encode_delete_marker(DeleteState::Deleted)?;
-        match self.read_latest(base_uri).await? {
+        let (deleting, incarnation) = match self.read_latest(base_uri).await? {
             Some(LatestRecord::Delete {
+                bytes,
                 state: DeleteState::Deleting,
-                ..
-            }) => {}
+                incarnation,
+            }) => (bytes, incarnation),
             record => {
-                let expected = match record {
-                    Some(LatestRecord::Pointer(latest)) => Some(latest.bytes),
-                    Some(LatestRecord::Delete { bytes, .. }) => Some(bytes),
-                    None => None,
+                let (expected, incarnation) = match record {
+                    Some(LatestRecord::Pointer(latest)) => {
+                        (Some(latest.bytes), latest.pointer.incarnation)
+                    }
+                    Some(LatestRecord::Delete {
+                        bytes, incarnation, ..
+                    }) => (Some(bytes), incarnation),
+                    None => (None, Uuid::now_v7().to_string()),
                 };
+                let deleting = encode_delete_marker(DeleteState::Deleting, &incarnation)?;
                 if !self
                     .meta
                     .cas(&latest_key, expected.as_deref(), &deleting)
@@ -490,8 +514,10 @@ impl ExternalManifestStore for MetaManifestStore {
                         "manifest latest changed during delete: {base_uri}"
                     )));
                 }
+                (deleting, incarnation)
             }
-        }
+        };
+        let deleted = encode_delete_marker(DeleteState::Deleted, &incarnation)?;
         let prefix = Self::base_prefix(base_uri);
         let versions = self.meta.list_prefix(&prefix).await.map_err(store_err)?;
         for version in versions {
@@ -608,6 +634,9 @@ mod tests {
         block_migration_cas:    AtomicBool,
         migration_cas_entered:  Notify,
         migration_cas_release:  Notify,
+        block_recreate_cas:     AtomicBool,
+        recreate_cas_entered:   Notify,
+        recreate_cas_release:   Notify,
         block_history_list:     AtomicBool,
         history_list_entered:   Notify,
         history_list_release:   Notify,
@@ -641,6 +670,20 @@ mod tests {
             {
                 self.migration_cas_entered.notify_one();
                 self.migration_cas_release.notified().await;
+            }
+            if key.starts_with(LATEST_KEY_PREFIX)
+                && expected.is_some_and(|value| {
+                    value
+                        .windows(b"\"state\":\"deleted\"".len())
+                        .any(|part| part == b"\"state\":\"deleted\"")
+                })
+                && new
+                    .windows(b"\"version\"".len())
+                    .any(|part| part == b"\"version\"")
+                && self.block_recreate_cas.swap(false, Ordering::SeqCst)
+            {
+                self.recreate_cas_entered.notify_one();
+                self.recreate_cas_release.notified().await;
             }
             if expected.is_some()
                 && new
@@ -690,6 +733,9 @@ mod tests {
             block_migration_cas:    AtomicBool::new(false),
             migration_cas_entered:  Notify::new(),
             migration_cas_release:  Notify::new(),
+            block_recreate_cas:     AtomicBool::new(false),
+            recreate_cas_entered:   Notify::new(),
+            recreate_cas_release:   Notify::new(),
             block_history_list:     AtomicBool::new(false),
             history_list_entered:   Notify::new(),
             history_list_release:   Notify::new(),
@@ -865,6 +911,14 @@ mod tests {
             .delete("archive-race")
             .await
             .expect("delete fences archive");
+        store
+            .put_if_not_exists("archive-race", 1, "v1.staging", 4, None)
+            .await
+            .expect("recreate same URI");
+        store
+            .put_if_exists("archive-race", 1, "v1.manifest", 4, None)
+            .await
+            .expect("restore same version and final path in new incarnation");
         meta.history_create_release.notify_one();
         assert!(
             advancing.await.expect("advance task").is_err(),
@@ -909,6 +963,54 @@ mod tests {
                 .await
                 .expect("backfill history")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_recreate_cannot_cross_incarnations() {
+        let (store, meta, _dir) = blocking_store();
+        let store = Arc::new(store);
+        store
+            .put_if_not_exists("recreate-aba", 1, "same.staging", 4, None)
+            .await
+            .expect("initial create");
+        store.delete("recreate-aba").await.expect("initial delete");
+
+        meta.block_recreate_cas.store(true, Ordering::SeqCst);
+        let stale_recreate = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .put_if_not_exists("recreate-aba", 1, "same.staging", 4, None)
+                    .await
+            })
+        };
+        meta.recreate_cas_entered.notified().await;
+
+        store
+            .put_if_not_exists("recreate-aba", 1, "same.staging", 4, None)
+            .await
+            .expect("new incarnation wins recreate");
+        store
+            .put_if_exists("recreate-aba", 1, "same.final", 4, None)
+            .await
+            .expect("new incarnation finalizes");
+        store
+            .delete("recreate-aba")
+            .await
+            .expect("new incarnation deletes");
+
+        meta.recreate_cas_release.notify_one();
+        assert!(
+            stale_recreate.await.expect("stale recreate task").is_err(),
+            "old deleted-marker bytes must not match a later incarnation"
+        );
+        assert_eq!(
+            store
+                .get_latest_version("recreate-aba")
+                .await
+                .expect("latest after second delete"),
+            None
         );
     }
 

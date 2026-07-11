@@ -36,6 +36,9 @@ may scan once to install the pointer; steady-state reads may not scan.
 - Archive and historical-backfill creation atomically guard on the exact fixed
   latest bytes observed by the writer, so a pre-fence writer cannot publish
   history after drop.
+- Fixed pointers and delete markers carry a dataset incarnation. Advance and
+  finalize preserve it; recreate generates a new incarnation, so exact bytes
+  never repeat across delete/recreate cycles even when version and path do.
 - If latest is absent but legacy history exists, scan once, CAS-install the
   maximum record, and let racing migrators converge on the installed value.
 - This commit-protocol boundary is not mixed-writer compatible: pre-#41
@@ -133,6 +136,14 @@ Scenario: History creation cannot cross the delete fence
   Given archive or historical backfill has read the old fixed pointer
   When drop installs its deletion fence before history creation
   Then the guarded history transaction fails and deletion leaves no old history
+
+Scenario: Recreate changes incarnation and defeats cross-cycle ABA
+  Test:
+    Package: lake-engine-lance
+    Filter: stale_recreate_cannot_cross_incarnations
+  Given a recreate has read a deleted marker and then pauses
+  When another recreate and delete cycle completes at the same base URI
+  Then the stale recreate cannot match the new incarnation-bound marker
 
 ## Out of Scope
 

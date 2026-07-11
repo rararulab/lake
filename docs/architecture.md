@@ -124,6 +124,10 @@ read legacy history before drop from winning an ABA `None` CAS afterward.
 Every history-key creation is a guarded transaction whose guard is the exact
 fixed-pointer bytes observed by that writer, so a writer paused before drop
 cannot add history after the deletion fence is installed.
+The pointer and both deletion states carry a UUIDv7 dataset incarnation.
+Advance and finalize preserve it; recreate generates a new one. Consequently,
+even recreating the same base URI with identical version and path values cannot
+make an old writer's exact guard match again.
 
 The fixed pointer is a commit-protocol boundary. A pre-pointer binary can write
 a newer per-version record without advancing it, so commit-capable binaries on
