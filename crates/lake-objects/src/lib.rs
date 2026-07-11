@@ -123,6 +123,9 @@ pub type ObjectReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
 /// Storage boundary used by the SDK for direct managed-object I/O.
 #[async_trait]
 pub trait ManagedObjectStore: Send + Sync {
+    /// Stable, credential-free identity used to namespace local checkpoints.
+    fn stage_identity(&self) -> String { "managed-stage".to_owned() }
+
     /// Upload one stream and return its stable immutable identity.
     async fn put_reader(&self, input: ObjectReader, content_type: String) -> Result<DataLocation>;
 

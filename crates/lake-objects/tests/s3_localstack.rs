@@ -264,8 +264,8 @@ async fn seed_resumable_checkpoint(
         checkpoint,
         serde_json::to_vec_pretty(&document).expect("encode checkpoint"),
     )
-        .await
-        .expect("write checkpoint");
+    .await
+    .expect("write checkpoint");
 }
 
 #[tokio::test]

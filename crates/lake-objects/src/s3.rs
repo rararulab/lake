@@ -519,6 +519,8 @@ impl S3ObjectStore {
 
 #[async_trait]
 impl ManagedObjectStore for S3ObjectStore {
+    fn stage_identity(&self) -> String { format!("s3://{}/{}", self.bucket, self.prefix) }
+
     async fn put_reader(
         &self,
         mut input: ObjectReader,
