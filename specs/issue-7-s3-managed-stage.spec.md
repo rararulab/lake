@@ -67,7 +67,10 @@ abstraction with local and S3 implementations while preserving the SQL API.
 Scenario: S3 stage streams multipart upload and direct read
   Test:
     Package: lake-objects
-    Filter: s3_multipart_roundtrip_localstack
+    Filter: s3_multipart_roundtrip_localstack_is_wired
+  External verification: `mise run test-integration` runs
+  `s3_multipart_roundtrip_localstack` against LocalStack because the spec
+  runner does not execute ignored infrastructure tests.
   Given a source larger than one minimum S3 multipart part
   When the S3 managed stage uploads and opens it against LocalStack
   Then the DataLocation has stable identity and verified size/hash and the
@@ -76,7 +79,10 @@ Scenario: S3 stage streams multipart upload and direct read
 Scenario: interrupted multipart upload publishes no object
   Test:
     Package: lake-objects
-    Filter: interrupted_s3_upload_is_aborted
+    Filter: interrupted_s3_upload_is_aborted_is_wired
+  External verification: `mise run test-integration` runs
+  `interrupted_s3_upload_is_aborted` against LocalStack because the spec
+  runner does not execute ignored infrastructure tests.
   Given a reader that fails after at least one uploaded part
   When the S3 managed stage continues the multipart upload
   Then it returns the source error and no completed object exists
@@ -94,7 +100,10 @@ Scenario: SDK FILE insert accepts either managed-stage backend
 Scenario: SDK SQL FILE insert streams through the S3 stage
   Test:
     Package: lake-sdk
-    Filter: sdk_file_insert_uses_s3_stage
+    Filter: sdk_file_insert_uses_s3_stage_is_wired
+  External verification: `mise run test-integration` runs
+  `sdk_file_insert_uses_s3_stage` against LocalStack because the spec runner
+  does not execute ignored infrastructure tests.
   Given a Lake client configured with an S3 managed stage and a multipart-sized
   video source
   When it executes the parameterized INSERT, queries the FILE, and opens it

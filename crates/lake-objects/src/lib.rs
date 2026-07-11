@@ -259,6 +259,7 @@ mod tests {
         for uri in [
             "s3://somebody-else/objects/object-id",
             "s3://lake-managed/objects-neighbor/object-id",
+            "s3://lake-managed:9000/objects/object-id",
             "https://lake-managed.s3.amazonaws.com/objects/object-id",
         ] {
             let location = DataLocation::builder()

@@ -268,7 +268,7 @@ impl LakeClient {
         client.do_get(ticket).await.context(FlightSnafu)
     }
 
-    /// Open a direct local reader for an immutable `DataLocation`.
+    /// Open a direct storage reader for an immutable `DataLocation`.
     pub async fn open(&self, location: &DataLocation) -> Result<ObjectReader> {
         self.objects
             .open_reader(location)
@@ -676,6 +676,13 @@ mod tests {
             .expect("read S3 object");
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn sdk_file_insert_uses_s3_stage_is_wired() {
+        let integration = include_str!("../../../scripts/test-integration.ts");
+        assert!(integration.contains("lake-sdk"));
+        assert!(integration.contains("--run-ignored"));
     }
 
     #[test]

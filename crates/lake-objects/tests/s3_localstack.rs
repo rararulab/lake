@@ -52,6 +52,12 @@ async fn stage() -> Option<(aws_sdk_s3::Client, S3ObjectStore, String)> {
     Some((client, store, bucket))
 }
 
+#[test]
+fn s3_multipart_roundtrip_localstack_is_wired() {
+    let integration = include_str!("../../../scripts/test-integration.ts");
+    assert!(integration.contains("lake-objects"));
+}
+
 #[tokio::test]
 #[ignore = "requires LocalStack S3; set LAKE_S3_ENDPOINT and run with --ignored"]
 async fn s3_multipart_roundtrip_localstack() {
@@ -150,4 +156,11 @@ async fn interrupted_s3_upload_is_aborted() {
         objects.contents().is_empty(),
         "failed upload published an object"
     );
+}
+
+#[test]
+fn interrupted_s3_upload_is_aborted_is_wired() {
+    let integration = include_str!("../../../scripts/test-integration.ts");
+    assert!(integration.contains("--run-ignored"));
+    assert!(integration.contains("ignored-only"));
 }

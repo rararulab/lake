@@ -78,7 +78,13 @@ impl S3ObjectStore {
         let parsed = Url::parse(uri).map_err(|_| ObjectError::InvalidS3Uri {
             uri: uri.to_owned(),
         })?;
-        if parsed.scheme() != "s3" || parsed.query().is_some() || parsed.fragment().is_some() {
+        if parsed.scheme() != "s3"
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.port().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
             return Err(ObjectError::InvalidS3Uri {
                 uri: uri.to_owned(),
             });
@@ -259,11 +265,12 @@ impl ManagedObjectStore for S3ObjectStore {
 
 async fn read_part(input: &mut ObjectReader) -> Result<Vec<u8>> {
     let mut part = Vec::with_capacity(MULTIPART_PART_BYTES);
+    let mut buffer = vec![0_u8; 64 * 1024];
     while part.len() < MULTIPART_PART_BYTES {
         let remaining = MULTIPART_PART_BYTES - part.len();
-        let mut buffer = vec![0_u8; remaining.min(64 * 1024)];
+        let chunk = remaining.min(buffer.len());
         let read = input
-            .read(&mut buffer)
+            .read(&mut buffer[..chunk])
             .await
             .map_err(|source| ObjectError::Read { source })?;
         if read == 0 {

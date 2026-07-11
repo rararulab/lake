@@ -45,6 +45,15 @@ commit path. Once metadata acknowledges the commit, that query node evicts the
 table's cached registration so the same SDK connection observes its write;
 other query nodes retain the normal bounded-staleness contract.
 
+`ManagedObjectStore` is the SDK's object-safe storage boundary. The local
+backend publishes `file://` locations after an atomic rename. The production
+S3 backend accepts an already-configured AWS SDK client plus one Lake-owned
+bucket/prefix. It uses multipart upload for non-empty objects, keeps at most
+one 5 MiB part plus a small read buffer in memory, and incrementally computes
+size and SHA-256. Any source, part, or completion failure triggers
+`AbortMultipartUpload`; only a successful completion produces the returned
+`DataLocation`. Empty objects use one ordinary `PutObject`.
+
 ```text
 Rust SDK INSERT (logical FILE)
   -> schema + parameter validation
@@ -63,12 +72,15 @@ open its `DataLocation` directly through the SDK.
 
 `DataLocation.uri` is a stable identity, never an expiring signed URL. The
 managed stage is the only storage namespace accepted by this SDK; public SQL
-never accepts arbitrary storage URIs or credentials. The local implementation
-uses `file://`; cloud locations must be backed by an authenticated ticket or
-short-lived direct-read capability generated at query time. No raw object
-bytes travel over Flight SQL or the metasrv control plane.
+never accepts arbitrary storage URIs or credentials. Local locations use
+`file://`; cloud locations use `s3://bucket/key`. The S3 reader validates the
+exact configured bucket and path-segment prefix before `GetObject`, preventing
+one SDK stage from becoming an arbitrary S3 reader. Endpoint, region,
+credentials, path-style behavior, and future presigning policy stay in the
+caller-configured AWS client. No raw object bytes travel over Flight SQL or
+the metasrv control plane.
 
-The current slice does not provide S3 multipart presigning/resume, tenant
-authorization, signed locations, object deduplication, or garbage collection.
-Those additions must keep the same visibility rule: an SQL-visible
+The current slice does not provide multipart resume across SDK restarts,
+tenant authorization, browser presigning, object deduplication, or garbage
+collection. Those additions must keep the same visibility rule: a SQL-visible
 `DataLocation` always identifies a complete, immutable object.
