@@ -215,9 +215,10 @@ impl ServerSecurity {
     /// Build tonic TLS configuration when a server identity is installed.
     #[must_use]
     pub fn tls_config(&self) -> Option<ServerTlsConfig> {
-        self.tls_identity
-            .clone()
-            .map(|identity| ServerTlsConfig::new().identity(identity))
+        self.tls_identity.clone().map(|identity| {
+            ensure_crypto_provider();
+            ServerTlsConfig::new().identity(identity)
+        })
     }
 }
 
@@ -279,6 +280,7 @@ impl ClientSecurity {
             return Err(FlightSecurityError::TlsRequiresHttps);
         }
         let endpoint = if is_https {
+            ensure_crypto_provider();
             let mut tls = ClientTlsConfig::new().with_enabled_roots();
             if let Some(ca) = &self.ca {
                 tls = tls.ca_certificate(ca.clone());
@@ -347,6 +349,8 @@ impl fmt::Debug for ClientSecurity {
             .finish()
     }
 }
+
+fn ensure_crypto_provider() { let _ = rustls::crypto::ring::default_provider().install_default(); }
 
 #[cfg(test)]
 mod tests {

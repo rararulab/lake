@@ -16,6 +16,7 @@ futures = { workspace = true }
 lake-catalog = { workspace = true }
 lake-common = { workspace = true }
 lake-engine = { workspace = true }
+lake-flight = { workspace = true }
 lake-meta = { workspace = true }
 prost = { workspace = true }
 snafu = { workspace = true }
@@ -28,6 +29,7 @@ lake-engine-lance = { workspace = true }
 lake-metasrv = { workspace = true }
 tempfile = "3"
 prost-types = { workspace = true }
+rcgen = "^0.13"
 
 [lints]
 workspace = true
