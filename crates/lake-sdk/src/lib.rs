@@ -29,14 +29,19 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_flight::{
-    FlightClient, FlightDescriptor, decode::FlightRecordBatchStream,
+    Action, FlightClient, FlightDescriptor, decode::FlightRecordBatchStream,
     encode::FlightDataEncoderBuilder, sql::client::FlightSqlServiceClient,
 };
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::config::Region;
 use futures::TryStreamExt;
-use lake_common::{DataLocation, FILE_APPEND_TYPE_URL, FileAppendRequest, TableRef, Version};
+use lake_common::{
+    DataLocation, FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION,
+    ManagedStageBackend, ManagedStageDescriptor, TableRef, Version,
+};
 use lake_objects::{
-    ManagedObjectStore, ObjectReader, data_location_array, data_location_field,
-    data_location_from_array,
+    LocalObjectStore, ManagedObjectStore, ObjectReader, S3ObjectStore, data_location_array,
+    data_location_field, data_location_from_array,
 };
 use prost::Message;
 use prost_types::Any;
@@ -75,6 +80,17 @@ pub enum SdkError {
     #[snafu(display("query Flight operation failed"))]
     Flight {
         source: arrow_flight::error::FlightError,
+    },
+
+    #[snafu(display("query returned no managed FILE stage descriptor"))]
+    MissingManagedStage,
+
+    #[snafu(display("query returned more than one managed FILE stage descriptor"))]
+    MultipleManagedStages,
+
+    #[snafu(display("query returned an invalid managed FILE stage descriptor"))]
+    InvalidManagedStage {
+        source: lake_common::ManagedStageError,
     },
 
     #[snafu(display("query returned no FILE append result"))]
@@ -182,18 +198,21 @@ pub struct LakeClient {
 }
 
 impl LakeClient {
-    /// Connect to Lake through its query endpoint.
-    pub async fn connect<S>(query_endpoint: impl AsRef<str>, objects: S) -> Result<Self>
+    /// Connect through query and discover the managed `FILE` stage once.
+    pub async fn connect(query_endpoint: impl AsRef<str>) -> Result<Self> {
+        let query = connect_query(query_endpoint.as_ref()).await?;
+        let descriptor = discover_managed_stage(query.clone()).await?;
+        let objects = open_managed_stage(&descriptor).await?;
+        Ok(Self { query, objects })
+    }
+
+    /// Connect with an explicitly injected managed stage for tests and
+    /// advanced embedding.
+    pub async fn connect_with_store<S>(query_endpoint: impl AsRef<str>, objects: S) -> Result<Self>
     where
         S: ManagedObjectStore + 'static,
     {
-        let query = Channel::from_shared(query_endpoint.as_ref().to_owned())
-            .map_err(|error| SdkError::InvalidEndpoint {
-                message: error.to_string(),
-            })?
-            .connect()
-            .await
-            .context(ConnectSnafu)?;
+        let query = connect_query(query_endpoint.as_ref()).await?;
         Ok(Self {
             query,
             objects: Arc::new(objects),
@@ -329,6 +348,71 @@ impl LakeClient {
             (..) => Err(SdkError::TypeMismatch {
                 column: "bound value".to_owned(),
             }),
+        }
+    }
+}
+
+async fn connect_query(query_endpoint: &str) -> Result<Channel> {
+    Channel::from_shared(query_endpoint.to_owned())
+        .map_err(|error| SdkError::InvalidEndpoint {
+            message: error.to_string(),
+        })?
+        .connect()
+        .await
+        .context(ConnectSnafu)
+}
+
+async fn discover_managed_stage(query: Channel) -> Result<ManagedStageDescriptor> {
+    let mut client = FlightClient::new(query);
+    let mut results = client
+        .do_action(Action {
+            r#type: MANAGED_STAGE_DISCOVERY_ACTION.to_owned(),
+            body:   Vec::new().into(),
+        })
+        .await
+        .context(FlightSnafu)?;
+    let wire = results
+        .try_next()
+        .await
+        .context(FlightSnafu)?
+        .context(MissingManagedStageSnafu)?;
+    if results.try_next().await.context(FlightSnafu)?.is_some() {
+        return Err(SdkError::MultipleManagedStages);
+    }
+    ManagedStageDescriptor::from_wire(&wire).context(InvalidManagedStageSnafu)
+}
+
+async fn open_managed_stage(
+    descriptor: &ManagedStageDescriptor,
+) -> Result<Arc<dyn ManagedObjectStore>> {
+    match descriptor.backend() {
+        ManagedStageBackend::Local { root } => Ok(Arc::new(
+            LocalObjectStore::open(root).await.context(ObjectSnafu)?,
+        )),
+        ManagedStageBackend::S3 {
+            bucket,
+            prefix,
+            region,
+            endpoint,
+            force_path_style,
+        } => {
+            let mut loader = aws_config::defaults(BehaviorVersion::latest());
+            if let Some(region) = region {
+                loader = loader.region(Region::new(region.clone()));
+            }
+            let shared = loader.load().await;
+            let mut config =
+                aws_sdk_s3::config::Builder::from(&shared).force_path_style(*force_path_style);
+            if let Some(endpoint) = endpoint {
+                config = config.endpoint_url(endpoint);
+            }
+            let store = S3ObjectStore::new(
+                aws_sdk_s3::Client::from_conf(config.build()),
+                bucket,
+                prefix,
+            )
+            .context(ObjectSnafu)?;
+            Ok(Arc::new(store))
         }
     }
 }
@@ -482,7 +566,7 @@ mod tests {
     use aws_config::BehaviorVersion;
     use aws_sdk_s3::config::{Credentials, Region};
     use futures::TryStreamExt;
-    use lake_common::{TableLocation, TableRef};
+    use lake_common::{ManagedStageDescriptor, TableLocation, TableRef};
     use lake_engine::TableEngineRef;
     use lake_engine_lance::LanceEngine;
     use lake_meta::{MetaStoreRef, RocksMeta};
@@ -505,7 +589,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = LakeClient::connect("http://127.0.0.1:1", objects).await;
+        let result = LakeClient::connect_with_store("http://127.0.0.1:1", objects).await;
 
         assert!(
             result.is_err(),
@@ -556,6 +640,42 @@ mod tests {
         let mut actual = Vec::new();
         reader.read_to_end(&mut actual).await.unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn client_discovers_local_stage_from_query() {
+        let root = tempdir().unwrap();
+        let client = setup_discovered_client(root.path()).await;
+        let expected = b"0123456789abcdef";
+
+        client
+            .insert(
+                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    InsertValue::Utf8("episode-discovery".to_owned()),
+                    InsertValue::File(FileUpload::from_reader(
+                        std::io::Cursor::new(expected),
+                        "video/mp4",
+                    )),
+                ],
+            )
+            .await
+            .unwrap();
+        let mut results = client
+            .query("SELECT video FROM lake.robots.episodes")
+            .await
+            .unwrap();
+        let batch = results.try_next().await.unwrap().unwrap();
+        let location = data_location(&batch, "video", 0).unwrap();
+        let mut full_reader = client.open(&location).await.unwrap();
+        let mut full = Vec::new();
+        full_reader.read_to_end(&mut full).await.unwrap();
+        let mut range_reader = client.open_range(&location, 4..10).await.unwrap();
+        let mut range = Vec::new();
+        range_reader.read_to_end(&mut range).await.unwrap();
+
+        assert_eq!(full, expected);
+        assert_eq!(range, b"456789");
     }
 
     #[tokio::test]
@@ -870,10 +990,48 @@ mod tests {
             async move { lake_query::serve_with_metadata(query, &addr, &metadata).await }
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let client = LakeClient::connect(format!("http://{query_addr}"), objects)
+        let client = LakeClient::connect_with_store(format!("http://{query_addr}"), objects)
             .await
             .unwrap();
         (client, metasrv, table, meta, engine)
+    }
+
+    async fn setup_discovered_client(root: &std::path::Path) -> LakeClient {
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
+        let table = TableRef::new("robots", "episodes");
+        metasrv
+            .create_table(
+                &table,
+                TableLocation::new(root.join("tables/episodes.lance").to_string_lossy()),
+                Arc::new(Schema::new(vec![
+                    Field::new("episode_id", DataType::Utf8, false),
+                    data_location_field("video", false),
+                ])),
+            )
+            .await
+            .unwrap();
+        let meta_addr = free_addr();
+        let query_addr = free_addr();
+        tokio::spawn({
+            let addr = meta_addr.clone();
+            async move { lake_metasrv::serve(metasrv, &addr).await }
+        });
+        tokio::spawn({
+            let query = Arc::new(QueryEngine::new(meta, engine));
+            let addr = query_addr.clone();
+            let metadata = format!("http://{meta_addr}");
+            let stage =
+                ManagedStageDescriptor::local(root.join("objects").to_string_lossy().into_owned());
+            async move {
+                lake_query::serve_with_metadata_and_stage(query, &addr, &metadata, stage).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        LakeClient::connect(format!("http://{query_addr}"))
+            .await
+            .unwrap()
     }
 
     struct DelegatingStore(LocalObjectStore);

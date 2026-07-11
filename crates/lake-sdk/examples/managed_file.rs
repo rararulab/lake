@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         async move { lake_query::serve_with_metadata(query, &addr, &metadata).await }
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let client = LakeClient::connect(
+    let client = LakeClient::connect_with_store(
         format!("http://{query_addr}"),
         LocalObjectStore::open(root.path().join("objects")).await?,
     )
