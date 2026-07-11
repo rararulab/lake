@@ -61,7 +61,7 @@ use tokio::{
 };
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::{QueryEngine, QueryLimits};
+use crate::{DiscoveryLimits, QueryEngine, QueryLimits};
 
 #[derive(Clone, Debug)]
 pub(crate) struct QueryAdmission {
@@ -257,15 +257,17 @@ impl Stream for AdmittedFlightStream {
 /// A Flight SQL service backed by a stateless [`QueryEngine`].
 pub struct FlightSqlServiceImpl {
     /// The warmed query engine that plans and executes incoming SQL.
-    pub engine:            Arc<QueryEngine>,
+    pub engine:                  Arc<QueryEngine>,
     /// Metadata Flight address used only for stateless FILE append forwarding.
-    pub metadata_addr:     Option<String>,
+    pub metadata_addr:           Option<String>,
     /// TLS and service credential for the Query-to-Metasrv hop.
-    pub metadata_security: ClientSecurity,
+    pub metadata_security:       ClientSecurity,
     /// Immutable, credential-free stage metadata advertised to SDK clients.
-    pub managed_stage:     Option<ManagedStageDescriptor>,
+    pub managed_stage:           Option<ManagedStageDescriptor>,
     /// Process-local admission shared by SQL statement RPCs.
-    pub(crate) admission:  QueryAdmission,
+    pub(crate) admission:        QueryAdmission,
+    /// Process-local row and batch bounds for metadata discovery.
+    pub(crate) discovery_limits: DiscoveryLimits,
 }
 
 impl FlightSqlServiceImpl {
@@ -820,6 +822,7 @@ mod tests {
             metadata_security: ClientSecurity::new(),
             managed_stage:     Some(descriptor.clone()),
             admission:         QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:  DiscoveryLimits::default(),
         };
         let action = arrow_flight::Action {
             r#type: MANAGED_STAGE_DISCOVERY_ACTION.to_owned(),
@@ -863,6 +866,7 @@ mod tests {
             metadata_security: ClientSecurity::new(),
             managed_stage:     None,
             admission:         QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:  DiscoveryLimits::default(),
         };
         let principal = Principal::try_new(
             PrincipalId::try_new("alpha-reader").unwrap(),
@@ -906,6 +910,7 @@ mod tests {
             metadata_security: ClientSecurity::new(),
             managed_stage: None,
             admission: QueryAdmission::new(QueryLimits::default()),
+            discovery_limits: DiscoveryLimits::default(),
         };
         let principal = Principal::try_new(
             PrincipalId::try_new("alpha-reader").unwrap(),
@@ -1000,6 +1005,7 @@ mod tests {
             metadata_security: ClientSecurity::new(),
             managed_stage: None,
             admission: QueryAdmission::new(QueryLimits::default()),
+            discovery_limits: DiscoveryLimits::default(),
         };
         let principal = Principal::try_new(
             PrincipalId::try_new("alpha-reader").unwrap(),
@@ -1166,6 +1172,7 @@ mod tests {
             metadata_security: ClientSecurity::new(),
             managed_stage: None,
             admission: QueryAdmission::new(QueryLimits::default()),
+            discovery_limits: DiscoveryLimits::default(),
         };
         let principal = Principal::try_new(
             PrincipalId::try_new("alpha-reader").unwrap(),
@@ -1226,6 +1233,7 @@ mod tests {
             metadata_security: ClientSecurity::new(),
             managed_stage: None,
             admission: QueryAdmission::new(QueryLimits::default()),
+            discovery_limits: DiscoveryLimits::default(),
         };
         let ticket = TicketStatementQuery {
             statement_handle: b"SELECT * FROM delayed".to_vec().into(),
@@ -1282,6 +1290,7 @@ mod tests {
             metadata_security: ClientSecurity::new(),
             managed_stage: None,
             admission: QueryAdmission::new(limits),
+            discovery_limits: DiscoveryLimits::default(),
         };
         let ticket = || TicketStatementQuery {
             statement_handle: b"SELECT * FROM admitted".to_vec().into(),
@@ -1345,6 +1354,7 @@ mod tests {
             metadata_security: ClientSecurity::new(),
             managed_stage: None,
             admission: QueryAdmission::new(limits),
+            discovery_limits: DiscoveryLimits::default(),
         };
         let ticket = || TicketStatementQuery {
             statement_handle: b"SELECT * FROM deadline".to_vec().into(),
@@ -1398,6 +1408,7 @@ mod tests {
             metadata_security: ClientSecurity::new(),
             managed_stage:     None,
             admission:         QueryAdmission::new(limits),
+            discovery_limits:  DiscoveryLimits::default(),
         };
         let query = CommandStatementQuery {
             query:          "SELECT 1".to_owned(),

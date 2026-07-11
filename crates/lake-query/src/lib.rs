@@ -110,6 +110,54 @@ pub enum QueryError {
 
 pub type Result<T> = std::result::Result<T, QueryError>;
 
+/// Per-request row and batch bounds for Flight SQL metadata discovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiscoveryLimits {
+    max_rows:   usize,
+    batch_rows: usize,
+}
+
+impl DiscoveryLimits {
+    /// Validate finite, non-zero discovery bounds.
+    pub fn try_new(max_rows: usize, batch_rows: usize) -> Result<Self> {
+        for (valid, message) in [
+            (max_rows > 0, "max_rows must be greater than zero"),
+            (batch_rows > 0, "batch_rows must be greater than zero"),
+            (
+                batch_rows <= max_rows,
+                "batch_rows must not exceed max_rows",
+            ),
+        ] {
+            if !valid {
+                return Err(QueryError::InvalidLimits {
+                    message: message.to_owned(),
+                });
+            }
+        }
+        Ok(Self {
+            max_rows,
+            batch_rows,
+        })
+    }
+
+    /// Maximum matching rows returned by one discovery request.
+    #[must_use]
+    pub const fn max_rows(&self) -> usize { self.max_rows }
+
+    /// Maximum rows allocated in one discovery record batch.
+    #[must_use]
+    pub const fn batch_rows(&self) -> usize { self.batch_rows }
+}
+
+impl Default for DiscoveryLimits {
+    fn default() -> Self {
+        Self {
+            max_rows:   10_000,
+            batch_rows: 256,
+        }
+    }
+}
+
 /// Per-replica admission and request limits for stateless Query execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryLimits {
@@ -262,6 +310,7 @@ pub struct QueryServerConfig {
     server_security:   ServerSecurity,
     allow_insecure:    bool,
     limits:            QueryLimits,
+    discovery_limits:  DiscoveryLimits,
     shutdown_grace:    Duration,
 }
 
@@ -276,6 +325,7 @@ impl QueryServerConfig {
             server_security:   ServerSecurity::insecure(),
             allow_insecure:    false,
             limits:            QueryLimits::default(),
+            discovery_limits:  DiscoveryLimits::default(),
             shutdown_grace:    Duration::from_secs(30),
         }
     }
@@ -314,6 +364,13 @@ impl QueryServerConfig {
     #[must_use]
     pub const fn with_limits(mut self, limits: QueryLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Apply immutable metadata discovery row and batch bounds.
+    #[must_use]
+    pub const fn with_discovery_limits(mut self, limits: DiscoveryLimits) -> Self {
+        self.discovery_limits = limits;
         self
     }
 
@@ -491,6 +548,7 @@ where
         metadata_security: config.metadata_security,
         managed_stage:     config.managed_stage,
         admission:         flight::QueryAdmission::new(config.limits),
+        discovery_limits:  config.discovery_limits,
     });
 
     tracing::info!(%addr, "Flight SQL server ready");
