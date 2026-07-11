@@ -4193,6 +4193,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lake-flight"
+version = "0.0.1"
+dependencies = [
+ "arrow-flight",
+ "snafu",
+ "subtle",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "lake-meta"
 version = "0.0.1"
 dependencies = [
@@ -6947,6 +6958,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -7980,11 +7992,13 @@ dependencies = [
  "socket2 0.6.4",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tokio-stream",
  "tower",
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
