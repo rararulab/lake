@@ -23,8 +23,11 @@ MCP 工具（索引：`mise run codegraph`）。
 
 - 改代码先建 workspace：`jj workspace add .worktrees/issue-N-<slug>`，禁止在主
   checkout 上开发（`.claude/hooks/guard-main-branch.ts` 强制）。
-- jj 不触发 git hooks：push 前必须 `mise run gate`（lane 1 另加
-  `mise run spec-lifecycle <spec>`）；CI 是兜底。
+- **Local-first**：本地门禁比 CI 全（本地有 Docker 跑 integration）。CI 只在
+  `main` 上 post-merge 兜底,不在 PR 跑。
+- jj 不触发 git hooks：`jj push`(全局 alias → jj-pre-push)自动跑 prek 快门禁
+  (fmt+clippy);完整门禁 + 推用 `mise run ship`(= `mise run ci` 含 integration
+  + conventional-commit 检查 + push)。lane 1 另加 `mise run spec-lifecycle <spec>`。
 - Conventional Commits，由 CI 和 reviewer 强制。
 - 所有变更走 issue → workspace → PR → merge，无例外。
 

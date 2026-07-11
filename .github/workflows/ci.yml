@@ -1,9 +1,14 @@
 name: CI
 
+# local-first: the comprehensive quality gate runs LOCALLY before push (see
+# docs/guides/workflow.md — `jj push` runs the prek gate, `mise run ship` runs
+# the full gate incl. integration). CI is a post-merge backstop on `main` only,
+# catching Linux-vs-macOS platform differences. Use workflow_dispatch to run it
+# on demand for a branch.
 on:
   push:
     branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -36,7 +41,7 @@ jobs:
   # main always run the full gate.
   changes:
     name: Detect changes
-    runs-on: namespace-profile-rara
+    runs-on: ubuntu-latest
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       site: ${{ steps.filter.outputs.site }}
@@ -73,13 +78,13 @@ jobs:
               - 'Cargo.lock'
               - 'deny.toml'
 
-  # One check per job so they run in parallel on separate Namespace runners
-  # (fast CPUs + persistent cache volumes for the big Rust dependency tree).
+  # One check per job so they run in parallel on separate GitHub-hosted runners
+  # (public repo => free, unlimited, ~20 concurrent).
   rust:
     name: ${{ matrix.name }}
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'push' }}
-    runs-on: namespace-profile-rara
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -108,7 +113,7 @@ jobs:
     name: Integration (LocalStack)
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'push' }}
-    runs-on: namespace-profile-rara
+    runs-on: ubuntu-latest
     services:
       localstack:
         # Community edition; `:latest` now requires a LOCALSTACK_AUTH_TOKEN.
@@ -147,7 +152,7 @@ jobs:
     name: Spec selftest
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.specs == 'true' || github.event_name == 'push' }}
-    runs-on: namespace-profile-rara
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -163,7 +168,7 @@ jobs:
     name: Site
     needs: changes
     if: ${{ needs.changes.outputs.site == 'true' || github.event_name == 'push' }}
-    runs-on: namespace-profile-rara
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -174,21 +179,8 @@ jobs:
           install: true
       - run: mise run site-check
 
-  # jj fires no git hooks locally, so Conventional Commits are enforced here.
-  commits:
-    name: Conventional Commits
-    if: ${{ github.event_name == 'pull_request' }}
-    runs-on: namespace-profile-rara
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4
-        with:
-          github_token: ${{ github.token }}
-          install: true
-      - run: mise run check-commits "origin/${{ github.base_ref }}..HEAD"
+  # Conventional Commits are enforced LOCALLY now (mise run ship runs
+  # `mise run check-commits`) — see docs/guides/workflow.md.
 
   # Advisory/ban/license/source sweep. Only runs when the dependency graph
   # changes; triage findings in deny.toml.
@@ -196,7 +188,7 @@ jobs:
     name: Cargo Deny
     needs: changes
     if: ${{ needs.changes.outputs.cargo_deps == 'true' }}
-    runs-on: namespace-profile-rara
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -211,7 +203,7 @@ jobs:
     name: Cargo Shear
     needs: changes
     if: ${{ needs.changes.outputs.cargo_deps == 'true' }}
-    runs-on: namespace-profile-rara
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -231,8 +223,8 @@ jobs:
   ci-ok:
     name: CI OK
     if: always()
-    needs: [changes, rust, integration, spec, site, commits]
-    runs-on: namespace-profile-rara
+    needs: [changes, rust, integration, spec, site]
+    runs-on: ubuntu-latest
     steps:
       - name: verify no job failed
         if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}

@@ -22,6 +22,7 @@ uv   = "0.11.26"       # uvx runs the code-review-graph MCP server (.mcp.json)
 "github:nextest-rs/nextest" = "cargo-nextest-0.9.140"
 # Protocol Buffer compiler required by Lance build scripts.
 "aqua:protocolbuffers/protobuf/protoc" = "35.1"
+"cargo:bacon" = "3"   # local watch loop: `mise run watch` (clippy on save)
 
 [env]
 # CARGO_INCREMENTAL deliberately NOT disabled here: local gates rely on
@@ -115,9 +116,28 @@ depends = ["hooks", "test", "e2e", "site-check"]
 description = "cargo doc with -D warnings (slow; CI and on demand)"
 run = 'env RUSTDOCFLAGS="-D warnings" cargo +nightly doc --workspace --no-deps --document-private-items'
 
+# The comprehensive LOCAL gate — deliberately broader than GitHub CI: it also
+# runs the LocalStack integration suite (needs Docker), which CI can only do in
+# a constrained ephemeral runner. Local-first: this is the real gate; CI is a
+# post-merge backstop on `main`. Ship via `mise run ship`.
 [tasks.ci]
-description = "full CI gate: gate + doc + spec-selftest"
-depends = ["gate", "doc", "spec-selftest"]
+description = "comprehensive local gate: gate + doc + spec-selftest + integration (needs Docker)"
+depends = ["gate", "doc", "spec-selftest", "test-integration"]
+
+# One command to ship: full local gate + Conventional Commit check, then push
+# through the jj-pre-push gate. Local-first replacement for CI-catches-problems.
+[tasks.ship]
+description = "full local gate + conventional-commit check, then push"
+run = '''
+mise run ci
+mise run check-commits "origin/main..@"
+jj git push
+'''
+
+# Continuous local feedback: bacon re-runs clippy on save.
+[tasks.watch]
+description = "bacon watch loop (clippy on save)"
+run = "bacon clippy"
 
 [tasks.check-commits]
 description = "validate Conventional Commit subjects in a git revision range"
