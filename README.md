@@ -241,8 +241,8 @@ Plaintext anonymous serving is allowed only on loopback and receives the named
 development principal. A non-loopback Query or Metasrv listener requires either
 `LAKE_AUTH_PRINCIPALS_FILE` or `LAKE_AUTH_TOKEN_FILE`, plus
 `LAKE_TLS_CERT_FILE` and `LAKE_TLS_KEY_FILE`. Set `LAKE_ALLOW_INSECURE=true` only
-when a trusted service mesh terminates both TLS and authentication before Lake.
-Metasrv nodes use
+when a trusted service mesh terminates TLS before Lake; Lake bearer
+authentication remains mandatory. Metasrv nodes use
 `LAKE_PEER_AUTH_TOKEN_FILE`, `LAKE_PEER_CA_FILE`, and
 `LAKE_PEER_SERVER_NAME` for follower-to-leader forwarding.
 

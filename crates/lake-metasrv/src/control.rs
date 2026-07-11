@@ -69,12 +69,12 @@ type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 /// results carrying JSON bodies.
 type ActionStream = BoxStream<FlightResult>;
 
-fn principal<T>(request: &Request<T>) -> Principal {
+fn principal<T>(request: &Request<T>) -> Result<Principal, Status> {
     request
         .extensions()
         .get::<Principal>()
         .cloned()
-        .unwrap_or_else(Principal::deployment_admin)
+        .ok_or_else(|| Status::unauthenticated("authenticated principal is missing"))
 }
 
 fn delegated_namespace<T>(request: &Request<T>) -> Result<Option<String>, Status> {
@@ -468,7 +468,7 @@ impl FlightService for MetasrvFlightService {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        let principal = principal(&request);
+        let principal = principal(&request)?;
         let delegated = delegated_namespace(&request)?;
         let mut input = request.into_inner();
         let first = input
@@ -512,7 +512,7 @@ impl FlightService for MetasrvFlightService {
         &self,
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        let principal = principal(&request);
+        let principal = principal(&request)?;
         let delegated = delegated_namespace(&request)?;
         let action = request.into_inner();
         match action.r#type.as_str() {

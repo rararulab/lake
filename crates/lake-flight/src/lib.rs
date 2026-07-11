@@ -262,11 +262,11 @@ impl ServerSecurity {
         self
     }
 
-    /// Validate that a remotely reachable listener cannot downgrade silently.
+    /// Validate that a remotely reachable listener always authenticates; an
+    /// explicit override may delegate TLS, but never identity, to a proxy.
     pub fn validate_exposure(&self, addr: SocketAddr, allow_insecure: bool) -> Result<()> {
         if addr.ip().is_loopback()
-            || allow_insecure
-            || (self.bearer.is_some() && self.tls_identity.is_some())
+            || (self.bearer.is_some() && (allow_insecure || self.tls_identity.is_some()))
         {
             return Ok(());
         }
@@ -570,10 +570,11 @@ mod tests {
         let insecure = ServerSecurity::insecure();
         assert!(insecure.validate_exposure(loopback, false).is_ok());
         assert!(insecure.validate_exposure(public, false).is_err());
-        assert!(insecure.validate_exposure(public, true).is_ok());
+        assert!(insecure.validate_exposure(public, true).is_err());
 
         let auth_only = ServerSecurity::with_bearer_token("secret").expect("auth");
         assert!(auth_only.validate_exposure(public, false).is_err());
+        assert!(auth_only.validate_exposure(public, true).is_ok());
 
         let secure = auth_only.with_tls_identity_pem(b"certificate", b"private-key");
         assert!(secure.validate_exposure(public, false).is_ok());

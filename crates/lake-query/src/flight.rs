@@ -168,12 +168,12 @@ impl FlightSqlServiceImpl {
         Ok(df.schema().as_arrow().clone())
     }
 
-    fn principal<T>(&self, request: &Request<T>) -> Principal {
+    fn principal<T>(&self, request: &Request<T>) -> std::result::Result<Principal, Status> {
         request
             .extensions()
             .get::<Principal>()
             .cloned()
-            .unwrap_or_else(Principal::deployment_admin)
+            .ok_or_else(|| Status::unauthenticated("authenticated principal is missing"))
     }
 
     fn authorize_namespace(
@@ -243,7 +243,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
     ) -> std::result::Result<Response<FlightInfo>, Status> {
         let CommandStatementQuery { query: sql, .. } = query;
         self.admission.validate_sql_size(sql.as_bytes())?;
-        let principal = self.principal(&request);
+        let principal = self.principal(&request)?;
         self.authorize_sql(&principal, &sql)?;
         let _permit = self.admission.acquire().await?;
         let schema =
@@ -302,12 +302,12 @@ impl FlightSqlService for FlightSqlServiceImpl {
         request: Request<Ticket>,
     ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         self.admission.validate_sql_size(&ticket.statement_handle)?;
-        let permit = self.admission.acquire().await?;
-        let deadline = self.admission.execution_deadline();
         let sql = String::from_utf8(ticket.statement_handle.to_vec())
             .map_err(|e| Status::invalid_argument(format!("ticket is not utf-8: {e}")))?;
-        let principal = self.principal(&request);
+        let principal = self.principal(&request)?;
         self.authorize_sql(&principal, &sql)?;
+        let permit = self.admission.acquire().await?;
+        let deadline = self.admission.execution_deadline();
 
         let batches = tokio::time::timeout_at(deadline, async {
             let df = self.engine.plan_sql(&sql).await.map_err(to_status)?;
@@ -334,7 +334,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetDbSchemas,
         request: Request<Ticket>,
     ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let principal = self.principal(&request);
+        let principal = self.principal(&request)?;
         let mut builder = query.into_builder();
         for (namespace, _) in self.engine.cached_catalog_snapshot() {
             if principal.can_access_namespace(&namespace.0) {
@@ -355,7 +355,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetTables,
         request: Request<Ticket>,
     ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let principal = self.principal(&request);
+        let principal = self.principal(&request)?;
         let mut builder = query.into_builder();
         let empty_schema = Schema::empty();
         for (namespace, tables) in self.engine.cached_catalog_snapshot() {
@@ -387,7 +387,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         }
         let append = FileAppendRequest::from_command_payload(&message.value)
             .ok_or_else(|| Status::invalid_argument("invalid FILE append command"))?;
-        let principal = self.principal(&request);
+        let principal = self.principal(&request)?;
         self.authorize_namespace(&principal, &append.table().namespace.0)?;
         let addr = self
             .metadata_addr
@@ -430,7 +430,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         &self,
         request: Request<Action>,
     ) -> std::result::Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let principal = self.principal(&request);
+        let principal = self.principal(&request)?;
         let action = request.into_inner();
         if action.r#type != MANAGED_STAGE_DISCOVERY_ACTION {
             return Err(Status::invalid_argument(format!(
@@ -629,10 +629,20 @@ mod tests {
             managed_stage:     Some(descriptor.clone()),
             admission:         QueryAdmission::new(QueryLimits::default()),
         };
-        let request = Request::new(arrow_flight::Action {
+        let action = arrow_flight::Action {
             r#type: MANAGED_STAGE_DISCOVERY_ACTION.to_owned(),
             body:   Vec::new().into(),
-        });
+        };
+        let error = service
+            .do_action_fallback(Request::new(action.clone()))
+            .await
+            .err()
+            .expect("missing principal must fail closed");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        let mut request = Request::new(action);
+        request
+            .extensions_mut()
+            .insert(Principal::deployment_admin());
 
         let results = service
             .do_action_fallback(request)
@@ -863,23 +873,25 @@ mod tests {
         let ticket = || TicketStatementQuery {
             statement_handle: b"SELECT * FROM admitted".to_vec().into(),
         };
+        let request = || {
+            let mut request = Request::new(Ticket::default());
+            request
+                .extensions_mut()
+                .insert(Principal::deployment_admin());
+            request
+        };
 
         let first = service
-            .do_get_statement(ticket(), Request::new(Ticket::default()))
+            .do_get_statement(ticket(), request())
             .await
             .expect("first query admitted");
-        let Err(saturated) = service
-            .do_get_statement(ticket(), Request::new(Ticket::default()))
-            .await
-        else {
+        let Err(saturated) = service.do_get_statement(ticket(), request()).await else {
             panic!("second query must be rejected while first stream lives");
         };
         assert_eq!(saturated.code(), tonic::Code::ResourceExhausted);
 
         drop(first);
-        let third = service
-            .do_get_statement(ticket(), Request::new(Ticket::default()))
-            .await;
+        let third = service.do_get_statement(ticket(), request()).await;
         assert!(third.is_ok(), "dropping the stream must release its permit");
         release.notify_waiters();
     }
@@ -924,8 +936,12 @@ mod tests {
         let ticket = || TicketStatementQuery {
             statement_handle: b"SELECT * FROM deadline".to_vec().into(),
         };
+        let mut request = Request::new(Ticket::default());
+        request
+            .extensions_mut()
+            .insert(Principal::deployment_admin());
         let response = service
-            .do_get_statement(ticket(), Request::new(Ticket::default()))
+            .do_get_statement(ticket(), request)
             .await
             .expect("query admitted");
         let mut stream = response.into_inner();
