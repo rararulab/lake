@@ -23,8 +23,66 @@ mod data_location;
 mod file_write;
 mod ids;
 mod location;
+mod managed_stage;
 
 pub use data_location::DataLocation;
 pub use file_write::{FILE_APPEND_TYPE_URL, FileAppendRequest};
 pub use ids::{Namespace, TableName, TableRef, Version};
 pub use location::TableLocation;
+pub use managed_stage::{
+    MANAGED_STAGE_DISCOVERY_ACTION, MANAGED_STAGE_PROTOCOL_VERSION, ManagedStageBackend,
+    ManagedStageDescriptor, ManagedStageError,
+};
+
+#[cfg(test)]
+mod managed_stage_contract_tests {
+    use crate::{ManagedStageBackend, ManagedStageDescriptor, ManagedStageError};
+
+    #[test]
+    fn managed_stage_descriptors_roundtrip_without_credentials() {
+        let descriptors = [
+            ManagedStageDescriptor::local("/var/lib/lake/managed-objects"),
+            ManagedStageDescriptor::s3(
+                "embodied-data",
+                "managed-objects",
+                Some("us-east-1".to_owned()),
+                Some("http://127.0.0.1:4566".to_owned()),
+                true,
+            ),
+        ];
+        assert!(matches!(
+            descriptors[0].backend(),
+            ManagedStageBackend::Local { .. }
+        ));
+
+        for expected in descriptors {
+            let wire = expected.to_wire().expect("encode descriptor");
+            let json = std::str::from_utf8(&wire).expect("JSON wire is UTF-8");
+            for forbidden in [
+                "access_key",
+                "secret_key",
+                "session_token",
+                "signed_url",
+                "object_bytes",
+            ] {
+                assert!(!json.contains(forbidden), "wire contains {forbidden}");
+            }
+
+            let decoded = ManagedStageDescriptor::from_wire(&wire).expect("decode descriptor");
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn managed_stage_rejects_unsupported_protocol_version() {
+        let future = br#"{"version":2,"backend":{"type":"local","root":"/tmp/objects"}}"#;
+
+        assert!(matches!(
+            ManagedStageDescriptor::from_wire(future),
+            Err(ManagedStageError::UnsupportedVersion {
+                version:   2,
+                supported: 1,
+            })
+        ));
+    }
+}
