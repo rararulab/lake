@@ -254,9 +254,7 @@ impl TableEngine for LanceEngine {
         let (store, path) = object_store::parse_url_opts(&url, self.config.storage_options.clone())
             .map_err(EngineError::backend)?;
         let paths = store.list(Some(&path)).map_ok(|meta| meta.location).boxed();
-        store
-            .delete_stream(paths)
-            .try_collect::<Vec<_>>()
+        drain_delete_results(store.delete_stream(paths))
             .await
             .map_err(EngineError::backend)?;
         if let Some(handler) = &self.config.commit_handler {
@@ -360,6 +358,16 @@ impl TableEngine for LanceEngine {
         });
         Ok(ObjectReferencePage::new(deltas, next_cursor))
     }
+}
+
+async fn drain_delete_results<S>(mut results: S) -> std::result::Result<(), S::Error>
+where
+    S: futures::TryStream + Unpin,
+{
+    while let Some(result) = results.try_next().await? {
+        drop(result);
+    }
+    Ok(())
 }
 
 /// Resolve a [`TableLocation`] to an object-store URL. A bare path (local dev)
@@ -1036,7 +1044,10 @@ impl TableHandle for LanceTable {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Weak};
+    use std::sync::{
+        Arc, Weak,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use datafusion::{
         arrow::{
@@ -1103,6 +1114,57 @@ mod tests {
 
     fn file_batch(index: usize) -> RecordBatch {
         RecordBatch::try_new(file_schema(), vec![file_array(index)]).unwrap()
+    }
+
+    struct LiveResult {
+        live: Arc<AtomicUsize>,
+    }
+
+    impl LiveResult {
+        fn new(live: Arc<AtomicUsize>, peak: &AtomicUsize) -> Self {
+            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            Self { live }
+        }
+    }
+
+    impl Drop for LiveResult {
+        fn drop(&mut self) { self.live.fetch_sub(1, Ordering::SeqCst); }
+    }
+
+    #[tokio::test]
+    async fn remove_result_stream_keeps_constant_live_items() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let results = futures::stream::iter((0..10_000).map({
+            let live = live.clone();
+            let peak = peak.clone();
+            move |_| Ok::<_, std::io::Error>(LiveResult::new(live.clone(), &peak))
+        }));
+
+        drain_delete_results(results).await.unwrap();
+
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_result_stream_stops_after_first_error() {
+        let polled = Arc::new(AtomicUsize::new(0));
+        let results = futures::stream::iter((0..10).map({
+            let polled = polled.clone();
+            move |index| {
+                polled.fetch_add(1, Ordering::SeqCst);
+                if index == 2 {
+                    Err("delete failed")
+                } else {
+                    Ok(())
+                }
+            }
+        }));
+
+        assert_eq!(drain_delete_results(results).await, Err("delete failed"));
+        assert_eq!(polled.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
