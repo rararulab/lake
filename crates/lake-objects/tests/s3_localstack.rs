@@ -24,7 +24,9 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart},
 };
-use lake_objects::{ManagedObjectStore, ObjectError, S3ObjectStore};
+use lake_objects::{
+    InventoryRequest, ManagedObjectInventory, ManagedObjectStore, ObjectError, S3ObjectStore,
+};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
@@ -131,6 +133,62 @@ async fn s3_multipart_roundtrip_localstack() {
     let mut downloaded = Vec::new();
     reader.read_to_end(&mut downloaded).await.unwrap();
     assert_eq!(downloaded, bytes);
+}
+
+#[tokio::test]
+#[ignore = "requires LocalStack S3; set LAKE_S3_ENDPOINT and run with --ignored"]
+async fn s3_inventory_is_bounded_sorted_and_stage_scoped_localstack() {
+    let Some((client, store, bucket)) = stage().await else {
+        return;
+    };
+    for key in [
+        "managed/objects/c",
+        "managed/objects/a",
+        "managed/objects/b",
+        "managed/objects/internal/metadata",
+        "somebody-else/object",
+    ] {
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"inventory"))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let first = store
+        .inventory_page(InventoryRequest::try_new(None, 2).unwrap())
+        .await
+        .unwrap();
+    let second = store
+        .inventory_page(
+            InventoryRequest::try_new(first.next_cursor().map(ToOwned::to_owned), 2).unwrap(),
+        )
+        .await
+        .unwrap();
+    let candidates = first
+        .candidates()
+        .iter()
+        .chain(second.candidates())
+        .collect::<Vec<_>>();
+    assert_eq!(candidates.len(), 3);
+    assert!(candidates.windows(2).all(|pair| pair[0].uri < pair[1].uri));
+    assert!(candidates.iter().all(|candidate| {
+        candidate
+            .uri
+            .starts_with(&format!("s3://{bucket}/managed/objects/"))
+            && !candidate.uri.contains("/internal/")
+    }));
+    assert!(second.next_cursor().is_none());
+}
+
+#[test]
+fn s3_inventory_localstack_is_wired() {
+    let integration = include_str!("../../../scripts/test-integration.ts");
+    assert!(integration.contains("lake-objects"));
+    assert!(integration.contains("--run-ignored"));
 }
 
 struct FailingReader {

@@ -27,9 +27,11 @@ use tokio::io::AsyncRead;
 
 mod checkpoint;
 mod gc;
+mod inventory;
 mod local;
 mod reference_index;
 pub use gc::{GcPlanPage, GcPlanner, ObjectCandidate};
+pub use inventory::{InventoryPage, InventoryRequest, ManagedObjectInventory};
 pub use local::LocalObjectStore;
 pub use reference_index::{LiveReferenceIndex, LiveReferenceIndexBuilder};
 mod s3;
@@ -295,8 +297,8 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     use crate::{
-        LocalObjectStore, ManagedObjectStore, ObjectError, S3ObjectStore, data_location_array,
-        data_location_from_array,
+        InventoryRequest, LocalObjectStore, ManagedObjectInventory, ManagedObjectStore,
+        ObjectError, S3ObjectStore, data_location_array, data_location_from_array,
     };
 
     #[test]
@@ -334,6 +336,47 @@ mod tests {
         assert!(location.uri.starts_with("file://"));
         let path = location.uri.strip_prefix("file://").unwrap();
         assert_eq!(tokio::fs::read(path).await.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn local_inventory_is_bounded_sorted_and_excludes_uploads() {
+        let managed_dir = tempdir().unwrap();
+        let store = LocalObjectStore::open(managed_dir.path()).await.unwrap();
+        for value in [b"third".as_slice(), b"first", b"second"] {
+            store
+                .put_reader(std::io::Cursor::new(value), "application/octet-stream")
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(managed_dir.path().join(".stale.uploading"), b"partial")
+            .await
+            .unwrap();
+
+        let first = store
+            .inventory_page(InventoryRequest::try_new(None, 2).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(first.candidates().len(), 2);
+        let second = store
+            .inventory_page(
+                InventoryRequest::try_new(first.next_cursor().map(ToOwned::to_owned), 2).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.candidates().len(), 1);
+        assert!(second.next_cursor().is_none());
+
+        let candidates = first
+            .candidates()
+            .iter()
+            .chain(second.candidates())
+            .collect::<Vec<_>>();
+        assert!(candidates.windows(2).all(|pair| pair[0].uri < pair[1].uri));
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| !candidate.uri.contains("uploading"))
+        );
     }
 
     #[tokio::test]
