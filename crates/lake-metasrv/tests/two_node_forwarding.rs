@@ -48,9 +48,9 @@ use lake_engine_lance::LanceEngine;
 use lake_flight::{ClientSecurity, ServerSecurity, append_flight_payload_digest};
 use lake_meta::{MetaStoreRef, RocksMeta, registry};
 use lake_metasrv::{
-    Metasrv, MetasrvServerConfig,
+    Metasrv, MetasrvServerConfig, TablePlacement,
     election::{LEASE_KEY, LeaseValue},
-    serve, serve_with_config, serve_with_config_and_shutdown,
+    serve_with_config, serve_with_config_and_shutdown,
 };
 use prost::Message;
 use prost_types::Any;
@@ -228,14 +228,17 @@ async fn follower_forwards_write_to_leader() {
 
     let node_a = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
     let node_b = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
+    let placement = TablePlacement::local(table_dir.path().to_path_buf());
 
     tokio::spawn({
         let addr = addr_a.clone();
-        async move { serve(node_a, &addr).await }
+        let config = MetasrvServerConfig::new().with_table_placement(placement.clone());
+        async move { serve_with_config(node_a, &addr, config).await }
     });
     tokio::spawn({
         let addr = addr_b.clone();
-        async move { serve(node_b, &addr).await }
+        let config = MetasrvServerConfig::new().with_table_placement(placement);
+        async move { serve_with_config(node_b, &addr, config).await }
     });
 
     wait_serving(&addr_a).await;
@@ -251,12 +254,10 @@ async fn follower_forwards_write_to_leader() {
 
     // THE ASSERTION: a write sent to the FOLLOWER must succeed, which is only
     // possible if the follower forwards it to the leader.
-    let location = format!("{}/robots/arm.lance", table_dir.path().display());
     let create_body = json!({
         "namespace": "robots",
         "name": "arm",
         "columns": ["ts:i64", "reward:f64"],
-        "location": location,
     });
     let created = forward_with_retry(&follower, "create_table", create_body).await;
     assert!(
@@ -315,6 +316,8 @@ async fn committed_replay_survives_graceful_leader_handoff() {
     let (shutdown_b_tx, shutdown_b_rx) = oneshot::channel();
     let mut shutdown_a_tx = Some(shutdown_a_tx);
     let mut shutdown_b_tx = Some(shutdown_b_tx);
+    let placement = TablePlacement::local(table_dir.path().to_path_buf());
+    let placement_a = placement.clone();
 
     let server_a = tokio::spawn({
         let node = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
@@ -323,7 +326,9 @@ async fn committed_replay_survives_graceful_leader_handoff() {
             serve_with_config_and_shutdown(
                 node,
                 &addr,
-                MetasrvServerConfig::new().with_shutdown_grace(Duration::from_secs(1)),
+                MetasrvServerConfig::new()
+                    .with_table_placement(placement_a)
+                    .with_shutdown_grace(Duration::from_secs(1)),
                 async move {
                     let _ = shutdown_a_rx.await;
                 },
@@ -338,7 +343,9 @@ async fn committed_replay_survives_graceful_leader_handoff() {
             serve_with_config_and_shutdown(
                 node,
                 &addr,
-                MetasrvServerConfig::new().with_shutdown_grace(Duration::from_secs(1)),
+                MetasrvServerConfig::new()
+                    .with_table_placement(placement)
+                    .with_shutdown_grace(Duration::from_secs(1)),
                 async move {
                     let _ = shutdown_b_rx.await;
                 },
@@ -357,7 +364,11 @@ async fn committed_replay_survives_graceful_leader_handoff() {
     } else {
         addr_a.clone()
     };
-    let location = format!("{}/robots/failover-arm.lance", table_dir.path().display());
+    let location = table_dir
+        .path()
+        .join("robots/failover_arm.lance")
+        .to_string_lossy()
+        .into_owned();
     forward_with_retry(
         &leader,
         "create_table",
@@ -365,7 +376,6 @@ async fn committed_replay_survives_graceful_leader_handoff() {
             "namespace": "robots",
             "name": "failover_arm",
             "columns": ["ts:i64", "reward:f64"],
-            "location": location,
         }),
     )
     .await
@@ -517,6 +527,7 @@ async fn secured_follower_forwards_with_peer_identity() {
     let engine: TableEngineRef = Arc::new(LanceEngine::with_manifest_store(meta.clone()));
     let addr_a = free_addr();
     let addr_b = free_addr();
+    let placement = TablePlacement::local(table_dir.path().to_path_buf());
 
     for (node, addr) in [
         (
@@ -529,6 +540,7 @@ async fn secured_follower_forwards_with_peer_identity() {
         ),
     ] {
         let config = MetasrvServerConfig::new()
+            .with_table_placement(placement.clone())
             .with_server_security(server_security.clone())
             .with_peer_security(client_security.clone());
         tokio::spawn(async move { serve_with_config(node, &addr, config).await });
@@ -538,12 +550,10 @@ async fn secured_follower_forwards_with_peer_identity() {
     wait_secure_serving(&addr_b, &client_security).await;
     let leader = wait_for_leader(&meta, &[&addr_a, &addr_b]).await;
     let follower = if leader == addr_a { &addr_b } else { &addr_a };
-    let location = format!("{}/robots/secure-arm.lance", table_dir.path().display());
     let body = json!({
         "namespace": "robots",
         "name": "secure_arm",
         "columns": ["ts:i64", "reward:f64"],
-        "location": location,
     });
 
     secure_do_action(follower, &client_security, "create_table", body)

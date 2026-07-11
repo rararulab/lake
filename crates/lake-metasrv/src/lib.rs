@@ -32,6 +32,7 @@ mod control;
 mod leadership;
 mod maintenance;
 mod operation;
+mod placement;
 
 use std::{
     collections::HashMap,
@@ -47,6 +48,7 @@ use lake_common::{AppendOperation, Namespace, TableLocation, TableName, TableRef
 use lake_engine::TableEngineRef;
 use lake_flight::{ClientSecurity, ServerSecurity};
 use lake_meta::{MetaStoreRef, registry, registry::TableRegistration};
+pub use placement::{PlacementError, TablePlacement};
 use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
@@ -180,6 +182,7 @@ impl AppendResultGate {
 pub struct MetasrvServerConfig {
     server_security:    ServerSecurity,
     peer_security:      ClientSecurity,
+    table_placement:    Option<TablePlacement>,
     allow_insecure:     bool,
     shutdown_grace:     Duration,
     #[cfg(feature = "test")]
@@ -193,6 +196,7 @@ impl MetasrvServerConfig {
         Self {
             server_security: ServerSecurity::insecure(),
             peer_security: ClientSecurity::new(),
+            table_placement: None,
             allow_insecure: false,
             shutdown_grace: Duration::from_secs(30),
             #[cfg(feature = "test")]
@@ -211,6 +215,13 @@ impl MetasrvServerConfig {
     #[must_use]
     pub fn with_peer_security(mut self, security: ClientSecurity) -> Self {
         self.peer_security = security;
+        self
+    }
+
+    /// Configure the trusted policy for remotely-created table datasets.
+    #[must_use]
+    pub fn with_table_placement(mut self, placement: TablePlacement) -> Self {
+        self.table_placement = Some(placement);
         self
     }
 
@@ -735,6 +746,7 @@ where
         leadership,
         own_addr: addr.to_string(),
         peer_security: config.peer_security,
+        table_placement: config.table_placement,
         #[cfg(feature = "test")]
         append_result_gate: config.append_result_gate,
     };

@@ -62,6 +62,7 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let config = MetasrvServerConfig::new()
+        .with_table_placement(ctx.table_placement().clone())
         .with_server_security(server_security_from_env()?)
         .with_peer_security(peer_client_security_from_env()?)
         .with_shutdown_grace(shutdown_grace_from_env()?)

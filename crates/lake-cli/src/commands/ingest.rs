@@ -38,7 +38,7 @@ pub async fn run(ctx: &Context, table: &str, file: &str) -> anyhow::Result<()> {
     // Create the table on first ingest, using the file's schema.
     if ctx.metasrv.resolve(&table).await?.is_none() {
         ctx.metasrv
-            .create_table(&table, ctx.location(&table), schema)
+            .create_table(&table, ctx.location(&table)?, schema)
             .await
             .with_context(|| format!("creating {table}"))?;
         println!("created table {table}");

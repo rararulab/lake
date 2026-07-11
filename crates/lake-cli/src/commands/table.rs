@@ -84,7 +84,7 @@ fn parse_schema(columns: &[String]) -> anyhow::Result<Arc<Schema>> {
 async fn create(ctx: &Context, table: &str, columns: &[String]) -> anyhow::Result<()> {
     let table = parse_table_ref(table)?;
     let schema = parse_schema(columns)?;
-    let location = ctx.location(&table);
+    let location = ctx.location(&table)?;
     ctx.metasrv
         .create_table(&table, location, schema)
         .await
