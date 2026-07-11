@@ -76,4 +76,11 @@ async fn dynamo_meta_roundtrip() {
     let mut listed = meta.list_prefix("ptr/").await.unwrap();
     listed.sort();
     assert_eq!(listed, vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(
+        meta.scan_prefix("ptr/").await.unwrap(),
+        vec![
+            ("a".to_owned(), b"v".to_vec()),
+            ("b".to_owned(), b"v".to_vec()),
+        ]
+    );
 }

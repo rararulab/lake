@@ -34,6 +34,19 @@ pub trait MetaStore: Send + Sync {
     /// List keys under a prefix, prefix stripped.
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>>;
 
+    /// Scan key-value entries under a prefix, returning stripped keys.
+    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let keys = self.list_prefix(prefix).await?;
+        let mut entries = Vec::with_capacity(keys.len());
+        for stripped in keys {
+            let key = format!("{prefix}{stripped}");
+            if let Some(value) = self.get(&key).await? {
+                entries.push((stripped, value));
+            }
+        }
+        Ok(entries)
+    }
+
     /// Delete `key` only when its current value exactly matches `expected`.
     /// Returns false when the key is absent or has changed.
     async fn delete(&self, key: &str, expected: &[u8]) -> Result<bool>;

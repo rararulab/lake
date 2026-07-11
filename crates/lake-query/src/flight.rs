@@ -356,6 +356,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         request: Request<Ticket>,
     ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let principal = self.principal(&request)?;
+        let include_schema = query.include_schema;
         let mut builder = query.into_builder();
         let empty_schema = Schema::empty();
         for (namespace, tables) in self.engine.cached_catalog_snapshot() {
@@ -363,8 +364,21 @@ impl FlightSqlService for FlightSqlServiceImpl {
                 continue;
             }
             for table in tables {
+                let table_ref = lake_common::TableRef::new(&namespace.0, &table.0);
+                let cached_schema = self.engine.cached_table_schema(&table_ref);
+                if include_schema && cached_schema.is_none() {
+                    return Err(Status::failed_precondition(
+                        "table schema is unavailable; migrate the legacy registration",
+                    ));
+                }
                 builder
-                    .append("lake", &namespace.0, table.0, "TABLE", &empty_schema)
+                    .append(
+                        "lake",
+                        &namespace.0,
+                        table.0,
+                        "TABLE",
+                        cached_schema.as_deref().unwrap_or(&empty_schema),
+                    )
                     .map_err(Status::from)?;
             }
         }
@@ -473,14 +487,16 @@ mod tests {
     };
 
     use arrow_flight::{
+        IpcMessage, SchemaAsIpc,
         decode::FlightRecordBatchStream,
         sql::{CommandGetDbSchemas, CommandGetTables},
     };
     use async_trait::async_trait;
     use datafusion::{
         arrow::{
-            array::{Int64Array, StringArray},
+            array::{BinaryArray, Int64Array, StringArray},
             datatypes::{DataType, Field},
+            ipc::writer::IpcWriteOptions,
             record_batch::RecordBatch,
         },
         catalog::streaming::StreamingTable,
@@ -493,11 +509,11 @@ mod tests {
     use futures::{StreamExt, TryStreamExt};
     use lake_common::{
         MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor, Principal, PrincipalId,
-        PrincipalRole, TenantId,
+        PrincipalRole, TableLocation, TenantId, Version,
     };
     use lake_engine::TableEngineRef;
     use lake_engine_lance::LanceEngine;
-    use lake_meta::{MetaStore, MetaStoreRef};
+    use lake_meta::{MetaStore, MetaStoreRef, registry::TableRegistration};
     use tokio::sync::Notify;
 
     use super::*;
@@ -531,6 +547,65 @@ mod tests {
 
     struct DiscoveryMeta;
 
+    struct SchemaDiscoveryMeta {
+        entries:    Vec<(String, Vec<u8>)>,
+        operations: AtomicUsize,
+    }
+
+    impl SchemaDiscoveryMeta {
+        fn new(entries: Vec<(String, Vec<u8>)>) -> Self {
+            Self {
+                entries,
+                operations: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MetaStore for SchemaDiscoveryMeta {
+        async fn get(&self, _key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.operations.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+
+        async fn cas(
+            &self,
+            _key: &str,
+            _expected: Option<&[u8]>,
+            _new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            unreachable!()
+        }
+
+        async fn list_prefix(&self, _prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.operations.fetch_add(1, Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+
+        async fn scan_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<(String, Vec<u8>)>> {
+            self.operations.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(prefix, "tbl/");
+            Ok(self.entries.clone())
+        }
+
+        async fn delete(&self, _key: &str, _expected: &[u8]) -> lake_meta::Result<bool> {
+            unreachable!()
+        }
+    }
+
+    fn registration_with_schema(schema: &Schema) -> Vec<u8> {
+        let IpcMessage(schema_ipc) = SchemaAsIpc::new(schema, &IpcWriteOptions::default())
+            .try_into()
+            .unwrap();
+        serde_json::to_vec(&TableRegistration::new(
+            TableLocation::new("mem://table"),
+            "lance",
+            Version(1),
+            schema_ipc.to_vec(),
+        ))
+        .unwrap()
+    }
+
     #[async_trait]
     impl MetaStore for DiscoveryMeta {
         async fn get(&self, _key: &str) -> lake_meta::Result<Option<Vec<u8>>> { Ok(None) }
@@ -554,6 +629,16 @@ mod tests {
                 "tbl/beta_episodes/" => vec!["secrets".to_owned()],
                 _ => Vec::new(),
             })
+        }
+
+        async fn scan_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<(String, Vec<u8>)>> {
+            assert_eq!(prefix, "tbl/");
+            let registration =
+                br#"{"location":"mem://table","engine":"lance","current_version":1}"#;
+            Ok(vec![
+                ("alpha_episodes/events".to_owned(), registration.to_vec()),
+                ("beta_episodes/secrets".to_owned(), registration.to_vec()),
+            ])
         }
 
         async fn delete(&self, _key: &str, _expected: &[u8]) -> lake_meta::Result<bool> { Ok(true) }
@@ -784,6 +869,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flight_table_discovery_returns_cached_real_schema() {
+        let alpha_schema = Schema::new(vec![Field::new("episode_id", DataType::Utf8, false)]);
+        let beta_schema = Schema::new(vec![Field::new("secret", DataType::Int64, false)]);
+        let meta = Arc::new(SchemaDiscoveryMeta::new(vec![
+            (
+                "alpha_episodes/events".to_owned(),
+                registration_with_schema(&alpha_schema),
+            ),
+            (
+                "beta_episodes/secrets".to_owned(),
+                registration_with_schema(&beta_schema),
+            ),
+        ]));
+        let meta_ref: MetaStoreRef = meta.clone();
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let engine = Arc::new(QueryEngine::new(meta_ref, storage));
+        engine.refresh().await.unwrap();
+        meta.operations.store(0, Ordering::Relaxed);
+        let service = FlightSqlServiceImpl {
+            engine,
+            metadata_addr: None,
+            metadata_security: ClientSecurity::new(),
+            managed_stage: None,
+            admission: QueryAdmission::new(QueryLimits::default()),
+        };
+        let principal = Principal::try_new(
+            PrincipalId::try_new("alpha-reader").unwrap(),
+            TenantId::try_new("tenant-alpha").unwrap(),
+            PrincipalRole::User,
+            ["alpha_episodes"],
+        )
+        .unwrap();
+        let mut request = Request::new(Ticket::default());
+        request.extensions_mut().insert(principal);
+
+        let stream = service
+            .do_get_tables(
+                CommandGetTables {
+                    catalog:                   None,
+                    db_schema_filter_pattern:  None,
+                    table_name_filter_pattern: None,
+                    table_types:               Vec::new(),
+                    include_schema:            true,
+                },
+                request,
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        let batches = FlightRecordBatchStream::new_from_flight_data(
+            stream.map_err(arrow_flight::error::FlightError::from),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        let names = batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let schemas = batches[0]
+            .column(4)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let actual = Schema::try_from(IpcMessage(schemas.value(0).to_vec().into())).unwrap();
+
+        assert_eq!(names.iter().collect::<Vec<_>>(), vec![Some("events")]);
+        assert_eq!(actual, alpha_schema);
+        assert_eq!(meta.operations.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn flight_table_discovery_rejects_unknown_legacy_schema() {
+        let meta = Arc::new(SchemaDiscoveryMeta::new(vec![(
+            "alpha_episodes/legacy".to_owned(),
+            br#"{"location":"mem://legacy","engine":"lance","current_version":1}"#.to_vec(),
+        )]));
+        let meta_ref: MetaStoreRef = meta.clone();
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let engine = Arc::new(QueryEngine::new(meta_ref, storage));
+        engine.refresh().await.unwrap();
+        meta.operations.store(0, Ordering::Relaxed);
+        let service = FlightSqlServiceImpl {
+            engine,
+            metadata_addr: None,
+            metadata_security: ClientSecurity::new(),
+            managed_stage: None,
+            admission: QueryAdmission::new(QueryLimits::default()),
+        };
+        let principal = Principal::try_new(
+            PrincipalId::try_new("alpha-reader").unwrap(),
+            TenantId::try_new("tenant-alpha").unwrap(),
+            PrincipalRole::User,
+            ["alpha_episodes"],
+        )
+        .unwrap();
+        let mut request = Request::new(Ticket::default());
+        request.extensions_mut().insert(principal);
+
+        let error = service
+            .do_get_tables(
+                CommandGetTables {
+                    catalog:                   None,
+                    db_schema_filter_pattern:  None,
+                    table_name_filter_pattern: None,
+                    table_types:               Vec::new(),
+                    include_schema:            true,
+                },
+                request,
+            )
+            .await
+            .err()
+            .expect("legacy schema must not be represented as empty");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(meta.operations.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn do_get_returns_before_the_input_stream_finishes() {
         let meta: MetaStoreRef = Arc::new(EmptyMeta);
         let storage: TableEngineRef = Arc::new(LanceEngine::new());
@@ -963,9 +1168,11 @@ mod tests {
         );
         assert_eq!(deadline_status.code(), tonic::Code::DeadlineExceeded);
 
-        let next = service
-            .do_get_statement(ticket(), Request::new(Ticket::default()))
-            .await;
+        let mut next_request = Request::new(Ticket::default());
+        next_request
+            .extensions_mut()
+            .insert(Principal::deployment_admin());
+        let next = service.do_get_statement(ticket(), next_request).await;
         assert!(next.is_ok(), "deadline must release the admission permit");
         release.notify_waiters();
     }

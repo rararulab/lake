@@ -48,6 +48,14 @@ root or S3 prefix and returns only that child stage's location hints. The SDK
 then opens storage directly and rejects `DataLocation` values outside the child
 prefix. Discovery happens once per client, not per query or object read.
 
+Flight SQL catalog discovery is also cache-only. New table registrations carry
+the table's Arrow IPC schema, and each Query replica loads names, versions, and
+schemas in one paginated registry scan. `GetTables(include_schema=true)` returns
+the real schema without a request-path Metasrv lookup. Registrations created by
+older Lake versions remain queryable and listable; schema-inclusive discovery
+for such a table fails explicitly until it is recreated or migrated, rather
+than claiming the table has an empty schema.
+
 For production S3, configure the query process instead of constructing a stage
 in application code:
 

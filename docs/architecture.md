@@ -112,15 +112,18 @@ the same trait over its own format, using `lake-meta`'s CAS directly.
 There are two distinct pieces of metadata, owned by different layers:
 
 1. **Registry** (lake's, in `lake-meta`): which tables exist and where —
-   `tbl/<namespace>/<name> → { location, current_version, engine }`. Tiny
-   (~10⁴ entries), fully cacheable, the metadata layer is its authority.
+   `tbl/<namespace>/<name> → { location, current_version, engine, schema_ipc? }`.
+   The optional opaque Arrow IPC schema keeps old JSON readable while allowing
+   Query to answer schema-inclusive Flight SQL discovery locally. Tiny (~10⁴
+   entries), fully cacheable, the metadata layer is its authority.
 2. **Per-table manifest** (the engine's): the file list, schema, and
    version history of one table. For Lance this is the Lance dataset
    manifest; lake does not reimplement it.
 
-The registry is prefix-scannable (`tbl/<namespace>/…`) with pagination so
-"list tables" never loads everything, even though at 10⁴ tables it would
-fit in memory anyway — the discipline matters if table count grows.
+The registry is key/value prefix-scannable with pagination. Metasrv can list a
+single `tbl/<namespace>/…` prefix, while each Query replica refreshes its whole
+table/name/schema snapshot with one `tbl/` scan. Discovery reads that immutable
+process-local generation and performs no request-path authority lookup.
 
 ## Commit protocol
 

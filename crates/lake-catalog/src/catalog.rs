@@ -21,7 +21,11 @@ use std::{
     time::Duration,
 };
 
-use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use arrow_flight::IpcMessage;
+use datafusion::{
+    arrow::datatypes::{Schema, SchemaRef},
+    catalog::{CatalogProvider, SchemaProvider},
+};
 use lake_common::{Namespace, TableName, TableRef};
 use lake_engine::TableEngineRef;
 use lake_meta::{MetaStoreRef, registry, registry::TableRegistration};
@@ -41,11 +45,17 @@ pub struct CatalogState {
     pub(crate) engine:   TableEngineRef,
     /// namespace -> table names. Read by DataFusion's sync listing methods,
     /// so it must never require I/O. Refreshed by [`LakeCatalog::refresh`].
-    pub(crate) snapshot: RwLock<BTreeMap<Namespace, Vec<TableName>>>,
+    pub(crate) snapshot: RwLock<CatalogSnapshot>,
     /// table -> registration; shields the registry from per-query load.
     pub(crate) regs:     Cache<TableRef, Arc<TableRegistration>>,
     /// Serializes refreshes and records when the listing snapshot was loaded.
     refreshed_at:        Mutex<Option<Instant>>,
+}
+
+#[derive(Default)]
+pub(crate) struct CatalogSnapshot {
+    pub(crate) listings: BTreeMap<Namespace, Vec<TableName>>,
+    pub(crate) schemas:  BTreeMap<TableRef, SchemaRef>,
 }
 
 impl CatalogState {
@@ -83,7 +93,7 @@ impl LakeCatalog {
             state: Arc::new(CatalogState {
                 meta,
                 engine,
-                snapshot: RwLock::new(BTreeMap::new()),
+                snapshot: RwLock::new(CatalogSnapshot::default()),
                 regs: Cache::builder()
                     .max_capacity(100_000)
                     .time_to_live(REGISTRATION_CACHE_TTL)
@@ -102,7 +112,20 @@ impl LakeCatalog {
             .snapshot
             .read()
             .expect("snapshot lock poisoned")
+            .listings
             .clone()
+    }
+
+    /// Return one schema from the same immutable generation as the listing.
+    #[must_use]
+    pub fn cached_table_schema(&self, table: &TableRef) -> Option<SchemaRef> {
+        self.state
+            .snapshot
+            .read()
+            .expect("snapshot lock poisoned")
+            .schemas
+            .get(table)
+            .cloned()
     }
 
     /// Evict one resolved registration after this query node proxies a
@@ -128,13 +151,21 @@ impl LakeCatalog {
             return Ok(());
         }
 
-        let namespaces = registry::list_namespaces(self.state.meta.as_ref()).await?;
-        let mut snap = BTreeMap::new();
-        for ns in namespaces {
-            let tables = registry::list(self.state.meta.as_ref(), &ns).await?;
-            snap.insert(ns, tables);
+        let registrations = registry::scan_tables(self.state.meta.as_ref()).await?;
+        let mut snapshot = CatalogSnapshot::default();
+        for (table, registration) in registrations {
+            snapshot
+                .listings
+                .entry(table.namespace.clone())
+                .or_default()
+                .push(table.name.clone());
+            if let Some(schema_ipc) = registration.schema_ipc()
+                && let Ok(schema) = Schema::try_from(IpcMessage(schema_ipc.to_vec().into()))
+            {
+                snapshot.schemas.insert(table, Arc::new(schema));
+            }
         }
-        *self.state.snapshot.write().expect("snapshot lock poisoned") = snap;
+        *self.state.snapshot.write().expect("snapshot lock poisoned") = snapshot;
         *refreshed_at = Some(Instant::now());
         Ok(())
     }
@@ -148,6 +179,7 @@ impl CatalogProvider for LakeCatalog {
             .snapshot
             .read()
             .expect("snapshot lock poisoned")
+            .listings
             .keys()
             .map(|ns| ns.0.clone())
             .collect()
@@ -163,9 +195,14 @@ impl CatalogProvider for LakeCatalog {
 
 #[cfg(test)]
 mod tests {
+    use arrow_flight::{IpcMessage, SchemaAsIpc};
     use async_trait::async_trait;
+    use datafusion::arrow::{
+        datatypes::{DataType, Field, Schema},
+        ipc::writer::IpcWriteOptions,
+    };
     use lake_engine_lance::LanceEngine;
-    use lake_meta::{MetaError, MetaStore};
+    use lake_meta::{MetaError, MetaStore, RocksMeta};
 
     use super::*;
 
@@ -209,6 +246,43 @@ mod tests {
         assert!(
             err.to_string().contains("injected get failure"),
             "registry outage must not be reported as a missing table: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_refresh_caches_registration_schemas() {
+        let root = tempfile::tempdir().unwrap();
+        let meta = Arc::new(RocksMeta::open(root.path()).unwrap());
+        let table = TableRef::new("robots", "episodes");
+        let expected = Schema::new(vec![Field::new("episode_id", DataType::Utf8, false)]);
+        let IpcMessage(schema_ipc) = SchemaAsIpc::new(&expected, &IpcWriteOptions::default())
+            .try_into()
+            .unwrap();
+        registry::register(
+            meta.as_ref(),
+            &table,
+            &TableRegistration::new(
+                lake_common::TableLocation::new("mem://episodes"),
+                "lance",
+                lake_common::Version(1),
+                schema_ipc.to_vec(),
+            ),
+        )
+        .await
+        .unwrap();
+        let meta_ref: MetaStoreRef = meta;
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let catalog = LakeCatalog::new(meta_ref, engine);
+
+        catalog.refresh().await.unwrap();
+
+        assert_eq!(
+            catalog.cached_table_schema(&table).as_deref(),
+            Some(&expected)
+        );
+        assert_eq!(
+            catalog.cached_snapshot(),
+            BTreeMap::from([(table.namespace.clone(), vec![table.name.clone()])])
         );
     }
 }
