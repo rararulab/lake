@@ -4245,6 +4245,7 @@ dependencies = [
  "snafu",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tonic",
  "tracing",
 ]

@@ -27,6 +27,7 @@ use std::{
 };
 
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use crate::election::{LeaseElection, LeaseStatus};
 
@@ -101,57 +102,85 @@ impl Leadership {
 /// demotes us to standby instead of taking the process down. Leadership
 /// transitions (acquire / lose) are logged via `tracing`.
 pub(crate) async fn run_campaign_loop(election: LeaseElection, leadership: Arc<Leadership>) {
-    loop {
-        // Bound local authority from the start of the store round-trip. This
-        // is conservative when the store is slow and immune to wall-clock
-        // jumps after the lease is written.
-        let campaign_started = Instant::now();
-        // A renewal starts halfway through the production lease. Spending at
-        // most another 40% of the lease on store I/O leaves a 10% demotion
-        // margin before the previously published deadline.
-        let campaign_timeout = election.ttl() * 2 / 5;
-        let (leader, local_deadline) =
-            match tokio::time::timeout(campaign_timeout, election.campaign()).await {
-                Ok(Ok(LeaseStatus::Leader { .. })) => (
-                    Some(election.node_id().to_string()),
-                    Some(campaign_started + election.ttl()),
-                ),
-                Ok(Ok(LeaseStatus::Follower { current_holder })) => {
-                    // An empty holder means the lease vanished under a lost race;
-                    // report "no known leader" so writes fail fast rather than
-                    // forwarding to nowhere.
-                    let leader = (!current_holder.is_empty()).then_some(current_holder);
-                    (leader, None)
-                }
-                Ok(Err(err)) => {
-                    tracing::warn!(
-                        node_id = election.node_id(),
-                        error = %err,
-                        "leadership campaign failed; treating as not leader this round"
-                    );
-                    (None, None)
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        node_id = election.node_id(),
-                        timeout_ms = campaign_timeout.as_millis(),
-                        "leadership campaign timed out; treating as not leader this round"
-                    );
-                    (None, None)
-                }
-            };
+    run_campaign_loop_until(election, leadership, CancellationToken::new()).await;
+}
 
-        let now_leader = local_deadline.is_some_and(|deadline| Instant::now() < deadline);
-        let was_leader = leadership.publish(leader, local_deadline);
-        if now_leader != was_leader {
-            if now_leader {
-                tracing::info!(node_id = election.node_id(), "acquired metasrv leadership");
-            } else {
-                tracing::warn!(node_id = election.node_id(), "lost metasrv leadership");
-            }
+/// Drive leadership until shutdown, then synchronously release local authority.
+pub(crate) async fn run_campaign_loop_until(
+    election: LeaseElection,
+    leadership: Arc<Leadership>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            () = campaign_once(&election, &leadership) => {}
         }
 
-        tokio::time::sleep(RENEW_INTERVAL).await;
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            () = tokio::time::sleep(RENEW_INTERVAL) => {}
+        }
+    }
+
+    if let Err(err) = election.resign().await {
+        tracing::warn!(
+            node_id = election.node_id(),
+            error = %err,
+            "failed to resign metasrv leadership during shutdown"
+        );
+    }
+    leadership.publish(None, None);
+}
+
+async fn campaign_once(election: &LeaseElection, leadership: &Leadership) {
+    // Bound local authority from the start of the store round-trip. This
+    // is conservative when the store is slow and immune to wall-clock
+    // jumps after the lease is written.
+    let campaign_started = Instant::now();
+    // A renewal starts halfway through the production lease. Spending at
+    // most another 40% of the lease on store I/O leaves a 10% demotion
+    // margin before the previously published deadline.
+    let campaign_timeout = election.ttl() * 2 / 5;
+    let (leader, local_deadline) =
+        match tokio::time::timeout(campaign_timeout, election.campaign()).await {
+            Ok(Ok(LeaseStatus::Leader { .. })) => (
+                Some(election.node_id().to_string()),
+                Some(campaign_started + election.ttl()),
+            ),
+            Ok(Ok(LeaseStatus::Follower { current_holder })) => {
+                // An empty holder means the lease vanished under a lost race;
+                // report "no known leader" so writes fail fast rather than
+                // forwarding to nowhere.
+                let leader = (!current_holder.is_empty()).then_some(current_holder);
+                (leader, None)
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    node_id = election.node_id(),
+                    error = %err,
+                    "leadership campaign failed; treating as not leader this round"
+                );
+                (None, None)
+            }
+            Err(_) => {
+                tracing::warn!(
+                    node_id = election.node_id(),
+                    timeout_ms = campaign_timeout.as_millis(),
+                    "leadership campaign timed out; treating as not leader this round"
+                );
+                (None, None)
+            }
+        };
+
+    let now_leader = local_deadline.is_some_and(|deadline| Instant::now() < deadline);
+    let was_leader = leadership.publish(leader, local_deadline);
+    if now_leader != was_leader {
+        if now_leader {
+            tracing::info!(node_id = election.node_id(), "acquired metasrv leadership");
+        } else {
+            tracing::warn!(node_id = election.node_id(), "lost metasrv leadership");
+        }
     }
 }
 
@@ -161,6 +190,7 @@ mod tests {
 
     use async_trait::async_trait;
     use lake_meta::{MetaStore, MetaStoreRef, RocksMeta};
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
 
@@ -241,5 +271,38 @@ mod tests {
         .await
         .expect("campaign I/O must be cancelled before the 50ms lease can expire");
         campaign.abort();
+    }
+
+    #[tokio::test]
+    async fn campaign_shutdown_resigns_and_clears_leadership() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(dir.path()).unwrap());
+        let observer = LeaseElection::new(meta.clone(), "observer", Duration::from_secs(10));
+        let election = LeaseElection::new(meta, "node-a", Duration::from_secs(10));
+        let leadership = Arc::new(Leadership::new());
+        let shutdown = CancellationToken::new();
+        let campaign = tokio::spawn(run_campaign_loop_until(
+            election,
+            leadership.clone(),
+            shutdown.clone(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !leadership.is_leader() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("campaign acquires the lease");
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), campaign)
+            .await
+            .expect("campaign loop joins on shutdown")
+            .unwrap();
+
+        assert!(!leadership.is_leader());
+        assert_eq!(leadership.leader(), None);
+        assert_eq!(observer.current_leader().await.unwrap(), None);
     }
 }
