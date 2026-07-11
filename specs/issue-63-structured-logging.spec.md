@@ -68,6 +68,30 @@ Scenario: Invalid logging configuration fails before storage setup
   When the binary starts
   Then it reports the logging configuration error and does not create the data directory
 
+Scenario: Logging defaults are production structured
+  Test:
+    Package: lake-cli
+    Filter: binary_defaults_to_json_logging
+  Given neither logging environment variable is set
+  When the binary starts
+  Then its startup event is JSON on stderr and stdout stays empty
+
+Scenario: Pretty logging is plain stderr
+  Test:
+    Package: lake-cli
+    Filter: pretty_logging_stays_on_plain_stderr
+  Given pretty logging is explicitly selected
+  When the binary starts
+  Then the startup event uses stderr without ANSI and stdout stays empty
+
+Scenario: Default filter exposes Lake operations without dependency noise
+  Test:
+    Package: lake-cli
+    Filter: default_filter_enables_lake_targets_only
+  Given INFO events from all four Lake targets and an external dependency
+  When the built-in filter is applied
+  Then every Lake event is emitted and the dependency event is suppressed
+
 ## Out of Scope
 
 - Prometheus metrics, distributed traces, or an OTLP exporter.

@@ -14,7 +14,9 @@ on output format or deployment configuration.
    invalid command and never writes logs to stdout.
 3. Assert an invalid format fails before a requested data directory is
    created.
-4. Run both tests and confirm RED because no subscriber/configuration exists.
+4. Lock the default JSON/filter behavior and pretty stderr/ANSI behavior with
+   subprocess and captured-subscriber tests.
+5. Run the tests and confirm RED because no subscriber/configuration exists.
 
 ## Task 2: Install the subscriber at startup
 

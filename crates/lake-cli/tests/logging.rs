@@ -14,12 +14,17 @@
 
 use std::process::Command;
 
+fn invalid_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lake"));
+    command.arg("definitely-not-a-command");
+    command
+}
+
 #[test]
 fn binary_emits_json_startup_log_before_command_dispatch() {
-    let output = Command::new(env!("CARGO_BIN_EXE_lake"))
+    let output = invalid_command()
         .env("LAKE_LOG_FORMAT", "json")
         .env("RUST_LOG", "lake=info")
-        .arg("definitely-not-a-command")
         .output()
         .expect("run lake binary");
 
@@ -33,6 +38,41 @@ fn binary_emits_json_startup_log_before_command_dispatch() {
     assert_eq!(event["fields"]["message"], "lake process starting");
     assert_eq!(event["fields"]["version"], env!("CARGO_PKG_VERSION"));
     assert!(!first.contains("definitely-not-a-command"));
+}
+
+#[test]
+fn binary_defaults_to_json_logging() {
+    let output = invalid_command()
+        .env_remove("LAKE_LOG_FORMAT")
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("run lake binary");
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    let first = stderr.lines().next().expect("startup log line");
+    let event: serde_json::Value = serde_json::from_str(first).expect("default log is JSON");
+    assert_eq!(event["target"], "lake");
+    assert_eq!(event["fields"]["message"], "lake process starting");
+}
+
+#[test]
+fn pretty_logging_stays_on_plain_stderr() {
+    let output = invalid_command()
+        .env("LAKE_LOG_FORMAT", "pretty")
+        .env("RUST_LOG", "lake=info")
+        .output()
+        .expect("run lake binary");
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert!(stderr.contains("lake process starting"));
+    assert!(
+        !stderr.contains("\u{1b}["),
+        "pretty logs must not contain ANSI"
+    );
 }
 
 #[test]
