@@ -49,7 +49,7 @@ use lake_common::{
     FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION,
     ManagedStageDescriptor, Principal, PrincipalRole,
 };
-use lake_flight::ClientSecurity;
+use lake_flight::{ClientSecurity, DELEGATED_NAMESPACE_HEADER};
 use prost::Message;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
@@ -402,6 +402,15 @@ impl FlightSqlService for FlightSqlServiceImpl {
         self.metadata_security
             .apply_to_flight_client(&mut client)
             .map_err(|error| Status::internal(error.to_string()))?;
+        client.metadata_mut().insert(
+            DELEGATED_NAMESPACE_HEADER,
+            append
+                .table()
+                .namespace
+                .0
+                .parse()
+                .map_err(|_| Status::internal("authorized namespace is not valid metadata"))?,
+        );
         let results = client
             .do_put(request.into_inner().map(|item| {
                 item.map_err(|error| arrow_flight::error::FlightError::protocol(error.to_string()))

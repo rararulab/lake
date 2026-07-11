@@ -27,6 +27,10 @@ use tonic::{
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig},
 };
 
+/// Metadata key used by trusted Query and metadata peers to preserve an
+/// already-authorized namespace across an internal Flight hop.
+pub const DELEGATED_NAMESPACE_HEADER: &str = "x-lake-delegated-namespace";
+
 /// Errors raised while constructing Flight transport security.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
