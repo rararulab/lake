@@ -62,6 +62,7 @@ tokio-util = "^0.7"
 # tonic/prost pinned to what arrow-flight 58 uses (tonic 0.14 / prost 0.14),
 # so the Flight service types share one tonic with our transport Server.
 tonic = { version = "^0.14", features = ["tls-ring", "tls-webpki-roots"] }
+tonic-health = "^0.14"
 tracing = "^0.1"
 tracing-subscriber = { version = "^0.3", features = ["env-filter", "fmt", "json"] }
 subtle = "^2.6"

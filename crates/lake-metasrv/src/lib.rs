@@ -55,6 +55,10 @@ use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
+use tonic_health::{
+    ServingStatus,
+    server::{HealthReporter, health_reporter},
+};
 
 use crate::{
     control::{AppendAdmission, MetasrvFlightService},
@@ -69,6 +73,7 @@ use crate::{
 pub const DEFAULT_APPEND_OPERATION_RETENTION: Duration = Duration::from_hours(7 * 24);
 const DEFAULT_OPERATION_GC_PAGE_SIZE: usize = 128;
 const MAX_APPEND_OPERATION_CLOCK_SKEW: Duration = Duration::from_mins(5);
+const FLIGHT_SERVICE_NAME: &str = "arrow.flight.protocol.FlightService";
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -911,17 +916,23 @@ where
 async fn join_background_tasks_until(
     mut maintenance: tokio::task::JoinHandle<()>,
     mut campaign: tokio::task::JoinHandle<()>,
+    mut health: tokio::task::JoinHandle<()>,
     deadline: tokio::time::Instant,
     grace: Duration,
 ) -> Result<()> {
     let joined = tokio::time::timeout_at(deadline, async {
-        let (maintenance, campaign) = tokio::join!(&mut maintenance, &mut campaign);
+        let (maintenance, campaign, health) =
+            tokio::join!(&mut maintenance, &mut campaign, &mut health);
         maintenance.map_err(|source| MetasrvError::BackgroundTask {
             task: "maintenance",
             source,
         })?;
         campaign.map_err(|source| MetasrvError::BackgroundTask {
             task: "leadership-campaign",
+            source,
+        })?;
+        health.map_err(|source| MetasrvError::BackgroundTask {
+            task: "health-readiness",
             source,
         })?;
         Ok(())
@@ -932,8 +943,48 @@ async fn join_background_tasks_until(
         Err(_) => {
             maintenance.abort();
             campaign.abort();
-            let _ = tokio::join!(maintenance, campaign);
+            health.abort();
+            let _ = tokio::join!(maintenance, campaign, health);
             Err(MetasrvError::BackgroundDrainTimeout { grace })
+        }
+    }
+}
+
+async fn run_health_readiness_until(
+    reporter: HealthReporter,
+    leadership: Arc<Leadership>,
+    own_addr: String,
+    shutdown: CancellationToken,
+    publication: Arc<Mutex<()>>,
+) {
+    let mut changes = leadership.subscribe_changes();
+    loop {
+        let readiness = leadership.write_readiness(&own_addr);
+        let status = if readiness.ready {
+            ServingStatus::Serving
+        } else {
+            ServingStatus::NotServing
+        };
+        let publication_guard = publication.lock().await;
+        if shutdown.is_cancelled() {
+            break;
+        }
+        reporter
+            .set_service_status(FLIGHT_SERVICE_NAME, status)
+            .await;
+        drop(publication_guard);
+
+        if let Some(deadline) = readiness.local_deadline {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                _ = changes.changed() => {}
+                () = tokio::time::sleep_until(deadline) => {}
+            }
+        } else {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                _ = changes.changed() => {}
+            }
         }
     }
 }
@@ -991,6 +1042,19 @@ where
         leadership.clone(),
         campaign_shutdown.clone(),
     ));
+    let (health_reporter, health_service) = health_reporter();
+    health_reporter
+        .set_service_status(FLIGHT_SERVICE_NAME, ServingStatus::NotServing)
+        .await;
+    let health_shutdown = CancellationToken::new();
+    let health_publication = Arc::new(Mutex::new(()));
+    let health = tokio::spawn(run_health_readiness_until(
+        health_reporter.clone(),
+        leadership.clone(),
+        addr.to_owned(),
+        health_shutdown.clone(),
+        health_publication.clone(),
+    ));
 
     let svc = MetasrvFlightService {
         metasrv,
@@ -1015,6 +1079,7 @@ where
                 config.server_security.interceptor(),
             ))
             .add_service(FlightServiceServer::new(svc))
+            .add_service(health_service)
             .serve_with_shutdown(socket, async move {
                 server_shutdown_waiter.cancelled().await;
             }),
@@ -1027,6 +1092,16 @@ where
         () = shutdown.as_mut() => {
             let deadline = tokio::time::Instant::now() + config.shutdown_grace;
             shutdown_deadline = Some(deadline);
+            health_shutdown.cancel();
+            if !crash {
+                let _publication_guard = health_publication.lock().await;
+                health_reporter
+                    .set_service_status(FLIGHT_SERVICE_NAME, ServingStatus::NotServing)
+                    .await;
+                health_reporter
+                    .set_service_status("", ServingStatus::NotServing)
+                    .await;
+            }
             maintenance_shutdown.cancel();
             server_shutdown.cancel();
             if crash {
@@ -1046,9 +1121,21 @@ where
     if crash {
         maintenance.abort();
         campaign.abort();
+        health.abort();
         let _ = maintenance.await;
         let _ = campaign.await;
+        let _ = health.await;
         return server_result;
+    }
+    health_shutdown.cancel();
+    {
+        let _publication_guard = health_publication.lock().await;
+        health_reporter
+            .set_service_status(FLIGHT_SERVICE_NAME, ServingStatus::NotServing)
+            .await;
+        health_reporter
+            .set_service_status("", ServingStatus::NotServing)
+            .await;
     }
     maintenance_shutdown.cancel();
     campaign_shutdown.cancel();
@@ -1057,6 +1144,7 @@ where
     let background_result = join_background_tasks_until(
         maintenance,
         campaign,
+        health,
         cleanup_deadline,
         config.shutdown_grace,
     )
@@ -1094,10 +1182,16 @@ mod tests {
     };
     use lake_engine_lance::LanceEngine;
     use lake_meta::{DynamoMeta, GuardedMutation, MetaScanPage, MetaStore, RocksMeta};
+    use rcgen::generate_simple_self_signed;
     use tokio::sync::{Notify, oneshot};
+    use tonic::Request;
+    use tonic_health::pb::{
+        HealthCheckRequest, health_check_response::ServingStatus as WireServingStatus,
+        health_client::HealthClient,
+    };
 
     use super::*;
-    use crate::election::LeaseStatus;
+    use crate::election::{LeaseGuard, LeaseStatus};
 
     struct RecordingMeta {
         inner:           MetaStoreRef,
@@ -1896,6 +1990,7 @@ mod tests {
     async fn background_shutdown_aborts_owned_tasks_at_total_deadline() {
         let maintenance_resource = Arc::new(());
         let campaign_resource = Arc::new(());
+        let health_resource = Arc::new(());
         let maintenance = tokio::spawn({
             let resource = maintenance_resource.clone();
             async move {
@@ -1910,11 +2005,19 @@ mod tests {
                 drop(resource);
             }
         });
+        let health = tokio::spawn({
+            let resource = health_resource.clone();
+            async move {
+                pending::<()>().await;
+                drop(resource);
+            }
+        });
         let grace = Duration::from_millis(20);
 
         let error = join_background_tasks_until(
             maintenance,
             campaign,
+            health,
             tokio::time::Instant::now() + grace,
             grace,
         )
@@ -1927,6 +2030,225 @@ mod tests {
         ));
         assert_eq!(Arc::strong_count(&maintenance_resource), 1);
         assert_eq!(Arc::strong_count(&campaign_resource), 1);
+        assert_eq!(Arc::strong_count(&health_resource), 1);
+    }
+
+    async fn wait_for_health_status(
+        client: &mut HealthClient<tonic::transport::Channel>,
+        service: &str,
+        expected: WireServingStatus,
+    ) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(response) = client
+                    .check(Request::new(HealthCheckRequest {
+                        service: service.to_owned(),
+                    }))
+                    .await
+                    && response.into_inner().status == expected as i32
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("health status transition");
+    }
+
+    #[tokio::test]
+    async fn metasrv_health_tracks_leader_route_and_lease_expiry() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let own_addr = addr.to_string();
+        let leadership = Arc::new(Leadership::new());
+        let (reporter, service) = health_reporter();
+        reporter
+            .set_service_status(FLIGHT_SERVICE_NAME, ServingStatus::NotServing)
+            .await;
+        let health_shutdown = CancellationToken::new();
+        let publication = Arc::new(Mutex::new(()));
+        let health = tokio::spawn(run_health_readiness_until(
+            reporter,
+            leadership.clone(),
+            own_addr.clone(),
+            health_shutdown.clone(),
+            publication,
+        ));
+        let server_shutdown = CancellationToken::new();
+        let server_waiter = server_shutdown.clone();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(service)
+                .serve_with_shutdown(addr, server_waiter.cancelled_owned())
+                .await
+        });
+        let channel = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(channel) = ClientSecurity::new()
+                    .connect(format!("http://{addr}"))
+                    .await
+                {
+                    break channel;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("health server starts");
+        let mut client = HealthClient::new(channel);
+
+        wait_for_health_status(
+            &mut client,
+            FLIGHT_SERVICE_NAME,
+            WireServingStatus::NotServing,
+        )
+        .await;
+        leadership.assume_follower("127.0.0.1:9999");
+        wait_for_health_status(&mut client, FLIGHT_SERVICE_NAME, WireServingStatus::Serving).await;
+        leadership.assume_guarded_leader(
+            &own_addr,
+            LeaseGuard::new(1, Vec::new()),
+            Duration::from_millis(200),
+        );
+        wait_for_health_status(&mut client, FLIGHT_SERVICE_NAME, WireServingStatus::Serving).await;
+        wait_for_health_status(
+            &mut client,
+            FLIGHT_SERVICE_NAME,
+            WireServingStatus::NotServing,
+        )
+        .await;
+        wait_for_health_status(&mut client, "", WireServingStatus::Serving).await;
+
+        health_shutdown.cancel();
+        server_shutdown.cancel();
+        health.await.unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn metasrv_health_watch_withdraws_and_monitor_joins() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let meta_dir = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Arc::new(Metasrv::new(meta, engine));
+        let secret = "metasrv-health-credential";
+        let certified = generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let certificate = certified.cert.pem();
+        let private_key = certified.key_pair.serialize_pem();
+        let server_security = ServerSecurity::with_bearer_token(secret)
+            .unwrap()
+            .with_tls_identity_pem(certificate.as_bytes(), private_key.as_bytes());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn({
+            let metasrv = metasrv.clone();
+            async move {
+                serve_with_config_and_shutdown(
+                    metasrv,
+                    &addr.to_string(),
+                    MetasrvServerConfig::new()
+                        .with_server_security(server_security)
+                        .with_shutdown_grace(Duration::from_secs(1)),
+                    async move {
+                        let _ = shutdown_rx.await;
+                    },
+                )
+                .await
+            }
+        });
+        let endpoint = format!("https://localhost:{}", addr.port());
+        let authenticated = ClientSecurity::new()
+            .with_ca_certificate_pem(certificate.as_bytes().to_vec())
+            .with_server_name("localhost")
+            .with_bearer_token(secret)
+            .unwrap();
+        let channel = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(channel) = authenticated.connect(endpoint.clone()).await {
+                    break channel;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("Metasrv starts");
+        let mut client = HealthClient::new(channel);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let request = authenticated.authorize_request(Request::new(HealthCheckRequest {
+                    service: FLIGHT_SERVICE_NAME.to_owned(),
+                }));
+                if client.check(request).await.is_ok_and(|response| {
+                    response.into_inner().status == WireServingStatus::Serving as i32
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("Metasrv becomes ready");
+        let mut flight_stream = client
+            .watch(
+                authenticated.authorize_request(Request::new(HealthCheckRequest {
+                    service: FLIGHT_SERVICE_NAME.to_owned(),
+                })),
+            )
+            .await
+            .expect("health watch")
+            .into_inner();
+        let mut liveness_stream = client
+            .watch(
+                authenticated.authorize_request(Request::new(HealthCheckRequest {
+                    service: String::new(),
+                })),
+            )
+            .await
+            .expect("liveness watch")
+            .into_inner();
+        assert_eq!(
+            flight_stream.message().await.unwrap().unwrap().status,
+            WireServingStatus::Serving as i32
+        );
+        assert_eq!(
+            liveness_stream.message().await.unwrap().unwrap().status,
+            WireServingStatus::Serving as i32
+        );
+
+        shutdown_tx.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), flight_stream.message())
+                .await
+                .expect("readiness withdrawal deadline")
+                .unwrap()
+                .unwrap()
+                .status,
+            WireServingStatus::NotServing as i32
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), liveness_stream.message())
+                .await
+                .expect("liveness withdrawal deadline")
+                .unwrap()
+                .unwrap()
+                .status,
+            WireServingStatus::NotServing as i32
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), flight_stream.message())
+                .await
+                .is_err(),
+            "readiness must not rebound during drain"
+        );
+        drop(flight_stream);
+        drop(liveness_stream);
+        server.await.unwrap().unwrap();
+        assert_eq!(Arc::strong_count(&metasrv), 1);
+        std::net::TcpListener::bind(addr).expect("shutdown releases listener");
     }
 
     #[tokio::test]

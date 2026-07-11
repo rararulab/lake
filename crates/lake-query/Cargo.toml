@@ -23,6 +23,7 @@ snafu = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tonic = { workspace = true }
+tonic-health = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
