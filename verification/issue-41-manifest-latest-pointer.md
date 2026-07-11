@@ -6,7 +6,7 @@ Issue: #41
 
 - Base: `2f0e95204d26609578d167816b057a0b0e714c80`
 - Workspace: `.worktrees/issue-41-manifest-latest-pointer`
-- Allowed-change paths: 8
+- Allowed-change paths: 9
 
 ## Evidence
 

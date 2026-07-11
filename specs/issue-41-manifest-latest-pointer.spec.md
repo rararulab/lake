@@ -21,8 +21,8 @@ may scan once to install the pointer; steady-state reads may not scan.
 
 ## Decisions
 
-- Store `lance-manifest-latest/<base_uri>` as `{version, path}` and use one
-  strongly consistent `MetaStore::get` for steady-state latest resolution.
+- Store `lance-manifest-latest/<base_uri>` as `{incarnation, version, path}` and
+  use one strongly consistent `MetaStore::get` for steady-state resolution.
 - The fixed latest record is also the atomic claim for the current version.
   Before advancing it, archive the prior exact pointer into its immutable
   per-version history key, then CAS latest from exact old bytes to new bytes.
@@ -51,6 +51,7 @@ may scan once to install the pointer; steady-state reads may not scan.
 ## Boundaries
 
 ### Allowed Changes
+Cargo.lock
 crates/lake-engine-lance/**
 docs/architecture.md
 docs/plans/2026-07-11-manifest-latest-pointer.md
