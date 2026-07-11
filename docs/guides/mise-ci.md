@@ -123,6 +123,33 @@ first.
   `scripts/check-conventional-commit.ts --range <base>..HEAD`.
 - The accepted format remains documented in `docs/guides/commit-style.md`.
 
+## Repository releases
+
+Release Please maintains one repository release for the entire lake workspace.
+It does not publish the internal crates, which remain `publish = false`.
+
+- `.github/workflows/release-please.yml` runs after a push to `main`.
+- `release-please-config.json` uses the `simple` strategy because upstream
+  release-please cannot currently process Cargo members that inherit
+  `version.workspace = true` through its `cargo-workspace` plugin
+  ([upstream issue #2111](https://github.com/googleapis/release-please/issues/2111)).
+- `version.txt` and `.release-please-manifest.json` track the repository
+  release version. TOML extra-file updaters keep
+  `workspace.package.version` and every lake package entry in `Cargo.lock`
+  synchronized.
+- When a new crate is added, add its exact `Cargo.lock` extra-file JSONPath
+  using `.name.value` to `release-please-config.json`.
+
+The workflow uses GitHub's short-lived built-in `GITHUB_TOKEN`; no long-lived
+release credential is stored. This matches the repository's local-first model:
+generated release PRs do not trigger a separate pull-request workflow.
+Maintainers review the version/changelog diff and run `mise run gate` before
+merge, while the existing main-only CI remains the post-merge backstop.
+
+Release Please continuously updates one release PR from Conventional Commits.
+Merging that PR updates the changelog and versions, creates `vX.Y.Z` without a
+component prefix, and publishes the matching GitHub Release.
+
 ## Review Checklist
 
 Before approving a PR that changes the toolchain, scripts, or CI:
