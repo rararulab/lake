@@ -1,7 +1,7 @@
 # Verification report — issue #4
 
-- base_sha: d27eb5d13eb31af7812e698c45d376ee8ef37f83
-- head_sha: d43bbcbd7f9fc85a0f9e2131f63f5145d55c8d6c (`issue-4-managed-objects`)
+- base_sha: d7c5a536037450aa77d4fc237f6315b49d928610
+- head_sha: 128e75d9bfb016a2440e6ed5720caff78a446457 (`issue-4-managed-objects`)
 - score_authority: verifier
 - implementer_evidence: self_check_only
 
@@ -186,4 +186,59 @@ local table, streams a video through `InsertValue::File`, queries its
 ```text
 $ cargo run -p lake-sdk --example managed_file
 FILE upload and direct read succeeded: file:///.../objects/<immutable-id>
+```
+
+## Query-mediated FILE write refactor
+
+The production `lake-sdk` dependency graph now contains `lake-common`,
+`lake-objects`, Arrow Flight/Tonic, and serialization/runtime crates only. It
+has no normal dependency on `lake-metasrv`, `lake-engine`, or `lake-meta`.
+`LakeClient::connect` receives a query endpoint plus managed-stage adapter;
+metadata and engine crates remain dev-only fixtures.
+
+The verified write route is:
+
+```text
+SDK -> managed stage: raw file stream
+SDK -> query DoPut: DataLocation Arrow row
+query -> metasrv DoPut: unchanged metadata stream
+metasrv leader -> engine append -> registry CAS
+```
+
+TDD evidence included four red-to-green boundaries:
+
+- `FileAppendRequest` command round-trip did not compile before the wire value
+  existed, then passed in `lake-common`.
+- metasrv rejected `DoPut` before the append decoder/leader forwarding path,
+  then both the direct decoder test and live two-node forwarding test passed.
+- query lacked `serve_with_metadata` before the stateless proxy, then the live
+  query-to-metasrv integration test passed.
+- `LakeClient::connect` did not exist before removal of in-process metasrv
+  ownership, then the query-only SDK acceptance test passed.
+
+Review also found an endpoint composition defect: query prepended `http://` to
+an already-complete CLI metadata URI. The integration test was changed to use
+`http://127.0.0.1:<port>` and failed with a broken transport; query now accepts
+the complete tonic endpoint URI and the same test passes.
+
+Final evidence:
+
+```text
+$ cargo run -p lake-sdk --example managed_file
+FILE upload and direct read succeeded: file:///.../objects/<immutable-id>
+
+$ cargo clippy -p lake-common -p lake-metasrv -p lake-query -p lake-sdk -p lake-cli --all-targets -- -D warnings
+Finished successfully
+
+$ mise run spec-lint specs/issue-4-managed-objects.spec.md
+Quality: 100% (determinism: 100%, testability: 100%, coverage: 100%)
+
+$ mise run spec-lifecycle specs/issue-4-managed-objects.spec.md
+[PASS] SQL FILE insert uploads an object before publishing its DataLocation row
+[PASS] failed object upload does not publish a partial row
+[PASS] unsupported INSERT syntax is rejected before any upload
+spec-lifecycle-guard: OK
+
+$ mise run gate
+Finished successfully: workspace all-target tests, CLI selftest, and site checks
 ```
