@@ -4225,6 +4225,7 @@ dependencies = [
  "lake-engine-lance",
  "lake-meta",
  "prost",
+ "prost-types",
  "serde",
  "serde_json",
  "snafu",
@@ -4257,11 +4258,15 @@ dependencies = [
  "datafusion",
  "futures",
  "lake-catalog",
+ "lake-common",
  "lake-engine",
  "lake-engine-lance",
  "lake-meta",
+ "lake-metasrv",
  "prost",
+ "prost-types",
  "snafu",
+ "tempfile",
  "tokio",
  "tonic",
  "tracing",
@@ -4271,7 +4276,8 @@ dependencies = [
 name = "lake-sdk"
 version = "0.0.1"
 dependencies = [
- "datafusion",
+ "arrow",
+ "arrow-flight",
  "futures",
  "lake-common",
  "lake-engine",
@@ -4280,10 +4286,14 @@ dependencies = [
  "lake-metasrv",
  "lake-objects",
  "lake-query",
+ "prost",
+ "prost-types",
+ "serde_json",
  "sha2 0.10.9",
  "snafu",
  "tempfile",
  "tokio",
+ "tonic",
 ]
 
 [[package]]

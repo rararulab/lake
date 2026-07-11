@@ -30,9 +30,17 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use arrow_flight::{Action, flight_service_client::FlightServiceClient};
-use futures::TryStreamExt;
-use lake_common::TableRef;
+use arrow_flight::{
+    Action, FlightDescriptor, encode::FlightDataEncoderBuilder,
+    flight_service_client::FlightServiceClient,
+};
+use datafusion::arrow::{
+    array::{Float64Array, Int64Array},
+    datatypes::{DataType, Field, Schema},
+    record_batch::RecordBatch,
+};
+use futures::{StreamExt, TryStreamExt};
+use lake_common::{FILE_APPEND_TYPE_URL, FileAppendRequest, TableRef};
 use lake_engine::TableEngineRef;
 use lake_engine_lance::LanceEngine;
 use lake_meta::{MetaStoreRef, RocksMeta, registry};
@@ -41,6 +49,8 @@ use lake_metasrv::{
     election::{LEASE_KEY, LeaseValue},
     serve,
 };
+use prost::Message;
+use prost_types::Any;
 use serde_json::json;
 use tonic::{Code, Request, Status, transport::Channel};
 
@@ -80,6 +90,38 @@ async fn do_action(addr: &str, r#type: &str, body: serde_json::Value) -> Result<
         body:   serde_json::to_vec(&body).expect("encode body").into(),
     };
     let response = client.do_action(Request::new(action)).await?;
+    response.into_inner().try_collect::<Vec<_>>().await?;
+    Ok(())
+}
+
+async fn do_file_append(addr: &str, table: TableRef) -> Result<(), Status> {
+    let mut client = client(addr).await?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new("reward", DataType::Float64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![42])),
+            Arc::new(Float64Array::from(vec![0.8])),
+        ],
+    )
+    .expect("build append batch");
+    let append = FileAppendRequest::new(table);
+    let descriptor = FlightDescriptor::new_cmd(
+        Any {
+            type_url: FILE_APPEND_TYPE_URL.to_owned(),
+            value:    append.command_payload(),
+        }
+        .encode_to_vec(),
+    );
+    let stream = FlightDataEncoderBuilder::new()
+        .with_schema(schema)
+        .with_flight_descriptor(Some(descriptor))
+        .build(futures::stream::iter(vec![Ok(batch)]));
+    let stream = stream.map(|item| item.expect("encode FlightData"));
+    let response = client.do_put(Request::new(stream)).await?;
     response.into_inner().try_collect::<Vec<_>>().await?;
     Ok(())
 }
@@ -205,6 +247,18 @@ async fn follower_forwards_write_to_leader() {
         reg.is_some(),
         "robots.arm is not registered after a forwarded create_table"
     );
+
+    let before_append = reg.expect("registered table").current_version;
+    let appended = do_file_append(&follower, table.clone()).await;
+    assert!(
+        appended.is_ok(),
+        "follower {follower} did not forward FILE append to leader {leader}: {appended:?}"
+    );
+    let after_append = registry::get(meta.as_ref(), &table)
+        .await
+        .expect("registry get after append")
+        .expect("table remains registered");
+    assert!(after_append.current_version > before_append);
 
     // A follower-issued drop forwards too: after it, the table is gone.
     let drop_body = json!({ "namespace": "robots", "name": "arm" });

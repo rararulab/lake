@@ -27,8 +27,8 @@ metadata and RecordBatch streams.
 
 ## Decisions
 
-- The first public SDK is Rust. Its in-process client is the vertical slice;
-  it connects only to the query Flight endpoint. Query forwards metadata-only
+- The first public SDK is Rust. Its client connects only to the query Flight
+  endpoint. Query forwards metadata-only
   file append streams to the leader-aware metadata service; Python bindings
   remain follow-up work.
 - The accepted SQL subset is one parameterized statement of the form
@@ -85,7 +85,7 @@ metadata and RecordBatch streams.
 Scenario: SQL FILE insert uploads an object before publishing its DataLocation row
   Test:
     Package: lake-sdk
-    Filter: insert_sql_file_uploads_and_queries_datalocation
+    Filter: client_connects_only_to_query_for_file_insert
   Given an empty Lance table with an object column and a local video file
   When the Rust SDK executes a parameterized INSERT with
   InsertValue::File(FileUpload::from_path(...))
@@ -107,15 +107,6 @@ Scenario: unsupported INSERT syntax is rejected before any upload
   Given SQL outside the parameterized single-row INSERT subset
   When the Rust SDK receives an object parameter
   Then it returns a syntax error and the managed object prefix is unchanged
-
-Scenario: SDK FILE insert connects only to query
-  Test:
-    Package: lake-sdk
-    Filter: client_connects_only_to_query_for_file_insert
-  Given running query and metadata Flight services plus a managed local stage
-  When the Rust SDK connects with only the query endpoint and inserts a FILE
-  Then the object bytes bypass both services and the metadata leader commits
-  the resulting DataLocation row
 
 ## Out of Scope
 

@@ -20,9 +20,9 @@ use lake_query::QueryEngine;
 
 use super::Context;
 
-pub async fn query(ctx: &Context, addr: &str) -> anyhow::Result<()> {
+pub async fn query(ctx: &Context, addr: &str, metadata_addr: &str) -> anyhow::Result<()> {
     let engine = Arc::new(QueryEngine::new(ctx.meta.clone(), ctx.engine.clone()));
-    lake_query::serve(engine, addr).await?;
+    lake_query::serve_with_metadata(engine, addr, metadata_addr).await?;
     Ok(())
 }
 

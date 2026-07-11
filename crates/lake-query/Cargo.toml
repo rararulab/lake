@@ -14,9 +14,11 @@ async-trait = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
 lake-catalog = { workspace = true }
+lake-common = { workspace = true }
 lake-engine = { workspace = true }
 lake-meta = { workspace = true }
 prost = { workspace = true }
+prost-types = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
@@ -24,6 +26,8 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 lake-engine-lance = { workspace = true }
+lake-metasrv = { workspace = true }
+tempfile = "3"
 
 [lints]
 workspace = true

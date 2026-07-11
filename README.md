@@ -35,6 +35,16 @@ Run the complete local example:
 cargo run -p lake-sdk --example managed_file
 ```
 
+The SDK connects only to the public query endpoint; it does not construct,
+embed, or connect directly to `lake-metasrv`:
+
+```rust
+let client = LakeClient::connect(
+    "http://127.0.0.1:50051",
+    LocalObjectStore::new("./managed-objects").await?,
+).await?;
+```
+
 Its essential write path is:
 
 ```rust
@@ -49,10 +59,18 @@ client.insert(
 
 The example queries the resulting `DataLocation` and passes it to
 `client.open(&location)` for direct streaming reads. The local slice uses a
-`file://` managed stage. Remote Flight writes, cloud multipart uploads,
-authentication, and short-lived read capabilities are intentionally not part
-of this first Rust API.
+`file://` managed stage. The query service forwards only the Arrow row to the
+metadata leader; video/model bytes travel directly between the SDK and the
+managed stage. Cloud multipart uploads, authentication, and short-lived read
+capabilities are intentionally not part of this first Rust API.
+
+For a local deployment, start metadata and query separately. The query process
+is told where metadata lives; clients are not:
+
+```bash
+lake meta --addr 127.0.0.1:50052
+lake query --addr 127.0.0.1:50051 --metadata-addr http://127.0.0.1:50052
+```
 
 For the design and invariants, see [managed objects](docs/design/managed-objects.md)
 and [architecture](docs/architecture.md).
-

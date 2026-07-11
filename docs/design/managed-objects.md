@@ -11,7 +11,14 @@ large-file proxy.
 
 ## Rust SDK vertical slice
 
-The current local SDK accepts one deliberately narrow SQL form:
+The current Rust SDK connects only to a query Flight endpoint and accepts one
+deliberately narrow SQL form:
+
+```rust
+let client = LakeClient::connect(query_endpoint, managed_stage).await?;
+```
+
+It then binds a `FILE` through a parameterized insert:
 
 ```rust
 client.insert(
@@ -27,7 +34,8 @@ The SDK validates the SQL subset, placeholders, column names, and Arrow types
 before opening any file upload. It then streams each `FileUpload` into the
 Lake-owned managed stage in bounded chunks while computing SHA-256. Only after
 the upload succeeds does it build a RecordBatch containing the immutable
-`DataLocation` physical representation and call the existing `Metasrv::append`
+`DataLocation` physical representation. It sends that metadata-only batch to
+query, which forwards it unchanged to the metadata leader's existing append
 commit path.
 
 ```text
@@ -35,8 +43,8 @@ Rust SDK INSERT (logical FILE)
   -> schema + parameter validation
   -> direct chunked managed-stage upload
   -> DataLocation { uri, content_type, size_bytes, sha256 }
-  -> Lance append
-  -> registry version CAS
+  -> query DoPut proxy (stateless)
+  -> metadata leader -> Lance append -> registry version CAS
 ```
 
 If upload fails, no append is attempted and the table's current version does
@@ -53,8 +61,7 @@ uses `file://`; cloud locations must be backed by an authenticated ticket or
 short-lived direct-read capability generated at query time. No raw object
 bytes travel over Flight SQL or the metasrv control plane.
 
-The current slice does not provide remote Flight data writes, S3 multipart
-presigning/resume, tenant authorization, signed locations, object
-deduplication, or garbage collection. Those additions must keep the same
-visibility rule: an SQL-visible `DataLocation` always identifies a complete,
-immutable object.
+The current slice does not provide S3 multipart presigning/resume, tenant
+authorization, signed locations, object deduplication, or garbage collection.
+Those additions must keep the same visibility rule: an SQL-visible
+`DataLocation` always identifies a complete, immutable object.

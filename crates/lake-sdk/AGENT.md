@@ -10,6 +10,8 @@ The Rust SDK's typed write and direct-read surface.
 - Schema and parameter validation complete before the SDK begins an upload.
 - A `DataLocation` row is appended only after every referenced object upload
   succeeds; per-table visibility remains owned by `Metasrv::append`.
+- The public client receives only a query endpoint and managed-stage adapter;
+  the production crate must not depend on, construct, or start `lake-metasrv`.
 
 ## Layout
 

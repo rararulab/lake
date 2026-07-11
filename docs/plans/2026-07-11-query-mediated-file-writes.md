@@ -19,8 +19,9 @@
 
 **Step 1: Write the failing test**
 
-Encode a `FileAppendRequest { table }` into a Flight descriptor and decode it.
-Assert malformed descriptors and non-`FILE` paths are rejected.
+Encode a `FileAppendRequest { table }` into a transport-neutral command payload
+carried by a Protobuf `Any`. Assert malformed commands and non-`FILE` type URLs
+are rejected.
 
 **Step 2: Run the test to verify it fails**
 
@@ -30,9 +31,10 @@ Expected: FAIL because the wire value does not exist.
 
 **Step 3: Write minimal implementation**
 
-Add a small serializable value object that maps only
-`lake.file.append/<namespace>/<table>` descriptors. It must carry table identity,
-not object-store URI, credentials, or object bytes.
+Add a small value object that maps only the
+`type.googleapis.com/lake.file.Append` command. It carries table identity in
+the command payload, not object-store credentials or object bytes; immutable
+object locations remain inside the Arrow rows.
 
 **Step 4: Run the test to verify it passes**
 
@@ -48,8 +50,7 @@ Expected: PASS.
 
 **Files:**
 - Modify: `crates/lake-metasrv/src/control.rs`
-- Modify: `crates/lake-metasrv/src/lib.rs`
-- Test: `crates/lake-metasrv/tests/file_append_forwarding.rs`
+- Test: `crates/lake-metasrv/tests/two_node_forwarding.rs`
 
 **Step 1: Write the failing test**
 
@@ -59,7 +60,7 @@ one new table version is committed by the leader.
 
 **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p lake-metasrv file_append_forwards_to_the_leader`
+Run: `cargo test -p lake-metasrv follower_forwards_mutations_to_leader`
 
 Expected: FAIL because `DoPut` is unsupported.
 
@@ -71,7 +72,7 @@ and call `Metasrv::append`. Return only the committed `Version` in `PutResult`.
 
 **Step 4: Run the test to verify it passes**
 
-Run: `cargo test -p lake-metasrv file_append_forwards_to_the_leader`
+Run: `cargo test -p lake-metasrv follower_forwards_mutations_to_leader`
 
 Expected: PASS.
 
@@ -85,7 +86,7 @@ Expected: PASS.
 - Modify: `crates/lake-query/src/lib.rs`
 - Modify: `crates/lake-query/src/flight.rs`
 - Modify: `crates/lake-query/AGENT.md`
-- Test: `crates/lake-query/src/flight.rs`
+- Test: `crates/lake-query/tests/file_append_proxy.rs`
 
 **Step 1: Write the failing test**
 
@@ -101,8 +102,8 @@ Expected: FAIL because query `DoPut` is unsupported.
 
 **Step 3: Write minimal implementation**
 
-Inject a `FileWriteForwarder` backed by a Flight channel to metadata. Query
-validates the descriptor and proxies Flight frames/acknowledgements. Keep
+Configure the query Flight service with a metadata address. Query validates
+the command and proxies Flight frames/acknowledgements. Keep
 Flight SQL statement execution read-only; this is a typed side channel for
 already-uploaded `DataLocation` rows, not arbitrary DML.
 

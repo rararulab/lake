@@ -122,6 +122,26 @@ impl QueryEngine {
 /// Warms the catalog, then binds a tonic server exposing the Flight SQL
 /// statement path. Runs until the server stops or the process is killed.
 pub async fn serve(engine: Arc<QueryEngine>, addr: &str) -> Result<()> {
+    serve_inner(engine, addr, None).await
+}
+
+/// Run the Flight SQL server with stateless FILE-write forwarding.
+///
+/// `metadata_addr` is a complete tonic endpoint URI such as
+/// `http://127.0.0.1:50052`.
+pub async fn serve_with_metadata(
+    engine: Arc<QueryEngine>,
+    addr: &str,
+    metadata_addr: &str,
+) -> Result<()> {
+    serve_inner(engine, addr, Some(metadata_addr.to_owned())).await
+}
+
+async fn serve_inner(
+    engine: Arc<QueryEngine>,
+    addr: &str,
+    metadata_addr: Option<String>,
+) -> Result<()> {
     engine.refresh().await?;
     let refresher = engine.clone();
     tokio::spawn(async move {
@@ -138,7 +158,10 @@ pub async fn serve(engine: Arc<QueryEngine>, addr: &str) -> Result<()> {
     });
 
     let socket = addr.parse().context(AddressSnafu { addr })?;
-    let service = FlightServiceServer::new(FlightSqlServiceImpl { engine });
+    let service = FlightServiceServer::new(FlightSqlServiceImpl {
+        engine,
+        metadata_addr,
+    });
 
     tracing::info!(%addr, "Flight SQL server ready");
     tonic::transport::Server::builder()

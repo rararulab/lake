@@ -32,13 +32,22 @@
 use std::{pin::Pin, sync::Arc};
 
 use arrow_flight::{
-    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
+    Action, ActionType, Criteria, Empty, FlightClient, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, Result as FlightResult, SchemaResult,
-    Ticket, flight_service_client::FlightServiceClient, flight_service_server::FlightService,
+    Ticket, decode::FlightRecordBatchStream, flight_service_client::FlightServiceClient,
+    flight_service_server::FlightService,
 };
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use futures::Stream;
-use lake_common::{Namespace, TableLocation, TableRef};
+use datafusion::{
+    arrow::datatypes::{DataType, Field, Schema, SchemaRef},
+    error::DataFusionError,
+    physical_plan::stream::RecordBatchStreamAdapter,
+};
+use futures::{Stream, StreamExt};
+use lake_common::{
+    FILE_APPEND_TYPE_URL, FileAppendRequest, Namespace, TableLocation, TableRef, Version,
+};
+use prost::Message;
+use prost_types::Any;
 use serde::{Serialize, de::DeserializeOwned};
 use tonic::{Request, Response, Status, Streaming, transport::Channel};
 
@@ -53,6 +62,47 @@ type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 /// The `DoAction` response stream: a (usually one-shot) stream of Flight
 /// results carrying JSON bodies.
 type ActionStream = BoxStream<FlightResult>;
+
+async fn append_file_stream<S, E>(metasrv: &Metasrv, mut input: S) -> Result<Version, Status>
+where
+    S: Stream<Item = std::result::Result<FlightData, E>> + Send + Unpin + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let first = input
+        .next()
+        .await
+        .ok_or_else(|| Status::invalid_argument("FILE append stream is empty"))?
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let descriptor = first
+        .flight_descriptor
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("FILE append requires a command descriptor"))?;
+    let command = Any::decode(descriptor.cmd.as_ref())
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    if command.type_url != FILE_APPEND_TYPE_URL {
+        return Err(Status::invalid_argument("invalid FILE append command type"));
+    }
+    let append = FileAppendRequest::from_command_payload(&command.value)
+        .ok_or_else(|| Status::invalid_argument("invalid FILE append descriptor"))?;
+    let flight_data = futures::stream::once(async move { Ok(first) }).chain(input.map(|item| {
+        item.map_err(|error| arrow_flight::error::FlightError::protocol(error.to_string()))
+    }));
+    let mut decoded = FlightRecordBatchStream::new_from_flight_data(flight_data);
+    let first_batch = decoded
+        .next()
+        .await
+        .ok_or_else(|| Status::invalid_argument("FILE append contains no rows"))?
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let schema = first_batch.schema();
+    let batches = futures::stream::once(async move { Ok(first_batch) }).chain(
+        decoded.map(|item| item.map_err(|error| DataFusionError::External(Box::new(error)))),
+    );
+    let stream = Box::pin(RecordBatchStreamAdapter::new(schema, batches));
+    metasrv
+        .append(append.table(), stream)
+        .await
+        .map_err(|error| Status::internal(error.to_string()))
+}
 
 /// The metadata-layer control-plane Flight service.
 ///
@@ -167,6 +217,27 @@ impl MetasrvFlightService {
         let response = client.do_action(Request::new(action.clone())).await?;
         let stream: ActionStream = Box::pin(response.into_inner());
         Ok(Response::new(stream))
+    }
+
+    async fn forward_put(
+        &self,
+        addr: &str,
+        input: Streaming<FlightData>,
+    ) -> Result<Response<BoxStream<PutResult>>, Status> {
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .map_err(|error| Status::unavailable(error.to_string()))?
+            .connect()
+            .await
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        let mut client = FlightClient::new(channel);
+        let results = client
+            .do_put(input.map(|item| {
+                item.map_err(|error| arrow_flight::error::FlightError::protocol(error.to_string()))
+            }))
+            .await
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        let results = results.map(|item| item.map_err(|error| Status::internal(error.to_string())));
+        Ok(Response::new(Box::pin(results)))
     }
 
     /// `create_table`: serve locally if leader, else forward to the leader,
@@ -297,9 +368,26 @@ impl FlightService for MetasrvFlightService {
 
     async fn do_put(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        Err(Status::unimplemented(UNSUPPORTED))
+        if !self.leadership.is_leader() {
+            match self.leadership.leader() {
+                Some(addr) if addr != self.own_addr => {
+                    return self.forward_put(&addr, request.into_inner()).await;
+                }
+                Some(_) => {}
+                None => return Err(Status::unavailable("no leader elected")),
+            }
+        }
+        let version = append_file_stream(&self.metasrv, request.into_inner()).await?;
+        let result = PutResult {
+            app_metadata: serde_json::to_vec(&version)
+                .map_err(|error| Status::internal(error.to_string()))?
+                .into(),
+        };
+        Ok(Response::new(Box::pin(futures::stream::once(async move {
+            Ok(result)
+        }))))
     }
 
     async fn do_exchange(
@@ -364,5 +452,77 @@ impl FlightService for MetasrvFlightService {
             actions.into_iter().map(Ok::<_, Status>),
         ));
         Ok(Response::new(stream))
+    }
+}
+
+#[cfg(test)]
+mod file_append_tests {
+    use std::sync::Arc;
+
+    use arrow_flight::{FlightDescriptor, encode::FlightDataEncoderBuilder};
+    use datafusion::arrow::{
+        array::StringArray,
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
+    use lake_common::{FILE_APPEND_TYPE_URL, FileAppendRequest, TableLocation, TableRef};
+    use lake_engine::TableEngineRef;
+    use lake_engine_lance::LanceEngine;
+    use lake_meta::{MetaStoreRef, RocksMeta};
+    use prost::Message;
+    use prost_types::Any;
+
+    use super::append_file_stream;
+    use crate::Metasrv;
+
+    #[tokio::test]
+    async fn file_append_commits_decoded_flight_batches() {
+        let root = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::new(meta, engine);
+        let table = TableRef::new("robots", "episodes");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        metasrv
+            .create_table(
+                &table,
+                TableLocation::new(root.path().join("episodes.lance").to_string_lossy()),
+                schema.clone(),
+            )
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["episode-42"]))],
+        )
+        .unwrap();
+        let append = FileAppendRequest::new(table.clone());
+        let descriptor = FlightDescriptor::new_cmd(
+            Any {
+                type_url: FILE_APPEND_TYPE_URL.to_owned(),
+                value:    append.command_payload(),
+            }
+            .encode_to_vec(),
+        );
+        let stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .with_flight_descriptor(Some(descriptor))
+            .build(futures::stream::iter(vec![Ok(batch)]));
+
+        let version = append_file_stream(&metasrv, stream).await.unwrap();
+
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            version
+        );
     }
 }

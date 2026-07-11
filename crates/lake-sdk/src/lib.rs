@@ -21,21 +21,24 @@ use std::{
     sync::Arc,
 };
 
-use datafusion::{
-    arrow::{
-        array::{ArrayRef, StringArray},
-        datatypes::{DataType, SchemaRef},
-        error::ArrowError,
-        record_batch::RecordBatch,
-    },
-    error::DataFusionError,
-    physical_plan::stream::RecordBatchStreamAdapter,
+use arrow::{
+    array::{ArrayRef, StringArray},
+    datatypes::{DataType, Schema, SchemaRef},
+    error::ArrowError,
+    record_batch::RecordBatch,
 };
-use lake_common::{DataLocation, TableRef, Version};
-use lake_metasrv::Metasrv;
+use arrow_flight::{
+    FlightClient, FlightDescriptor, encode::FlightDataEncoderBuilder,
+    sql::client::FlightSqlServiceClient,
+};
+use futures::TryStreamExt;
+use lake_common::{DataLocation, FILE_APPEND_TYPE_URL, FileAppendRequest, TableRef, Version};
 use lake_objects::{LocalObjectStore, data_location_array, data_location_field};
-use snafu::{ResultExt, Snafu};
+use prost::Message;
+use prost_types::Any;
+use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::{fs::File, io::AsyncRead};
+use tonic::transport::Channel;
 
 /// Errors raised by the typed Rust SDK.
 #[derive(Debug, Snafu)]
@@ -59,11 +62,22 @@ pub enum SdkError {
     #[snafu(display("table '{table}' not found"))]
     NotFound { table: String },
 
-    #[snafu(display("metasrv operation failed"))]
-    Metasrv { source: lake_metasrv::MetasrvError },
+    #[snafu(display("query connection failed"))]
+    Connect { source: tonic::transport::Error },
 
-    #[snafu(display("storage engine operation failed"))]
-    Engine { source: lake_engine::EngineError },
+    #[snafu(display("invalid query endpoint: {message}"))]
+    InvalidEndpoint { message: String },
+
+    #[snafu(display("query Flight operation failed"))]
+    Flight {
+        source: arrow_flight::error::FlightError,
+    },
+
+    #[snafu(display("query returned no FILE append result"))]
+    MissingAppendResult,
+
+    #[snafu(display("query returned an invalid FILE append version"))]
+    InvalidAppendResult { source: serde_json::Error },
 
     #[snafu(display("managed object operation failed"))]
     Object { source: lake_objects::ObjectError },
@@ -135,22 +149,27 @@ pub enum InsertValue {
     File(FileUpload),
 }
 
-/// An in-process Rust SDK client for managed-object inserts and direct reads.
+/// A Rust SDK client connected to the stateless query endpoint.
 #[derive(Clone)]
 pub struct LakeClient {
-    metasrv: Metasrv,
+    query:   Channel,
     objects: LocalObjectStore,
 }
 
 impl LakeClient {
-    /// Construct a client over the existing metadata authority and object
-    /// prefix.
-    #[must_use]
-    pub fn new(metasrv: Arc<Metasrv>, objects: LocalObjectStore) -> Self {
-        Self {
-            metasrv: (*metasrv).clone(),
-            objects,
-        }
+    /// Connect to Lake through its query endpoint.
+    pub async fn connect(
+        query_endpoint: impl AsRef<str>,
+        objects: LocalObjectStore,
+    ) -> Result<Self> {
+        let query = Channel::from_shared(query_endpoint.as_ref().to_owned())
+            .map_err(|error| SdkError::InvalidEndpoint {
+                message: error.to_string(),
+            })?
+            .connect()
+            .await
+            .context(ConnectSnafu)?;
+        Ok(Self { query, objects })
     }
 
     /// Execute a parameterized, single-row INSERT with typed scalar/`FILE`
@@ -181,14 +200,28 @@ impl LakeClient {
             arrays.push(self.upload_and_encode(field.data_type(), value).await?);
         }
         let batch = RecordBatch::try_new(schema, arrays).context(ArrowSnafu)?;
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
-            batch.schema(),
-            futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
-        ));
-        self.metasrv
-            .append(&insert.table, stream)
+        let append = FileAppendRequest::new(insert.table);
+        let descriptor = FlightDescriptor::new_cmd(
+            Any {
+                type_url: FILE_APPEND_TYPE_URL.to_owned(),
+                value:    append.command_payload(),
+            }
+            .encode_to_vec(),
+        );
+        let stream = FlightDataEncoderBuilder::new()
+            .with_schema(batch.schema())
+            .with_flight_descriptor(Some(descriptor))
+            .build(futures::stream::iter(vec![Ok(batch)]));
+        let mut client = FlightClient::new(self.query.clone());
+        let result = client
+            .do_put(stream)
             .await
-            .context(MetasrvSnafu)
+            .context(FlightSnafu)?
+            .try_next()
+            .await
+            .context(FlightSnafu)?
+            .context(MissingAppendResultSnafu)?;
+        serde_json::from_slice(&result.app_metadata).context(InvalidAppendResultSnafu)
     }
 
     /// Open a direct local reader for an immutable `DataLocation`.
@@ -200,24 +233,13 @@ impl LakeClient {
     }
 
     async fn table_schema(&self, table: &TableRef) -> Result<SchemaRef> {
-        let registration = self
-            .metasrv
-            .resolve(table)
+        let mut client = FlightSqlServiceClient::new(self.query.clone());
+        let info = client
+            .execute(format!("SELECT * FROM lake.{table} LIMIT 0"), None)
             .await
-            .context(MetasrvSnafu)?
-            .ok_or_else(|| SdkError::NotFound {
-                table: table.to_string(),
-            })?;
-        let handle = self
-            .metasrv
-            .engine()
-            .open(&registration.location)
-            .await
-            .context(EngineSnafu)?
-            .ok_or_else(|| SdkError::NotFound {
-                table: table.to_string(),
-            })?;
-        Ok(handle.schema())
+            .context(FlightSnafu)?;
+        let schema = Schema::try_from(info).context(ArrowSnafu)?;
+        Ok(Arc::new(schema))
     }
 
     async fn upload_and_encode(
@@ -368,9 +390,10 @@ mod tests {
         pin::Pin,
         sync::Arc,
         task::{Context, Poll},
+        time::Duration,
     };
 
-    use datafusion::arrow::{
+    use arrow::{
         array::{Array, StringArray, StructArray},
         datatypes::{DataType, Field, Schema},
     };
@@ -388,35 +411,28 @@ mod tests {
     use crate::{FileUpload, InsertValue, LakeClient};
 
     #[tokio::test]
-    async fn insert_sql_file_uploads_and_queries_datalocation() {
+    async fn unreachable_query_endpoint_fails_connect() {
         let root = tempdir().unwrap();
-        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
-        let engine: TableEngineRef = Arc::new(LanceEngine::new());
-        let metasrv = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
-        let table = TableRef::new("robots", "episodes");
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("episode_id", DataType::Utf8, false),
-            data_location_field("video", false),
-        ]));
-        metasrv
-            .create_table(
-                &table,
-                TableLocation::new(root.path().join("tables/episodes.lance").to_string_lossy()),
-                schema,
-            )
+        let objects = LocalObjectStore::open(root.path().join("objects"))
             .await
             .unwrap();
+
+        let result = LakeClient::connect("http://127.0.0.1:1", objects).await;
+
+        assert!(
+            result.is_err(),
+            "an unreachable query endpoint must fail connect"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_connects_only_to_query_for_file_insert() {
+        let root = tempdir().unwrap();
+        let (client, _metasrv, _table, meta, engine) = setup_client(root.path()).await;
 
         let source = root.path().join("episode.mp4");
         let expected = b"large video bytes streamed by the sdk";
         tokio::fs::write(&source, expected).await.unwrap();
-        let client = LakeClient::new(
-            metasrv,
-            LocalObjectStore::open(root.path().join("objects"))
-                .await
-                .unwrap(),
-        );
-
         client
             .insert(
                 "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
@@ -457,7 +473,7 @@ mod tests {
     #[tokio::test]
     async fn failed_upload_does_not_publish_a_table_version() {
         let root = tempdir().unwrap();
-        let (client, metasrv, table) = setup_client(root.path()).await;
+        let (client, metasrv, table, _meta, _engine) = setup_client(root.path()).await;
         let before = metasrv
             .resolve(&table)
             .await
@@ -501,7 +517,7 @@ mod tests {
     #[tokio::test]
     async fn unsupported_insert_syntax_never_starts_an_upload() {
         let root = tempdir().unwrap();
-        let (client, _metasrv, _table) = setup_client(root.path()).await;
+        let (client, _metasrv, _table, _meta, _engine) = setup_client(root.path()).await;
         let source = root.path().join("episode.mp4");
         tokio::fs::write(&source, b"must not be uploaded")
             .await
@@ -524,10 +540,23 @@ mod tests {
         assert!(objects.next_entry().await.unwrap().is_none());
     }
 
-    async fn setup_client(root: &std::path::Path) -> (LakeClient, Arc<Metasrv>, TableRef) {
+    fn free_addr() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().to_string()
+    }
+
+    async fn setup_client(
+        root: &std::path::Path,
+    ) -> (
+        LakeClient,
+        Arc<Metasrv>,
+        TableRef,
+        MetaStoreRef,
+        TableEngineRef,
+    ) {
         let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.join("meta")).unwrap());
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
-        let metasrv = Arc::new(Metasrv::new(meta, engine));
+        let metasrv = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
         let table = TableRef::new("robots", "episodes");
         let schema = Arc::new(Schema::new(vec![
             Field::new("episode_id", DataType::Utf8, false),
@@ -541,11 +570,27 @@ mod tests {
             )
             .await
             .unwrap();
-        let client = LakeClient::new(
-            metasrv.clone(),
+        let meta_addr = free_addr();
+        let query_addr = free_addr();
+        tokio::spawn({
+            let metasrv = metasrv.clone();
+            let addr = meta_addr.clone();
+            async move { lake_metasrv::serve(metasrv, &addr).await }
+        });
+        tokio::spawn({
+            let query = Arc::new(QueryEngine::new(meta.clone(), engine.clone()));
+            let addr = query_addr.clone();
+            let metadata = format!("http://{meta_addr}");
+            async move { lake_query::serve_with_metadata(query, &addr, &metadata).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let client = LakeClient::connect(
+            format!("http://{query_addr}"),
             LocalObjectStore::open(root.join("objects")).await.unwrap(),
-        );
-        (client, metasrv, table)
+        )
+        .await
+        .unwrap();
+        (client, metasrv, table, meta, engine)
     }
 
     struct FailingReader {
