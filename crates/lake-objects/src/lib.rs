@@ -27,6 +27,8 @@ use tokio::io::AsyncRead;
 
 mod local;
 pub use local::LocalObjectStore;
+mod s3;
+pub use s3::S3ObjectStore;
 
 /// Errors converting managed-object values at the Arrow boundary.
 #[derive(Debug, Snafu)]
@@ -53,6 +55,27 @@ pub enum ObjectError {
 
     #[snafu(display("DataLocation path {path:?} escapes managed object root {root:?}"))]
     OutsideManagedPrefix { path: PathBuf, root: PathBuf },
+
+    #[snafu(display("managed S3 stage requires a non-empty bucket and prefix"))]
+    InvalidS3Stage,
+
+    #[snafu(display("DataLocation URI '{uri}' is not a valid s3:// URI"))]
+    InvalidS3Uri { uri: String },
+
+    #[snafu(display(
+        "DataLocation URI '{uri}' is outside managed S3 prefix s3://{bucket}/{prefix}/"
+    ))]
+    OutsideManagedS3Prefix {
+        uri:    String,
+        bucket: String,
+        prefix: String,
+    },
+
+    #[snafu(display("S3 operation '{action}' failed: {message}"))]
+    S3 {
+        action:  &'static str,
+        message: String,
+    },
 
     #[snafu(display("reading the object source failed"))]
     Read { source: std::io::Error },
@@ -148,11 +171,15 @@ fn u64_value(array: &StructArray, column: &'static str, row: usize) -> Result<u6
 
 #[cfg(test)]
 mod tests {
+    use aws_config::BehaviorVersion;
+    use aws_sdk_s3::config::{Credentials, Region};
     use lake_common::DataLocation;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
-    use crate::{LocalObjectStore, ObjectError, data_location_array, data_location_from_array};
+    use crate::{
+        LocalObjectStore, ObjectError, S3ObjectStore, data_location_array, data_location_from_array,
+    };
 
     #[test]
     fn datalocation_arrow_roundtrip_preserves_identity() {
@@ -211,5 +238,41 @@ mod tests {
             store.open_reader(&location).await,
             Err(ObjectError::OutsideManagedPrefix { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn s3_reader_rejects_locations_outside_managed_prefix() {
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .endpoint_url("http://127.0.0.1:1")
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .force_path_style(true)
+            .build();
+        let store = S3ObjectStore::new(
+            aws_sdk_s3::Client::from_conf(config),
+            "lake-managed",
+            "objects",
+        )
+        .unwrap();
+
+        for uri in [
+            "s3://somebody-else/objects/object-id",
+            "s3://lake-managed/objects-neighbor/object-id",
+            "https://lake-managed.s3.amazonaws.com/objects/object-id",
+        ] {
+            let location = DataLocation::builder()
+                .uri(uri)
+                .content_type("video/mp4")
+                .size_bytes(42)
+                .sha256("unused")
+                .build();
+
+            assert!(matches!(
+                store.open_reader(&location).await,
+                Err(ObjectError::OutsideManagedS3Prefix { .. })
+                    | Err(ObjectError::InvalidS3Uri { .. })
+            ));
+        }
     }
 }

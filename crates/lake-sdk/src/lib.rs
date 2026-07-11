@@ -459,13 +459,15 @@ mod tests {
         pin::Pin,
         sync::Arc,
         task::{Context, Poll},
-        time::Duration,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use arrow::{
         array::{Array, StringArray, StructArray},
         datatypes::{DataType, Field, Schema},
     };
+    use aws_config::BehaviorVersion;
+    use aws_sdk_s3::config::{Credentials, Region};
     use futures::TryStreamExt;
     use lake_common::{TableLocation, TableRef};
     use lake_engine::TableEngineRef;
@@ -473,7 +475,7 @@ mod tests {
     use lake_meta::{MetaStoreRef, RocksMeta};
     use lake_metasrv::Metasrv;
     use lake_objects::{
-        LocalObjectStore, ManagedObjectStore, ObjectReader, Result as ObjectResult,
+        LocalObjectStore, ManagedObjectStore, ObjectReader, Result as ObjectResult, S3ObjectStore,
         data_location_field, data_location_from_array,
     };
     use lake_query::QueryEngine;
@@ -606,6 +608,76 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[tokio::test]
+    #[ignore = "requires LocalStack S3; set LAKE_S3_ENDPOINT and run with --ignored"]
+    async fn sdk_file_insert_uses_s3_stage() {
+        let Ok(endpoint) = std::env::var("LAKE_S3_ENDPOINT") else {
+            return;
+        };
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .endpoint_url(endpoint)
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "localstack"))
+            .force_path_style(true)
+            .build();
+        let s3 = aws_sdk_s3::Client::from_conf(config);
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let bucket = format!("lake-sdk-{suffix}");
+        s3.create_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .expect("create LocalStack bucket");
+        let stage = S3ObjectStore::new(s3, &bucket, "managed/files").expect("valid S3 stage");
+        let root = tempdir().expect("temporary SDK fixture");
+        let (client, _metasrv, _table, _meta, _engine) =
+            setup_client_with_store(root.path(), stage).await;
+        let expected = (0..(5 * 1024 * 1024 + 17))
+            .map(|index| u8::try_from(index % 251).expect("bounded byte"))
+            .collect::<Vec<_>>();
+
+        client
+            .insert(
+                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    InsertValue::Utf8("episode-s3".to_owned()),
+                    InsertValue::File(FileUpload::from_reader(
+                        std::io::Cursor::new(expected.clone()),
+                        "video/mp4",
+                    )),
+                ],
+            )
+            .await
+            .expect("SQL FILE insert over S3 stage");
+        let mut results = client
+            .query("SELECT video FROM lake.robots.episodes")
+            .await
+            .expect("query DataLocation");
+        let batch = results
+            .try_next()
+            .await
+            .expect("query stream")
+            .expect("one batch");
+        let location = data_location(&batch, "video", 0).expect("decode DataLocation");
+        assert!(
+            location
+                .uri
+                .starts_with(&format!("s3://{bucket}/managed/files/"))
+        );
+        let mut reader = client.open(&location).await.expect("direct S3 reader");
+        let mut actual = Vec::new();
+        reader
+            .read_to_end(&mut actual)
+            .await
+            .expect("read S3 object");
+
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn managed_file_example_queries_through_sdk() {
         let example = include_str!("../examples/managed_file.rs");
@@ -699,6 +771,23 @@ mod tests {
         MetaStoreRef,
         TableEngineRef,
     ) {
+        let objects = DelegatingStore(LocalObjectStore::open(root.join("objects")).await.unwrap());
+        setup_client_with_store(root, objects).await
+    }
+
+    async fn setup_client_with_store<S>(
+        root: &std::path::Path,
+        objects: S,
+    ) -> (
+        LakeClient,
+        Arc<Metasrv>,
+        TableRef,
+        MetaStoreRef,
+        TableEngineRef,
+    )
+    where
+        S: ManagedObjectStore + 'static,
+    {
         let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.join("meta")).unwrap());
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
         let metasrv = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
@@ -729,12 +818,9 @@ mod tests {
             async move { lake_query::serve_with_metadata(query, &addr, &metadata).await }
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let client = LakeClient::connect(
-            format!("http://{query_addr}"),
-            DelegatingStore(LocalObjectStore::open(root.join("objects")).await.unwrap()),
-        )
-        .await
-        .unwrap();
+        let client = LakeClient::connect(format!("http://{query_addr}"), objects)
+            .await
+            .unwrap();
         (client, metasrv, table, meta, engine)
     }
 

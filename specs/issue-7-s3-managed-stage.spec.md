@@ -91,6 +91,16 @@ Scenario: SDK FILE insert accepts either managed-stage backend
   Then the existing public round trip succeeds without a concrete local-store
   field in LakeClient
 
+Scenario: SDK SQL FILE insert streams through the S3 stage
+  Test:
+    Package: lake-sdk
+    Filter: sdk_file_insert_uses_s3_stage
+  Given a Lake client configured with an S3 managed stage and a multipart-sized
+  video source
+  When it executes the parameterized INSERT, queries the FILE, and opens it
+  Then SQL returns a stable s3 DataLocation and the direct reader yields the
+  original bytes without query or metasrv carrying the payload
+
 Scenario: S3 direct reader rejects locations outside its managed prefix
   Test:
     Package: lake-objects
