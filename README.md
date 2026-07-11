@@ -55,13 +55,36 @@ in application code:
 LAKE_S3_BUCKET=embodied-data \
 LAKE_MANAGED_OBJECT_PREFIX=lake/managed-files \
 AWS_REGION=us-east-1 \
-lake query --addr 0.0.0.0:50051 --metadata-addr http://lake-meta:50052
+LAKE_AUTH_TOKEN_FILE=/run/secrets/query-token \
+LAKE_TLS_CERT_FILE=/run/tls/query.crt \
+LAKE_TLS_KEY_FILE=/run/tls/query.key \
+LAKE_METADATA_AUTH_TOKEN_FILE=/run/secrets/meta-token \
+LAKE_METADATA_CA_FILE=/run/tls/ca.crt \
+LAKE_METADATA_SERVER_NAME=lake-meta.internal \
+lake query --addr 0.0.0.0:50051 \
+  --metadata-addr https://lake-meta.internal:50052
 ```
 
 Lake stores the stable `s3://` identity. AWS credentials come from the SDK
 process's default credential chain or workload identity; they never enter SQL,
 table rows, or the discovery descriptor. Embedders and tests that need a custom
 backend can use the explicit `LakeClient::connect_with_store` constructor.
+
+Production SDK connections verify TLS and send the Query credential on every
+Flight RPC, including discovery, schema lookup, SQL, and FILE append:
+
+```rust
+let client = LakeClient::builder("https://query.internal:50051")
+    .with_bearer_token(std::fs::read_to_string("/run/secrets/query-token")?.trim())?
+    .with_ca_certificate_pem(std::fs::read("/run/tls/ca.crt")?)
+    .with_server_name("query.internal")
+    .connect()
+    .await?;
+```
+
+Tokens are read from files rather than command-line flags and are redacted from
+all Debug/error output. This deployment credential authenticates the caller;
+tenant catalog/object authorization remains a separate policy layer.
 
 Create the table with a first-class `file` column through either the local or
 remote administrative CLI:
@@ -126,6 +149,13 @@ is told where metadata lives; clients are not:
 lake meta --addr 127.0.0.1:50052
 lake query --addr 127.0.0.1:50051 --metadata-addr http://127.0.0.1:50052
 ```
+
+Plaintext anonymous serving is allowed only on loopback. A non-loopback Query
+or Metasrv listener requires `LAKE_AUTH_TOKEN_FILE`, `LAKE_TLS_CERT_FILE`, and
+`LAKE_TLS_KEY_FILE`. Set `LAKE_ALLOW_INSECURE=true` only when a trusted service
+mesh terminates both TLS and authentication before Lake. Metasrv nodes use
+`LAKE_PEER_AUTH_TOKEN_FILE`, `LAKE_PEER_CA_FILE`, and
+`LAKE_PEER_SERVER_NAME` for follower-to-leader forwarding.
 
 For the design and invariants, see [managed objects](docs/design/managed-objects.md)
 and [architecture](docs/architecture.md).

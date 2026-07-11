@@ -15,8 +15,11 @@ write path — create tables, resolve/list, and the append commit protocol.
   `TableEngine`, so the storage engine stays swappable.
 - FILE `DoPut` contains Arrow `DataLocation` rows only. Followers forward the
   stream to the observed leader; metasrv never accepts the object payload.
+- Production inbound RPCs and follower-to-leader forwarding share the
+  `lake-flight` TLS/auth boundary; a follower must never downgrade to anonymous
+  hard-coded HTTP.
 
 ## Layout
 
-- `lib.rs` — `Metasrv` (`create_table`/`append`/`resolve`/`list_*`) + `serve`
+- `lib.rs` — `Metasrv`, `MetasrvServerConfig`, and server lifecycle
 - `control.rs` — Flight actions, FILE append decoding, and follower forwarding

@@ -83,12 +83,15 @@ partial objects and incomplete multipart uploads.
 
 ## Security boundary
 
-The current endpoint is suitable for local/trusted-network use, not direct
-Internet exposure. Production exposure requires all of the following:
+Lake now provides verified TLS and deployment-bearer authentication on every
+Flight RPC and every internal forwarding hop. Plaintext anonymous listeners
+are loopback-only unless deployment explicitly declares a trusted terminating
+proxy. Direct Internet or multi-tenant exposure still requires all remaining
+policy and resource controls below:
 
-- TLS on every Flight connection and authentication/authorization metadata on
-  every RPC, including polling and cancellation. Handshake alone is not an
-  authorization boundary.
+- Rotate/issue deployment credentials operationally, and replace the initial
+  opaque bearer authenticator with tenant-aware identity validation. Handshake
+  is already covered by the same interceptor as every other RPC.
 - Tenant-aware catalog authorization before planning, with denied objects
   indistinguishable from missing objects where disclosure matters.
 - Read-only SQL validation in the server. Never trust clients to omit DDL/DML.
@@ -128,8 +131,9 @@ schema encoding, streaming, error mapping, and result-location semantics.
 
 ## Delivery sequence
 
-1. Productionize Tier 1: TLS, per-RPC auth, tenant authorization, limits,
-   signed opaque tickets, cancellation, and load tests.
+1. Productionize Tier 1: TLS and per-RPC deployment authentication are wired;
+   next add tenant authorization, limits, signed opaque tickets, cancellation,
+   credential rotation, and load tests.
 2. Add an async query state store and `PollFlightInfo`.
 3. Add bounded result materialization, manifest publication, presigned HTTPS
    endpoints, and result garbage collection.

@@ -15,6 +15,8 @@ The Rust SDK's typed write and direct-read surface.
   the production crate must not depend on, construct, or start `lake-metasrv`.
 - `connect_with_store` is an explicit test/embedding seam, not the normal
   application connection path.
+- `LakeClientBuilder` applies one redacted TLS/bearer configuration to every
+  Query Flight client; credentials never enter stage discovery or SQL data.
 - `query` streams Flight RecordBatches; `data_location` decodes a logical
   `FILE`, and `open` reads its bytes directly from the managed stage.
 - `open_range` delegates one validated half-open interval directly to the

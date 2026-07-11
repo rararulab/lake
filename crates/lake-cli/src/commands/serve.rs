@@ -16,23 +16,33 @@
 
 use std::sync::Arc;
 
-use lake_query::QueryEngine;
+use lake_metasrv::MetasrvServerConfig;
+use lake_query::{QueryEngine, QueryServerConfig};
 
-use super::Context;
+use super::{
+    Context,
+    security::{
+        allow_insecure_from_env, metadata_client_security_from_env, peer_client_security_from_env,
+        server_security_from_env,
+    },
+};
 
 pub async fn query(ctx: &Context, addr: &str, metadata_addr: &str) -> anyhow::Result<()> {
     let engine = Arc::new(QueryEngine::new(ctx.meta.clone(), ctx.engine.clone()));
-    lake_query::serve_with_metadata_and_stage(
-        engine,
-        addr,
-        metadata_addr,
-        ctx.managed_stage().clone(),
-    )
-    .await?;
+    let config = QueryServerConfig::new()
+        .with_metadata(metadata_addr, metadata_client_security_from_env()?)
+        .with_managed_stage(ctx.managed_stage().clone())
+        .with_server_security(server_security_from_env()?)
+        .allow_insecure(allow_insecure_from_env()?);
+    lake_query::serve_with_config(engine, addr, config).await?;
     Ok(())
 }
 
 pub async fn meta(ctx: &Context, addr: &str) -> anyhow::Result<()> {
-    lake_metasrv::serve(ctx.metasrv.clone(), addr).await?;
+    let config = MetasrvServerConfig::new()
+        .with_server_security(server_security_from_env()?)
+        .with_peer_security(peer_client_security_from_env()?)
+        .allow_insecure(allow_insecure_from_env()?);
+    lake_metasrv::serve_with_config(ctx.metasrv.clone(), addr, config).await?;
     Ok(())
 }

@@ -4141,11 +4141,13 @@ dependencies = [
  "lake-common",
  "lake-engine",
  "lake-engine-lance",
+ "lake-flight",
  "lake-meta",
  "lake-metasrv",
  "lake-objects",
  "lake-query",
  "serde_json",
+ "tempfile",
  "tokio",
  "tonic",
 ]

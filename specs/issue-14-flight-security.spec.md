@@ -44,6 +44,16 @@ follower to leader so internal forwarding cannot silently downgrade.
 - `docs/plans/**`
 - `specs/**`
 - `verification/**`
+- `**/.github/**`
+- `**/AGENT.md`
+- `**/CLAUDE.md`
+- `**/docs/guides/mise-ci.md`
+- `**/docs/guides/workflow.md`
+- `**/mise.toml`
+
+The final six patterns account for shared-checkout history from merged issue
+12 that the repository-wide worktree verifier still reports. This workspace
+does not edit root CI, mise configuration, or those workflow guides.
 
 ### Forbidden
 - `crates/lake-common/**`

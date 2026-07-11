@@ -26,10 +26,16 @@ use anyhow::Context as _;
 use arrow_flight::{Action, Result as FlightResult, flight_service_client::FlightServiceClient};
 use clap::Subcommand;
 use futures::TryStreamExt;
+use lake_flight::ClientSecurity;
 use serde_json::json;
 use tonic::{Code, Request, Status, transport::Channel};
 
-use super::table::parse_table_ref;
+use super::{security::metadata_client_security_from_env, table::parse_table_ref};
+
+struct MetasrvClient {
+    inner:    FlightServiceClient<Channel>,
+    security: ClientSecurity,
+}
 
 /// Subcommands of `lake client`, each a single Flight `do_action` call.
 #[derive(Subcommand)]
@@ -79,15 +85,22 @@ pub async fn run(addr: &str, cmd: ClientCmd) -> anyhow::Result<()> {
     }
 }
 
-/// Open a Flight client to `addr`. arrow-flight 58's generated client has no
-/// `connect` associated fn, so build the tonic [`Channel`] explicitly.
-async fn connect(addr: &str) -> anyhow::Result<FlightServiceClient<Channel>> {
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .with_context(|| format!("invalid metasrv address '{addr}'"))?
-        .connect()
+/// Open a Flight client with the configured metadata TLS and credential.
+async fn connect(addr: &str) -> anyhow::Result<MetasrvClient> {
+    let security = metadata_client_security_from_env()?;
+    let endpoint = if addr.contains("://") {
+        addr.to_owned()
+    } else {
+        security.endpoint_for_authority(addr)
+    };
+    let channel = security
+        .connect(endpoint)
         .await
         .with_context(|| format!("cannot connect to metasrv at '{addr}'"))?;
-    Ok(FlightServiceClient::new(channel))
+    Ok(MetasrvClient {
+        inner: FlightServiceClient::new(channel),
+        security,
+    })
 }
 
 /// Map a Flight [`Status`] to an actionable CLI error, calling out the
@@ -108,11 +121,13 @@ fn map_status(status: &Status) -> anyhow::Error {
 
 /// Issue `action` and collect its (usually empty or one-shot) result stream.
 async fn do_action(
-    client: &mut FlightServiceClient<Channel>,
+    client: &mut MetasrvClient,
     action: Action,
 ) -> anyhow::Result<Vec<FlightResult>> {
+    let request = client.security.authorize_request(Request::new(action));
     let response = client
-        .do_action(Request::new(action))
+        .inner
+        .do_action(request)
         .await
         .map_err(|s| map_status(&s))?;
     response
@@ -131,7 +146,7 @@ fn action(r#type: &str, body: &serde_json::Value) -> anyhow::Result<Action> {
 }
 
 async fn create_table(
-    client: &mut FlightServiceClient<Channel>,
+    client: &mut MetasrvClient,
     table: &str,
     columns: &[String],
     location: &str,
@@ -148,7 +163,7 @@ async fn create_table(
     Ok(())
 }
 
-async fn drop_table(client: &mut FlightServiceClient<Channel>, table: &str) -> anyhow::Result<()> {
+async fn drop_table(client: &mut MetasrvClient, table: &str) -> anyhow::Result<()> {
     let table = parse_table_ref(table)?;
     let body = json!({ "namespace": table.namespace.0, "name": table.name.0 });
     do_action(client, action("drop_table", &body)?).await?;
@@ -156,13 +171,13 @@ async fn drop_table(client: &mut FlightServiceClient<Channel>, table: &str) -> a
     Ok(())
 }
 
-async fn resolve(client: &mut FlightServiceClient<Channel>, table: &str) -> anyhow::Result<()> {
+async fn resolve(client: &mut MetasrvClient, table: &str) -> anyhow::Result<()> {
     let table = parse_table_ref(table)?;
     let body = json!({ "namespace": table.namespace.0, "name": table.name.0 });
-    match client
-        .do_action(Request::new(action("resolve", &body)?))
-        .await
-    {
+    let request = client
+        .security
+        .authorize_request(Request::new(action("resolve", &body)?));
+    match client.inner.do_action(request).await {
         // `resolve` reports a missing table as a NotFound status; surface that
         // as ordinary output rather than an error.
         Err(status) if status.code() == Code::NotFound => {
@@ -185,10 +200,7 @@ async fn resolve(client: &mut FlightServiceClient<Channel>, table: &str) -> anyh
     }
 }
 
-async fn list(
-    client: &mut FlightServiceClient<Channel>,
-    namespace: Option<&str>,
-) -> anyhow::Result<()> {
+async fn list(client: &mut MetasrvClient, namespace: Option<&str>) -> anyhow::Result<()> {
     let action = match namespace {
         Some(ns) => action("list_tables", &json!({ "namespace": ns }))?,
         None => Action {
