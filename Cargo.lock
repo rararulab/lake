@@ -4149,6 +4149,7 @@ dependencies = [
  "lake-metasrv",
  "lake-objects",
  "lake-query",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",

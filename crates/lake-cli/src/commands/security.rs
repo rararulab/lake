@@ -17,7 +17,47 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use lake_flight::{ClientSecurity, ServerSecurity};
+use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
+use lake_flight::{BearerPrincipalBinding, ClientSecurity, ServerSecurity};
+use serde::Deserialize;
+
+const MAX_PRINCIPAL_FILE_BYTES: u64 = 1024 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrincipalFile {
+    bindings: Vec<PrincipalBindingFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrincipalBindingFile {
+    token:        String,
+    principal_id: String,
+    tenant_id:    String,
+    role:         PrincipalRoleFile,
+    namespaces:   Vec<String>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PrincipalRoleFile {
+    User,
+    QueryService,
+    MetadataPeer,
+    Admin,
+}
+
+impl From<PrincipalRoleFile> for PrincipalRole {
+    fn from(role: PrincipalRoleFile) -> Self {
+        match role {
+            PrincipalRoleFile::User => Self::User,
+            PrincipalRoleFile::QueryService => Self::QueryService,
+            PrincipalRoleFile::MetadataPeer => Self::MetadataPeer,
+            PrincipalRoleFile::Admin => Self::Admin,
+        }
+    }
+}
 
 pub(crate) fn server_security_from_files(
     token: Option<&Path>,
@@ -44,6 +84,33 @@ pub(crate) fn server_security_from_files(
     Ok(security)
 }
 
+pub(crate) fn server_security_from_principal_file(path: &Path) -> anyhow::Result<ServerSecurity> {
+    validate_protected_file(path)?;
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("cannot inspect principal map {}", path.display()))?;
+    if metadata.len() > MAX_PRINCIPAL_FILE_BYTES {
+        anyhow::bail!("principal map {} exceeds 1 MiB", path.display());
+    }
+    let wire = std::fs::read(path)
+        .with_context(|| format!("cannot read principal map {}", path.display()))?;
+    let file: PrincipalFile = serde_json::from_slice(&wire)
+        .with_context(|| format!("invalid principal map {}", path.display()))?;
+    let bindings = file
+        .bindings
+        .into_iter()
+        .map(|binding| {
+            let principal = Principal::try_new(
+                PrincipalId::try_new(binding.principal_id)?,
+                TenantId::try_new(binding.tenant_id)?,
+                binding.role.into(),
+                binding.namespaces,
+            )?;
+            BearerPrincipalBinding::new(binding.token, principal).map_err(anyhow::Error::from)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    ServerSecurity::with_bearer_principals(bindings).map_err(Into::into)
+}
+
 pub(crate) fn client_security_from_files(
     token: Option<&Path>,
     ca_certificate: Option<&Path>,
@@ -66,13 +133,33 @@ pub(crate) fn client_security_from_files(
 
 pub(crate) fn server_security_from_env() -> anyhow::Result<ServerSecurity> {
     let token = env_path("LAKE_AUTH_TOKEN_FILE");
+    let principals = env_path("LAKE_AUTH_PRINCIPALS_FILE");
     let certificate = env_path("LAKE_TLS_CERT_FILE");
     let private_key = env_path("LAKE_TLS_KEY_FILE");
-    server_security_from_files(
-        token.as_deref(),
-        certificate.as_deref(),
-        private_key.as_deref(),
-    )
+    if token.is_some() && principals.is_some() {
+        anyhow::bail!("LAKE_AUTH_TOKEN_FILE and LAKE_AUTH_PRINCIPALS_FILE are mutually exclusive");
+    }
+    let mut security = match principals {
+        Some(path) => server_security_from_principal_file(&path)?,
+        None => match token {
+            Some(path) => ServerSecurity::with_bearer_token(read_token(&path)?)?,
+            None => ServerSecurity::insecure(),
+        },
+    };
+    match (certificate, private_key) {
+        (Some(certificate), Some(private_key)) => {
+            let certificate = std::fs::read(&certificate).with_context(|| {
+                format!("cannot read TLS certificate {}", certificate.display())
+            })?;
+            let private_key = std::fs::read(&private_key).with_context(|| {
+                format!("cannot read TLS private key {}", private_key.display())
+            })?;
+            security = security.with_tls_identity_pem(&certificate, &private_key);
+        }
+        (None, None) => {}
+        (..) => anyhow::bail!("LAKE_TLS_CERT_FILE and LAKE_TLS_KEY_FILE must be set together"),
+    }
+    Ok(security)
 }
 
 pub(crate) fn metadata_client_security_from_env() -> anyhow::Result<ClientSecurity> {
@@ -108,13 +195,37 @@ fn read_token(path: &Path) -> anyhow::Result<String> {
     Ok(token.trim_end_matches(['\r', '\n']).to_owned())
 }
 
+fn validate_protected_file(path: &Path) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("cannot inspect principal map {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("principal map {} must be a regular file", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if metadata.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!(
+                "principal map {} must not be accessible by group or other users",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
+    use lake_common::Principal;
     use tempfile::tempdir;
+    use tonic::{Request, service::Interceptor};
 
-    use super::{client_security_from_files, server_security_from_files};
+    use super::{
+        client_security_from_files, server_security_from_files, server_security_from_principal_file,
+    };
 
     #[test]
     fn security_files_require_complete_tls_and_redact_credentials() {
@@ -141,5 +252,34 @@ mod tests {
             "https://127.0.0.1:50052"
         );
         assert!(!format!("{client:?}").contains("deployment-secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_principal_map_loads_protected_tenant_bindings() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().unwrap();
+        let path = root.path().join("principals.json");
+        fs::write(
+            &path,
+            r#"{"bindings":[{"token":"alpha-secret","principal_id":"alice","tenant_id":"alpha","role":"user","namespaces":["alpha"]}]}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let security = server_security_from_principal_file(&path).unwrap();
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert("authorization", "Bearer alpha-secret".parse().unwrap());
+        let accepted = security.interceptor().call(request).unwrap();
+        let principal = accepted.extensions().get::<Principal>().unwrap();
+        assert_eq!(principal.tenant().as_str(), "alpha");
+        assert!(principal.can_access_namespace("alpha"));
+        assert!(!format!("{security:?}").contains("alpha-secret"));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(server_security_from_principal_file(&path).is_err());
     }
 }

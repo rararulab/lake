@@ -22,9 +22,9 @@ reader-proportional metadata traffic or proxying large-object bytes.
   discovery from its cached catalog snapshot. Policy evaluation is local and
   cannot add a per-query metastore lookup.
 - Metasrv independently authorizes DDL, resolve, drop, and FILE append. A
-  trusted Query service principal may carry a delegated end-user tenant header;
-  ordinary principals may not forge delegation. Follower forwarding preserves
-  the already-authorized identity.
+  trusted Query service principal may carry the exact already-authorized
+  namespace; ordinary principals may not forge delegation. Follower forwarding
+  preserves that authorization context.
 - Managed-stage discovery derives an exact tenant child prefix from the
   configured base stage. The SDK continues to validate every DataLocation
   against that scoped prefix and never receives credentials from Lake.

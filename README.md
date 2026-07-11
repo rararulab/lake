@@ -43,10 +43,10 @@ let client = LakeClient::connect("http://127.0.0.1:50051").await?;
 ```
 
 At connection time the SDK asks query for a versioned, credential-free managed
-stage descriptor. Query returns either a local root or the S3 bucket, prefix,
-region, endpoint, and path-style policy configured by the deployment. The SDK
-then opens storage directly. This discovery happens once per client, not per
-query or object read.
+stage descriptor. Query derives `tenants/<tenant-id>` below the configured local
+root or S3 prefix and returns only that child stage's location hints. The SDK
+then opens storage directly and rejects `DataLocation` values outside the child
+prefix. Discovery happens once per client, not per query or object read.
 
 For production S3, configure the query process instead of constructing a stage
 in application code:
@@ -55,7 +55,7 @@ in application code:
 LAKE_S3_BUCKET=embodied-data \
 LAKE_MANAGED_OBJECT_PREFIX=lake/managed-files \
 AWS_REGION=us-east-1 \
-LAKE_AUTH_TOKEN_FILE=/run/secrets/query-token \
+LAKE_AUTH_PRINCIPALS_FILE=/run/secrets/query-principals.json \
 LAKE_TLS_CERT_FILE=/run/tls/query.crt \
 LAKE_TLS_KEY_FILE=/run/tls/query.key \
 LAKE_METADATA_AUTH_TOKEN_FILE=/run/secrets/meta-token \
@@ -70,6 +70,35 @@ process's default credential chain or workload identity; they never enter SQL,
 table rows, or the discovery descriptor. Embedders and tests that need a custom
 backend can use the explicit `LakeClient::connect_with_store` constructor.
 
+The principal map is immutable for the process lifetime and must be a regular
+file with no group/other permissions on Unix (`chmod 600`). Restart replicas to
+rotate it. Tokens are opaque; `role` is one of `user`, `query_service`,
+`metadata_peer`, or `admin`:
+
+```json
+{
+  "bindings": [
+    {
+      "token": "replace-with-secret-from-your-secret-manager",
+      "principal_id": "robotics-ingest",
+      "tenant_id": "acme-robotics",
+      "role": "user",
+      "namespaces": ["acme_episodes", "acme_models"]
+    }
+  ]
+}
+```
+
+Query's map contains SDK/user credentials. Metasrv's map contains the
+Query→Meta credential as `query_service`, follower credentials as
+`metadata_peer`, and any direct administrative identities. Keep each internal
+client token in its existing `LAKE_METADATA_AUTH_TOKEN_FILE` or
+`LAKE_PEER_AUTH_TOKEN_FILE`. `LAKE_AUTH_TOKEN_FILE` remains a backward-compatible
+single deployment-admin credential and is mutually exclusive with the map.
+For S3, also restrict each SDK workload identity to
+`<base-prefix>/tenants/<tenant-id>/*`; the software prefix check is defense in
+depth, not a replacement for IAM.
+
 Production SDK connections verify TLS and send the Query credential on every
 Flight RPC, including discovery, schema lookup, SQL, and FILE append:
 
@@ -83,8 +112,9 @@ let client = LakeClient::builder("https://query.internal:50051")
 ```
 
 Tokens are read from files rather than command-line flags and are redacted from
-all Debug/error output. This deployment credential authenticates the caller;
-tenant catalog/object authorization remains a separate policy layer.
+all Debug/error output. Query authorizes parsed table references before planning;
+Metasrv repeats authorization before registry or engine access. Hidden resources
+return the same `PermissionDenied` response as other authorization failures.
 
 Create the table with a first-class `file` column through either the local or
 remote administrative CLI:
@@ -152,7 +182,8 @@ discovers an `s3://` stage. Non-empty S3 objects stream through
 bounded 5 MiB multipart parts, with incremental SHA-256 and abort-on-error.
 The query service forwards only the Arrow row to the metadata leader;
 video/model bytes travel directly between the SDK and the managed stage.
-Presigned browser access and tenant authorization remain outside this Rust API.
+Tenant child-prefix authorization is enforced by Query, Metasrv, and the SDK;
+presigned browser access remains outside this Rust API.
 
 ## Managed-object garbage collection
 
@@ -206,10 +237,12 @@ lake meta --addr 127.0.0.1:50052
 lake query --addr 127.0.0.1:50051 --metadata-addr http://127.0.0.1:50052
 ```
 
-Plaintext anonymous serving is allowed only on loopback. A non-loopback Query
-or Metasrv listener requires `LAKE_AUTH_TOKEN_FILE`, `LAKE_TLS_CERT_FILE`, and
-`LAKE_TLS_KEY_FILE`. Set `LAKE_ALLOW_INSECURE=true` only when a trusted service
-mesh terminates both TLS and authentication before Lake. Metasrv nodes use
+Plaintext anonymous serving is allowed only on loopback and receives the named
+development principal. A non-loopback Query or Metasrv listener requires either
+`LAKE_AUTH_PRINCIPALS_FILE` or `LAKE_AUTH_TOKEN_FILE`, plus
+`LAKE_TLS_CERT_FILE` and `LAKE_TLS_KEY_FILE`. Set `LAKE_ALLOW_INSECURE=true` only
+when a trusted service mesh terminates both TLS and authentication before Lake.
+Metasrv nodes use
 `LAKE_PEER_AUTH_TOKEN_FILE`, `LAKE_PEER_CA_FILE`, and
 `LAKE_PEER_SERVER_NAME` for follower-to-leader forwarding.
 
