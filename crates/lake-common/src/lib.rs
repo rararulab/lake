@@ -20,9 +20,11 @@
 //! dependencies, so every crate can depend on `lake-common` freely.
 
 mod data_location;
+mod file_write;
 mod ids;
 mod location;
 
 pub use data_location::DataLocation;
+pub use file_write::FileAppendRequest;
 pub use ids::{Namespace, TableName, TableRef, Version};
 pub use location::TableLocation;

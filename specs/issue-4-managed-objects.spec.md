@@ -28,7 +28,9 @@ metadata and RecordBatch streams.
 ## Decisions
 
 - The first public SDK is Rust. Its in-process client is the vertical slice;
-  remote Flight write transport and Python bindings are follow-up work.
+  it connects only to the query Flight endpoint. Query forwards metadata-only
+  file append streams to the leader-aware metadata service; Python bindings
+  remain follow-up work.
 - The accepted SQL subset is one parameterized statement of the form
   `INSERT INTO <namespace>.<table> (<columns...>) VALUES (?, ...)`. Its
   logical large-object type is `FILE`; Rust binds it with
@@ -58,6 +60,8 @@ metadata and RecordBatch streams.
 - `crates/lake-objects/**`
 - `crates/lake-sdk/**`
 - `crates/lake-cli/**`
+- `crates/lake-query/**`
+- `crates/lake-metasrv/**`
 - `README.md`
 - `docs/architecture.md`
 - `docs/design/managed-objects.md`
@@ -66,13 +70,12 @@ metadata and RecordBatch streams.
 - `verification/**`
 
 ### Forbidden
-- `crates/lake-query/**`
-- `crates/lake-metasrv/control.rs`
 - `crates/lake-meta/**`
 - `crates/lake-engine/**`
 - `crates/lake-engine-lance/**`
 - `site/**`
-- Adding a server-side endpoint that receives full object bytes
+- Adding a server-side endpoint that receives full object bytes (metadata-only
+  `DataLocation` append streams are required)
 - Accepting arbitrary object-store URIs or credentials in public SQL
 - Storing expiring signed URLs in Lance rows
 - Changing the registry or table commit protocol
@@ -105,10 +108,19 @@ Scenario: unsupported INSERT syntax is rejected before any upload
   When the Rust SDK receives an object parameter
   Then it returns a syntax error and the managed object prefix is unchanged
 
+Scenario: SDK FILE insert connects only to query
+  Test:
+    Package: lake-sdk
+    Filter: client_connects_only_to_query_for_file_insert
+  Given running query and metadata Flight services plus a managed local stage
+  When the Rust SDK connects with only the query endpoint and inserts a FILE
+  Then the object bytes bypass both services and the metadata leader commits
+  the resulting DataLocation row
+
 ## Out of Scope
 
-- Remote Flight data writes, multipart presigning, resumable cloud uploads,
-  and Python/other language SDKs.
+- Multipart presigning, resumable cloud uploads, and Python/other language
+  SDKs.
 - Authentication, tenant authorization, signed `DataLocation` tickets, and
   direct public query-service exposure.
 - Object GC, deduplication, cross-table transactions, frame decoding, model
