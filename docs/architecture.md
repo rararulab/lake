@@ -128,6 +128,9 @@ The pointer and both deletion states carry a UUIDv7 dataset incarnation.
 Advance and finalize preserve it; recreate generates a new one. Consequently,
 even recreating the same base URI with identical version and path values cannot
 make an old writer's exact guard match again.
+Immutable history records carry the same incarnation. Legacy path-only history
+is accepted and upgraded on first archive/finalize. Finalizer retries converge
+only when both target path and incarnation match, never merely by path.
 
 The fixed pointer is a commit-protocol boundary. A pre-pointer binary can write
 a newer per-version record without advancing it, so commit-capable binaries on

@@ -30,18 +30,21 @@ Issue: #41
 - `stale_recreate_cannot_cross_incarnations` pauses recreate after reading a
   deleted marker, completes another recreate/delete cycle, then proves UUIDv7
   incarnation bytes prevent the stale CAS from matching.
+- `stale_finalize_cannot_cross_incarnations` pauses both current and historical
+  CAS, recreates identical version/path values, and proves old-incarnation
+  finalizers fail instead of falsely converging.
 - Exact current/historical reads, historical backfill, delete, and recreate
   scenarios pass.
-- `cargo test -p lake-engine-lance --lib`: 22/22 PASS.
+- `cargo test -p lake-engine-lance --lib`: 23/23 PASS.
 - Real LocalStack S3 + Dynamo test
   `lance_engine_on_s3_with_dynamo_external_manifest`: PASS; Dynamo contains a
   fixed v2 latest record plus immutable v1 history; drop clears live state and
   history while retaining only the durable `deleted` fence.
 - `cargo clippy -p lake-engine-lance --all-targets -- -D warnings`: PASS.
 - `mise run spec-lifecycle specs/issue-41-manifest-latest-pointer.spec.md`:
-  10/10 PASS with every selector matching a real test.
+  11/11 PASS with every selector matching a real test.
 - Final post-review `mise run gate`: PASS (format, clippy, workspace tests,
-  e2e self-check, and site checks); 89.98s with incarnation-bound pointers.
+  e2e self-check, and site checks); 93.88s with incarnation-bound history.
 
 ## Rollout
 

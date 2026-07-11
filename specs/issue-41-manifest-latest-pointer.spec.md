@@ -39,6 +39,8 @@ may scan once to install the pointer; steady-state reads may not scan.
 - Fixed pointers and delete markers carry a dataset incarnation. Advance and
   finalize preserve it; recreate generates a new incarnation, so exact bytes
   never repeat across delete/recreate cycles even when version and path do.
+- History records carry the same incarnation. Legacy path-only records are
+  upgraded lazily; finalize convergence requires both incarnation and path.
 - If latest is absent but legacy history exists, scan once, CAS-install the
   maximum record, and let racing migrators converge on the installed value.
 - This commit-protocol boundary is not mixed-writer compatible: pre-#41
@@ -145,6 +147,14 @@ Scenario: Recreate changes incarnation and defeats cross-cycle ABA
   Given a recreate has read a deleted marker and then pauses
   When another recreate and delete cycle completes at the same base URI
   Then the stale recreate cannot match the new incarnation-bound marker
+
+Scenario: Finalizers cannot converge across incarnations
+  Test:
+    Package: lake-engine-lance
+    Filter: stale_finalize_cannot_cross_incarnations
+  Given a current or historical finalizer pauses after reading the old incarnation
+  When delete and same-URI recreate install the same version and final path
+  Then the stale finalizer fails because pointer and history identity changed
 
 ## Out of Scope
 

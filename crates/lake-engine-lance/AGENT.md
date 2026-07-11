@@ -23,6 +23,8 @@ Lance dataset.
   bytes, preventing a writer that read before drop from publishing afterward.
 - Fixed pointers and delete markers carry a UUIDv7 incarnation. Recreate gets a
   new one, so identical version/path bytes cannot produce cross-cycle ABA.
+- Historical records carry the same incarnation (legacy path-only records are
+  upgraded lazily), so finalize convergence cannot cross a recreate boundary.
 
 ## Layout
 

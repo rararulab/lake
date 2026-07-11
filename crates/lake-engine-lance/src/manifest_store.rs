@@ -58,7 +58,9 @@ const LATEST_KEY_PREFIX: &str = "lance-manifest-latest";
 /// The JSON value persisted per `(base_uri, version)`.
 #[derive(Serialize, Deserialize)]
 struct ManifestPointer {
-    path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    incarnation: Option<String>,
+    path:        String,
 }
 
 /// The mutable current-version claim read on every dataset open.
@@ -210,7 +212,7 @@ impl MetaManifestStore {
 
     async fn archive_latest(&self, base_uri: &str, latest: &LatestState) -> Result<()> {
         let key = Self::version_key(base_uri, latest.pointer.version);
-        let value = encode(&latest.pointer.path)?;
+        let value = encode(&latest.pointer.path, &latest.pointer.incarnation)?;
         let latest_key = Self::latest_key(base_uri);
         if self
             .meta
@@ -222,6 +224,42 @@ impl MetaManifestStore {
             ))
             .await
             .map_err(store_err)?
+        {
+            return Ok(());
+        }
+        let Some(current) = self.meta.get(&key).await.map_err(store_err)? else {
+            return Err(Error::io(format!(
+                "manifest archive conflicts: {base_uri}@{}",
+                latest.pointer.version
+            )));
+        };
+        if current == value {
+            return Ok(());
+        }
+        let installed = decode_manifest(&current)?;
+        if installed.path != latest.pointer.path
+            || installed
+                .incarnation
+                .as_deref()
+                .is_some_and(|incarnation| incarnation != latest.pointer.incarnation)
+        {
+            return Err(Error::io(format!(
+                "manifest archive conflicts: {base_uri}@{}",
+                latest.pointer.version
+            )));
+        }
+        if installed.incarnation.is_none()
+            && self
+                .meta
+                .guarded_mutate(GuardedMutation::update(
+                    &latest_key,
+                    &latest.bytes,
+                    &key,
+                    &current,
+                    &value,
+                ))
+                .await
+                .map_err(store_err)?
         {
             return Ok(());
         }
@@ -244,12 +282,19 @@ impl MetaManifestStore {
         let Some(current) = self.meta.get(&key).await.map_err(store_err)? else {
             return Ok(());
         };
-        let expected = encode(&latest.pointer.path)?;
-        let value = encode(final_path)?;
-        if current == value {
+        let installed = decode_manifest(&current)?;
+        let value = encode(final_path, &latest.pointer.incarnation)?;
+        if installed.path == final_path
+            && installed.incarnation.as_deref() == Some(&latest.pointer.incarnation)
+        {
             return Ok(());
         }
-        if current != expected {
+        if installed.path != latest.pointer.path
+            || installed
+                .incarnation
+                .as_deref()
+                .is_some_and(|incarnation| incarnation != latest.pointer.incarnation)
+        {
             return Err(Error::io(format!(
                 "manifest latest archive conflicts: {base_uri}@{}",
                 latest.pointer.version
@@ -264,7 +309,14 @@ impl MetaManifestStore {
             return Ok(());
         }
         match self.meta.get(&key).await.map_err(store_err)? {
-            Some(installed) if installed == value => Ok(()),
+            Some(installed)
+                if decode_manifest(&installed).is_ok_and(|pointer| {
+                    pointer.path == final_path
+                        && pointer.incarnation.as_deref() == Some(&latest.pointer.incarnation)
+                }) =>
+            {
+                Ok(())
+            }
             _ => Err(Error::io(format!(
                 "manifest latest archive finalize raced: {base_uri}@{}",
                 latest.pointer.version
@@ -276,18 +328,27 @@ impl MetaManifestStore {
 /// Lift a KV failure into Lance's error type so the commit loop can surface it.
 fn store_err(source: MetaError) -> Error { Error::io_source(Box::new(source)) }
 
-fn encode(path: &str) -> Result<Vec<u8>> {
+fn encode(path: &str, incarnation: &str) -> Result<Vec<u8>> {
     serde_json::to_vec(&ManifestPointer {
-        path: path.to_owned(),
+        incarnation: Some(incarnation.to_owned()),
+        path:        path.to_owned(),
     })
     .map_err(|e| Error::invalid_input(e.to_string()))
 }
 
-fn decode(bytes: &[u8]) -> Result<String> {
-    let pointer: ManifestPointer =
-        serde_json::from_slice(bytes).map_err(|e| Error::invalid_input(e.to_string()))?;
-    Ok(pointer.path)
+fn encode_legacy(path: &str) -> Result<Vec<u8>> {
+    serde_json::to_vec(&ManifestPointer {
+        incarnation: None,
+        path:        path.to_owned(),
+    })
+    .map_err(|e| Error::invalid_input(e.to_string()))
 }
+
+fn decode_manifest(bytes: &[u8]) -> Result<ManifestPointer> {
+    serde_json::from_slice(bytes).map_err(|e| Error::invalid_input(e.to_string()))
+}
+
+fn decode(bytes: &[u8]) -> Result<String> { Ok(decode_manifest(bytes)?.path) }
 
 fn encode_latest(pointer: &LatestManifestPointer) -> Result<Vec<u8>> {
     serde_json::to_vec(pointer).map_err(|e| Error::invalid_input(e.to_string()))
@@ -364,7 +425,7 @@ impl ExternalManifestStore for MetaManifestStore {
             }
             LatestResolution::Present(latest) if version < latest.pointer.version => {
                 let key = Self::version_key(base_uri, version);
-                let value = encode(path)?;
+                let value = encode(path, &latest.pointer.incarnation)?;
                 if self
                     .meta
                     .guarded_mutate(GuardedMutation::create(
@@ -452,6 +513,7 @@ impl ExternalManifestStore for MetaManifestStore {
                     return Ok(());
                 }
                 if let Some(LatestRecord::Pointer(installed)) = self.read_latest(base_uri).await?
+                    && installed.pointer.incarnation == latest.pointer.incarnation
                     && installed.pointer.version == version
                     && installed.pointer.path == path
                 {
@@ -463,7 +525,17 @@ impl ExternalManifestStore for MetaManifestStore {
                 let Some(current) = self.meta.get(&key).await.map_err(store_err)? else {
                     return Err(Error::not_found(format!("{base_uri}@{version}")));
                 };
-                let value = encode(path)?;
+                let current_pointer = decode_manifest(&current)?;
+                if current_pointer
+                    .incarnation
+                    .as_deref()
+                    .is_some_and(|incarnation| incarnation != latest.pointer.incarnation)
+                {
+                    return Err(Error::io(format!(
+                        "manifest finalize crossed incarnation: {base_uri}@{version}"
+                    )));
+                }
+                let value = encode(path, &latest.pointer.incarnation)?;
                 if self
                     .meta
                     .cas(&key, Some(&current), &value)
@@ -472,7 +544,12 @@ impl ExternalManifestStore for MetaManifestStore {
                 {
                     return Ok(());
                 }
-                if self.meta.get(&key).await.map_err(store_err)?.as_deref() == Some(&value) {
+                if let Some(installed) = self.meta.get(&key).await.map_err(store_err)?
+                    && decode_manifest(&installed).is_ok_and(|pointer| {
+                        pointer.path == path
+                            && pointer.incarnation.as_deref() == Some(&latest.pointer.incarnation)
+                    })
+                {
                     return Ok(());
                 }
             }
@@ -647,6 +724,9 @@ mod tests {
         finalize_cas_arrivals:  AtomicUsize,
         finalize_cas_entered:   Notify,
         finalize_cas_release:   Semaphore,
+        block_stale_finalize:   AtomicBool,
+        stale_finalize_entered: Notify,
+        stale_finalize_release: Notify,
     }
 
     #[async_trait]
@@ -684,6 +764,15 @@ mod tests {
             {
                 self.recreate_cas_entered.notify_one();
                 self.recreate_cas_release.notified().await;
+            }
+            if expected.is_some()
+                && new
+                    .windows(b"same-final.manifest".len())
+                    .any(|part| part == b"same-final.manifest")
+                && self.block_stale_finalize.swap(false, Ordering::SeqCst)
+            {
+                self.stale_finalize_entered.notify_one();
+                self.stale_finalize_release.notified().await;
             }
             if expected.is_some()
                 && new
@@ -746,6 +835,9 @@ mod tests {
             finalize_cas_arrivals:  AtomicUsize::new(0),
             finalize_cas_entered:   Notify::new(),
             finalize_cas_release:   Semaphore::new(0),
+            block_stale_finalize:   AtomicBool::new(false),
+            stale_finalize_entered: Notify::new(),
+            stale_finalize_release: Notify::new(),
         });
         (MetaManifestStore::new(meta.clone()), meta, dir)
     }
@@ -831,7 +923,7 @@ mod tests {
             meta.cas(
                 &legacy_key,
                 None,
-                &encode("v1.manifest").expect("legacy pointer")
+                &encode_legacy("v1.manifest").expect("legacy pointer")
             )
             .await
             .expect("legacy write")
@@ -1015,6 +1107,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_finalize_cannot_cross_incarnations() {
+        let (store, meta, _dir) = blocking_store();
+        let store = Arc::new(store);
+
+        store
+            .put_if_not_exists("stale-current", 1, "staging.manifest", 4, None)
+            .await
+            .expect("old current staging");
+        meta.block_stale_finalize.store(true, Ordering::SeqCst);
+        let stale_current = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .put_if_exists("stale-current", 1, "same-final.manifest", 4, None)
+                    .await
+            })
+        };
+        meta.stale_finalize_entered.notified().await;
+        store
+            .delete("stale-current")
+            .await
+            .expect("delete old current");
+        store
+            .put_if_not_exists("stale-current", 1, "staging.manifest", 4, None)
+            .await
+            .expect("recreate current");
+        store
+            .put_if_exists("stale-current", 1, "same-final.manifest", 4, None)
+            .await
+            .expect("finalize new current to same path");
+        meta.stale_finalize_release.notify_one();
+        assert!(
+            stale_current.await.expect("stale current task").is_err(),
+            "current finalizer must not converge across incarnations"
+        );
+
+        store
+            .put_if_not_exists("stale-history", 1, "staging.manifest", 4, None)
+            .await
+            .expect("old historical staging");
+        store
+            .put_if_not_exists("stale-history", 2, "v2.staging", 4, None)
+            .await
+            .expect("archive old historical staging");
+        meta.block_stale_finalize.store(true, Ordering::SeqCst);
+        let stale_history = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .put_if_exists("stale-history", 1, "same-final.manifest", 4, None)
+                    .await
+            })
+        };
+        meta.stale_finalize_entered.notified().await;
+        store
+            .delete("stale-history")
+            .await
+            .expect("delete old history");
+        store
+            .put_if_not_exists("stale-history", 1, "staging.manifest", 4, None)
+            .await
+            .expect("recreate history v1");
+        store
+            .put_if_not_exists("stale-history", 2, "v2.staging", 4, None)
+            .await
+            .expect("archive new history v1");
+        store
+            .put_if_exists("stale-history", 1, "same-final.manifest", 4, None)
+            .await
+            .expect("finalize new history to same path");
+        meta.stale_finalize_release.notify_one();
+        assert!(
+            stale_history.await.expect("stale history task").is_err(),
+            "historical finalizer must not converge across incarnations"
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_finalize_converges_on_same_path() {
         async fn finalize_twice(
             store: Arc<MetaManifestStore>,
@@ -1089,9 +1259,13 @@ mod tests {
 
         let key = MetaManifestStore::version_key("legacy-finalize", 1);
         assert!(
-            meta.cas(&key, None, &encode("staging.manifest").expect("pointer"))
-                .await
-                .expect("legacy staging")
+            meta.cas(
+                &key,
+                None,
+                &encode_legacy("staging.manifest").expect("pointer")
+            )
+            .await
+            .expect("legacy staging")
         );
         store
             .get_latest_version("legacy-finalize")
@@ -1206,7 +1380,7 @@ mod tests {
         for (version, path) in [(1, "v1.manifest"), (2, "v2.manifest")] {
             let key = MetaManifestStore::version_key("legacy-ds", version);
             assert!(
-                meta.cas(&key, None, &encode(path).expect("pointer"))
+                meta.cas(&key, None, &encode_legacy(path).expect("pointer"))
                     .await
                     .expect("legacy write")
             );
@@ -1235,7 +1409,7 @@ mod tests {
         let (store, meta, _dir) = counting_store();
         let key = MetaManifestStore::version_key("legacy-stage", 1);
         assert!(
-            meta.cas(&key, None, &encode("v1.staging").expect("pointer"))
+            meta.cas(&key, None, &encode_legacy("v1.staging").expect("pointer"))
                 .await
                 .expect("legacy write")
         );
