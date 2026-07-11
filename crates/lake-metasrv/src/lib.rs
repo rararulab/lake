@@ -267,7 +267,7 @@ impl MaintenanceLimits {
 impl Default for MaintenanceLimits {
     fn default() -> Self {
         Self {
-            interval:        Duration::from_secs(60),
+            interval:        Duration::from_mins(1),
             table_page_size: 128,
         }
     }
