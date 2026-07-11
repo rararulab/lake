@@ -42,6 +42,12 @@ pub enum MetaError {
         message: String,
         source:  Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("invalid guarded mutation: guard and target keys must differ"))]
+    InvalidGuardedMutation,
+
+    #[snafu(display("metastore backend does not support atomic guarded mutations"))]
+    GuardedMutationUnsupported,
 }
 
 pub type Result<T> = std::result::Result<T, MetaError>;

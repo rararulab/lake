@@ -248,12 +248,24 @@ surfaced through `lake-catalog`.
 - **Query layer**: stateless → N replicas behind a load balancer.
 - **Metadata layer**: leader + standby; leader elected via a lease in the
   HA KV (GreptimeDB's `election` pattern). Durable state lives in the KV, so
-  a failed leader loses no data — a standby takes the lease and resumes.
+  a failed leader loses no data — a standby takes the lease and resumes. The
+  lease record carries a monotonic fencing epoch. `MetaStore::guarded_mutate`
+  atomically checks the exact lease record together with an exact target
+  create, update, or delete: RocksDB uses one writer critical section and
+  write batch; DynamoDB uses one `TransactWriteItems` request. Backends without
+  a native atomic implementation fail closed.
 - **Metastore**: DynamoDB is multi-AZ HA by construction; RocksDB is
   single-node, dev only.
 
 No self-built consensus: read HA comes from stateless replicas, write HA
 from lease-election over an already-HA KV.
+
+The guarded mutation is the durable fencing primitive, not yet the complete
+write-path integration. Registry create/version/delete, append-operation
+records, and maintenance must pass their observed lease bytes into it before
+the epoch fences every metadata publication. Destructive table drop also
+requires a durable tombstone because object deletion cannot share the KV
+transaction; that recovery protocol is separate follow-up work.
 
 ## Deliberate simplifications (ponytail markers)
 

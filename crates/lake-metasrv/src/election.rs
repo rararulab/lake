@@ -55,6 +55,10 @@ pub enum ElectionError {
     /// The stored lease value could not be decoded from JSON.
     #[snafu(display("failed to decode lease value at '{LEASE_KEY}'"))]
     Decode { source: serde_json::Error },
+
+    /// The fencing epoch cannot advance without wrapping.
+    #[snafu(display("lease fencing epoch exhausted"))]
+    EpochExhausted,
 }
 
 /// Election result alias.
@@ -71,6 +75,11 @@ pub struct LeaseValue {
     pub holder:        String,
     /// Absolute expiry, in milliseconds since the Unix epoch.
     pub expires_at_ms: u64,
+    /// Monotonic fencing token. Missing legacy values deserialize as zero and
+    /// are upgraded to one by the next successful campaign from the holder or
+    /// a successor.
+    #[serde(default)]
+    pub epoch:         u64,
 }
 
 /// The outcome of a single campaign round.
@@ -80,6 +89,8 @@ pub enum LeaseStatus {
     Leader {
         /// Absolute expiry of the lease this node now holds.
         expires_at_ms: u64,
+        /// Durable fencing epoch held by this node.
+        epoch:         u64,
     },
     /// Another node holds the lease.
     Follower {
@@ -123,21 +134,22 @@ impl LeaseElection {
     pub(crate) fn ttl(&self) -> Duration { self.ttl }
 
     /// Read and decode the current lease, if any.
-    async fn read_lease(&self) -> Result<Option<LeaseValue>> {
+    async fn read_lease(&self) -> Result<Option<(LeaseValue, Vec<u8>)>> {
         match self.meta.get(LEASE_KEY).await.context(StoreSnafu)? {
             Some(bytes) => {
                 let value = serde_json::from_slice(&bytes).context(DecodeSnafu)?;
-                Ok(Some(value))
+                Ok(Some((value, bytes)))
             }
             None => Ok(None),
         }
     }
 
     /// Build the lease this node would install at `now_ms`.
-    fn our_lease(&self, now_ms: u64) -> LeaseValue {
+    fn our_lease(&self, now_ms: u64, epoch: u64) -> LeaseValue {
         LeaseValue {
-            holder:        self.node_id.clone(),
+            holder: self.node_id.clone(),
             expires_at_ms: now_ms.saturating_add(self.ttl_ms()),
+            epoch,
         }
     }
 
@@ -153,12 +165,11 @@ impl LeaseElection {
     /// - it is held by another but expired → steal it.
     /// - it is held by another and still valid → [`LeaseStatus::Follower`].
     pub async fn campaign_at(&self, now_ms: u64) -> Result<LeaseStatus> {
-        let new_lease = self.our_lease(now_ms);
-        let new_bytes = serde_json::to_vec(&new_lease).context(EncodeSnafu)?;
-
         match self.read_lease().await? {
             // No lease yet: try to install ours from the empty state.
             None => {
+                let new_lease = self.our_lease(now_ms, 1);
+                let new_bytes = serde_json::to_vec(&new_lease).context(EncodeSnafu)?;
                 if self
                     .meta
                     .cas(LEASE_KEY, None, &new_bytes)
@@ -167,20 +178,32 @@ impl LeaseElection {
                 {
                     Ok(LeaseStatus::Leader {
                         expires_at_ms: new_lease.expires_at_ms,
+                        epoch:         new_lease.epoch,
                     })
                 } else {
                     // Lost the install race: someone else got in first.
                     self.follower_after_lost_race().await
                 }
             }
-            Some(current) => {
+            Some((current, old_bytes)) => {
                 let held_by_us = current.holder == self.node_id;
                 let expired = current.expires_at_ms <= now_ms;
                 if held_by_us || expired {
+                    let epoch = if held_by_us {
+                        current.epoch.max(1)
+                    } else if current.epoch == 0 {
+                        1
+                    } else {
+                        current
+                            .epoch
+                            .checked_add(1)
+                            .ok_or(ElectionError::EpochExhausted)?
+                    };
+                    let new_lease = self.our_lease(now_ms, epoch);
+                    let new_bytes = serde_json::to_vec(&new_lease).context(EncodeSnafu)?;
                     // Renew (ours) or steal (expired other): CAS from the
                     // exact observed bytes so a concurrent writer can't be
                     // clobbered.
-                    let old_bytes = serde_json::to_vec(&current).context(EncodeSnafu)?;
                     if self
                         .meta
                         .cas(LEASE_KEY, Some(&old_bytes), &new_bytes)
@@ -189,6 +212,7 @@ impl LeaseElection {
                     {
                         Ok(LeaseStatus::Leader {
                             expires_at_ms: new_lease.expires_at_ms,
+                            epoch:         new_lease.epoch,
                         })
                     } else {
                         self.follower_after_lost_race().await
@@ -210,7 +234,7 @@ impl LeaseElection {
         let current_holder = self
             .read_lease()
             .await?
-            .map_or_else(String::new, |lease| lease.holder);
+            .map_or_else(String::new, |(lease, _)| lease.holder);
         Ok(LeaseStatus::Follower { current_holder })
     }
 
@@ -232,7 +256,7 @@ impl LeaseElection {
         Ok(self
             .read_lease()
             .await?
-            .and_then(|lease| (lease.expires_at_ms > now_ms).then_some(lease.holder)))
+            .and_then(|(lease, _)| (lease.expires_at_ms > now_ms).then_some(lease.holder)))
     }
 
     /// Resign at the injected clock `now_ms`: if this node holds the lease,
@@ -240,7 +264,7 @@ impl LeaseElection {
     /// campaign instead of waiting out the full TTL. Returns whether we held
     /// and released the lease.
     pub async fn resign_at(&self, now_ms: u64) -> Result<bool> {
-        let Some(current) = self.read_lease().await? else {
+        let Some((current, old_bytes)) = self.read_lease().await? else {
             return Ok(false);
         };
         if current.holder != self.node_id {
@@ -249,8 +273,8 @@ impl LeaseElection {
         let released = LeaseValue {
             holder:        self.node_id.clone(),
             expires_at_ms: now_ms,
+            epoch:         current.epoch,
         };
-        let old_bytes = serde_json::to_vec(&current).context(EncodeSnafu)?;
         let new_bytes = serde_json::to_vec(&released).context(EncodeSnafu)?;
         self.meta
             .cas(LEASE_KEY, Some(&old_bytes), &new_bytes)
@@ -279,7 +303,7 @@ mod tests {
     use lake_meta::{MetaStoreRef, RocksMeta};
     use tempfile::TempDir;
 
-    use super::{Duration, LeaseElection, LeaseStatus};
+    use super::{Duration, LEASE_KEY, LeaseElection, LeaseStatus, LeaseValue};
 
     const TTL_MS: u64 = 10_000;
 
@@ -304,6 +328,7 @@ mod tests {
             a.campaign_at(0).await.expect("a campaigns"),
             LeaseStatus::Leader {
                 expires_at_ms: TTL_MS,
+                epoch:         1,
             }
         );
         assert!(a.campaign_at(0).await.expect("a status").is_leader());
@@ -319,6 +344,7 @@ mod tests {
             a.campaign_at(1000).await.expect("a renews"),
             LeaseStatus::Leader {
                 expires_at_ms: 1000 + TTL_MS,
+                epoch:         1,
             }
         );
 
@@ -335,6 +361,7 @@ mod tests {
             b.campaign_at(20_000).await.expect("b steals"),
             LeaseStatus::Leader {
                 expires_at_ms: 20_000 + TTL_MS,
+                epoch:         2,
             }
         );
         assert_eq!(
@@ -342,6 +369,66 @@ mod tests {
             LeaseStatus::Follower {
                 current_holder: "b".to_string(),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_epoch_advances_only_on_takeover() {
+        let (_dir, meta) = shared_store();
+        let a = election(&meta, "a");
+        let b = election(&meta, "b");
+
+        let legacy = br#"{"holder":"a","expires_at_ms":10000}"#;
+        assert!(
+            meta.cas(LEASE_KEY, None, legacy)
+                .await
+                .expect("seed legacy")
+        );
+        assert_eq!(
+            a.campaign_at(100).await.expect("upgrade legacy renewal"),
+            LeaseStatus::Leader {
+                expires_at_ms: 100 + TTL_MS,
+                epoch:         1,
+            }
+        );
+        assert_eq!(
+            a.campaign_at(200).await.expect("renew epoch 1"),
+            LeaseStatus::Leader {
+                expires_at_ms: 200 + TTL_MS,
+                epoch:         1,
+            }
+        );
+        assert_eq!(
+            b.campaign_at(20_000).await.expect("take over"),
+            LeaseStatus::Leader {
+                expires_at_ms: 20_000 + TTL_MS,
+                epoch:         2,
+            }
+        );
+
+        let current_bytes = meta.get(LEASE_KEY).await.expect("read lease").unwrap();
+        let exhausted = LeaseValue {
+            holder:        "b".to_owned(),
+            expires_at_ms: 20_000,
+            epoch:         u64::MAX,
+        };
+        let exhausted_bytes = serde_json::to_vec(&exhausted).unwrap();
+        assert!(
+            meta.cas(LEASE_KEY, Some(&current_bytes), &exhausted_bytes)
+                .await
+                .expect("install exhausted lease")
+        );
+        let error = a
+            .campaign_at(20_001)
+            .await
+            .expect_err("epoch exhaustion must fail closed");
+        assert!(matches!(error, super::ElectionError::EpochExhausted));
+        assert_eq!(
+            meta.get(LEASE_KEY)
+                .await
+                .expect("read unchanged")
+                .as_deref(),
+            Some(exhausted_bytes.as_slice())
         );
     }
 
@@ -384,6 +471,7 @@ mod tests {
             b.campaign_at(300).await.expect("b takes over"),
             LeaseStatus::Leader {
                 expires_at_ms: 300 + TTL_MS,
+                epoch:         2,
             }
         );
     }

@@ -19,9 +19,99 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::error::Result;
+use crate::error::{MetaError, Result};
 
 pub type MetaStoreRef = Arc<dyn MetaStore>;
+
+/// One exact target transition protected by an exact guard value.
+///
+/// Constructors enforce that create, update, and delete always carry the
+/// target condition required for an atomic compare-and-set. Backends must
+/// check the guard and target condition in the same transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardedMutation<'a> {
+    pub(crate) guard_key:      &'a str,
+    pub(crate) guard_expected: &'a [u8],
+    pub(crate) target_key:     &'a str,
+    pub(crate) target:         GuardedTarget<'a>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GuardedTarget<'a> {
+    Put {
+        expected: Option<&'a [u8]>,
+        value:    &'a [u8],
+    },
+    Delete {
+        expected: &'a [u8],
+    },
+}
+
+impl<'a> GuardedMutation<'a> {
+    /// Create an absent target while the guard has `guard_expected`.
+    #[must_use]
+    pub const fn create(
+        guard_key: &'a str,
+        guard_expected: &'a [u8],
+        target_key: &'a str,
+        value: &'a [u8],
+    ) -> Self {
+        Self {
+            guard_key,
+            guard_expected,
+            target_key,
+            target: GuardedTarget::Put {
+                expected: None,
+                value,
+            },
+        }
+    }
+
+    /// Replace an exact target value while the guard has `guard_expected`.
+    #[must_use]
+    pub const fn update(
+        guard_key: &'a str,
+        guard_expected: &'a [u8],
+        target_key: &'a str,
+        target_expected: &'a [u8],
+        value: &'a [u8],
+    ) -> Self {
+        Self {
+            guard_key,
+            guard_expected,
+            target_key,
+            target: GuardedTarget::Put {
+                expected: Some(target_expected),
+                value,
+            },
+        }
+    }
+
+    /// Delete an exact target value while the guard has `guard_expected`.
+    #[must_use]
+    pub const fn delete(
+        guard_key: &'a str,
+        guard_expected: &'a [u8],
+        target_key: &'a str,
+        target_expected: &'a [u8],
+    ) -> Self {
+        Self {
+            guard_key,
+            guard_expected,
+            target_key,
+            target: GuardedTarget::Delete {
+                expected: target_expected,
+            },
+        }
+    }
+
+    pub(crate) fn validate(self) -> Result<Self> {
+        if self.guard_key == self.target_key {
+            return Err(MetaError::InvalidGuardedMutation);
+        }
+        Ok(self)
+    }
+}
 
 /// One bounded page from a prefix scan. The continuation token is opaque to
 /// callers and may be passed back only with the same prefix.
@@ -63,6 +153,17 @@ pub trait MetaStore: Send + Sync {
     /// Atomic compare-and-set. `expected = None` means "key must not exist".
     /// Returns false if the current value didn't match.
     async fn cas(&self, key: &str, expected: Option<&[u8]>, new: &[u8]) -> Result<bool>;
+
+    /// Apply a target transition only when both its expected state and an
+    /// independent guard value match. Both checks and the write are atomic.
+    ///
+    /// Backends must override this with a native transaction. The default is
+    /// deliberately fail-closed; a read followed by [`Self::cas`] is not an
+    /// implementation of this contract.
+    async fn guarded_mutate(&self, mutation: GuardedMutation<'_>) -> Result<bool> {
+        mutation.validate()?;
+        Err(MetaError::GuardedMutationUnsupported)
+    }
 
     /// List keys under a prefix, prefix stripped.
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>>;
