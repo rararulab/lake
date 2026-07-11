@@ -3,14 +3,14 @@
 - verdict: **PASS**
 - score_authority: `verifier`
 - base_sha: `6a2d94046a8f0d9ed24f53a3bd9c46e1689b8df5`
-- head_sha: `e7cc17bebd9b67cc0ddafae9fcb056803bf28998`
+- head_sha: `f1ff39dfb62a22be520e39cc6334eb01049e2005`
 - implementer_evidence: not consulted; commands were rerun independently from a clean workspace
 
 ## Revision and boundary
 
-- `jj st` was clean before verification and `@-` was exactly candidate `e7cc17be`.
-- The candidate contains one conventional commit: `feat(observability): expose bounded Prometheus metrics (#69)`.
-- The 21 changed paths are all inside the spec allowlist: root Cargo files, README, Query/Metasrv/CLI crates, the two allowed docs, the issue plan, and the issue spec. No forbidden common/flight/meta/sdk, wire-format, Kubernetes, or OTLP path changed.
+- `jj st` was clean before incremental verification and `@-` was exactly candidate `f1ff39df`.
+- The candidate chain contains the conventional feature commit plus `fix(observability): harden metrics lifecycle coverage (#69)`.
+- The incremental `e7cc17be..f1ff39df` diff changes only CLI/Query/Metasrv implementation and tests, the CLI guide, issue spec, and this verification record. The final diff remains entirely inside the spec allowlist; no forbidden common/flight/meta/sdk, wire-format, Kubernetes, or OTLP path changed.
 
 ## Selector transition and lifecycle
 
@@ -26,8 +26,9 @@
 
 - Metrics remain opt-in: no recorder or HTTP listener is created when `LAKE_METRICS_ADDR` is absent.
 - Address parsing requires a literal IP socket and `ip().is_loopback()`. Hostnames, wildcard addresses, and non-loopback IPs fail before the Flight server future is constructed or polled.
-- The Axum router registers only `GET /metrics`; other paths and methods receive non-success routing responses. Exposition uses Prometheus text content type.
-- The scrape listener and 30-second exporter upkeep loop run in one owned task. CLI cancellation drives both Flight and metrics shutdown; every server, shutdown, and metrics-failure branch cancels and joins the metrics task before return. Listener release is asserted by rebinding the socket.
+- The Axum router now dispatches all methods explicitly and serves exposition only when `method == GET` on `/metrics`. The selector proves GET returns 200, HEAD and POST return 405, and an unrelated GET path returns 404. Exposition uses Prometheus text content type.
+- The scrape listener and 30-second exporter upkeep loop are no longer placed in a detached spawned task. The metrics future is pinned inside and owned directly by the outer server future. The selector aborts that outer future and proves the listener becomes immediately re-bindable, covering cancellation-by-drop as well as ordinary joined shutdown.
+- Query metrics are now exercised through the production `serve_with_config_and_shutdown` path for initial refresh/readiness and shutdown withdrawal, plus the production catalog refresh loop for a background failure. Metasrv metrics are exercised through production `campaign_once`, bounded `sweep`, and the health-readiness monitor rather than direct telemetry helper calls.
 - Query labels are limited to static admission, rejection, refresh phase, and outcome states. Metasrv labels are limited to static admission, campaign, maintenance stage, and outcome states. Call-site review found no SQL, tenant, namespace, table, URI, credential, operation ID, or arbitrary path value used as a label. Global labels are fixed service identity and build version.
 - README and CLI/architecture docs cover the opt-in loopback address, localhost sidecar/node-agent model, endpoint, exported series and semantics, forbidden labels, and owned lifecycle.
 
@@ -39,11 +40,11 @@
 - `cargo test -p lake-query`: PASS (34 unit + 1 integration).
 - `cargo test -p lake-metasrv`: PASS (61 unit passed, 1 explicit LocalStack-only ignored; 5 integration passed).
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: PASS.
-- Cold-state `mise run gate`: PASS in 27.47s.
-- `mise run ci`: PASS in 37.39s, including rustdoc with warnings denied, spec self-test, site checks, CLI e2e, workspace tests, and 14/14 LocalStack integration tests.
-- `mise run check-commits '6a2d9404..e7cc17be'`: PASS.
+- Latest-head `mise run gate`: PASS in 32.12s after removing `data/`.
+- Earlier full `mise run ci` evidence on the feature candidate passed in 37.39s, including rustdoc with warnings denied, spec self-test, site checks, CLI e2e, workspace tests, and 14/14 LocalStack integration tests. Per incremental-verification direction it was not repeated after the test/lifecycle-only hardening commit; the latest full workspace gate was repeated and passed.
+- `mise run check-commits '6a2d9404..e7cc17be'`: PASS for the feature commit; the incremental fix subject is also conventional by inspection.
 - `mise run ship` was not invoked because its final command is `jj git push`, which verifier instructions forbid. All non-mutating ship components (`ci` and candidate-range commit validation) were run independently and passed.
 
 ## Verdict
 
-**PASS.** Candidate `e7cc17be` satisfies the three bound scenarios, stays within the declared boundary, keeps the scrape surface loopback-only and lifecycle-owned, exports bounded labels, documents the operational contract, and passes focused, package, strict lint, guarded lifecycle, gate, and full local CI verification.
+**PASS.** Candidate `f1ff39df` satisfies the three bound scenarios, stays within the declared boundary, strictly limits exposition to `GET /metrics`, releases the listener when the owning future is aborted, exercises Query and Metasrv production transitions, exports bounded labels, documents the operational contract, and passes the latest focused, strict lint, guarded lifecycle, and full workspace gate verification.
