@@ -21,7 +21,11 @@
 //! data. Only the statement path is overridden — every other Flight SQL method
 //! keeps its trait default (an `unimplemented` [`Status`]).
 
-use std::{pin::Pin, sync::Arc};
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use arrow_flight::{
     Action, ActionType, FlightClient, FlightDescriptor, FlightEndpoint, FlightInfo,
@@ -41,9 +45,48 @@ use lake_common::{
 };
 use lake_flight::ClientSecurity;
 use prost::Message;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::QueryEngine;
+use crate::{QueryEngine, QueryLimits};
+
+#[derive(Clone, Debug)]
+pub(crate) struct QueryAdmission {
+    semaphore: Arc<Semaphore>,
+    limits:    QueryLimits,
+}
+
+impl QueryAdmission {
+    pub(crate) fn new(limits: QueryLimits) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(limits.max_concurrent())),
+            limits,
+        }
+    }
+
+    async fn acquire(&self) -> std::result::Result<OwnedSemaphorePermit, Status> {
+        tokio::time::timeout(
+            self.limits.queue_wait(),
+            self.semaphore.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| Status::resource_exhausted("query concurrency limit reached"))?
+        .map_err(|_| Status::unavailable("query admission is shutting down"))
+    }
+}
+
+struct AdmittedFlightStream {
+    inner:   <FlightSqlServiceImpl as FlightService>::DoGetStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Stream for AdmittedFlightStream {
+    type Item = std::result::Result<arrow_flight::FlightData, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(context)
+    }
+}
 
 /// A Flight SQL service backed by a stateless [`QueryEngine`].
 pub struct FlightSqlServiceImpl {
@@ -55,6 +98,8 @@ pub struct FlightSqlServiceImpl {
     pub metadata_security: ClientSecurity,
     /// Immutable, credential-free stage metadata advertised to SDK clients.
     pub managed_stage:     Option<ManagedStageDescriptor>,
+    /// Process-local admission shared by SQL statement RPCs.
+    pub(crate) admission:  QueryAdmission,
 }
 
 impl FlightSqlServiceImpl {
@@ -118,6 +163,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         ticket: TicketStatementQuery,
         _request: Request<Ticket>,
     ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let permit = self.admission.acquire().await?;
         let sql = String::from_utf8(ticket.statement_handle.to_vec())
             .map_err(|e| Status::invalid_argument(format!("ticket is not utf-8: {e}")))?;
 
@@ -130,7 +176,10 @@ impl FlightSqlService for FlightSqlServiceImpl {
             .with_schema(schema)
             .build(batches)
             .map_err(Status::from);
-        Ok(Response::new(Box::pin(stream)))
+        Ok(Response::new(Box::pin(AdmittedFlightStream {
+            inner:   Box::pin(stream),
+            _permit: permit,
+        })))
     }
 
     async fn do_put_fallback(
@@ -304,6 +353,7 @@ mod tests {
             metadata_addr:     None,
             metadata_security: ClientSecurity::new(),
             managed_stage:     Some(descriptor.clone()),
+            admission:         QueryAdmission::new(QueryLimits::default()),
         };
         let request = Request::new(arrow_flight::Action {
             r#type: MANAGED_STAGE_DISCOVERY_ACTION.to_owned(),
@@ -355,6 +405,7 @@ mod tests {
             metadata_addr: None,
             metadata_security: ClientSecurity::new(),
             managed_stage: None,
+            admission: QueryAdmission::new(QueryLimits::default()),
         };
         let ticket = TicketStatementQuery {
             statement_handle: b"SELECT * FROM delayed".to_vec().into(),
@@ -377,5 +428,62 @@ mod tests {
             returned_early,
             "DoGet must return its Flight stream before the producer completes"
         );
+    }
+
+    #[tokio::test]
+    async fn query_admission_rejects_when_saturated_and_releases_on_drop() {
+        let meta: MetaStoreRef = Arc::new(EmptyMeta);
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let engine = Arc::new(QueryEngine::new(meta, storage));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let release = Arc::new(Notify::new());
+        let table = StreamingTable::try_new(
+            schema.clone(),
+            vec![Arc::new(DelayedPartition {
+                schema,
+                release: release.clone(),
+            })],
+        )
+        .expect("streaming table");
+        engine
+            .context()
+            .register_table("admitted", Arc::new(table))
+            .expect("register table");
+        let limits =
+            QueryLimits::try_new(1, Duration::from_millis(20), Duration::from_secs(5), 1024)
+                .expect("limits");
+        let service = FlightSqlServiceImpl {
+            engine,
+            metadata_addr: None,
+            metadata_security: ClientSecurity::new(),
+            managed_stage: None,
+            admission: QueryAdmission::new(limits),
+        };
+        let ticket = || TicketStatementQuery {
+            statement_handle: b"SELECT * FROM admitted".to_vec().into(),
+        };
+
+        let first = service
+            .do_get_statement(ticket(), Request::new(Ticket::default()))
+            .await
+            .expect("first query admitted");
+        let Err(saturated) = service
+            .do_get_statement(ticket(), Request::new(Ticket::default()))
+            .await
+        else {
+            panic!("second query must be rejected while first stream lives");
+        };
+        assert_eq!(saturated.code(), tonic::Code::ResourceExhausted);
+
+        drop(first);
+        let third = service
+            .do_get_statement(ticket(), Request::new(Ticket::default()))
+            .await;
+        assert!(third.is_ok(), "dropping the stream must release its permit");
+        release.notify_waiters();
     }
 }

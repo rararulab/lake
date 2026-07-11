@@ -76,9 +76,82 @@ pub enum QueryError {
     Security {
         source: lake_flight::FlightSecurityError,
     },
+
+    #[snafu(display("invalid Query limits: {message}"))]
+    InvalidLimits { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, QueryError>;
+
+/// Per-replica admission and request limits for stateless Query execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueryLimits {
+    max_concurrent: usize,
+    queue_wait:     Duration,
+    execution_time: Duration,
+    max_sql_bytes:  usize,
+}
+
+impl QueryLimits {
+    /// Validate finite, non-zero Query limits.
+    pub fn try_new(
+        max_concurrent: usize,
+        queue_wait: Duration,
+        execution_time: Duration,
+        max_sql_bytes: usize,
+    ) -> Result<Self> {
+        for (valid, message) in [
+            (
+                max_concurrent > 0,
+                "max_concurrent must be greater than zero",
+            ),
+            (
+                !queue_wait.is_zero(),
+                "queue_wait must be greater than zero",
+            ),
+            (
+                !execution_time.is_zero(),
+                "execution_time must be greater than zero",
+            ),
+            (max_sql_bytes > 0, "max_sql_bytes must be greater than zero"),
+        ] {
+            if !valid {
+                return Err(QueryError::InvalidLimits {
+                    message: message.to_owned(),
+                });
+            }
+        }
+        Ok(Self {
+            max_concurrent,
+            queue_wait,
+            execution_time,
+            max_sql_bytes,
+        })
+    }
+
+    #[must_use]
+    pub const fn max_concurrent(&self) -> usize { self.max_concurrent }
+
+    #[must_use]
+    pub const fn queue_wait(&self) -> Duration { self.queue_wait }
+
+    #[must_use]
+    pub const fn execution_time(&self) -> Duration { self.execution_time }
+
+    #[must_use]
+    pub const fn max_sql_bytes(&self) -> usize { self.max_sql_bytes }
+}
+
+impl Default for QueryLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 64,
+            queue_wait:     Duration::from_millis(100),
+            execution_time: Duration::from_mins(30),
+            max_sql_bytes:  1024 * 1024,
+        }
+    }
+}
 
 /// Complete network configuration for one stateless Query server.
 #[derive(Clone, Debug)]
@@ -88,18 +161,20 @@ pub struct QueryServerConfig {
     managed_stage:     Option<ManagedStageDescriptor>,
     server_security:   ServerSecurity,
     allow_insecure:    bool,
+    limits:            QueryLimits,
 }
 
 impl QueryServerConfig {
     /// Explicit loopback development configuration.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             metadata_endpoint: None,
             metadata_security: ClientSecurity::new(),
             managed_stage:     None,
             server_security:   ServerSecurity::insecure(),
             allow_insecure:    false,
+            limits:            QueryLimits::default(),
         }
     }
 
@@ -130,6 +205,13 @@ impl QueryServerConfig {
     #[must_use]
     pub const fn allow_insecure(mut self, allow: bool) -> Self {
         self.allow_insecure = allow;
+        self
+    }
+
+    /// Apply immutable per-replica admission and request limits.
+    #[must_use]
+    pub const fn with_limits(mut self, limits: QueryLimits) -> Self {
+        self.limits = limits;
         self
     }
 }
@@ -252,6 +334,7 @@ pub async fn serve_with_config(
         metadata_addr: config.metadata_endpoint,
         metadata_security: config.metadata_security,
         managed_stage: config.managed_stage,
+        admission: flight::QueryAdmission::new(config.limits),
     });
 
     tracing::info!(%addr, "Flight SQL server ready");
