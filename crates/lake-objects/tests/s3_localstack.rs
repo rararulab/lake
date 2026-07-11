@@ -60,6 +60,42 @@ fn s3_multipart_roundtrip_localstack_is_wired() {
 
 #[tokio::test]
 #[ignore = "requires LocalStack S3; set LAKE_S3_ENDPOINT and run with --ignored"]
+async fn s3_range_read_returns_requested_bytes_localstack() {
+    let Some((_client, store, _bucket)) = stage().await else {
+        return;
+    };
+    let bytes = (0..(PART_BYTES + 1024))
+        .map(|index| u8::try_from(index % 251).expect("bounded byte"))
+        .collect::<Vec<_>>();
+    let location = store
+        .put_reader(
+            Box::pin(std::io::Cursor::new(bytes.clone())),
+            "video/mp4".to_owned(),
+        )
+        .await
+        .expect("multipart upload");
+    let start = u64::try_from(PART_BYTES - 7).expect("part size fits u64");
+    let end = u64::try_from(PART_BYTES + 13).expect("part size fits u64");
+
+    let mut reader = store
+        .open_range(&location, start..end)
+        .await
+        .expect("S3 range GET");
+    let mut actual = Vec::new();
+    reader.read_to_end(&mut actual).await.expect("read range");
+
+    assert_eq!(actual, bytes[PART_BYTES - 7..PART_BYTES + 13]);
+}
+
+#[test]
+fn s3_range_read_localstack_is_wired() {
+    let integration = include_str!("../../../scripts/test-integration.ts");
+    assert!(integration.contains("lake-objects"));
+    assert!(integration.contains("--run-ignored"));
+}
+
+#[tokio::test]
+#[ignore = "requires LocalStack S3; set LAKE_S3_ENDPOINT and run with --ignored"]
 async fn s3_multipart_roundtrip_localstack() {
     let Some((_client, store, bucket)) = stage().await else {
         return;
