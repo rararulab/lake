@@ -73,6 +73,14 @@ Scenario: Failed refresh preserves the published Arc
   When the next full registry scan fails
   Then the exact same Arc remains published
 
+Scenario: Flight filters before schema resolution
+  Test:
+    Package: lake-query
+    Filter: flight_table_discovery_prefilters_before_schema_resolution
+  Given a requested table matches discovery filters and an unrelated legacy table lacks schema
+  When GetTables requests schemas with catalog, namespace, name, and type filters
+  Then only matching rows are allocated and the unrelated legacy table is never resolved
+
 ## Out of Scope
 
 - Discovery admission, row limits, or multi-batch pagination.
