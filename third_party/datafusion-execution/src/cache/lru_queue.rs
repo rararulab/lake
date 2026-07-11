@@ -42,7 +42,7 @@ use parking_lot::Mutex;
 /// assert_eq!(lru_queue.pop(), None);
 /// ```
 pub struct LruQueue<K: Eq + Hash + Clone, V> {
-    data:  LruData<K, V>,
+    data: LruData<K, V>,
     queue: LruList<K>,
 }
 
@@ -58,20 +58,19 @@ struct LruList<K> {
 
 /// Doubly-linked list node.
 struct LruNode<K> {
-    key:  K,
+    key: K,
     prev: Link<K>,
     next: Link<K>,
 }
 
-/// Weak pointer to a [`LruNode`], used to connect nodes in the doubly-linked
-/// list. The strong reference is guaranteed to be stored in the `data` map of
-/// the [`LruQueue`].
+/// Weak pointer to a [`LruNode`], used to connect nodes in the doubly-linked list.
+/// The strong reference is guaranteed to be stored in the `data` map of the [`LruQueue`].
 type Link<K> = Option<Weak<Mutex<LruNode<K>>>>;
 
 impl<K: Eq + Hash + Clone, V> LruQueue<K, V> {
     pub fn new() -> Self {
         Self {
-            data:  HashMap::new(),
+            data: HashMap::new(),
             queue: LruList {
                 head: None,
                 tail: None,
@@ -90,11 +89,15 @@ impl<K: Eq + Hash + Clone, V> LruQueue<K, V> {
 
     /// Returns a reference to value mapped by `key`, if it exists.
     /// Does not affect the queue order.
-    pub fn peek(&self, key: &K) -> Option<&V> { self.data.get(key).map(|(_, value)| value) }
+    pub fn peek(&self, key: &K) -> Option<&V> {
+        self.data.get(key).map(|(_, value)| value)
+    }
 
     /// Checks whether there is an entry with key `key` in the queue.
     /// Does not affect the queue order.
-    pub fn contains_key(&self, key: &K) -> bool { self.data.contains_key(key) }
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.data.contains_key(key)
+    }
 
     /// Inserts an entry in the queue, becoming the most recently used.
     /// If the entry already exists, returns the previous value.
@@ -102,7 +105,7 @@ impl<K: Eq + Hash + Clone, V> LruQueue<K, V> {
         let old_value = self.remove(&key);
 
         let node = Arc::new(Mutex::new(LruNode {
-            key:  key.clone(),
+            key: key.clone(),
             prev: None,
             next: None,
         }));
@@ -160,20 +163,24 @@ impl<K: Eq + Hash + Clone, V> LruQueue<K, V> {
                 }
                 // removed the head node
                 (None, Some(n)) => {
-                    let n_strong = n.upgrade().expect("value has been unexpectedly dropped");
+                    let n_strong =
+                        n.upgrade().expect("value has been unexpectedly dropped");
                     n_strong.lock().prev = None;
                     self.queue.head = Some(Weak::clone(n));
                 }
                 // removed the tail node
                 (Some(p), None) => {
-                    let p_strong = p.upgrade().expect("value has been unexpectedly dropped");
+                    let p_strong =
+                        p.upgrade().expect("value has been unexpectedly dropped");
                     p_strong.lock().next = None;
                     self.queue.tail = Some(Weak::clone(p));
                 }
                 // removed a middle node
                 (Some(p), Some(n)) => {
-                    let n_strong = n.upgrade().expect("value has been unexpectedly dropped");
-                    let p_strong = p.upgrade().expect("value has been unexpectedly dropped");
+                    let n_strong =
+                        n.upgrade().expect("value has been unexpectedly dropped");
+                    let p_strong =
+                        p.upgrade().expect("value has been unexpectedly dropped");
                     n_strong.lock().prev = Some(Weak::clone(p));
                     p_strong.lock().next = Some(Weak::clone(n));
                 }
@@ -185,10 +192,14 @@ impl<K: Eq + Hash + Clone, V> LruQueue<K, V> {
     }
 
     /// Returns the number of entries in the queue.
-    pub fn len(&self) -> usize { self.data.len() }
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
 
     /// Checks whether the queue has no items.
-    pub fn is_empty(&self) -> bool { self.data.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
 
     /// Removes all entries from the queue.
     pub fn clear(&mut self) {
@@ -503,7 +514,10 @@ mod tests {
                 "get" => {
                     assert_eq!(lru_queue.get(&(i % max_keys)), map.get(&(i % max_keys)))
                 }
-                "put" => assert_eq!(lru_queue.put(i % max_keys, i), map.insert(i % max_keys, i)),
+                "put" => assert_eq!(
+                    lru_queue.put(i % max_keys, i),
+                    map.insert(i % max_keys, i)
+                ),
                 "remove" => assert_eq!(
                     lru_queue.remove(&(i % max_keys)),
                     map.remove(&(i % max_keys))

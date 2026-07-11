@@ -27,10 +27,10 @@ use crate::cache::{
 
 /// Handles the inner state of the [`DefaultFilesMetadataCache`] struct.
 struct DefaultFilesMetadataCacheState {
-    lru_queue:    LruQueue<Path, CachedFileMetadataEntry>,
+    lru_queue: LruQueue<Path, CachedFileMetadataEntry>,
     memory_limit: usize,
-    memory_used:  usize,
-    cache_hits:   HashMap<Path, usize>,
+    memory_used: usize,
+    cache_hits: HashMap<Path, usize>,
 }
 
 impl DefaultFilesMetadataCacheState {
@@ -53,12 +53,13 @@ impl DefaultFilesMetadataCacheState {
 
     /// Checks if the metadata is currently cached.
     /// The LRU queue is not updated.
-    fn contains_key(&self, k: &Path) -> bool { self.lru_queue.peek(k).is_some() }
+    fn contains_key(&self, k: &Path) -> bool {
+        self.lru_queue.peek(k).is_some()
+    }
 
-    /// Adds a new key-value pair to cache, meaning LRU entries might be evicted
-    /// if required. If the key is already in the cache, the previous
-    /// metadata is returned. If the size of the metadata is greater than
-    /// the `memory_limit`, the value is not inserted.
+    /// Adds a new key-value pair to cache, meaning LRU entries might be evicted if required.
+    /// If the key is already in the cache, the previous metadata is returned.
+    /// If the size of the metadata is greater than the `memory_limit`, the value is not inserted.
     fn put(
         &mut self,
         key: Path,
@@ -84,8 +85,7 @@ impl DefaultFilesMetadataCacheState {
         old_value
     }
 
-    /// Evicts entries from the LRU cache until `memory_used` is lower than
-    /// `memory_limit`.
+    /// Evicts entries from the LRU cache until `memory_used` is lower than `memory_limit`.
     fn evict_entries(&mut self) {
         while self.memory_used > self.memory_limit {
             if let Some(removed) = self.lru_queue.pop() {
@@ -113,7 +113,9 @@ impl DefaultFilesMetadataCacheState {
     }
 
     /// Returns the number of entries currently cached.
-    fn len(&self) -> usize { self.lru_queue.len() }
+    fn len(&self) -> usize {
+        self.lru_queue.len()
+    }
 
     /// Removes all entries from the cache.
     fn clear(&mut self) {
@@ -127,16 +129,15 @@ impl DefaultFilesMetadataCacheState {
 ///
 /// Collected file embedded metadata cache.
 ///
-/// The metadata for each file is validated by comparing the cached
-/// [`ObjectMeta`] (size and last_modified) against the current file state using
-/// `cached.is_valid_for(&current_meta)`.
+/// The metadata for each file is validated by comparing the cached [`ObjectMeta`]
+/// (size and last_modified) against the current file state using `cached.is_valid_for(&current_meta)`.
 ///
 /// # Internal details
 ///
 /// The `memory_limit` controls the maximum size of the cache, which uses a
-/// Least Recently Used eviction algorithm. When adding a new entry, if the
-/// total size of the cached entries exceeds `memory_limit`, the least recently
-/// used entries are evicted until the total size is lower than `memory_limit`.
+/// Least Recently Used eviction algorithm. When adding a new entry, if the total
+/// size of the cached entries exceeds `memory_limit`, the least recently used entries
+/// are evicted until the total size is lower than `memory_limit`.
 ///
 /// [`ObjectMeta`]: object_store::ObjectMeta
 pub struct DefaultFilesMetadataCache {
@@ -169,7 +170,11 @@ impl CacheAccessor<Path, CachedFileMetadataEntry> for DefaultFilesMetadataCache 
         state.get(key)
     }
 
-    fn put(&self, key: &Path, value: CachedFileMetadataEntry) -> Option<CachedFileMetadataEntry> {
+    fn put(
+        &self,
+        key: &Path,
+        value: CachedFileMetadataEntry,
+    ) -> Option<CachedFileMetadataEntry> {
         let mut state = self.state.lock().unwrap();
         state.put(key.clone(), value)
     }
@@ -194,7 +199,9 @@ impl CacheAccessor<Path, CachedFileMetadataEntry> for DefaultFilesMetadataCache 
         state.clear();
     }
 
-    fn name(&self) -> String { "DefaultFilesMetadataCache".to_string() }
+    fn name(&self) -> String {
+        "DefaultFilesMetadataCache".to_string()
+    }
 }
 
 impl FileMetadataCache for DefaultFilesMetadataCache {
@@ -218,9 +225,9 @@ impl FileMetadataCache for DefaultFilesMetadataCache {
                 path.clone(),
                 FileMetadataCacheEntry {
                     object_meta: entry.meta.clone(),
-                    size_bytes:  entry.file_metadata.memory_size(),
-                    hits:        *state.cache_hits.get(path).expect("entry must exist"),
-                    extra:       entry.file_metadata.extra_info(),
+                    size_bytes: entry.file_metadata.memory_size(),
+                    hits: *state.cache_hits.get(path).expect("entry must exist"),
+                    extra: entry.file_metadata.extra_info(),
                 },
             );
         }
@@ -231,26 +238,29 @@ impl FileMetadataCache for DefaultFilesMetadataCache {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
-    use object_store::{ObjectMeta, path::Path};
-
-    use crate::cache::{
-        CacheAccessor,
-        cache_manager::{
-            CachedFileMetadataEntry, FileMetadata, FileMetadataCache, FileMetadataCacheEntry,
-        },
-        file_metadata_cache::DefaultFilesMetadataCache,
+    use crate::cache::CacheAccessor;
+    use crate::cache::cache_manager::{
+        CachedFileMetadataEntry, FileMetadata, FileMetadataCache, FileMetadataCacheEntry,
     };
+    use crate::cache::file_metadata_cache::DefaultFilesMetadataCache;
+    use object_store::ObjectMeta;
+    use object_store::path::Path;
 
     pub struct TestFileMetadata {
         metadata: String,
     }
 
     impl FileMetadata for TestFileMetadata {
-        fn as_any(&self) -> &dyn std::any::Any { self }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
 
-        fn memory_size(&self) -> usize { self.metadata.len() }
+        fn memory_size(&self) -> usize {
+            self.metadata.len()
+        }
 
         fn extra_info(&self) -> HashMap<String, String> {
             HashMap::from([("extra_info".to_owned(), "abc".to_owned())])
@@ -259,13 +269,15 @@ mod tests {
 
     fn create_test_object_meta(path: &str, size: usize) -> ObjectMeta {
         ObjectMeta {
-            location:      Path::from(path),
-            last_modified: chrono::DateTime::parse_from_rfc3339("2025-07-29T12:12:12+00:00")
-                .unwrap()
-                .into(),
-            size:          size as u64,
-            e_tag:         None,
-            version:       None,
+            location: Path::from(path),
+            last_modified: chrono::DateTime::parse_from_rfc3339(
+                "2025-07-29T12:12:12+00:00",
+            )
+            .unwrap()
+            .into(),
+            size: size as u64,
+            e_tag: None,
+            version: None,
         }
     }
 
@@ -283,7 +295,8 @@ mod tests {
         assert!(cache.get(&object_meta.location).is_none());
 
         // Put a value
-        let cached_entry = CachedFileMetadataEntry::new(object_meta.clone(), Arc::clone(&metadata));
+        let cached_entry =
+            CachedFileMetadataEntry::new(object_meta.clone(), Arc::clone(&metadata));
         cache.put(&object_meta.location, cached_entry);
 
         // Verify the cached value
@@ -304,7 +317,8 @@ mod tests {
         assert!(!result3.is_valid_for(&object_meta2));
 
         // Return new entry
-        let new_entry = CachedFileMetadataEntry::new(object_meta2.clone(), Arc::clone(&metadata));
+        let new_entry =
+            CachedFileMetadataEntry::new(object_meta2.clone(), Arc::clone(&metadata));
         cache.put(&object_meta2.location, new_entry);
 
         let result4 = cache.get(&object_meta2.location).unwrap();
@@ -334,11 +348,11 @@ mod tests {
         size: usize,
     ) -> (ObjectMeta, Arc<dyn FileMetadata>) {
         let object_meta = ObjectMeta {
-            location:      Path::from(path),
+            location: Path::from(path),
             last_modified: chrono::Utc::now(),
-            size:          size as u64,
-            e_tag:         None,
-            version:       None,
+            size: size as u64,
+            e_tag: None,
+            version: None,
         };
         let metadata: Arc<dyn FileMetadata> = Arc::new(TestFileMetadata {
             metadata: "a".repeat(size),
@@ -385,8 +399,8 @@ mod tests {
         assert!(!cache.contains_key(&object_meta1.location));
         assert!(cache.contains_key(&object_meta4.location));
 
-        // get entry "2", which will move it to the top of the queue, and add a new one
-        // which will remove the new least recently used ("3")
+        // get entry "2", which will move it to the top of the queue, and add a new one which will
+        // remove the new least recently used ("3")
         let _ = cache.get(&object_meta2.location);
         let (object_meta5, metadata5) = generate_test_metadata_with_size("5", 100);
         cache.put(
@@ -431,7 +445,8 @@ mod tests {
         // when updating an entry, the previous ones are not unnecessarily removed
         let (object_meta9, metadata9) = generate_test_metadata_with_size("9", 300);
         let (object_meta10, metadata10) = generate_test_metadata_with_size("10", 200);
-        let (object_meta11_v1, metadata11_v1) = generate_test_metadata_with_size("11", 400);
+        let (object_meta11_v1, metadata11_v1) =
+            generate_test_metadata_with_size("11", 400);
         cache.put(
             &object_meta9.location,
             CachedFileMetadataEntry::new(object_meta9.clone(), metadata9),
@@ -446,7 +461,8 @@ mod tests {
         );
         assert_eq!(cache.memory_used(), 900);
         assert_eq!(cache.len(), 3);
-        let (object_meta11_v2, metadata11_v2) = generate_test_metadata_with_size("11", 500);
+        let (object_meta11_v2, metadata11_v2) =
+            generate_test_metadata_with_size("11", 500);
         cache.put(
             &object_meta11_v2.location,
             CachedFileMetadataEntry::new(object_meta11_v2.clone(), metadata11_v2),
@@ -457,9 +473,9 @@ mod tests {
         assert!(cache.contains_key(&object_meta10.location));
         assert!(cache.contains_key(&object_meta11_v2.location));
 
-        // when updating an entry that now exceeds the limit, the LRU ("9") needs to be
-        // removed
-        let (object_meta11_v3, metadata11_v3) = generate_test_metadata_with_size("11", 501);
+        // when updating an entry that now exceeds the limit, the LRU ("9") needs to be removed
+        let (object_meta11_v3, metadata11_v3) =
+            generate_test_metadata_with_size("11", 501);
         cache.put(
             &object_meta11_v3.location,
             CachedFileMetadataEntry::new(object_meta11_v3.clone(), metadata11_v3),
@@ -534,27 +550,36 @@ mod tests {
                     Path::from("1"),
                     FileMetadataCacheEntry {
                         object_meta: object_meta1.clone(),
-                        size_bytes:  100,
-                        hits:        0,
-                        extra:       HashMap::from([("extra_info".to_owned(), "abc".to_owned())]),
+                        size_bytes: 100,
+                        hits: 0,
+                        extra: HashMap::from([(
+                            "extra_info".to_owned(),
+                            "abc".to_owned()
+                        )]),
                     }
                 ),
                 (
                     Path::from("2"),
                     FileMetadataCacheEntry {
                         object_meta: object_meta2.clone(),
-                        size_bytes:  200,
-                        hits:        0,
-                        extra:       HashMap::from([("extra_info".to_owned(), "abc".to_owned())]),
+                        size_bytes: 200,
+                        hits: 0,
+                        extra: HashMap::from([(
+                            "extra_info".to_owned(),
+                            "abc".to_owned()
+                        )]),
                     }
                 ),
                 (
                     Path::from("3"),
                     FileMetadataCacheEntry {
                         object_meta: object_meta3.clone(),
-                        size_bytes:  300,
-                        hits:        0,
-                        extra:       HashMap::from([("extra_info".to_owned(), "abc".to_owned())]),
+                        size_bytes: 300,
+                        hits: 0,
+                        extra: HashMap::from([(
+                            "extra_info".to_owned(),
+                            "abc".to_owned()
+                        )]),
                     }
                 )
             ])
@@ -569,27 +594,36 @@ mod tests {
                     Path::from("1"),
                     FileMetadataCacheEntry {
                         object_meta: object_meta1.clone(),
-                        size_bytes:  100,
-                        hits:        1,
-                        extra:       HashMap::from([("extra_info".to_owned(), "abc".to_owned())]),
+                        size_bytes: 100,
+                        hits: 1,
+                        extra: HashMap::from([(
+                            "extra_info".to_owned(),
+                            "abc".to_owned()
+                        )]),
                     }
                 ),
                 (
                     Path::from("2"),
                     FileMetadataCacheEntry {
                         object_meta: object_meta2.clone(),
-                        size_bytes:  200,
-                        hits:        0,
-                        extra:       HashMap::from([("extra_info".to_owned(), "abc".to_owned())]),
+                        size_bytes: 200,
+                        hits: 0,
+                        extra: HashMap::from([(
+                            "extra_info".to_owned(),
+                            "abc".to_owned()
+                        )]),
                     }
                 ),
                 (
                     Path::from("3"),
                     FileMetadataCacheEntry {
                         object_meta: object_meta3.clone(),
-                        size_bytes:  300,
-                        hits:        0,
-                        extra:       HashMap::from([("extra_info".to_owned(), "abc".to_owned())]),
+                        size_bytes: 300,
+                        hits: 0,
+                        extra: HashMap::from([(
+                            "extra_info".to_owned(),
+                            "abc".to_owned()
+                        )]),
                     }
                 )
             ])
@@ -608,27 +642,36 @@ mod tests {
                     Path::from("1"),
                     FileMetadataCacheEntry {
                         object_meta: object_meta1.clone(),
-                        size_bytes:  100,
-                        hits:        1,
-                        extra:       HashMap::from([("extra_info".to_owned(), "abc".to_owned())]),
+                        size_bytes: 100,
+                        hits: 1,
+                        extra: HashMap::from([(
+                            "extra_info".to_owned(),
+                            "abc".to_owned()
+                        )]),
                     }
                 ),
                 (
                     Path::from("3"),
                     FileMetadataCacheEntry {
                         object_meta: object_meta3.clone(),
-                        size_bytes:  300,
-                        hits:        0,
-                        extra:       HashMap::from([("extra_info".to_owned(), "abc".to_owned())]),
+                        size_bytes: 300,
+                        hits: 0,
+                        extra: HashMap::from([(
+                            "extra_info".to_owned(),
+                            "abc".to_owned()
+                        )]),
                     }
                 ),
                 (
                     Path::from("4"),
                     FileMetadataCacheEntry {
                         object_meta: object_meta4.clone(),
-                        size_bytes:  600,
-                        hits:        0,
-                        extra:       HashMap::from([("extra_info".to_owned(), "abc".to_owned())]),
+                        size_bytes: 600,
+                        hits: 0,
+                        extra: HashMap::from([(
+                            "extra_info".to_owned(),
+                            "abc".to_owned()
+                        )]),
                     }
                 )
             ])
@@ -647,27 +690,36 @@ mod tests {
                     Path::from("1"),
                     FileMetadataCacheEntry {
                         object_meta: object_meta1_new.clone(),
-                        size_bytes:  50,
-                        hits:        0,
-                        extra:       HashMap::from([("extra_info".to_owned(), "abc".to_owned())]),
+                        size_bytes: 50,
+                        hits: 0,
+                        extra: HashMap::from([(
+                            "extra_info".to_owned(),
+                            "abc".to_owned()
+                        )]),
                     }
                 ),
                 (
                     Path::from("3"),
                     FileMetadataCacheEntry {
                         object_meta: object_meta3.clone(),
-                        size_bytes:  300,
-                        hits:        0,
-                        extra:       HashMap::from([("extra_info".to_owned(), "abc".to_owned())]),
+                        size_bytes: 300,
+                        hits: 0,
+                        extra: HashMap::from([(
+                            "extra_info".to_owned(),
+                            "abc".to_owned()
+                        )]),
                     }
                 ),
                 (
                     Path::from("4"),
                     FileMetadataCacheEntry {
                         object_meta: object_meta4.clone(),
-                        size_bytes:  600,
-                        hits:        0,
-                        extra:       HashMap::from([("extra_info".to_owned(), "abc".to_owned())]),
+                        size_bytes: 600,
+                        hits: 0,
+                        extra: HashMap::from([(
+                            "extra_info".to_owned(),
+                            "abc".to_owned()
+                        )]),
                     }
                 )
             ])
@@ -682,18 +734,24 @@ mod tests {
                     Path::from("1"),
                     FileMetadataCacheEntry {
                         object_meta: object_meta1_new.clone(),
-                        size_bytes:  50,
-                        hits:        0,
-                        extra:       HashMap::from([("extra_info".to_owned(), "abc".to_owned())]),
+                        size_bytes: 50,
+                        hits: 0,
+                        extra: HashMap::from([(
+                            "extra_info".to_owned(),
+                            "abc".to_owned()
+                        )]),
                     }
                 ),
                 (
                     Path::from("3"),
                     FileMetadataCacheEntry {
                         object_meta: object_meta3.clone(),
-                        size_bytes:  300,
-                        hits:        0,
-                        extra:       HashMap::from([("extra_info".to_owned(), "abc".to_owned())]),
+                        size_bytes: 300,
+                        hits: 0,
+                        extra: HashMap::from([(
+                            "extra_info".to_owned(),
+                            "abc".to_owned()
+                        )]),
                     }
                 )
             ])

@@ -17,14 +17,15 @@
 
 use std::collections::HashMap;
 
+use crate::cache::CacheAccessor;
+use crate::cache::cache_manager::{
+    CachedFileMetadata, FileStatisticsCache, FileStatisticsCacheEntry,
+};
+
 use dashmap::DashMap;
 use object_store::path::Path;
 
 pub use crate::cache::DefaultFilesMetadataCache;
-use crate::cache::{
-    CacheAccessor,
-    cache_manager::{CachedFileMetadata, FileStatisticsCache, FileStatisticsCacheEntry},
-};
 
 /// Default implementation of [`FileStatisticsCache`]
 ///
@@ -56,13 +57,21 @@ impl CacheAccessor<Path, CachedFileMetadata> for DefaultFileStatisticsCache {
         self.cache.remove(k).map(|(_, entry)| entry)
     }
 
-    fn contains_key(&self, k: &Path) -> bool { self.cache.contains_key(k) }
+    fn contains_key(&self, k: &Path) -> bool {
+        self.cache.contains_key(k)
+    }
 
-    fn len(&self) -> usize { self.cache.len() }
+    fn len(&self) -> usize {
+        self.cache.len()
+    }
 
-    fn clear(&self) { self.cache.clear(); }
+    fn clear(&self) {
+        self.cache.clear();
+    }
 
-    fn name(&self) -> String { "DefaultFileStatisticsCache".to_string() }
+    fn name(&self) -> String {
+        "DefaultFileStatisticsCache".to_string()
+    }
 }
 
 impl FileStatisticsCache for DefaultFileStatisticsCache {
@@ -75,12 +84,12 @@ impl FileStatisticsCache for DefaultFileStatisticsCache {
             entries.insert(
                 path.clone(),
                 FileStatisticsCacheEntry {
-                    object_meta:           cached.meta.clone(),
-                    num_rows:              cached.statistics.num_rows,
-                    num_columns:           cached.statistics.column_statistics.len(),
-                    table_size_bytes:      cached.statistics.total_byte_size,
+                    object_meta: cached.meta.clone(),
+                    num_rows: cached.statistics.num_rows,
+                    num_columns: cached.statistics.column_statistics.len(),
+                    table_size_bytes: cached.statistics.total_byte_size,
                     statistics_size_bytes: 0, // TODO: set to the real size in the future
-                    has_ordering:          cached.ordering.is_some(),
+                    has_ordering: cached.ordering.is_some(),
                 },
             );
         }
@@ -91,26 +100,22 @@ impl FileStatisticsCache for DefaultFileStatisticsCache {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use arrow::{
-        array::RecordBatch,
-        datatypes::{DataType, Field, Schema, TimeUnit},
-    };
-    use chrono::DateTime;
-    use datafusion_common::{Statistics, stats::Precision};
-    use datafusion_expr::ColumnarValue;
-    use datafusion_physical_expr_common::{
-        physical_expr::PhysicalExpr,
-        sort_expr::{LexOrdering, PhysicalSortExpr},
-    };
-    use object_store::{ObjectMeta, path::Path};
-
     use super::*;
-    use crate::cache::{
-        CacheAccessor,
-        cache_manager::{CachedFileMetadata, FileStatisticsCache, FileStatisticsCacheEntry},
+    use crate::cache::CacheAccessor;
+    use crate::cache::cache_manager::{
+        CachedFileMetadata, FileStatisticsCache, FileStatisticsCacheEntry,
     };
+    use arrow::array::RecordBatch;
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use chrono::DateTime;
+    use datafusion_common::Statistics;
+    use datafusion_common::stats::Precision;
+    use datafusion_expr::ColumnarValue;
+    use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
+    use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
+    use object_store::ObjectMeta;
+    use object_store::path::Path;
+    use std::sync::Arc;
 
     fn create_test_meta(path: &str, size: u64) -> ObjectMeta {
         ObjectMeta {
@@ -176,23 +181,37 @@ mod tests {
     struct MockExpr {}
 
     impl std::fmt::Display for MockExpr {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "MockExpr") }
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "MockExpr")
+        }
     }
 
     impl PhysicalExpr for MockExpr {
-        fn as_any(&self) -> &dyn std::any::Any { self }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
 
-        fn data_type(&self, _input_schema: &Schema) -> datafusion_common::Result<DataType> {
+        fn data_type(
+            &self,
+            _input_schema: &Schema,
+        ) -> datafusion_common::Result<DataType> {
             Ok(DataType::Int32)
         }
 
-        fn nullable(&self, _input_schema: &Schema) -> datafusion_common::Result<bool> { Ok(false) }
+        fn nullable(&self, _input_schema: &Schema) -> datafusion_common::Result<bool> {
+            Ok(false)
+        }
 
-        fn evaluate(&self, _batch: &RecordBatch) -> datafusion_common::Result<ColumnarValue> {
+        fn evaluate(
+            &self,
+            _batch: &RecordBatch,
+        ) -> datafusion_common::Result<ColumnarValue> {
             unimplemented!()
         }
 
-        fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> { vec![] }
+        fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+            vec![]
+        }
 
         fn with_new_children(
             self: Arc<Self>,
@@ -290,13 +309,13 @@ mod tests {
 
         // Cache with original metadata and ordering
         let meta_v1 = ObjectMeta {
-            location:      path.clone(),
+            location: path.clone(),
             last_modified: DateTime::parse_from_rfc3339("2022-09-27T22:36:00+02:00")
                 .unwrap()
                 .into(),
-            size:          100,
-            e_tag:         None,
-            version:       None,
+            size: 100,
+            e_tag: None,
+            version: None,
         };
         let ordering_v1 = ordering();
         let cached_v1 = CachedFileMetadata::new(
@@ -313,13 +332,13 @@ mod tests {
 
         // File modified (size changed)
         let meta_v2 = ObjectMeta {
-            location:      path.clone(),
+            location: path.clone(),
             last_modified: DateTime::parse_from_rfc3339("2022-09-28T10:00:00+02:00")
                 .unwrap()
                 .into(),
-            size:          200, // Changed
-            e_tag:         None,
-            version:       None,
+            size: 200, // Changed
+            e_tag: None,
+            version: None,
         };
 
         // Cache entry exists but should be invalid for new metadata
@@ -372,23 +391,23 @@ mod tests {
                 (
                     Path::from("test1.parquet"),
                     FileStatisticsCacheEntry {
-                        object_meta:           meta1,
-                        num_rows:              Precision::Absent,
-                        num_columns:           1,
-                        table_size_bytes:      Precision::Absent,
+                        object_meta: meta1,
+                        num_rows: Precision::Absent,
+                        num_columns: 1,
+                        table_size_bytes: Precision::Absent,
                         statistics_size_bytes: 0,
-                        has_ordering:          false,
+                        has_ordering: false,
                     }
                 ),
                 (
                     Path::from("test2.parquet"),
                     FileStatisticsCacheEntry {
-                        object_meta:           meta2,
-                        num_rows:              Precision::Absent,
-                        num_columns:           1,
-                        table_size_bytes:      Precision::Absent,
+                        object_meta: meta2,
+                        num_rows: Precision::Absent,
+                        num_columns: 1,
+                        table_size_bytes: Precision::Absent,
                         statistics_size_bytes: 0,
-                        has_ordering:          true,
+                        has_ordering: true,
                     }
                 ),
             ])

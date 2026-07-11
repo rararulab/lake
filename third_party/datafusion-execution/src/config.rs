@@ -29,25 +29,19 @@ use datafusion_common::{
 
 /// Configuration options for [`SessionContext`].
 ///
-/// Can be passed to [`SessionContext::new_with_config`] to customize the
-/// configuration of DataFusion.
+/// Can be passed to [`SessionContext::new_with_config`] to customize the configuration of DataFusion.
 ///
-/// Options can be set using namespaces keys with `.` as the separator, where
-/// the namespace determines which configuration struct the value to routed to.
-/// All built-in options are under the `datafusion` namespace.
+/// Options can be set using namespaces keys with `.` as the separator, where the
+/// namespace determines which configuration struct the value to routed to. All
+/// built-in options are under the `datafusion` namespace.
 ///
-/// For example, the key `datafusion.execution.batch_size` will set
-/// [ExecutionOptions::batch_size][datafusion_common::config::ExecutionOptions::batch_size],
-/// because [ConfigOptions::execution] is
-/// [ExecutionOptions][datafusion_common::config::ExecutionOptions]. Similarly,
-/// the key `datafusion.execution.parquet.pushdown_filters` will set
-/// [ParquetOptions::pushdown_filters][datafusion_common::config::ParquetOptions::pushdown_filters],
-///
+/// For example, the key `datafusion.execution.batch_size` will set [ExecutionOptions::batch_size][datafusion_common::config::ExecutionOptions::batch_size],
+/// because [ConfigOptions::execution] is [ExecutionOptions][datafusion_common::config::ExecutionOptions]. Similarly, the key
+/// `datafusion.execution.parquet.pushdown_filters` will set [ParquetOptions::pushdown_filters][datafusion_common::config::ParquetOptions::pushdown_filters],
 /// since [ExecutionOptions::parquet][datafusion_common::config::ExecutionOptions::parquet] is [ParquetOptions][datafusion_common::config::ParquetOptions].
 ///
-/// Some options have convenience methods. For example
-/// [SessionConfig::with_batch_size] is shorthand for setting
-/// `datafusion.execution.batch_size`.
+/// Some options have convenience methods. For example [SessionConfig::with_batch_size] is
+/// shorthand for setting `datafusion.execution.batch_size`.
 ///
 /// ```
 /// use datafusion_common::ScalarValue;
@@ -94,8 +88,7 @@ use datafusion_common::{
 ///
 /// ## Custom configuration
 ///
-/// Configuration options can be extended. See [SessionConfig::with_extension]
-/// for details.
+/// Configuration options can be extended. See [SessionConfig::with_extension] for details.
 ///
 /// [`SessionContext`]: https://docs.rs/datafusion/latest/datafusion/execution/context/struct.SessionContext.html
 /// [`SessionContext::new_with_config`]: https://docs.rs/datafusion/latest/datafusion/execution/context/struct.SessionContext.html#method.new_with_config
@@ -105,7 +98,7 @@ pub struct SessionConfig {
     ///
     /// A new copy is created on write, if there are other outstanding
     /// references to the same options.
-    options:    Arc<ConfigOptions>,
+    options: Arc<ConfigOptions>,
     /// Opaque extensions.
     extensions: AnyMap,
 }
@@ -113,22 +106,29 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            options:    Arc::new(ConfigOptions::new()),
+            options: Arc::new(ConfigOptions::new()),
             // Assume no extensions by default.
-            extensions: HashMap::with_capacity_and_hasher(0, BuildHasherDefault::default()),
+            extensions: HashMap::with_capacity_and_hasher(
+                0,
+                BuildHasherDefault::default(),
+            ),
         }
     }
 }
 
 impl SessionConfig {
     /// Create an execution config with default setting
-    pub fn new() -> Self { Default::default() }
+    pub fn new() -> Self {
+        Default::default()
+    }
 
     /// Create an execution config with config options read from the environment
     ///
     /// See [`ConfigOptions::from_env`] for details on how environment variables
     /// are mapped to config options.
-    pub fn from_env() -> Result<Self> { Ok(ConfigOptions::from_env()?.into()) }
+    pub fn from_env() -> Result<Self> {
+        Ok(ConfigOptions::from_env()?.into())
+    }
 
     /// Create new ConfigOptions struct, taking values from a string hash map.
     pub fn from_string_hash_map(settings: &HashMap<String, String>) -> Result<Self> {
@@ -145,7 +145,9 @@ impl SessionConfig {
     /// let config = SessionConfig::new();
     /// assert!(config.options().execution.batch_size > 0);
     /// ```
-    pub fn options(&self) -> &Arc<ConfigOptions> { &self.options }
+    pub fn options(&self) -> &Arc<ConfigOptions> {
+        &self.options
+    }
 
     /// Return a mutable handle to the configuration options.
     ///
@@ -158,7 +160,9 @@ impl SessionConfig {
     /// config.options_mut().execution.batch_size = 1024;
     /// assert_eq!(config.options().execution.batch_size, 1024);
     /// ```
-    pub fn options_mut(&mut self) -> &mut ConfigOptions { Arc::make_mut(&mut self.options) }
+    pub fn options_mut(&mut self) -> &mut ConfigOptions {
+        Arc::make_mut(&mut self.options)
+    }
 
     /// Set a configuration option
     pub fn set(self, key: &str, value: &ScalarValue) -> Self {
@@ -166,10 +170,14 @@ impl SessionConfig {
     }
 
     /// Set a boolean configuration option
-    pub fn set_bool(self, key: &str, value: bool) -> Self { self.set_str(key, &value.to_string()) }
+    pub fn set_bool(self, key: &str, value: bool) -> Self {
+        self.set_str(key, &value.to_string())
+    }
 
     /// Set a generic `u64` configuration option
-    pub fn set_u64(self, key: &str, value: u64) -> Self { self.set_str(key, &value.to_string()) }
+    pub fn set_u64(self, key: &str, value: u64) -> Self {
+        self.set_str(key, &value.to_string())
+    }
 
     /// Set a generic `usize` configuration option
     pub fn set_usize(self, key: &str, value: usize) -> Self {
@@ -211,10 +219,14 @@ impl SessionConfig {
     /// Get [`target_partitions`]
     ///
     /// [`target_partitions`]: datafusion_common::config::ExecutionOptions::target_partitions
-    pub fn target_partitions(&self) -> usize { self.options.execution.target_partitions }
+    pub fn target_partitions(&self) -> usize {
+        self.options.execution.target_partitions
+    }
 
     /// Is the information schema enabled?
-    pub fn information_schema(&self) -> bool { self.options.catalog.information_schema }
+    pub fn information_schema(&self) -> bool {
+        self.options.catalog.information_schema
+    }
 
     /// Should the context create the default catalog and schema?
     pub fn create_default_catalog_and_schema(&self) -> bool {
@@ -222,7 +234,9 @@ impl SessionConfig {
     }
 
     /// Are joins repartitioned during execution?
-    pub fn repartition_joins(&self) -> bool { self.options.optimizer.repartition_joins }
+    pub fn repartition_joins(&self) -> bool {
+        self.options.optimizer.repartition_joins
+    }
 
     /// Are aggregates repartitioned during execution?
     pub fn repartition_aggregations(&self) -> bool {
@@ -236,19 +250,27 @@ impl SessionConfig {
 
     /// Do we execute sorts in a per-partition fashion and merge afterwards,
     /// or do we coalesce partitions first and sort globally?
-    pub fn repartition_sorts(&self) -> bool { self.options.optimizer.repartition_sorts }
+    pub fn repartition_sorts(&self) -> bool {
+        self.options.optimizer.repartition_sorts
+    }
 
     /// Prefer existing sort (true) or maximize parallelism (false). See
     /// [prefer_existing_sort] for more details
     ///
     /// [prefer_existing_sort]: datafusion_common::config::OptimizerOptions::prefer_existing_sort
-    pub fn prefer_existing_sort(&self) -> bool { self.options.optimizer.prefer_existing_sort }
+    pub fn prefer_existing_sort(&self) -> bool {
+        self.options.optimizer.prefer_existing_sort
+    }
 
     /// Are statistics collected during execution?
-    pub fn collect_statistics(&self) -> bool { self.options.execution.collect_statistics }
+    pub fn collect_statistics(&self) -> bool {
+        self.options.execution.collect_statistics
+    }
 
     /// Compression codec for spill file
-    pub fn spill_compression(&self) -> SpillCompression { self.options.execution.spill_compression }
+    pub fn spill_compression(&self) -> SpillCompression {
+        self.options.execution.spill_compression
+    }
 
     /// Selects a name for the default catalog and schema
     pub fn with_default_catalog_and_schema(
@@ -261,8 +283,7 @@ impl SessionConfig {
         self
     }
 
-    /// Controls whether the default catalog and schema will be automatically
-    /// created
+    /// Controls whether the default catalog and schema will be automatically created
     pub fn with_create_default_catalog_and_schema(mut self, create: bool) -> Self {
         self.options_mut().catalog.create_default_catalog_and_schema = create;
         self
@@ -274,15 +295,13 @@ impl SessionConfig {
         self
     }
 
-    /// Enables or disables the use of repartitioning for joins to improve
-    /// parallelism
+    /// Enables or disables the use of repartitioning for joins to improve parallelism
     pub fn with_repartition_joins(mut self, enabled: bool) -> Self {
         self.options_mut().optimizer.repartition_joins = enabled;
         self
     }
 
-    /// Enables or disables the use of repartitioning for aggregations to
-    /// improve parallelism
+    /// Enables or disables the use of repartitioning for aggregations to improve parallelism
     pub fn with_repartition_aggregations(mut self, enabled: bool) -> Self {
         self.options_mut().optimizer.repartition_aggregations = enabled;
         self
@@ -308,15 +327,13 @@ impl SessionConfig {
         self
     }
 
-    /// Enables or disables the use of repartitioning for window functions to
-    /// improve parallelism
+    /// Enables or disables the use of repartitioning for window functions to improve parallelism
     pub fn with_repartition_windows(mut self, enabled: bool) -> Self {
         self.options_mut().optimizer.repartition_windows = enabled;
         self
     }
 
-    /// Enables or disables the use of per-partition sorting to improve
-    /// parallelism
+    /// Enables or disables the use of per-partition sorting to improve parallelism
     pub fn with_repartition_sorts(mut self, enabled: bool) -> Self {
         self.options_mut().optimizer.repartition_sorts = enabled;
         self
@@ -331,8 +348,7 @@ impl SessionConfig {
         self
     }
 
-    /// Prefer existing union (true). See [prefer_existing_union] for more
-    /// details
+    /// Prefer existing union (true). See [prefer_existing_union] for more details
     ///
     /// [prefer_existing_union]: datafusion_common::config::OptimizerOptions::prefer_existing_union
     pub fn with_prefer_existing_union(mut self, enabled: bool) -> Self {
@@ -340,24 +356,23 @@ impl SessionConfig {
         self
     }
 
-    /// Enables or disables the use of pruning predicate for parquet readers to
-    /// skip row groups
+    /// Enables or disables the use of pruning predicate for parquet readers to skip row groups
     pub fn with_parquet_pruning(mut self, enabled: bool) -> Self {
         self.options_mut().execution.parquet.pruning = enabled;
         self
     }
 
-    /// Returns true if pruning predicate should be used to skip parquet row
-    /// groups
-    pub fn parquet_pruning(&self) -> bool { self.options.execution.parquet.pruning }
+    /// Returns true if pruning predicate should be used to skip parquet row groups
+    pub fn parquet_pruning(&self) -> bool {
+        self.options.execution.parquet.pruning
+    }
 
     /// Returns true if bloom filter should be used to skip parquet row groups
     pub fn parquet_bloom_filter_pruning(&self) -> bool {
         self.options.execution.parquet.bloom_filter_on_read
     }
 
-    /// Enables or disables the use of bloom filter for parquet readers to skip
-    /// row groups
+    /// Enables or disables the use of bloom filter for parquet readers to skip row groups
     pub fn with_parquet_bloom_filter_pruning(mut self, enabled: bool) -> Self {
         self.options_mut().execution.parquet.bloom_filter_on_read = enabled;
         self
@@ -368,8 +383,7 @@ impl SessionConfig {
         self.options.execution.parquet.enable_page_index
     }
 
-    /// Enables or disables the use of page index for parquet readers to skip
-    /// parquet data pages
+    /// Enables or disables the use of page index for parquet readers to skip parquet data pages
     pub fn with_parquet_page_index_pruning(mut self, enabled: bool) -> Self {
         self.options_mut().execution.parquet.enable_page_index = enabled;
         self
@@ -382,7 +396,9 @@ impl SessionConfig {
     }
 
     /// Get the currently configured batch size
-    pub fn batch_size(&self) -> usize { self.options.execution.batch_size }
+    pub fn batch_size(&self) -> usize {
+        self.options.execution.batch_size
+    }
 
     /// Enables or disables the coalescence of small batches into larger batches
     pub fn with_coalesce_batches(mut self, enabled: bool) -> Self {
@@ -392,18 +408,18 @@ impl SessionConfig {
 
     /// Returns true if record batches will be examined between each operator
     /// and small batches will be coalesced into larger batches.
-    pub fn coalesce_batches(&self) -> bool { self.options.execution.coalesce_batches }
+    pub fn coalesce_batches(&self) -> bool {
+        self.options.execution.coalesce_batches
+    }
 
-    /// Enables or disables the round robin repartition for increasing
-    /// parallelism
+    /// Enables or disables the round robin repartition for increasing parallelism
     pub fn with_round_robin_repartition(mut self, enabled: bool) -> Self {
         self.options_mut().optimizer.enable_round_robin_repartition = enabled;
         self
     }
 
     /// Returns true if the physical plan optimizer will try to
-    /// add round robin repartition to increase parallelism to leverage more CPU
-    /// cores.
+    /// add round robin repartition to increase parallelism to leverage more CPU cores.
     pub fn round_robin_repartition(&self) -> bool {
         self.options.optimizer.enable_round_robin_repartition
     }
@@ -423,12 +439,12 @@ impl SessionConfig {
         mut self,
         sort_spill_reservation_bytes: usize,
     ) -> Self {
-        self.options_mut().execution.sort_spill_reservation_bytes = sort_spill_reservation_bytes;
+        self.options_mut().execution.sort_spill_reservation_bytes =
+            sort_spill_reservation_bytes;
         self
     }
 
-    /// Set the compression codec [`spill_compression`] used when spilling data
-    /// to disk.
+    /// Set the compression codec [`spill_compression`] used when spilling data to disk.
     ///
     /// [`spill_compression`]: datafusion_common::config::ExecutionOptions::spill_compression
     pub fn with_spill_compression(mut self, spill_compression: SpillCompression) -> Self {
@@ -444,18 +460,22 @@ impl SessionConfig {
         mut self,
         sort_in_place_threshold_bytes: usize,
     ) -> Self {
-        self.options_mut().execution.sort_in_place_threshold_bytes = sort_in_place_threshold_bytes;
+        self.options_mut().execution.sort_in_place_threshold_bytes =
+            sort_in_place_threshold_bytes;
         self
     }
 
     /// Enables or disables the enforcement of batch size in joins
-    pub fn with_enforce_batch_size_in_joins(mut self, enforce_batch_size_in_joins: bool) -> Self {
-        self.options_mut().execution.enforce_batch_size_in_joins = enforce_batch_size_in_joins;
+    pub fn with_enforce_batch_size_in_joins(
+        mut self,
+        enforce_batch_size_in_joins: bool,
+    ) -> Self {
+        self.options_mut().execution.enforce_batch_size_in_joins =
+            enforce_batch_size_in_joins;
         self
     }
 
-    /// Returns true if the joins will be enforced to output batches of the
-    /// configured size
+    /// Returns true if the joins will be enforced to output batches of the configured size
     pub fn enforce_batch_size_in_joins(&self) -> bool {
         self.options.execution.enforce_batch_size_in_joins
     }
@@ -485,27 +505,21 @@ impl SessionConfig {
 
     /// Add extensions.
     ///
-    /// Extensions can be used to attach extra data to the session config --
-    /// e.g. tracing information or caches. Extensions are opaque and the
-    /// types are unknown to DataFusion itself, which makes them extremely
-    /// flexible. [^1]
+    /// Extensions can be used to attach extra data to the session config -- e.g. tracing information or caches.
+    /// Extensions are opaque and the types are unknown to DataFusion itself, which makes them extremely flexible. [^1]
     ///
-    /// Extensions are stored within an [`Arc`] so they do NOT require
-    /// [`Clone`]. The are immutable. If you need to modify their state over
-    /// their lifetime -- e.g. for caches -- you need to establish some for of
-    /// interior mutability.
+    /// Extensions are stored within an [`Arc`] so they do NOT require [`Clone`]. The are immutable. If you need to
+    /// modify their state over their lifetime -- e.g. for caches -- you need to establish some for of interior mutability.
     ///
-    /// Extensions are indexed by their type `T`. If multiple values of the same
-    /// type are provided, only the last one will be kept.
+    /// Extensions are indexed by their type `T`. If multiple values of the same type are provided, only the last one
+    /// will be kept.
     ///
-    /// You may use [`get_extension`](Self::get_extension) to retrieve
-    /// extensions.
+    /// You may use [`get_extension`](Self::get_extension) to retrieve extensions.
     ///
     /// # Example
     /// ```
-    /// use std::sync::Arc;
-    ///
     /// use datafusion_execution::config::SessionConfig;
+    /// use std::sync::Arc;
     ///
     /// // application-specific extension types
     /// struct Ext1(u8);
@@ -541,16 +555,14 @@ impl SessionConfig {
         self
     }
 
-    /// Set extension. Pretty much the same as
-    /// [`with_extension`](Self::with_extension), but take mutable reference
-    /// instead of owning it. Useful if you want to add another extension after
+    /// Set extension. Pretty much the same as [`with_extension`](Self::with_extension), but take
+    /// mutable reference instead of owning it. Useful if you want to add another extension after
     /// the [`SessionConfig`] is created.
     ///
     /// # Example
     /// ```
-    /// use std::sync::Arc;
-    ///
     /// use datafusion_execution::config::SessionConfig;
+    /// use std::sync::Arc;
     ///
     /// // application-specific extension types
     /// struct Ext1(u8);
@@ -588,8 +600,7 @@ impl SessionConfig {
 
     /// Get extension, if any for the specified type `T` exists.
     ///
-    /// See [`with_extension`](Self::with_extension) on how to add attach
-    /// extensions.
+    /// See [`with_extension`](Self::with_extension) on how to add attach extensions.
     pub fn get_extension<T>(&self) -> Option<Arc<T>>
     where
         T: Send + Sync + 'static,
@@ -614,18 +625,16 @@ impl From<ConfigOptions> for SessionConfig {
 
 /// Map that holds opaque objects indexed by their type.
 ///
-/// Data is wrapped into an [`Arc`] to enable [`Clone`] while still being
-/// [object safe].
+/// Data is wrapped into an [`Arc`] to enable [`Clone`] while still being [object safe].
 ///
 /// [object safe]: https://doc.rust-lang.org/reference/items/traits.html#object-safety
-type AnyMap = HashMap<TypeId, Arc<dyn Any + Send + Sync + 'static>, BuildHasherDefault<IdHasher>>;
+type AnyMap =
+    HashMap<TypeId, Arc<dyn Any + Send + Sync + 'static>, BuildHasherDefault<IdHasher>>;
 
 /// Hasher for [`AnyMap`].
 ///
-/// With [`TypeId`]s as keys, there's no need to hash them. They are already
-/// hashes themselves, coming from the compiler. The [`IdHasher`] just holds the
-/// [`u64`] of the [`TypeId`], and then returns it, instead of doing any bit
-/// fiddling.
+/// With [`TypeId`]s as keys, there's no need to hash them. They are already hashes themselves, coming from the compiler.
+/// The [`IdHasher`] just holds the [`u64`] of the [`TypeId`], and then returns it, instead of doing any bit fiddling.
 #[derive(Default)]
 struct IdHasher(u64);
 
@@ -635,8 +644,12 @@ impl Hasher for IdHasher {
     }
 
     #[inline]
-    fn write_u64(&mut self, id: u64) { self.0 = id; }
+    fn write_u64(&mut self, id: u64) {
+        self.0 = id;
+    }
 
     #[inline]
-    fn finish(&self) -> u64 { self.0 }
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }

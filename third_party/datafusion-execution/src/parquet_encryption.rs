@@ -15,14 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use datafusion_common::{config::EncryptionFactoryOptions, error::Result, internal_datafusion_err};
+use datafusion_common::config::EncryptionFactoryOptions;
+use datafusion_common::error::Result;
+use datafusion_common::internal_datafusion_err;
 use object_store::path::Path;
-use parquet::encryption::{decrypt::FileDecryptionProperties, encrypt::FileEncryptionProperties};
+use parquet::encryption::decrypt::FileDecryptionProperties;
+use parquet::encryption::encrypt::FileEncryptionProperties;
+use std::sync::Arc;
 
 /// Trait for types that generate file encryption and decryption properties to
 /// write and read encrypted Parquet files.
@@ -49,18 +51,16 @@ pub trait EncryptionFactory: Send + Sync + std::fmt::Debug + 'static {
     ) -> Result<Option<Arc<FileDecryptionProperties>>>;
 }
 
-/// Stores [`EncryptionFactory`] implementations that can be retrieved by a
-/// unique string identifier
+/// Stores [`EncryptionFactory`] implementations that can be retrieved by a unique string identifier
 #[derive(Clone, Debug, Default)]
 pub struct EncryptionFactoryRegistry {
     factories: DashMap<String, Arc<dyn EncryptionFactory>>,
 }
 
 impl EncryptionFactoryRegistry {
-    /// Register an [`EncryptionFactory`] with an associated identifier that can
-    /// be later used to configure encryption when reading or writing
-    /// Parquet. If an encryption factory with the same identifier was
-    /// already registered, it is replaced and returned.
+    /// Register an [`EncryptionFactory`] with an associated identifier that can be later
+    /// used to configure encryption when reading or writing Parquet.
+    /// If an encryption factory with the same identifier was already registered, it is replaced and returned.
     pub fn register_factory(
         &self,
         id: &str,
@@ -75,7 +75,9 @@ impl EncryptionFactoryRegistry {
             .get(id)
             .map(|f| Arc::clone(f.value()))
             .ok_or_else(|| {
-                internal_datafusion_err!("No Parquet encryption factory found for id '{id}'")
+                internal_datafusion_err!(
+                    "No Parquet encryption factory found for id '{id}'"
+                )
             })
     }
 }

@@ -23,26 +23,26 @@ mod file_metadata_cache;
 mod list_files_cache;
 
 pub use file_metadata_cache::DefaultFilesMetadataCache;
-pub use list_files_cache::{DefaultListFilesCache, ListFilesEntry, TableScopedPath};
+pub use list_files_cache::DefaultListFilesCache;
+pub use list_files_cache::ListFilesEntry;
+pub use list_files_cache::TableScopedPath;
 
 /// Base trait for cache implementations with common operations.
 ///
-/// This trait provides the fundamental cache operations (`get`, `put`,
-/// `remove`, etc.) that all cache types share. Specific cache traits like
-/// [`cache_manager::FileStatisticsCache`], [`cache_manager::ListFilesCache`],
-/// and [`cache_manager::FileMetadataCache`] extend this trait with their
-/// specialized methods.
+/// This trait provides the fundamental cache operations (`get`, `put`, `remove`, etc.)
+/// that all cache types share. Specific cache traits like [`cache_manager::FileStatisticsCache`],
+/// [`cache_manager::ListFilesCache`], and [`cache_manager::FileMetadataCache`] extend this
+/// trait with their specialized methods.
 ///
 /// ## Thread Safety
 ///
-/// Implementations must handle their own locking via internal mutability, as
-/// methods do not take mutable references and may be accessed by multiple
-/// concurrent queries.
+/// Implementations must handle their own locking via internal mutability, as methods do not
+/// take mutable references and may be accessed by multiple concurrent queries.
 ///
 /// ## Validation Pattern
 ///
-/// Validation metadata (e.g., file size, last modified time) should be embedded
-/// in the value type `V`. The typical usage pattern is:
+/// Validation metadata (e.g., file size, last modified time) should be embedded in the
+/// value type `V`. The typical usage pattern is:
 /// 1. Call `get(key)` to check for cached value
 /// 2. If `Some(cached)`, validate with `cached.is_valid_for(&current_meta)`
 /// 3. If invalid or missing, compute new value and call `put(key, new_value)`
@@ -68,7 +68,9 @@ pub trait CacheAccessor<K, V>: Send + Sync {
     fn len(&self) -> usize;
 
     /// Check if the cache collection is empty.
-    fn is_empty(&self) -> bool { self.len() == 0 }
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Remove all entries from the cache.
     fn clear(&self);

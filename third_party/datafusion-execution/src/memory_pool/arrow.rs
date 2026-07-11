@@ -15,12 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Adapter for integrating DataFusion's [`MemoryPool`] with Arrow's memory
-//! tracking APIs.
-
-use std::{fmt::Debug, sync::Arc};
+//! Adapter for integrating DataFusion's [`MemoryPool`] with Arrow's memory tracking APIs.
 
 use crate::memory_pool::{MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation};
+use std::fmt::Debug;
+use std::sync::Arc;
 
 /// An adapter that implements Arrow's [`arrow_buffer::MemoryPool`] trait
 /// by wrapping a DataFusion [`MemoryPool`].
@@ -35,23 +34,26 @@ use crate::memory_pool::{MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservat
 /// and respect the same memory limits as DataFusion operators.
 #[derive(Debug)]
 pub struct ArrowMemoryPool {
-    inner:    Arc<dyn MemoryPool>,
+    inner: Arc<dyn MemoryPool>,
     consumer: MemoryConsumer,
 }
 
 impl ArrowMemoryPool {
-    /// Creates a new [`ArrowMemoryPool`] that wraps the given DataFusion
-    /// [`MemoryPool`] and tracks allocations under the specified
-    /// [`MemoryConsumer`].
+    /// Creates a new [`ArrowMemoryPool`] that wraps the given DataFusion [`MemoryPool`]
+    /// and tracks allocations under the specified [`MemoryConsumer`].
     pub fn new(inner: Arc<dyn MemoryPool>, consumer: MemoryConsumer) -> Self {
         Self { inner, consumer }
     }
 }
 
 impl arrow_buffer::MemoryReservation for MemoryReservation {
-    fn size(&self) -> usize { MemoryReservation::size(self) }
+    fn size(&self) -> usize {
+        MemoryReservation::size(self)
+    }
 
-    fn resize(&mut self, new_size: usize) { MemoryReservation::resize(self, new_size) }
+    fn resize(&mut self, new_size: usize) {
+        MemoryReservation::resize(self, new_size)
+    }
 }
 
 impl arrow_buffer::MemoryPool for ArrowMemoryPool {
@@ -70,7 +72,9 @@ impl arrow_buffer::MemoryPool for ArrowMemoryPool {
             .unwrap_or(isize::MIN)
     }
 
-    fn used(&self) -> usize { self.inner.reserved() }
+    fn used(&self) -> usize {
+        self.inner.reserved()
+    }
 
     fn capacity(&self) -> usize {
         match self.inner.memory_limit() {
@@ -82,11 +86,10 @@ impl arrow_buffer::MemoryPool for ArrowMemoryPool {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Array, Int32Array};
-    use arrow_buffer::MemoryPool;
-
     use super::*;
     use crate::memory_pool::{GreedyMemoryPool, UnboundedMemoryPool};
+    use arrow::array::{Array, Int32Array};
+    use arrow_buffer::MemoryPool;
 
     // Until https://github.com/apache/arrow-rs/pull/8918 lands, we need to iterate all
     // buffers in the array. Change once the PR is released.

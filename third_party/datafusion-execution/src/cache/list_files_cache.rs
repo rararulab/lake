@@ -15,14 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::mem::size_of;
 use std::{
     collections::HashMap,
-    mem::size_of,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use datafusion_common::{TableReference, instant::Instant};
+use datafusion_common::TableReference;
+use datafusion_common::instant::Instant;
 use object_store::{ObjectMeta, path::Path};
 
 use crate::cache::{
@@ -39,7 +40,9 @@ pub trait TimeProvider: Send + Sync + 'static {
 pub struct SystemTimeProvider;
 
 impl TimeProvider for SystemTimeProvider {
-    fn now(&self) -> Instant { Instant::now() }
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
 }
 
 /// Default implementation of [`ListFilesCache`]
@@ -48,23 +51,24 @@ impl TimeProvider for SystemTimeProvider {
 ///
 /// # Internal details
 ///
-/// The `memory_limit` parameter controls the maximum size of the cache, which
-/// uses a Least Recently Used eviction algorithm. When adding a new entry, if
-/// the total number of entries in the cache exceeds `memory_limit`, the least
-/// recently used entries are evicted until the total size is lower than the
-/// `memory_limit`.
+/// The `memory_limit` parameter controls the maximum size of the cache, which uses a Least
+/// Recently Used eviction algorithm. When adding a new entry, if the total number of entries in
+/// the cache exceeds `memory_limit`, the least recently used entries are evicted until the total
+/// size is lower than the `memory_limit`.
 ///
 /// # Cache API
 ///
-/// Uses `get` and `put` methods for cache operations. TTL validation is handled
-/// internally - expired entries return `None` from `get`.
+/// Uses `get` and `put` methods for cache operations. TTL validation is handled internally -
+/// expired entries return `None` from `get`.
 pub struct DefaultListFilesCache {
-    state:         Mutex<DefaultListFilesCacheState>,
+    state: Mutex<DefaultListFilesCacheState>,
     time_provider: Arc<dyn TimeProvider>,
 }
 
 impl Default for DefaultListFilesCache {
-    fn default() -> Self { Self::new(DEFAULT_LIST_FILES_CACHE_MEMORY_LIMIT, None) }
+    fn default() -> Self {
+        Self::new(DEFAULT_LIST_FILES_CACHE_MEMORY_LIMIT, None)
+    }
 }
 
 impl DefaultListFilesCache {
@@ -75,7 +79,7 @@ impl DefaultListFilesCache {
     /// * `ttl` - The TTL (time-to-live) of entries in the cache.
     pub fn new(memory_limit: usize, ttl: Option<Duration>) -> Self {
         Self {
-            state:         Mutex::new(DefaultListFilesCacheState::new(memory_limit, ttl)),
+            state: Mutex::new(DefaultListFilesCacheState::new(memory_limit, ttl)),
             time_provider: Arc::new(SystemTimeProvider),
         }
     }
@@ -89,9 +93,9 @@ impl DefaultListFilesCache {
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct ListFilesEntry {
-    pub metas:      CachedFileList,
+    pub metas: CachedFileList,
     pub size_bytes: usize,
-    pub expires:    Option<Instant>,
+    pub expires: Option<Instant>,
 }
 
 impl ListFilesEntry {
@@ -143,24 +147,24 @@ pub const DEFAULT_LIST_FILES_CACHE_TTL: Option<Duration> = None; // Infinite
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct TableScopedPath {
     pub table: Option<TableReference>,
-    pub path:  Path,
+    pub path: Path,
 }
 
 /// Handles the inner state of the [`DefaultListFilesCache`] struct.
 pub struct DefaultListFilesCacheState {
-    lru_queue:    LruQueue<TableScopedPath, ListFilesEntry>,
+    lru_queue: LruQueue<TableScopedPath, ListFilesEntry>,
     memory_limit: usize,
-    memory_used:  usize,
-    ttl:          Option<Duration>,
+    memory_used: usize,
+    ttl: Option<Duration>,
 }
 
 impl Default for DefaultListFilesCacheState {
     fn default() -> Self {
         Self {
-            lru_queue:    LruQueue::new(),
+            lru_queue: LruQueue::new(),
             memory_limit: DEFAULT_LIST_FILES_CACHE_MEMORY_LIMIT,
-            memory_used:  0,
-            ttl:          DEFAULT_LIST_FILES_CACHE_TTL,
+            memory_used: 0,
+            ttl: DEFAULT_LIST_FILES_CACHE_TTL,
         }
     }
 }
@@ -216,8 +220,7 @@ impl DefaultListFilesCacheState {
     ///
     /// This means that LRU entries might be evicted if required.
     /// If the key is already in the cache, the previous entry is returned.
-    /// If the size of the entry is greater than the `memory_limit`, the value
-    /// is not inserted.
+    /// If the size of the entry is greater than the `memory_limit`, the value is not inserted.
     fn put(
         &mut self,
         key: &TableScopedPath,
@@ -245,8 +248,7 @@ impl DefaultListFilesCacheState {
         old_value.map(|v| v.metas)
     }
 
-    /// Evicts entries from the LRU cache until `memory_used` is lower than
-    /// `memory_limit`.
+    /// Evicts entries from the LRU cache until `memory_used` is lower than `memory_limit`.
     fn evict_entries(&mut self) {
         while self.memory_used > self.memory_limit {
             if let Some(removed) = self.lru_queue.pop() {
@@ -273,7 +275,9 @@ impl DefaultListFilesCacheState {
     }
 
     /// Returns the number of entries currently cached.
-    fn len(&self) -> usize { self.lru_queue.len() }
+    fn len(&self) -> usize {
+        self.lru_queue.len()
+    }
 
     /// Removes all entries from the cache.
     fn clear(&mut self) {
@@ -289,7 +293,11 @@ impl CacheAccessor<TableScopedPath, CachedFileList> for DefaultListFilesCache {
         state.get(key, now)
     }
 
-    fn put(&self, key: &TableScopedPath, value: CachedFileList) -> Option<CachedFileList> {
+    fn put(
+        &self,
+        key: &TableScopedPath,
+        value: CachedFileList,
+    ) -> Option<CachedFileList> {
         let mut state = self.state.lock().unwrap();
         let now = self.time_provider.now();
         state.put(key, value, now)
@@ -316,7 +324,9 @@ impl CacheAccessor<TableScopedPath, CachedFileList> for DefaultListFilesCache {
         state.clear();
     }
 
-    fn name(&self) -> String { String::from("DefaultListFilesCache") }
+    fn name(&self) -> String {
+        String::from("DefaultListFilesCache")
+    }
 }
 
 impl ListFilesCache for DefaultListFilesCache {
@@ -371,21 +381,19 @@ impl ListFilesCache for DefaultListFilesCache {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use chrono::DateTime;
     use std::thread;
 
-    use chrono::DateTime;
-
-    use super::*;
-
     struct MockTimeProvider {
-        base:   Instant,
+        base: Instant,
         offset: Mutex<Duration>,
     }
 
     impl MockTimeProvider {
         fn new() -> Self {
             Self {
-                base:   Instant::now(),
+                base: Instant::now(),
                 offset: Mutex::new(Duration::ZERO),
             }
         }
@@ -397,11 +405,12 @@ mod tests {
     }
 
     impl TimeProvider for MockTimeProvider {
-        fn now(&self) -> Instant { self.base + *self.offset.lock().unwrap() }
+        fn now(&self) -> Instant {
+            self.base + *self.offset.lock().unwrap()
+        }
     }
 
-    /// Helper function to create a test ObjectMeta with a specific path and
-    /// location string size
+    /// Helper function to create a test ObjectMeta with a specific path and location string size
     fn create_test_object_meta(path: &str, location_size: usize) -> ObjectMeta {
         // Create a location string of the desired size by padding with zeros
         let location_str = if location_size > path.len() {
@@ -411,13 +420,13 @@ mod tests {
         };
 
         ObjectMeta {
-            location:      Path::from(location_str),
+            location: Path::from(location_str),
             last_modified: DateTime::parse_from_rfc3339("2022-09-27T22:36:00+02:00")
                 .unwrap()
                 .into(),
-            size:          1024,
-            e_tag:         None,
-            version:       None,
+            size: 1024,
+            e_tag: None,
+            version: None,
         }
     }
 
@@ -476,11 +485,11 @@ mod tests {
         let (path2, value2, size2) = create_test_list_files_entry("path2", 3, 50);
         let key1 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path1,
+            path: path1,
         };
         let key2 = TableScopedPath {
             table: table_ref,
-            path:  path2,
+            path: path2,
         };
         cache.put(&key1, value1.clone());
         cache.put(&key2, value2.clone());
@@ -493,17 +502,17 @@ mod tests {
                 (
                     key1.clone(),
                     ListFilesEntry {
-                        metas:      value1,
+                        metas: value1,
                         size_bytes: size1,
-                        expires:    None,
+                        expires: None,
                     }
                 ),
                 (
                     key2.clone(),
                     ListFilesEntry {
-                        metas:      value2,
+                        metas: value2,
                         size_bytes: size2,
-                        expires:    None,
+                        expires: None,
                     }
                 )
             ])
@@ -528,15 +537,15 @@ mod tests {
         let table_ref = Some(TableReference::from("table"));
         let key1 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path1,
+            path: path1,
         };
         let key2 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path2,
+            path: path2,
         };
         let key3 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path3,
+            path: path3,
         };
 
         // All three entries should fit
@@ -552,7 +561,7 @@ mod tests {
         let (path4, value4, _) = create_test_list_files_entry("path4", 1, 100);
         let key4 = TableScopedPath {
             table: table_ref,
-            path:  path4,
+            path: path4,
         };
         cache.put(&key4, value4);
 
@@ -575,15 +584,15 @@ mod tests {
         let table_ref = Some(TableReference::from("table"));
         let key1 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path1,
+            path: path1,
         };
         let key2 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path2,
+            path: path2,
         };
         let key3 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path3,
+            path: path3,
         };
 
         cache.put(&key1, value1);
@@ -599,7 +608,7 @@ mod tests {
         let (path4, value4, _) = create_test_list_files_entry("path4", 1, 100);
         let key4 = TableScopedPath {
             table: table_ref,
-            path:  path4,
+            path: path4,
         };
         cache.put(&key4, value4);
 
@@ -621,11 +630,11 @@ mod tests {
         let table_ref = Some(TableReference::from("table"));
         let key1 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path1,
+            path: path1,
         };
         let key2 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path2,
+            path: path2,
         };
         cache.put(&key1, value1);
         cache.put(&key2, value2);
@@ -636,7 +645,7 @@ mod tests {
         let (path_large, value_large, _) = create_test_list_files_entry("large", 1, 1000);
         let key_large = TableScopedPath {
             table: table_ref,
-            path:  path_large,
+            path: path_large,
         };
         cache.put(&key_large, value_large);
 
@@ -659,15 +668,15 @@ mod tests {
         let table_ref = Some(TableReference::from("table"));
         let key1 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path1,
+            path: path1,
         };
         let key2 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path2,
+            path: path2,
         };
         let key3 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path3,
+            path: path3,
         };
         cache.put(&key1, value1);
         cache.put(&key2, value2);
@@ -678,7 +687,7 @@ mod tests {
         let (path_large, value_large, _) = create_test_list_files_entry("large", 1, 200);
         let key_large = TableScopedPath {
             table: table_ref,
-            path:  path_large,
+            path: path_large,
         };
         cache.put(&key_large, value_large);
 
@@ -701,15 +710,15 @@ mod tests {
         let table_ref = Some(TableReference::from("table"));
         let key1 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path1,
+            path: path1,
         };
         let key2 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path2,
+            path: path2,
         };
         let key3 = TableScopedPath {
             table: table_ref,
-            path:  path3,
+            path: path3,
         };
         // Add three entries
         cache.put(&key1, value1);
@@ -739,15 +748,15 @@ mod tests {
         let table_ref = Some(TableReference::from("table"));
         let key1 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path1,
+            path: path1,
         };
         let key2 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path2,
+            path: path2,
         };
         let key3 = TableScopedPath {
             table: table_ref,
-            path:  path3,
+            path: path3,
         };
         // Add three entries
         cache.put(&key1, value1);
@@ -780,17 +789,17 @@ mod tests {
                 (
                     key2,
                     ListFilesEntry {
-                        metas:      value2,
+                        metas: value2,
                         size_bytes: size2,
-                        expires:    None,
+                        expires: None,
                     }
                 ),
                 (
                     key3,
                     ListFilesEntry {
-                        metas:      value3_v3,
+                        metas: value3_v3,
                         size_bytes: size3_v3,
-                        expires:    None,
+                        expires: None,
                     }
                 )
             ])
@@ -811,11 +820,11 @@ mod tests {
         let table_ref = Some(TableReference::from("table"));
         let key1 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path1,
+            path: path1,
         };
         let key2 = TableScopedPath {
             table: table_ref,
-            path:  path2,
+            path: path2,
         };
         cache.put(&key1, value1.clone());
         cache.put(&key2, value2.clone());
@@ -830,17 +839,17 @@ mod tests {
                 (
                     key1.clone(),
                     ListFilesEntry {
-                        metas:      value1,
+                        metas: value1,
                         size_bytes: size1,
-                        expires:    mock_time.now().checked_add(ttl),
+                        expires: mock_time.now().checked_add(ttl),
                     }
                 ),
                 (
                     key2.clone(),
                     ListFilesEntry {
-                        metas:      value2,
+                        metas: value2,
                         size_bytes: size2,
-                        expires:    mock_time.now().checked_add(ttl),
+                        expires: mock_time.now().checked_add(ttl),
                     }
                 )
             ])
@@ -870,15 +879,15 @@ mod tests {
         let table_ref = Some(TableReference::from("table"));
         let key1 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path1,
+            path: path1,
         };
         let key2 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path2,
+            path: path2,
         };
         let key3 = TableScopedPath {
             table: table_ref,
-            path:  path3,
+            path: path3,
         };
         cache.put(&key1, value1);
         mock_time.inc(Duration::from_millis(50));
@@ -929,41 +938,41 @@ mod tests {
     fn test_meta_heap_bytes_calculation() {
         // Test with minimal ObjectMeta (no e_tag, no version)
         let meta1 = ObjectMeta {
-            location:      Path::from("test"),
+            location: Path::from("test"),
             last_modified: chrono::Utc::now(),
-            size:          100,
-            e_tag:         None,
-            version:       None,
+            size: 100,
+            e_tag: None,
+            version: None,
         };
         assert_eq!(meta_heap_bytes(&meta1), 4); // Just the location string "test"
 
         // Test with e_tag
         let meta2 = ObjectMeta {
-            location:      Path::from("test"),
+            location: Path::from("test"),
             last_modified: chrono::Utc::now(),
-            size:          100,
-            e_tag:         Some("etag123".to_string()),
-            version:       None,
+            size: 100,
+            e_tag: Some("etag123".to_string()),
+            version: None,
         };
         assert_eq!(meta_heap_bytes(&meta2), 4 + 7); // location (4) + e_tag (7)
 
         // Test with version
         let meta3 = ObjectMeta {
-            location:      Path::from("test"),
+            location: Path::from("test"),
             last_modified: chrono::Utc::now(),
-            size:          100,
-            e_tag:         None,
-            version:       Some("v1.0".to_string()),
+            size: 100,
+            e_tag: None,
+            version: Some("v1.0".to_string()),
         };
         assert_eq!(meta_heap_bytes(&meta3), 4 + 4); // location (4) + version (4)
 
         // Test with both e_tag and version
         let meta4 = ObjectMeta {
-            location:      Path::from("test"),
+            location: Path::from("test"),
             last_modified: chrono::Utc::now(),
-            size:          100,
-            e_tag:         Some("tag".to_string()),
-            version:       Some("ver".to_string()),
+            size: 100,
+            e_tag: Some("tag".to_string()),
+            version: Some("ver".to_string()),
         };
         assert_eq!(meta_heap_bytes(&meta4), 4 + 3 + 3); // location (4) + e_tag (3) + version (3)
     }
@@ -1011,7 +1020,7 @@ mod tests {
         let table_ref = Some(TableReference::from("table"));
         let key1 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path1,
+            path: path1,
         };
         cache.put(&key1, value1);
         {
@@ -1023,7 +1032,7 @@ mod tests {
         let (path2, value2, size2) = create_test_list_files_entry("path2", 1, 200);
         let key2 = TableScopedPath {
             table: table_ref.clone(),
-            path:  path2,
+            path: path2,
         };
         cache.put(&key2, value2);
         {
@@ -1051,13 +1060,13 @@ mod tests {
     /// Helper function to create ObjectMeta with a specific location path
     fn create_object_meta_with_path(location: &str) -> ObjectMeta {
         ObjectMeta {
-            location:      Path::from(location),
+            location: Path::from(location),
             last_modified: DateTime::parse_from_rfc3339("2022-09-27T22:36:00+02:00")
                 .unwrap()
                 .into(),
-            size:          1024,
-            e_tag:         None,
-            version:       None,
+            size: 1024,
+            e_tag: None,
+            version: None,
         }
     }
 
@@ -1078,7 +1087,7 @@ mod tests {
         let table_ref = Some(TableReference::from("table"));
         let key = TableScopedPath {
             table: table_ref,
-            path:  table_base,
+            path: table_base,
         };
         cache.put(&key, CachedFileList::new(files));
 
@@ -1122,7 +1131,7 @@ mod tests {
         let table_ref = Some(TableReference::from("table"));
         let key = TableScopedPath {
             table: table_ref,
-            path:  table_base,
+            path: table_base,
         };
         cache.put(&key, CachedFileList::new(files));
         let result = cache.get(&key).unwrap();
@@ -1139,16 +1148,24 @@ mod tests {
 
         let table_base = Path::from("events");
         let files = vec![
-            create_object_meta_with_path("events/year=2024/month=01/day=01/file1.parquet"),
-            create_object_meta_with_path("events/year=2024/month=01/day=02/file2.parquet"),
-            create_object_meta_with_path("events/year=2024/month=02/day=01/file3.parquet"),
-            create_object_meta_with_path("events/year=2025/month=01/day=01/file4.parquet"),
+            create_object_meta_with_path(
+                "events/year=2024/month=01/day=01/file1.parquet",
+            ),
+            create_object_meta_with_path(
+                "events/year=2024/month=01/day=02/file2.parquet",
+            ),
+            create_object_meta_with_path(
+                "events/year=2024/month=02/day=01/file3.parquet",
+            ),
+            create_object_meta_with_path(
+                "events/year=2025/month=01/day=01/file4.parquet",
+            ),
         ];
 
         let table_ref = Some(TableReference::from("table"));
         let key = TableScopedPath {
             table: table_ref,
-            path:  table_base,
+            path: table_base,
         };
         cache.put(&key, CachedFileList::new(files));
         let result = cache.get(&key).unwrap();
@@ -1175,17 +1192,17 @@ mod tests {
         let table_ref1 = Some(TableReference::from("table1"));
         let key1 = TableScopedPath {
             table: table_ref1.clone(),
-            path:  path1,
+            path: path1,
         };
         let key2 = TableScopedPath {
             table: table_ref1.clone(),
-            path:  path2,
+            path: path2,
         };
 
         let table_ref2 = Some(TableReference::from("table2"));
         let key3 = TableScopedPath {
             table: table_ref2.clone(),
-            path:  path3,
+            path: path3,
         };
 
         cache.put(&key1, value1);

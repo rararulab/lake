@@ -15,18 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
-
-use datafusion_common::{Result, internal_datafusion_err, plan_datafusion_err};
-use datafusion_expr::{AggregateUDF, ScalarUDF, WindowUDF, planner::ExprPlanner};
-
 use crate::{
     config::SessionConfig, memory_pool::MemoryPool, registry::FunctionRegistry,
     runtime_env::RuntimeEnv,
 };
+use datafusion_common::{Result, internal_datafusion_err, plan_datafusion_err};
+use datafusion_expr::planner::ExprPlanner;
+use datafusion_expr::{AggregateUDF, ScalarUDF, WindowUDF};
+use std::collections::HashSet;
+use std::{collections::HashMap, sync::Arc};
 
 /// Task Execution Context
 ///
@@ -38,19 +35,19 @@ use crate::{
 #[derive(Debug)]
 pub struct TaskContext {
     /// Session Id
-    session_id:          String,
+    session_id: String,
     /// Optional Task Identify
-    task_id:             Option<String>,
+    task_id: Option<String>,
     /// Session configuration
-    session_config:      SessionConfig,
+    session_config: SessionConfig,
     /// Scalar functions associated with this task context
-    scalar_functions:    HashMap<String, Arc<ScalarUDF>>,
+    scalar_functions: HashMap<String, Arc<ScalarUDF>>,
     /// Aggregate functions associated with this task context
     aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
     /// Window functions associated with this task context
-    window_functions:    HashMap<String, Arc<WindowUDF>>,
+    window_functions: HashMap<String, Arc<WindowUDF>>,
     /// Runtime environment associated with this task context
-    runtime:             Arc<RuntimeEnv>,
+    runtime: Arc<RuntimeEnv>,
 }
 
 impl Default for TaskContext {
@@ -73,8 +70,7 @@ impl Default for TaskContext {
 impl TaskContext {
     /// Create a new [`TaskContext`] instance.
     ///
-    /// Most users will use [`SessionContext::task_ctx`] to create
-    /// [`TaskContext`]s
+    /// Most users will use [`SessionContext::task_ctx`] to create [`TaskContext`]s
     ///
     /// [`SessionContext::task_ctx`]: https://docs.rs/datafusion/latest/datafusion/execution/context/struct.SessionContext.html#method.task_ctx
     pub fn new(
@@ -98,27 +94,41 @@ impl TaskContext {
     }
 
     /// Return the SessionConfig associated with this [TaskContext]
-    pub fn session_config(&self) -> &SessionConfig { &self.session_config }
+    pub fn session_config(&self) -> &SessionConfig {
+        &self.session_config
+    }
 
     /// Return the `session_id` of this [TaskContext]
-    pub fn session_id(&self) -> String { self.session_id.clone() }
+    pub fn session_id(&self) -> String {
+        self.session_id.clone()
+    }
 
     /// Return the `task_id` of this [TaskContext]
-    pub fn task_id(&self) -> Option<String> { self.task_id.clone() }
+    pub fn task_id(&self) -> Option<String> {
+        self.task_id.clone()
+    }
 
     /// Return the [`MemoryPool`] associated with this [TaskContext]
-    pub fn memory_pool(&self) -> &Arc<dyn MemoryPool> { &self.runtime.memory_pool }
+    pub fn memory_pool(&self) -> &Arc<dyn MemoryPool> {
+        &self.runtime.memory_pool
+    }
 
     /// Return the [RuntimeEnv] associated with this [TaskContext]
-    pub fn runtime_env(&self) -> Arc<RuntimeEnv> { Arc::clone(&self.runtime) }
+    pub fn runtime_env(&self) -> Arc<RuntimeEnv> {
+        Arc::clone(&self.runtime)
+    }
 
-    pub fn scalar_functions(&self) -> &HashMap<String, Arc<ScalarUDF>> { &self.scalar_functions }
+    pub fn scalar_functions(&self) -> &HashMap<String, Arc<ScalarUDF>> {
+        &self.scalar_functions
+    }
 
     pub fn aggregate_functions(&self) -> &HashMap<String, Arc<AggregateUDF>> {
         &self.aggregate_functions
     }
 
-    pub fn window_functions(&self) -> &HashMap<String, Arc<WindowUDF>> { &self.window_functions }
+    pub fn window_functions(&self) -> &HashMap<String, Arc<WindowUDF>> {
+        &self.window_functions
+    }
 
     /// Update the [`SessionConfig`]
     pub fn with_session_config(mut self, session_config: SessionConfig) -> Self {
@@ -134,7 +144,9 @@ impl TaskContext {
 }
 
 impl FunctionRegistry for TaskContext {
-    fn udfs(&self) -> HashSet<String> { self.scalar_functions.keys().cloned().collect() }
+    fn udfs(&self) -> HashSet<String> {
+        self.scalar_functions.keys().cloned().collect()
+    }
 
     fn udf(&self, name: &str) -> Result<Arc<ScalarUDF>> {
         let result = self.scalar_functions.get(name);
@@ -156,18 +168,21 @@ impl FunctionRegistry for TaskContext {
         let result = self.window_functions.get(name);
 
         result.cloned().ok_or_else(|| {
-            internal_datafusion_err!("There is no UDWF named \"{name}\" in the TaskContext")
+            internal_datafusion_err!(
+                "There is no UDWF named \"{name}\" in the TaskContext"
+            )
         })
     }
-
-    fn register_udaf(&mut self, udaf: Arc<AggregateUDF>) -> Result<Option<Arc<AggregateUDF>>> {
+    fn register_udaf(
+        &mut self,
+        udaf: Arc<AggregateUDF>,
+    ) -> Result<Option<Arc<AggregateUDF>>> {
         udaf.aliases().iter().for_each(|alias| {
             self.aggregate_functions
                 .insert(alias.clone(), Arc::clone(&udaf));
         });
         Ok(self.aggregate_functions.insert(udaf.name().into(), udaf))
     }
-
     fn register_udwf(&mut self, udwf: Arc<WindowUDF>) -> Result<Option<Arc<WindowUDF>>> {
         udwf.aliases().iter().for_each(|alias| {
             self.window_functions
@@ -175,7 +190,6 @@ impl FunctionRegistry for TaskContext {
         });
         Ok(self.window_functions.insert(udwf.name().into(), udwf))
     }
-
     fn register_udf(&mut self, udf: Arc<ScalarUDF>) -> Result<Option<Arc<ScalarUDF>>> {
         udf.aliases().iter().for_each(|alias| {
             self.scalar_functions
@@ -184,11 +198,17 @@ impl FunctionRegistry for TaskContext {
         Ok(self.scalar_functions.insert(udf.name().into(), udf))
     }
 
-    fn expr_planners(&self) -> Vec<Arc<dyn ExprPlanner>> { vec![] }
+    fn expr_planners(&self) -> Vec<Arc<dyn ExprPlanner>> {
+        vec![]
+    }
 
-    fn udafs(&self) -> HashSet<String> { self.aggregate_functions.keys().cloned().collect() }
+    fn udafs(&self) -> HashSet<String> {
+        self.aggregate_functions.keys().cloned().collect()
+    }
 
-    fn udwfs(&self) -> HashSet<String> { self.window_functions.keys().cloned().collect() }
+    fn udwfs(&self) -> HashSet<String> {
+        self.window_functions.keys().cloned().collect()
+    }
 }
 
 /// Produce the [`TaskContext`].
@@ -198,12 +218,11 @@ pub trait TaskContextProvider {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use datafusion_common::{
         config::{ConfigExtension, ConfigOptions, Extensions},
         extensions_options,
     };
-
-    use super::*;
 
     extensions_options! {
         struct TestExtension {

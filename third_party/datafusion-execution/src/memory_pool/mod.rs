@@ -18,13 +18,9 @@
 //! [`MemoryPool`] for memory management during query execution, [`proxy`] for
 //! help with allocation accounting.
 
-use std::{
-    cmp::Ordering,
-    hash::{Hash, Hasher},
-    sync::{Arc, atomic},
-};
-
 use datafusion_common::{Result, internal_datafusion_err};
+use std::hash::{Hash, Hasher};
+use std::{cmp::Ordering, sync::Arc, sync::atomic};
 
 mod pool;
 
@@ -109,27 +105,27 @@ pub use pool::*;
 ///
 /// # Related Structs
 ///
-/// To better understand memory management in DataFusion, here are the key
-/// structs and their relationships:
+/// To better understand memory management in DataFusion, here are the key structs
+/// and their relationships:
 ///
-/// - [`MemoryConsumer`]: A named allocation traced by a particular operator. If
-///   an execution is parallelized, and there are multiple partitions of the
-///   same operator, each partition will have a separate `MemoryConsumer`.
-/// - `SharedRegistration`: A registration of a `MemoryConsumer` with a
-///   `MemoryPool`. `SharedRegistration` and `MemoryPool` have a many-to-one
-///   relationship. `MemoryPool` implementation can decide how to allocate
-///   memory based on the registered consumers. (e.g. `FairSpillPool` will try
-///   to share available memory evenly among all registered consumers)
+/// - [`MemoryConsumer`]: A named allocation traced by a particular operator. If an
+///   execution is parallelized, and there are multiple partitions of the same
+///   operator, each partition will have a separate `MemoryConsumer`.
+/// - `SharedRegistration`: A registration of a `MemoryConsumer` with a `MemoryPool`.
+///   `SharedRegistration` and `MemoryPool` have a many-to-one relationship. `MemoryPool`
+///   implementation can decide how to allocate memory based on the registered consumers.
+///   (e.g. `FairSpillPool` will try to share available memory evenly among all registered
+///   consumers)
 /// - [`MemoryReservation`]: Each `MemoryConsumer`/operator can have multiple
-///   `MemoryReservation`s for different internal data structures. The
-///   relationship between `MemoryConsumer` and `MemoryReservation` is
-///   one-to-many. This design enables cleaner operator implementations:
+///   `MemoryReservation`s for different internal data structures. The relationship
+///   between `MemoryConsumer` and `MemoryReservation` is one-to-many. This design
+///   enables cleaner operator implementations:
 ///   - Different `MemoryReservation`s can be used for different purposes
 ///   - `MemoryReservation` follows RAII principles - to release a reservation,
-///     simply drop the `MemoryReservation` object. When all
-///     `MemoryReservation`s for a `SharedRegistration` are dropped, the
-///     `SharedRegistration` is dropped when its reference count reaches zero,
-///     automatically unregistering the `MemoryConsumer` from the `MemoryPool`.
+///     simply drop the `MemoryReservation` object. When all `MemoryReservation`s
+///     for a `SharedRegistration` are dropped, the `SharedRegistration` is dropped
+///     when its reference count reaches zero, automatically unregistering the
+///     `MemoryConsumer` from the `MemoryPool`.
 ///
 /// ## Relationship Diagram
 ///
@@ -162,19 +158,18 @@ pub use pool::*;
 ///    ╚═══════════════════════════════════════════════════╝
 /// ```
 ///
-/// For example, there are two parallel partitions of an operator X: each
-/// partition corresponds to a `MemoryConsumer` in the above diagram. Inside
-/// each partition of operator X, there are typically several
-/// `MemoryReservation`s - one for each internal data structure that needs
-/// memory tracking (e.g., 1 reservation for the hash table, and 1 reservation
-/// for buffered input, etc.).
+/// For example, there are two parallel partitions of an operator X: each partition
+/// corresponds to a `MemoryConsumer` in the above diagram. Inside each partition of
+/// operator X, there are typically several `MemoryReservation`s - one for each
+/// internal data structure that needs memory tracking (e.g., 1 reservation for the hash
+/// table, and 1 reservation for buffered input, etc.).
 ///
 /// # Implementing `MemoryPool`
 ///
 /// You can implement a custom allocation policy by implementing the
 /// [`MemoryPool`] trait and configuring a `SessionContext` appropriately.
-/// However, DataFusion comes with the following simple memory pool
-/// implementations that handle many common cases:
+/// However, DataFusion comes with the following simple memory pool implementations that
+/// handle many common cases:
 ///
 /// * [`UnboundedMemoryPool`]: no memory limits (the default)
 ///
@@ -192,11 +187,9 @@ pub trait MemoryPool: Send + Sync + std::fmt::Debug {
     /// Note: Subsequent calls to [`Self::grow`] must be made to reserve memory
     fn register(&self, _consumer: &MemoryConsumer) {}
 
-    /// Records the destruction of a [`MemoryReservation`] with
-    /// [`MemoryConsumer`]
+    /// Records the destruction of a [`MemoryReservation`] with [`MemoryConsumer`]
     ///
-    /// Note: Prior calls to [`Self::shrink`] must be made to free any reserved
-    /// memory
+    /// Note: Prior calls to [`Self::shrink`] must be made to free any reserved memory
     fn unregister(&self, _consumer: &MemoryConsumer) {}
 
     /// Infallibly grow the provided `reservation` by `additional` bytes
@@ -222,7 +215,9 @@ pub trait MemoryPool: Send + Sync + std::fmt::Debug {
     /// If you are using your custom memory pool, but have the requirement to
     /// know the memory usage limit of the pool, please implement this method
     /// to return it(`Memory::Finite(limit)`).
-    fn memory_limit(&self) -> MemoryLimit { MemoryLimit::Unknown }
+    fn memory_limit(&self) -> MemoryLimit {
+        MemoryLimit::Unknown
+    }
 }
 
 /// Memory limit of `MemoryPool`
@@ -237,10 +232,9 @@ pub enum MemoryLimit {
 /// [`MemoryReservation`] in a [`MemoryPool`]. All allocations are registered to
 /// a particular `MemoryConsumer`;
 ///
-/// Each `MemoryConsumer` is identifiable by a process-unique id, and is
-/// therefor not cloneable, If you want a clone of a `MemoryConsumer`, you
-/// should look into [`MemoryConsumer::clone_with_new_id`], but note that this
-/// `MemoryConsumer` may be treated as a separate entity based on the used pool,
+/// Each `MemoryConsumer` is identifiable by a process-unique id, and is therefor not cloneable,
+/// If you want a clone of a `MemoryConsumer`, you should look into [`MemoryConsumer::clone_with_new_id`],
+/// but note that this `MemoryConsumer` may be treated as a separate entity based on the used pool,
 /// and is only guaranteed to share the name and inner properties.
 ///
 /// For help with allocation accounting, see the [`proxy`] module.
@@ -248,9 +242,9 @@ pub enum MemoryLimit {
 /// [proxy]: datafusion_common::utils::proxy
 #[derive(Debug)]
 pub struct MemoryConsumer {
-    name:      String,
+    name: String,
     can_spill: bool,
-    id:        usize,
+    id: usize,
 }
 
 impl PartialEq for MemoryConsumer {
@@ -283,13 +277,12 @@ impl MemoryConsumer {
         ID.fetch_add(1, atomic::Ordering::Relaxed)
     }
 
-    /// Create a new empty [`MemoryConsumer`] that can be grown using
-    /// [`MemoryReservation`]
+    /// Create a new empty [`MemoryConsumer`] that can be grown using [`MemoryReservation`]
     pub fn new(name: impl Into<String>) -> Self {
         Self {
-            name:      name.into(),
+            name: name.into(),
             can_spill: false,
-            id:        Self::new_unique_id(),
+            id: Self::new_unique_id(),
         }
     }
 
@@ -298,35 +291,42 @@ impl MemoryConsumer {
     /// This new consumer is separate from the original.
     pub fn clone_with_new_id(&self) -> Self {
         Self {
-            name:      self.name.clone(),
+            name: self.name.clone(),
             can_spill: self.can_spill,
-            id:        Self::new_unique_id(),
+            id: Self::new_unique_id(),
         }
     }
 
     /// Return the unique id of this [`MemoryConsumer`]
-    pub fn id(&self) -> usize { self.id }
+    pub fn id(&self) -> usize {
+        self.id
+    }
 
     /// Set whether this allocation can be spilled to disk
-    pub fn with_can_spill(self, can_spill: bool) -> Self { Self { can_spill, ..self } }
+    pub fn with_can_spill(self, can_spill: bool) -> Self {
+        Self { can_spill, ..self }
+    }
 
     /// Returns true if this allocation can spill to disk
-    pub fn can_spill(&self) -> bool { self.can_spill }
+    pub fn can_spill(&self) -> bool {
+        self.can_spill
+    }
 
     /// Returns the name associated with this allocation
-    pub fn name(&self) -> &str { &self.name }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 
-    /// Registers this [`MemoryConsumer`] with the provided [`MemoryPool`]
-    /// returning a [`MemoryReservation`] that can be used to grow or shrink
-    /// the memory reservation
+    /// Registers this [`MemoryConsumer`] with the provided [`MemoryPool`] returning
+    /// a [`MemoryReservation`] that can be used to grow or shrink the memory reservation
     pub fn register(self, pool: &Arc<dyn MemoryPool>) -> MemoryReservation {
         pool.register(&self);
         MemoryReservation {
             registration: Arc::new(SharedRegistration {
-                pool:     Arc::clone(pool),
+                pool: Arc::clone(pool),
                 consumer: self,
             }),
-            size:         atomic::AtomicUsize::new(0),
+            size: atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -337,12 +337,14 @@ impl MemoryConsumer {
 /// the underlying pool.
 #[derive(Debug)]
 struct SharedRegistration {
-    pool:     Arc<dyn MemoryPool>,
+    pool: Arc<dyn MemoryPool>,
     consumer: MemoryConsumer,
 }
 
 impl Drop for SharedRegistration {
-    fn drop(&mut self) { self.pool.unregister(&self.consumer); }
+    fn drop(&mut self) {
+        self.pool.unregister(&self.consumer);
+    }
 }
 
 /// A [`MemoryReservation`] tracks an individual reservation of a
@@ -353,15 +355,19 @@ impl Drop for SharedRegistration {
 #[derive(Debug)]
 pub struct MemoryReservation {
     registration: Arc<SharedRegistration>,
-    size:         atomic::AtomicUsize,
+    size: atomic::AtomicUsize,
 }
 
 impl MemoryReservation {
     /// Returns the size of this reservation in bytes
-    pub fn size(&self) -> usize { self.size.load(atomic::Ordering::Relaxed) }
+    pub fn size(&self) -> usize {
+        self.size.load(atomic::Ordering::Relaxed)
+    }
 
     /// Returns [MemoryConsumer] for this [MemoryReservation]
-    pub fn consumer(&self) -> &MemoryConsumer { &self.registration.consumer }
+    pub fn consumer(&self) -> &MemoryConsumer {
+        &self.registration.consumer
+    }
 
     /// Frees all bytes from this reservation back to the underlying
     /// pool, returning the number of bytes freed.
@@ -470,16 +476,15 @@ impl MemoryReservation {
             )
             .unwrap();
         Self {
-            size:         atomic::AtomicUsize::new(capacity),
+            size: atomic::AtomicUsize::new(capacity),
             registration: Arc::clone(&self.registration),
         }
     }
 
-    /// Returns a new empty [`MemoryReservation`] with the same
-    /// [`MemoryConsumer`]
+    /// Returns a new empty [`MemoryReservation`] with the same [`MemoryConsumer`]
     pub fn new_empty(&self) -> Self {
         Self {
-            size:         atomic::AtomicUsize::new(0),
+            size: atomic::AtomicUsize::new(0),
             registration: Arc::clone(&self.registration),
         }
     }
@@ -492,7 +497,9 @@ impl MemoryReservation {
 }
 
 impl Drop for MemoryReservation {
-    fn drop(&mut self) { self.free(); }
+    fn drop(&mut self) {
+        self.free();
+    }
 }
 
 #[cfg(test)]

@@ -15,26 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{
-    any::Any,
-    collections::HashMap,
-    fmt::{Debug, Formatter},
-    ops::Deref,
-    sync::Arc,
-    time::Duration,
-};
-
-use datafusion_common::{Result, Statistics, TableReference, stats::Precision};
+use crate::cache::CacheAccessor;
+use crate::cache::DefaultListFilesCache;
+use crate::cache::cache_unit::DefaultFilesMetadataCache;
+use crate::cache::list_files_cache::ListFilesEntry;
+use crate::cache::list_files_cache::TableScopedPath;
+use datafusion_common::TableReference;
+use datafusion_common::stats::Precision;
+use datafusion_common::{Result, Statistics};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
-use object_store::{ObjectMeta, path::Path};
+use object_store::ObjectMeta;
+use object_store::path::Path;
+use std::any::Any;
+use std::collections::HashMap;
+use std::fmt::{Debug, Formatter};
+use std::ops::Deref;
+use std::sync::Arc;
+use std::time::Duration;
 
 pub use super::list_files_cache::{
     DEFAULT_LIST_FILES_CACHE_MEMORY_LIMIT, DEFAULT_LIST_FILES_CACHE_TTL,
-};
-use crate::cache::{
-    CacheAccessor, DefaultListFilesCache,
-    cache_unit::DefaultFilesMetadataCache,
-    list_files_cache::{ListFilesEntry, TableScopedPath},
 };
 
 /// Cached metadata for a file, including statistics and ordering.
@@ -44,11 +44,11 @@ use crate::cache::{
 #[derive(Debug, Clone)]
 pub struct CachedFileMetadata {
     /// File metadata used for cache validation (size, last_modified).
-    pub meta:       ObjectMeta,
+    pub meta: ObjectMeta,
     /// Cached statistics for the file, if available.
     pub statistics: Arc<Statistics>,
     /// Cached ordering for the file.
-    pub ordering:   Option<LexOrdering>,
+    pub ordering: Option<LexOrdering>,
 }
 
 impl CachedFileMetadata {
@@ -69,7 +69,8 @@ impl CachedFileMetadata {
     ///
     /// Returns true if the file size and last modified time match.
     pub fn is_valid_for(&self, current_meta: &ObjectMeta) -> bool {
-        self.meta.size == current_meta.size && self.meta.last_modified == current_meta.last_modified
+        self.meta.size == current_meta.size
+            && self.meta.last_modified == current_meta.last_modified
     }
 }
 
@@ -99,17 +100,17 @@ pub trait FileStatisticsCache: CacheAccessor<Path, CachedFileMetadata> {
 /// This is used to expose the statistics cache contents to outside modules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileStatisticsCacheEntry {
-    pub object_meta:           ObjectMeta,
+    pub object_meta: ObjectMeta,
     /// Number of table rows.
-    pub num_rows:              Precision<usize>,
+    pub num_rows: Precision<usize>,
     /// Number of table columns.
-    pub num_columns:           usize,
+    pub num_columns: usize,
     /// Total table size, in bytes.
-    pub table_size_bytes:      Precision<usize>,
+    pub table_size_bytes: Precision<usize>,
     /// Size of the statistics entry, in bytes.
     pub statistics_size_bytes: usize,
     /// Whether ordering information is cached for this file.
-    pub has_ordering:          bool,
+    pub has_ordering: bool,
 }
 
 /// Cached file listing.
@@ -145,8 +146,7 @@ impl CachedFileList {
     /// Returns files matching the given prefix.
     ///
     /// When prefix is `None`, returns a clone of the `Arc` (no data copy).
-    /// When filtering is needed, returns a new `Arc` with filtered results
-    /// (clones each matching [`ObjectMeta`]).
+    /// When filtering is needed, returns a new `Arc` with filtered results (clones each matching [`ObjectMeta`]).
     pub fn files_matching_prefix(&self, prefix: &Option<Path>) -> Arc<Vec<ObjectMeta>> {
         match prefix {
             None => Arc::clone(&self.files),
@@ -157,12 +157,15 @@ impl CachedFileList {
 
 impl Deref for CachedFileList {
     type Target = Arc<Vec<ObjectMeta>>;
-
-    fn deref(&self) -> &Self::Target { &self.files }
+    fn deref(&self) -> &Self::Target {
+        &self.files
+    }
 }
 
 impl From<Vec<ObjectMeta>> for CachedFileList {
-    fn from(files: Vec<ObjectMeta>) -> Self { Self::new(files) }
+    fn from(files: Vec<ObjectMeta>) -> Self {
+        Self::new(files)
+    }
 }
 
 /// Cache for storing the [`ObjectMeta`]s that result from listing a path
@@ -172,11 +175,9 @@ impl From<Vec<ObjectMeta>> for CachedFileList {
 /// especially when done over remote object stores.
 ///
 /// The cache key is always the table's base path, ensuring a stable cache key.
-/// The cached value is a [`CachedFileList`] containing the files and a
-/// timestamp.
+/// The cached value is a [`CachedFileList`] containing the files and a timestamp.
 ///
-/// Partition filtering is done after retrieval using
-/// [`CachedFileList::files_matching_prefix`].
+/// Partition filtering is done after retrieval using [`CachedFileList::files_matching_prefix`].
 ///
 /// See [`crate::runtime_env::RuntimeEnv`] for more details.
 pub trait ListFilesCache: CacheAccessor<TableScopedPath, CachedFileList> {
@@ -206,15 +207,14 @@ pub trait ListFilesCache: CacheAccessor<TableScopedPath, CachedFileList> {
 ///
 /// See [`crate::runtime_env::RuntimeEnv`] for more details
 pub trait FileMetadata: Any + Send + Sync {
-    /// Returns the file metadata as [`Any`] so that it can be downcast to a
-    /// specific implementation.
+    /// Returns the file metadata as [`Any`] so that it can be downcast to a specific
+    /// implementation.
     fn as_any(&self) -> &dyn Any;
 
     /// Returns the size of the metadata in bytes.
     fn memory_size(&self) -> usize;
 
-    /// Returns extra information about this entry (used by
-    /// [`FileMetadataCache::list_entries`]).
+    /// Returns extra information about this entry (used by [`FileMetadataCache::list_entries`]).
     fn extra_info(&self) -> HashMap<String, String>;
 }
 
@@ -222,7 +222,7 @@ pub trait FileMetadata: Any + Send + Sync {
 #[derive(Clone)]
 pub struct CachedFileMetadataEntry {
     /// File metadata used for cache validation (size, last_modified).
-    pub meta:          ObjectMeta,
+    pub meta: ObjectMeta,
     /// The cached file metadata.
     pub file_metadata: Arc<dyn FileMetadata>,
 }
@@ -238,7 +238,8 @@ impl CachedFileMetadataEntry {
 
     /// Check if this cached entry is still valid for the given metadata.
     pub fn is_valid_for(&self, current_meta: &ObjectMeta) -> bool {
-        self.meta.size == current_meta.size && self.meta.last_modified == current_meta.last_modified
+        self.meta.size == current_meta.size
+            && self.meta.last_modified == current_meta.last_modified
     }
 }
 
@@ -253,9 +254,8 @@ impl Debug for CachedFileMetadataEntry {
 
 /// Cache for file-embedded metadata.
 ///
-/// This cache stores per-file metadata in the form of
-/// [`CachedFileMetadataEntry`], which includes the [`ObjectMeta`] for
-/// validation.
+/// This cache stores per-file metadata in the form of [`CachedFileMetadataEntry`],
+/// which includes the [`ObjectMeta`] for validation.
 ///
 /// For example, the built in [`ListingTable`] uses this cache to avoid parsing
 /// Parquet footers multiple times for the same file.
@@ -289,11 +289,11 @@ pub trait FileMetadataCache: CacheAccessor<Path, CachedFileMetadataEntry> {
 pub struct FileMetadataCacheEntry {
     pub object_meta: ObjectMeta,
     /// Size of the cached metadata, in bytes.
-    pub size_bytes:  usize,
+    pub size_bytes: usize,
     /// Number of times this entry was retrieved.
-    pub hits:        usize,
+    pub hits: usize,
     /// Additional object-specific information.
-    pub extra:       HashMap<String, String>,
+    pub extra: HashMap<String, String>,
 }
 
 impl Debug for dyn FileStatisticsCache {
@@ -324,20 +324,20 @@ impl Debug for dyn FileMetadataCache {
 #[derive(Debug)]
 pub struct CacheManager {
     file_statistic_cache: Option<Arc<dyn FileStatisticsCache>>,
-    list_files_cache:     Option<Arc<dyn ListFilesCache>>,
-    file_metadata_cache:  Arc<dyn FileMetadataCache>,
+    list_files_cache: Option<Arc<dyn ListFilesCache>>,
+    file_metadata_cache: Arc<dyn FileMetadataCache>,
 }
 
 impl CacheManager {
     pub fn try_new(config: &CacheManagerConfig) -> Result<Arc<Self>> {
-        let file_statistic_cache = config.table_files_statistics_cache.as_ref().map(Arc::clone);
+        let file_statistic_cache =
+            config.table_files_statistics_cache.as_ref().map(Arc::clone);
 
         let list_files_cache = match &config.list_files_cache {
             Some(lfc) if config.list_files_cache_limit > 0 => {
                 // the cache memory limit or ttl might have changed, ensure they are updated
                 lfc.update_cache_limit(config.list_files_cache_limit);
-                // Only update TTL if explicitly set in config, otherwise preserve the cache's
-                // existing TTL
+                // Only update TTL if explicitly set in config, otherwise preserve the cache's existing TTL
                 if let Some(ttl) = config.list_files_cache_ttl {
                     lfc.update_cache_ttl(Some(ttl));
                 }
@@ -376,8 +376,7 @@ impl CacheManager {
         self.file_statistic_cache.clone()
     }
 
-    /// Get the cache for storing the result of listing [`ObjectMeta`]s under
-    /// the same path.
+    /// Get the cache for storing the result of listing [`ObjectMeta`]s under the same path.
     pub fn get_list_files_cache(&self) -> Option<Arc<dyn ListFilesCache>> {
         self.list_files_cache.clone()
     }
@@ -400,7 +399,9 @@ impl CacheManager {
     }
 
     /// Get the limit of the file embedded metadata cache.
-    pub fn get_metadata_cache_limit(&self) -> usize { self.file_metadata_cache.cache_limit() }
+    pub fn get_metadata_cache_limit(&self) -> usize {
+        self.file_metadata_cache.cache_limit()
+    }
 }
 
 pub const DEFAULT_METADATA_CACHE_LIMIT: usize = 50 * 1024 * 1024; // 50M
@@ -408,43 +409,40 @@ pub const DEFAULT_METADATA_CACHE_LIMIT: usize = 50 * 1024 * 1024; // 50M
 #[derive(Clone)]
 pub struct CacheManagerConfig {
     /// Enable caching of file statistics when listing files.
-    /// Enabling the cache avoids repeatedly reading file statistics in a
-    /// DataFusion session. Default is disabled. Currently only Parquet
-    /// files are supported.
+    /// Enabling the cache avoids repeatedly reading file statistics in a DataFusion session.
+    /// Default is disabled. Currently only Parquet files are supported.
     pub table_files_statistics_cache: Option<Arc<dyn FileStatisticsCache>>,
     /// Enable caching of file metadata when listing files.
-    /// Enabling the cache avoids repeat list and object metadata fetch
-    /// operations, which may be expensive in certain situations (e.g.
-    /// remote object storage), for objects under paths that are cached.
-    /// Note that if this option is enabled, DataFusion will not see any updates
-    /// to the underlying storage for at least `list_files_cache_ttl`
-    /// duration. Default is disabled.
-    pub list_files_cache:             Option<Arc<dyn ListFilesCache>>,
+    /// Enabling the cache avoids repeat list and object metadata fetch operations, which may be
+    /// expensive in certain situations (e.g. remote object storage), for objects under paths that
+    /// are cached.
+    /// Note that if this option is enabled, DataFusion will not see any updates to the underlying
+    /// storage for at least `list_files_cache_ttl` duration.
+    /// Default is disabled.
+    pub list_files_cache: Option<Arc<dyn ListFilesCache>>,
     /// Limit of the `list_files_cache`, in bytes. Default: 1MiB.
-    pub list_files_cache_limit:       usize,
-    /// The duration the list files cache will consider an entry valid after
-    /// insertion. Note that changes to the underlying storage system, such
-    /// as adding or removing data, will not be visible until an entry
-    /// expires. Default: None (infinite).
-    pub list_files_cache_ttl:         Option<Duration>,
-    /// Cache of file-embedded metadata, used to avoid reading it multiple times
-    /// when processing a data file (e.g., Parquet footer and page
-    /// metadata). If not provided, the [`CacheManager`] will create a
-    /// [`DefaultFilesMetadataCache`].
-    pub file_metadata_cache:          Option<Arc<dyn FileMetadataCache>>,
+    pub list_files_cache_limit: usize,
+    /// The duration the list files cache will consider an entry valid after insertion. Note that
+    /// changes to the underlying storage system, such as adding or removing data, will not be
+    /// visible until an entry expires. Default: None (infinite).
+    pub list_files_cache_ttl: Option<Duration>,
+    /// Cache of file-embedded metadata, used to avoid reading it multiple times when processing a
+    /// data file (e.g., Parquet footer and page metadata).
+    /// If not provided, the [`CacheManager`] will create a [`DefaultFilesMetadataCache`].
+    pub file_metadata_cache: Option<Arc<dyn FileMetadataCache>>,
     /// Limit of the file-embedded metadata cache, in bytes.
-    pub metadata_cache_limit:         usize,
+    pub metadata_cache_limit: usize,
 }
 
 impl Default for CacheManagerConfig {
     fn default() -> Self {
         Self {
             table_files_statistics_cache: Default::default(),
-            list_files_cache:             Default::default(),
-            list_files_cache_limit:       DEFAULT_LIST_FILES_CACHE_MEMORY_LIMIT,
-            list_files_cache_ttl:         DEFAULT_LIST_FILES_CACHE_TTL,
-            file_metadata_cache:          Default::default(),
-            metadata_cache_limit:         DEFAULT_METADATA_CACHE_LIMIT,
+            list_files_cache: Default::default(),
+            list_files_cache_limit: DEFAULT_LIST_FILES_CACHE_MEMORY_LIMIT,
+            list_files_cache_ttl: DEFAULT_LIST_FILES_CACHE_TTL,
+            file_metadata_cache: Default::default(),
+            metadata_cache_limit: DEFAULT_METADATA_CACHE_LIMIT,
         }
     }
 }
@@ -464,7 +462,10 @@ impl CacheManagerConfig {
     /// Set the cache for listing files.
     ///
     /// Default is `None` (disabled).
-    pub fn with_list_files_cache(mut self, cache: Option<Arc<dyn ListFilesCache>>) -> Self {
+    pub fn with_list_files_cache(
+        mut self,
+        cache: Option<Arc<dyn ListFilesCache>>,
+    ) -> Self {
         self.list_files_cache = cache;
         self
     }
@@ -488,7 +489,10 @@ impl CacheManagerConfig {
     /// Sets the cache for file-embedded metadata.
     ///
     /// Default is a [`DefaultFilesMetadataCache`].
-    pub fn with_file_metadata_cache(mut self, cache: Option<Arc<dyn FileMetadataCache>>) -> Self {
+    pub fn with_file_metadata_cache(
+        mut self,
+        cache: Option<Arc<dyn FileMetadataCache>>,
+    ) -> Self {
         self.file_metadata_cache = cache;
         self
     }
@@ -506,15 +510,15 @@ mod tests {
     use crate::cache::DefaultListFilesCache;
 
     /// Test to verify that TTL is preserved when not explicitly set in config.
-    /// This fixes issue #19396 where TTL was being unset from
-    /// DefaultListFilesCache when CacheManagerConfig::list_files_cache_ttl
-    /// was not set explicitly.
+    /// This fixes issue #19396 where TTL was being unset from DefaultListFilesCache
+    /// when CacheManagerConfig::list_files_cache_ttl was not set explicitly.
     #[test]
     fn test_ttl_preserved_when_not_set_in_config() {
         use std::time::Duration;
 
         // Create a cache with TTL = 1 second
-        let list_file_cache = DefaultListFilesCache::new(1024, Some(Duration::from_secs(1)));
+        let list_file_cache =
+            DefaultListFilesCache::new(1024, Some(Duration::from_secs(1)));
 
         // Verify the cache has TTL set initially
         assert_eq!(
@@ -524,8 +528,8 @@ mod tests {
         );
 
         // Put cache in config WITHOUT setting list_files_cache_ttl
-        let config =
-            CacheManagerConfig::default().with_list_files_cache(Some(Arc::new(list_file_cache)));
+        let config = CacheManagerConfig::default()
+            .with_list_files_cache(Some(Arc::new(list_file_cache)));
 
         // Create CacheManager from config
         let cache_manager = CacheManager::try_new(&config).unwrap();
@@ -535,8 +539,7 @@ mod tests {
 
         assert!(
             cache_ttl.is_some(),
-            "TTL should be preserved when not set in config. Expected \
-             Some(Duration::from_secs(1)), got {cache_ttl:?}"
+            "TTL should be preserved when not set in config. Expected Some(Duration::from_secs(1)), got {cache_ttl:?}"
         );
 
         // Verify it's the correct TTL value
@@ -547,14 +550,14 @@ mod tests {
         );
     }
 
-    /// Test to verify that TTL can still be overridden when explicitly set in
-    /// config.
+    /// Test to verify that TTL can still be overridden when explicitly set in config.
     #[test]
     fn test_ttl_overridden_when_set_in_config() {
         use std::time::Duration;
 
         // Create a cache with TTL = 1 second
-        let list_file_cache = DefaultListFilesCache::new(1024, Some(Duration::from_secs(1)));
+        let list_file_cache =
+            DefaultListFilesCache::new(1024, Some(Duration::from_secs(1)));
 
         // Put cache in config WITH a different TTL set
         let config = CacheManagerConfig::default()

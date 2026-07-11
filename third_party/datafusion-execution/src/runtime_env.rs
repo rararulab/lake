@@ -18,28 +18,28 @@
 //! Execution [`RuntimeEnv`] environment that manages access to object
 //! store, memory manager, disk manager.
 
+#[expect(deprecated)]
+use crate::disk_manager::{DiskManagerConfig, SpillingProgress};
+use crate::{
+    disk_manager::{DiskManager, DiskManagerBuilder, DiskManagerMode},
+    memory_pool::{
+        GreedyMemoryPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool,
+    },
+    object_store::{DefaultObjectStoreRegistry, ObjectStoreRegistry},
+};
+
+use crate::cache::cache_manager::{CacheManager, CacheManagerConfig};
+#[cfg(feature = "parquet_encryption")]
+use crate::parquet_encryption::{EncryptionFactory, EncryptionFactoryRegistry};
+use datafusion_common::{Result, config::ConfigEntry};
+use object_store::ObjectStore;
+use std::sync::Arc;
 use std::{
     fmt::{Debug, Formatter},
     num::NonZeroUsize,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
 };
-
-use datafusion_common::{Result, config::ConfigEntry};
-use object_store::ObjectStore;
+use std::{path::PathBuf, time::Duration};
 use url::Url;
-
-#[expect(deprecated)]
-use crate::disk_manager::{DiskManagerConfig, SpillingProgress};
-#[cfg(feature = "parquet_encryption")]
-use crate::parquet_encryption::{EncryptionFactory, EncryptionFactoryRegistry};
-use crate::{
-    cache::cache_manager::{CacheManager, CacheManagerConfig},
-    disk_manager::{DiskManager, DiskManagerBuilder, DiskManagerMode},
-    memory_pool::{GreedyMemoryPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool},
-    object_store::{DefaultObjectStoreRegistry, ObjectStoreRegistry},
-};
 
 #[derive(Clone)]
 /// Execution runtime environment that manages system resources such
@@ -86,14 +86,16 @@ pub struct RuntimeEnv {
 }
 
 impl Debug for RuntimeEnv {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result { write!(f, "RuntimeEnv") }
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "RuntimeEnv")
+    }
 }
 
 /// Creates runtime configuration entries with the provided values
 ///
-/// This helper function defines the structure and metadata for all runtime
-/// configuration entries to avoid duplication between
-/// `RuntimeEnv::config_entries()` and `RuntimeEnvBuilder::entries()`.
+/// This helper function defines the structure and metadata for all runtime configuration
+/// entries to avoid duplication between `RuntimeEnv::config_entries()` and
+/// `RuntimeEnvBuilder::entries()`.
 fn create_runtime_config_entries(
     memory_limit: Option<String>,
     max_temp_directory_size: Option<String>,
@@ -104,50 +106,42 @@ fn create_runtime_config_entries(
 ) -> Vec<ConfigEntry> {
     vec![
         ConfigEntry {
-            key:         "datafusion.runtime.memory_limit".to_string(),
-            value:       memory_limit,
-            description: "Maximum memory limit for query execution. Supports suffixes K \
-                          (kilobytes), M (megabytes), and G (gigabytes). Example: '2G' for 2 \
-                          gigabytes.",
+            key: "datafusion.runtime.memory_limit".to_string(),
+            value: memory_limit,
+            description: "Maximum memory limit for query execution. Supports suffixes K (kilobytes), M (megabytes), and G (gigabytes). Example: '2G' for 2 gigabytes.",
         },
         ConfigEntry {
-            key:         "datafusion.runtime.max_temp_directory_size".to_string(),
-            value:       max_temp_directory_size,
-            description: "Maximum temporary file directory size. Supports suffixes K (kilobytes), \
-                          M (megabytes), and G (gigabytes). Example: '2G' for 2 gigabytes.",
+            key: "datafusion.runtime.max_temp_directory_size".to_string(),
+            value: max_temp_directory_size,
+            description: "Maximum temporary file directory size. Supports suffixes K (kilobytes), M (megabytes), and G (gigabytes). Example: '2G' for 2 gigabytes.",
         },
         ConfigEntry {
-            key:         "datafusion.runtime.temp_directory".to_string(),
-            value:       temp_directory,
+            key: "datafusion.runtime.temp_directory".to_string(),
+            value: temp_directory,
             description: "The path to the temporary file directory.",
         },
         ConfigEntry {
-            key:         "datafusion.runtime.metadata_cache_limit".to_string(),
-            value:       metadata_cache_limit,
-            description: "Maximum memory to use for file metadata cache such as Parquet metadata. \
-                          Supports suffixes K (kilobytes), M (megabytes), and G (gigabytes). \
-                          Example: '2G' for 2 gigabytes.",
+            key: "datafusion.runtime.metadata_cache_limit".to_string(),
+            value: metadata_cache_limit,
+            description: "Maximum memory to use for file metadata cache such as Parquet metadata. Supports suffixes K (kilobytes), M (megabytes), and G (gigabytes). Example: '2G' for 2 gigabytes.",
         },
         ConfigEntry {
-            key:         "datafusion.runtime.list_files_cache_limit".to_string(),
-            value:       list_files_cache_limit,
-            description: "Maximum memory to use for list files cache. Supports suffixes K \
-                          (kilobytes), M (megabytes), and G (gigabytes). Example: '2G' for 2 \
-                          gigabytes.",
+            key: "datafusion.runtime.list_files_cache_limit".to_string(),
+            value: list_files_cache_limit,
+            description: "Maximum memory to use for list files cache. Supports suffixes K (kilobytes), M (megabytes), and G (gigabytes). Example: '2G' for 2 gigabytes.",
         },
         ConfigEntry {
-            key:         "datafusion.runtime.list_files_cache_ttl".to_string(),
-            value:       list_files_cache_ttl,
-            description: "TTL (time-to-live) of the entries in the list file cache. Supports \
-                          units m (minutes), and s (seconds). Example: '2m' for 2 minutes.",
+            key: "datafusion.runtime.list_files_cache_ttl".to_string(),
+            value: list_files_cache_ttl,
+            description: "TTL (time-to-live) of the entries in the list file cache. Supports units m (minutes), and s (seconds). Example: '2m' for 2 minutes.",
         },
     ]
 }
 
 impl RuntimeEnv {
     /// Registers a custom `ObjectStore` to be used with a specific url.
-    /// This allows DataFusion to create external tables from urls that do not
-    /// have built in support such as `hdfs://namenode:port/...`.
+    /// This allows DataFusion to create external tables from urls that do not have
+    /// built in support such as `hdfs://namenode:port/...`.
     ///
     /// Returns the [`ObjectStore`] previously registered for this
     /// scheme, if any.
@@ -192,8 +186,8 @@ impl RuntimeEnv {
         self.object_store_registry.register_store(url, object_store)
     }
 
-    /// Deregisters a custom `ObjectStore` previously registered for a specific
-    /// url. See [`ObjectStoreRegistry::deregister_store`] for more details.
+    /// Deregisters a custom `ObjectStore` previously registered for a specific url.
+    /// See [`ObjectStoreRegistry::deregister_store`] for more details.
     pub fn deregister_object_store(&self, url: &Url) -> Result<Arc<dyn ObjectStore>> {
         self.object_store_registry.deregister_store(url)
     }
@@ -206,12 +200,13 @@ impl RuntimeEnv {
     }
 
     /// Returns the current spilling progress
-    pub fn spilling_progress(&self) -> SpillingProgress { self.disk_manager.spilling_progress() }
+    pub fn spilling_progress(&self) -> SpillingProgress {
+        self.disk_manager.spilling_progress()
+    }
 
-    /// Register an [`EncryptionFactory`] with an associated identifier that can
-    /// be later used to configure encryption when reading or writing
-    /// Parquet. If an encryption factory with the same identifier was
-    /// already registered, it is replaced and returned.
+    /// Register an [`EncryptionFactory`] with an associated identifier that can be later
+    /// used to configure encryption when reading or writing Parquet.
+    /// If an encryption factory with the same identifier was already registered, it is replaced and returned.
     #[cfg(feature = "parquet_encryption")]
     pub fn register_parquet_encryption_factory(
         &self,
@@ -224,7 +219,10 @@ impl RuntimeEnv {
 
     /// Retrieve an [`EncryptionFactory`] by its identifier
     #[cfg(feature = "parquet_encryption")]
-    pub fn parquet_encryption_factory(&self, id: &str) -> Result<Arc<dyn EncryptionFactory>> {
+    pub fn parquet_encryption_factory(
+        &self,
+        id: &str,
+    ) -> Result<Arc<dyn EncryptionFactory>> {
         self.parquet_encryption_factory_registry.get_factory(id)
     }
 
@@ -310,7 +308,9 @@ impl RuntimeEnv {
 }
 
 impl Default for RuntimeEnv {
-    fn default() -> Self { RuntimeEnvBuilder::new().build().unwrap() }
+    fn default() -> Self {
+        RuntimeEnvBuilder::new().build().unwrap()
+    }
 }
 
 /// Execution runtime configuration builder.
@@ -337,7 +337,9 @@ pub struct RuntimeEnvBuilder {
 }
 
 impl Default for RuntimeEnvBuilder {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RuntimeEnvBuilder {
@@ -430,8 +432,7 @@ impl RuntimeEnvBuilder {
         self
     }
 
-    /// Specifies the duration entries in the object list cache will be
-    /// considered valid.
+    /// Specifies the duration entries in the object list cache will be considered valid.
     pub fn with_object_list_cache_ttl(mut self, ttl: Option<Duration>) -> Self {
         self.cache_manager = self.cache_manager.with_list_files_cache_ttl(ttl);
         self
@@ -448,7 +449,8 @@ impl RuntimeEnvBuilder {
             #[cfg(feature = "parquet_encryption")]
             parquet_encryption_factory_registry,
         } = self;
-        let memory_pool = memory_pool.unwrap_or_else(|| Arc::new(UnboundedMemoryPool::default()));
+        let memory_pool =
+            memory_pool.unwrap_or_else(|| Arc::new(UnboundedMemoryPool::default()));
 
         Ok(RuntimeEnv {
             memory_pool,
@@ -466,22 +468,32 @@ impl RuntimeEnvBuilder {
     }
 
     /// Convenience method to create a new `Arc<RuntimeEnv>`
-    pub fn build_arc(self) -> Result<Arc<RuntimeEnv>> { self.build().map(Arc::new) }
+    pub fn build_arc(self) -> Result<Arc<RuntimeEnv>> {
+        self.build().map(Arc::new)
+    }
 
     /// Create a new RuntimeEnvBuilder from an existing RuntimeEnv
     pub fn from_runtime_env(runtime_env: &RuntimeEnv) -> Self {
         let cache_config = CacheManagerConfig {
-            table_files_statistics_cache: runtime_env.cache_manager.get_file_statistic_cache(),
-            list_files_cache:             runtime_env.cache_manager.get_list_files_cache(),
-            list_files_cache_limit:       runtime_env.cache_manager.get_list_files_cache_limit(),
-            list_files_cache_ttl:         runtime_env.cache_manager.get_list_files_cache_ttl(),
-            file_metadata_cache:          Some(runtime_env.cache_manager.get_file_metadata_cache()),
-            metadata_cache_limit:         runtime_env.cache_manager.get_metadata_cache_limit(),
+            table_files_statistics_cache: runtime_env
+                .cache_manager
+                .get_file_statistic_cache(),
+            list_files_cache: runtime_env.cache_manager.get_list_files_cache(),
+            list_files_cache_limit: runtime_env
+                .cache_manager
+                .get_list_files_cache_limit(),
+            list_files_cache_ttl: runtime_env.cache_manager.get_list_files_cache_ttl(),
+            file_metadata_cache: Some(
+                runtime_env.cache_manager.get_file_metadata_cache(),
+            ),
+            metadata_cache_limit: runtime_env.cache_manager.get_metadata_cache_limit(),
         };
 
         Self {
             #[expect(deprecated)]
-            disk_manager: DiskManagerConfig::Existing(Arc::clone(&runtime_env.disk_manager)),
+            disk_manager: DiskManagerConfig::Existing(Arc::clone(
+                &runtime_env.disk_manager,
+            )),
             disk_manager_builder: None,
             memory_pool: Some(Arc::clone(&runtime_env.memory_pool)),
             cache_manager: cache_config,
@@ -493,8 +505,7 @@ impl RuntimeEnvBuilder {
         }
     }
 
-    /// Returns a list of all available runtime configurations with their
-    /// current values and descriptions
+    /// Returns a list of all available runtime configurations with their current values and descriptions
     pub fn entries(&self) -> Vec<ConfigEntry> {
         create_runtime_config_entries(
             None,

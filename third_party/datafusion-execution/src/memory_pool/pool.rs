@@ -15,17 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::memory_pool::{
+    MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation, human_readable_size,
+};
+use datafusion_common::HashMap;
+use datafusion_common::{DataFusionError, Result, resources_datafusion_err};
+use log::debug;
+use parking_lot::Mutex;
 use std::{
     num::NonZeroUsize,
     sync::atomic::{AtomicUsize, Ordering},
-};
-
-use datafusion_common::{DataFusionError, HashMap, Result, resources_datafusion_err};
-use log::debug;
-use parking_lot::Mutex;
-
-use crate::memory_pool::{
-    MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation, human_readable_size,
 };
 
 /// A [`MemoryPool`] that enforces no limit
@@ -48,9 +47,13 @@ impl MemoryPool for UnboundedMemoryPool {
         Ok(())
     }
 
-    fn reserved(&self) -> usize { self.used.load(Ordering::Relaxed) }
+    fn reserved(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
 
-    fn memory_limit(&self) -> MemoryLimit { MemoryLimit::Infinite }
+    fn memory_limit(&self) -> MemoryLimit {
+        MemoryLimit::Infinite
+    }
 }
 
 /// A [`MemoryPool`] that implements a greedy first-come first-serve limit.
@@ -61,7 +64,7 @@ impl MemoryPool for UnboundedMemoryPool {
 #[derive(Debug)]
 pub struct GreedyMemoryPool {
     pool_size: usize,
-    used:      AtomicUsize,
+    used: AtomicUsize,
 }
 
 impl GreedyMemoryPool {
@@ -100,9 +103,13 @@ impl MemoryPool for GreedyMemoryPool {
         Ok(())
     }
 
-    fn reserved(&self) -> usize { self.used.load(Ordering::Relaxed) }
+    fn reserved(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
 
-    fn memory_limit(&self) -> MemoryLimit { MemoryLimit::Finite(self.pool_size) }
+    fn memory_limit(&self) -> MemoryLimit {
+        MemoryLimit::Finite(self.pool_size)
+    }
 }
 
 /// A [`MemoryPool`] that prevents spillable reservations from using more than
@@ -154,8 +161,8 @@ impl FairSpillPool {
         Self {
             pool_size,
             state: Mutex::new(FairSpillPoolState {
-                num_spill:   0,
-                spillable:   0,
+                num_spill: 0,
+                spillable: 0,
                 unspillable: 0,
             }),
         }
@@ -237,11 +244,12 @@ impl MemoryPool for FairSpillPool {
         state.spillable + state.unspillable
     }
 
-    fn memory_limit(&self) -> MemoryLimit { MemoryLimit::Finite(self.pool_size) }
+    fn memory_limit(&self) -> MemoryLimit {
+        MemoryLimit::Finite(self.pool_size)
+    }
 }
 
-/// Constructs a resources error based upon the individual
-/// [`MemoryReservation`].
+/// Constructs a resources error based upon the individual [`MemoryReservation`].
 ///
 /// The error references the `bytes already allocated` for the reservation,
 /// and not the total within the collective [`MemoryPool`],
@@ -253,8 +261,7 @@ fn insufficient_capacity_err(
     available: usize,
 ) -> DataFusionError {
     resources_datafusion_err!(
-        "Failed to allocate additional {} for {} with {} already allocated for this reservation - \
-         {} remain available for the total pool",
+        "Failed to allocate additional {} for {} with {} already allocated for this reservation - {} remain available for the total pool",
         human_readable_size(additional),
         reservation.registration.consumer.name,
         human_readable_size(reservation.size()),
@@ -264,18 +271,22 @@ fn insufficient_capacity_err(
 
 #[derive(Debug)]
 struct TrackedConsumer {
-    name:      String,
+    name: String,
     can_spill: bool,
-    reserved:  AtomicUsize,
-    peak:      AtomicUsize,
+    reserved: AtomicUsize,
+    peak: AtomicUsize,
 }
 
 impl TrackedConsumer {
     /// Shorthand to return the currently reserved value
-    fn reserved(&self) -> usize { self.reserved.load(Ordering::Relaxed) }
+    fn reserved(&self) -> usize {
+        self.reserved.load(Ordering::Relaxed)
+    }
 
     /// Return the peak value
-    fn peak(&self) -> usize { self.peak.load(Ordering::Relaxed) }
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
 
     /// Grows the tracked consumer's reserved size,
     /// should be called after the pool has successfully performed the grow().
@@ -286,7 +297,9 @@ impl TrackedConsumer {
 
     /// Reduce the tracked consumer's reserved size,
     /// should be called after the pool has successfully performed the shrink().
-    fn shrink(&self, shrink: usize) { self.reserved.fetch_sub(shrink, Ordering::Relaxed); }
+    fn shrink(&self, shrink: usize) {
+        self.reserved.fetch_sub(shrink, Ordering::Relaxed);
+    }
 }
 
 /// A [`MemoryPool`] that tracks the consumers that have
@@ -309,18 +322,16 @@ impl TrackedConsumer {
 ///
 /// # Usage Examples
 ///
-/// For more examples of using `TrackConsumersPool`, see the
-/// [memory_pool_tracking.rs] example
+/// For more examples of using `TrackConsumersPool`, see the [memory_pool_tracking.rs] example
 ///
 /// [memory_pool_tracking.rs]: https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/execution_monitoring/memory_pool_tracking.rs
 /// [memory_pool_execution_plan.rs]: https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/execution_monitoring/memory_pool_execution_plan.rs
 #[derive(Debug)]
 pub struct TrackConsumersPool<I> {
     /// The wrapped memory pool that actually handles reservation logic
-    inner:             I,
-    /// The amount of consumers to report(ordered top to bottom by reservation
-    /// size)
-    top:               NonZeroUsize,
+    inner: I,
+    /// The amount of consumers to report(ordered top to bottom by reservation size)
+    top: NonZeroUsize,
     /// Maps consumer_id --> TrackedConsumer
     tracked_consumers: Mutex<HashMap<usize, TrackedConsumer>>,
 }
@@ -329,23 +340,21 @@ impl<I: MemoryPool> TrackConsumersPool<I> {
     /// Creates a new [`TrackConsumersPool`].
     ///
     /// # Arguments
-    /// * `inner` - The underlying memory pool that handles actual memory
-    ///   allocation
-    /// * `top` - The number of top memory consumers to include in error
-    ///   messages
+    /// * `inner` - The underlying memory pool that handles actual memory allocation
+    /// * `top` - The number of top memory consumers to include in error messages
     ///
     /// # Note
-    /// In most cases, you should use
-    /// [`RuntimeEnvBuilder::with_memory_limit()`](crate::runtime_env::RuntimeEnvBuilder::with_memory_limit)
-    /// instead of creating this pool manually, as it automatically sets up
-    /// tracking with sensible defaults (top 5 consumers).
+    /// In most cases, you should use [`RuntimeEnvBuilder::with_memory_limit()`](crate::runtime_env::RuntimeEnvBuilder::with_memory_limit)
+    /// instead of creating this pool manually, as it automatically sets up tracking with
+    /// sensible defaults (top 5 consumers).
     ///
     /// # Example
     ///
     /// ```rust
+    /// use datafusion_execution::memory_pool::{
+    ///     FairSpillPool, GreedyMemoryPool, TrackConsumersPool,
+    /// };
     /// use std::num::NonZeroUsize;
-    ///
-    /// use datafusion_execution::memory_pool::{FairSpillPool, GreedyMemoryPool, TrackConsumersPool};
     ///
     /// // Create with a greedy pool backend, reporting top 3 consumers in error messages
     /// let tracked_greedy = TrackConsumersPool::new(
@@ -415,10 +424,10 @@ impl<I: MemoryPool> MemoryPool for TrackConsumersPool<I> {
         let existing = guard.insert(
             consumer.id(),
             TrackedConsumer {
-                name:      consumer.name().to_string(),
+                name: consumer.name().to_string(),
                 can_spill: consumer.can_spill(),
-                reserved:  Default::default(),
-                peak:      Default::default(),
+                reserved: Default::default(),
+                peak: Default::default(),
             },
         );
 
@@ -459,11 +468,13 @@ impl<I: MemoryPool> MemoryPool for TrackConsumersPool<I> {
             .map_err(|e| match e {
                 DataFusionError::ResourcesExhausted(e) => {
                     // wrap OOM message in top consumers
-                    DataFusionError::ResourcesExhausted(provide_top_memory_consumers_to_error_msg(
-                        &reservation.consumer().name,
-                        &e,
-                        &self.report_top(self.top.into()),
-                    ))
+                    DataFusionError::ResourcesExhausted(
+                        provide_top_memory_consumers_to_error_msg(
+                            &reservation.consumer().name,
+                            &e,
+                            &self.report_top(self.top.into()),
+                        ),
+                    )
                 }
                 _ => e,
             })?;
@@ -477,9 +488,13 @@ impl<I: MemoryPool> MemoryPool for TrackConsumersPool<I> {
         Ok(())
     }
 
-    fn reserved(&self) -> usize { self.inner.reserved() }
+    fn reserved(&self) -> usize {
+        self.inner.reserved()
+    }
 
-    fn memory_limit(&self) -> MemoryLimit { self.inner.memory_limit() }
+    fn memory_limit(&self) -> MemoryLimit {
+        self.inner.memory_limit()
+    }
 }
 
 fn provide_top_memory_consumers_to_error_msg(
@@ -488,18 +503,15 @@ fn provide_top_memory_consumers_to_error_msg(
     top_consumers: &str,
 ) -> String {
     format!(
-        "Additional allocation failed for {consumer_name} with top memory consumers (across \
-         reservations) as:\n{top_consumers}\nError: {error_msg}"
+        "Additional allocation failed for {consumer_name} with top memory consumers (across reservations) as:\n{top_consumers}\nError: {error_msg}"
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use insta::{Settings, allow_duplicates, assert_snapshot};
-
     use super::*;
+    use insta::{Settings, allow_duplicates, assert_snapshot};
+    use std::sync::Arc;
 
     fn make_settings() -> Settings {
         let mut settings = Settings::clone_current();
@@ -558,7 +570,7 @@ mod tests {
         let err = r3.try_grow(70).unwrap_err().strip_backtrace();
         assert_snapshot!(err, @"Resources exhausted: Failed to allocate additional 70.0 B for r3 with 0.0 B already allocated for this reservation - 40.0 B remain available for the total pool");
 
-        // Shrinking r2 to zero doesn't allow a3 to allocate more than 45
+        //Shrinking r2 to zero doesn't allow a3 to allocate more than 45
         r2.free();
         let err = r3.try_grow(70).unwrap_err().strip_backtrace();
         assert_snapshot!(err, @"Resources exhausted: Failed to allocate additional 70.0 B for r3 with 0.0 B already allocated for this reservation - 40.0 B remain available for the total pool");
@@ -654,9 +666,8 @@ mod tests {
         r0.grow(10); // make r0=10, pool available=90
         let new_consumer_same_name = MemoryConsumer::new(same_name);
         let r1 = new_consumer_same_name.register(&pool);
-        // TODO: the insufficient_capacity_err() message is per reservation, not per
-        // consumer. a followup PR will clarify this message "0 bytes already
-        // allocated for this reservation"
+        // TODO: the insufficient_capacity_err() message is per reservation, not per consumer.
+        // a followup PR will clarify this message "0 bytes already allocated for this reservation"
         let res = r1.try_grow(150);
         assert!(res.is_err());
         let error = res.unwrap_err().strip_backtrace();
@@ -731,9 +742,8 @@ mod tests {
             Error: Failed to allocate additional 150.0 B for r0 with 10.0 B already allocated for this reservation - 90.0 B remain available for the total pool
             "));
 
-            // Test: actual message we see is the `available is 70`. When it should be
-            // `available is 90`. This is because the pool.shrink() does not
-            // automatically occur within the inner_pool.deregister().
+            // Test: actual message we see is the `available is 70`. When it should be `available is 90`.
+            // This is because the pool.shrink() does not automatically occur within the inner_pool.deregister().
             let res = r0.try_grow(150);
             assert!(res.is_err());
             let error = res.unwrap_err().strip_backtrace();
@@ -772,10 +782,11 @@ mod tests {
     fn test_tracked_consumers_pool_use_beyond_errors() {
         let setting = make_settings();
         let _bound = setting.bind_to_scope();
-        let upcasted: Arc<dyn std::any::Any + Send + Sync> = Arc::new(TrackConsumersPool::new(
-            GreedyMemoryPool::new(100),
-            NonZeroUsize::new(3).unwrap(),
-        ));
+        let upcasted: Arc<dyn std::any::Any + Send + Sync> =
+            Arc::new(TrackConsumersPool::new(
+                GreedyMemoryPool::new(100),
+                NonZeroUsize::new(3).unwrap(),
+            ));
         let pool: Arc<dyn MemoryPool> = Arc::clone(&upcasted)
             .downcast::<TrackConsumersPool<GreedyMemoryPool>>()
             .unwrap();
