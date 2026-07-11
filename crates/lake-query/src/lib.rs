@@ -275,6 +275,13 @@ impl QueryEngine {
         self.catalog.cached_snapshot()
     }
 
+    pub(crate) fn cached_table_schema(
+        &self,
+        table: &lake_common::TableRef,
+    ) -> Option<datafusion::arrow::datatypes::SchemaRef> {
+        self.catalog.cached_table_schema(table)
+    }
+
     /// Execute a SQL statement and collect the results.
     pub async fn execute_sql(&self, sql: &str) -> Result<Vec<RecordBatch>> {
         let df = self.plan_sql(sql).await?;

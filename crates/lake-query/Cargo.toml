@@ -31,6 +31,7 @@ lake-metasrv = { workspace = true }
 tempfile = "3"
 prost-types = { workspace = true }
 rcgen = "^0.13"
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

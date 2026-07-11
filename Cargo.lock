@@ -4297,6 +4297,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rcgen",
+ "serde_json",
  "snafu",
  "tempfile",
  "tokio",
