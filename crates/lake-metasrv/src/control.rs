@@ -460,20 +460,14 @@ impl MetasrvFlightService {
         Ok(Response::new(stream))
     }
 
-    /// `drop_table`: serve locally if leader, else forward to the leader, then
-    /// delete the table's data and deregister it. Idempotent.
+    /// Reject remote destructive drop until the durable tombstone protocol can
+    /// recover object deletion across leader failure. Local administrative
+    /// drop remains available through [`Metasrv::drop_table`].
     async fn action_drop_table(&self, action: Action) -> Result<Response<ActionStream>, Status> {
-        let req: TableIdent = parse_body(&action.body)?;
-        if let Some(forwarded) = self.maybe_forward(&action, &req.namespace).await? {
-            return Ok(forwarded);
-        }
-        let table = TableRef::new(req.namespace, req.name);
-        self.metasrv
-            .drop_table(&table)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let stream: ActionStream = Box::pin(futures::stream::empty());
-        Ok(Response::new(stream))
+        let _: TableIdent = parse_body(&action.body)?;
+        Err(Status::failed_precondition(
+            "remote drop requires durable tombstone support",
+        ))
     }
 
     /// `resolve`: return the table's registration as one JSON result, or
@@ -687,8 +681,8 @@ impl FlightService for MetasrvFlightService {
             },
             ActionType {
                 r#type:      "drop_table".to_string(),
-                description: "Delete a table's data and deregister it (leader only). Body JSON: \
-                              {namespace, name}"
+                description: "Unavailable until durable tombstones are implemented; returns \
+                              FailedPrecondition. Body JSON: {namespace, name}"
                     .to_string(),
             },
             ActionType {
@@ -714,9 +708,12 @@ impl FlightService for MetasrvFlightService {
 
 #[cfg(test)]
 mod file_append_tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
 
     use arrow_flight::{FlightDescriptor, encode::FlightDataEncoderBuilder};
@@ -733,13 +730,15 @@ mod file_append_tests {
     use lake_engine::TableEngineRef;
     use lake_engine_lance::LanceEngine;
     use lake_flight::append_flight_payload_digest;
-    use lake_meta::{MetaError, MetaStore, MetaStoreRef, RocksMeta};
+    use lake_meta::{GuardedMutation, MetaError, MetaStore, MetaStoreRef, RocksMeta};
     use prost::Message;
     use prost_types::Any;
 
     use super::{append_file_stream, append_file_stream_with_limit};
     use crate::{
         Metasrv,
+        election::{LeaseElection, LeaseStatus},
+        leadership::Leadership,
         operation::{AppendRecord, active_key, operation_key},
     };
 
@@ -752,6 +751,53 @@ mod file_append_tests {
         inner:     MetaStoreRef,
         needle:    &'static [u8],
         fail_once: AtomicBool,
+    }
+
+    struct TakeoverBeforeEnginePublicationMeta {
+        inner:         MetaStoreRef,
+        guarded_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl MetaStore for TakeoverBeforeEnginePublicationMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn guarded_mutate(&self, mutation: GuardedMutation<'_>) -> lake_meta::Result<bool> {
+            let call = self.guarded_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 3 {
+                let takeover =
+                    LeaseElection::new(self.inner.clone(), "b", Duration::from_millis(10));
+                let status = takeover
+                    .campaign_at(20)
+                    .await
+                    .expect("injected takeover succeeds");
+                assert!(matches!(status, LeaseStatus::Leader { .. }));
+            }
+            self.inner.guarded_mutate(mutation).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn scan_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<(String, Vec<u8>)>> {
+            self.inner.scan_prefix(prefix).await
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
+        }
     }
 
     #[async_trait::async_trait]
@@ -1033,6 +1079,84 @@ mod file_append_tests {
                 .unwrap()
                 .current_version,
             first
+        );
+    }
+
+    #[tokio::test]
+    async fn append_recovers_after_stale_leader_engine_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let raw: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let table = TableRef::new("robots", "episodes");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        Metasrv::new(raw.clone(), engine.clone())
+            .create_table(
+                &table,
+                TableLocation::new(root.path().join("episodes.lance").to_string_lossy()),
+                schema.clone(),
+            )
+            .await
+            .unwrap();
+
+        let election_a = LeaseElection::new(raw.clone(), "a", Duration::from_millis(10));
+        let LeaseStatus::Leader { guard: guard_a, .. } = election_a.campaign_at(0).await.unwrap()
+        else {
+            panic!("a must acquire the lease");
+        };
+        let leadership_a = Arc::new(Leadership::new());
+        leadership_a.assume_guarded_leader("a", guard_a, Duration::from_mins(1));
+        let takeover_meta: MetaStoreRef = Arc::new(TakeoverBeforeEnginePublicationMeta {
+            inner:         raw.clone(),
+            guarded_calls: AtomicUsize::new(0),
+        });
+        let authority_a =
+            Metasrv::new(takeover_meta, engine.clone()).fenced_for_server(leadership_a);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["episode-42"]))],
+        )
+        .unwrap();
+        let (_append, messages) =
+            encoded_append(table.clone(), schema, batch, AppendOperationId::generate()).await;
+        let first = append_file_stream(
+            &authority_a,
+            TenantId::try_new("tenant-a").unwrap(),
+            futures::stream::iter(messages.clone().into_iter().map(Ok::<_, String>)),
+        )
+        .await;
+        assert!(first.is_err(), "stale publication must be rejected");
+
+        let election_b = LeaseElection::new(raw.clone(), "b", Duration::from_millis(10));
+        let LeaseStatus::Leader { guard: guard_b, .. } = election_b.campaign_at(21).await.unwrap()
+        else {
+            panic!("b must hold the takeover lease");
+        };
+        assert_eq!(guard_b.epoch(), 2);
+        let leadership_b = Arc::new(Leadership::new());
+        leadership_b.assume_guarded_leader("b", guard_b, Duration::from_mins(1));
+        let authority_b = Metasrv::new(raw, engine).fenced_for_server(leadership_b);
+        let recovered = append_file_stream(
+            &authority_b,
+            TenantId::try_new("tenant-a").unwrap(),
+            futures::stream::iter(messages.into_iter().map(Ok::<_, String>)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(recovered, Version(2));
+        assert_eq!(
+            authority_b
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(2)
         );
     }
 
@@ -1704,6 +1828,62 @@ mod table_placement_tests {
             r#type: "create_table".to_owned(),
             body:   serde_json::to_vec(&body).expect("serialize action").into(),
         }
+    }
+
+    fn drop_action(namespace: &str, name: &str) -> Action {
+        Action {
+            r#type: "drop_table".to_owned(),
+            body:   serde_json::to_vec(&json!({
+                "namespace": namespace,
+                "name": name,
+            }))
+            .expect("serialize action")
+            .into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_drop_requires_durable_tombstone() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let service = service(&root);
+        service
+            .action_create_table(create_action(json!({
+                "namespace": "robots",
+                "name": "episodes",
+                "columns": ["episode_id:utf8"]
+            })))
+            .await
+            .expect("create table");
+        let table = TableRef::new("robots", "episodes");
+        let registration = service
+            .metasrv
+            .resolve(&table)
+            .await
+            .unwrap()
+            .expect("created registration");
+
+        let error = match service
+            .action_drop_table(drop_action("robots", "episodes"))
+            .await
+        {
+            Ok(_) => panic!("remote drop must wait for durable tombstones"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(
+            service.metasrv.resolve(&table).await.unwrap().is_some(),
+            "drop rejection must happen before registry or engine mutation"
+        );
+        assert!(
+            service
+                .metasrv
+                .engine()
+                .open(&registration.location)
+                .await
+                .unwrap()
+                .is_some(),
+            "drop rejection must leave the underlying dataset intact"
+        );
     }
 
     #[tokio::test]

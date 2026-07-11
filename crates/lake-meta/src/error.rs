@@ -48,6 +48,9 @@ pub enum MetaError {
 
     #[snafu(display("metastore backend does not support atomic guarded mutations"))]
     GuardedMutationUnsupported,
+
+    #[snafu(display("metadata mutation requires a live lease guard"))]
+    MutationGuardUnavailable,
 }
 
 pub type Result<T> = std::result::Result<T, MetaError>;

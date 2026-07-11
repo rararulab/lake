@@ -26,10 +26,13 @@ use std::{
     time::Duration,
 };
 
-use tokio::time::Instant;
+use tokio::{
+    sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 
-use crate::election::{LeaseElection, LeaseStatus};
+use crate::election::{LeaseElection, LeaseGuard, LeaseStatus};
 
 /// How often the campaign loop renews the lease. Half the 10s TTL used by
 /// [`serve`](crate::serve), so a renew is attempted well before expiry.
@@ -42,25 +45,44 @@ const RENEW_INTERVAL: Duration = Duration::from_secs(5);
 /// follower can forward writes to the current leader. [`run_campaign_loop`]
 /// writes both; the Flight service reads them.
 pub(crate) struct Leadership {
-    state: Mutex<LeadershipState>,
+    state:             Mutex<LeadershipState>,
+    authority_barrier: RwLock<()>,
 }
 
 struct LeadershipState {
     /// Address of the observed lease holder, or `None` when no leader is known.
-    leader:         Option<String>,
-    /// Local monotonic deadline for a lease held by this node.
-    local_deadline: Option<Instant>,
+    leader:          Option<String>,
+    /// Exact durable guard paired with its conservative local deadline.
+    local_authority: Option<LocalAuthority>,
+}
+
+struct LocalAuthority {
+    deadline: Instant,
+    guard:    LeaseGuard,
 }
 
 impl Leadership {
     /// A fresh leadership state: not leading, no known leader yet.
     pub(crate) fn new() -> Self {
         Self {
-            state: Mutex::new(LeadershipState {
-                leader:         None,
-                local_deadline: None,
+            state:             Mutex::new(LeadershipState {
+                leader:          None,
+                local_authority: None,
             }),
+            authority_barrier: RwLock::new(()),
         }
+    }
+
+    /// Prevent an exact-guard publication from crossing a local lease
+    /// transition. Readers hold this only for the metastore transaction;
+    /// campaign and resignation hold the writer side until the new local
+    /// authority has been published.
+    pub(crate) async fn begin_publication(&self) -> RwLockReadGuard<'_, ()> {
+        self.authority_barrier.read().await
+    }
+
+    async fn begin_authority_transition(&self) -> RwLockWriteGuard<'_, ()> {
+        self.authority_barrier.write().await
     }
 
     /// Whether this node currently holds an unexpired local lease.
@@ -68,8 +90,9 @@ impl Leadership {
         self.state
             .lock()
             .expect("leadership mutex poisoned")
-            .local_deadline
-            .is_some_and(|deadline| Instant::now() < deadline)
+            .local_authority
+            .as_ref()
+            .is_some_and(|authority| Instant::now() < authority.deadline)
     }
 
     /// The address of the currently observed leader, if any.
@@ -81,14 +104,24 @@ impl Leadership {
             .clone()
     }
 
+    /// Clone the exact current lease guard only while local authority remains
+    /// inside its conservative monotonic deadline.
+    pub(crate) fn current_guard(&self) -> Option<LeaseGuard> {
+        let state = self.state.lock().expect("leadership mutex poisoned");
+        state.local_authority.as_ref().and_then(|authority| {
+            (Instant::now() < authority.deadline).then(|| authority.guard.clone())
+        })
+    }
+
     /// Atomically publish the observed leader and our local lease deadline.
-    fn publish(&self, leader: Option<String>, local_deadline: Option<Instant>) -> bool {
+    fn publish(&self, leader: Option<String>, local_authority: Option<LocalAuthority>) -> bool {
         let mut state = self.state.lock().expect("leadership mutex poisoned");
         let was_leader = state
-            .local_deadline
-            .is_some_and(|deadline| Instant::now() < deadline);
+            .local_authority
+            .as_ref()
+            .is_some_and(|authority| Instant::now() < authority.deadline);
         state.leader = leader;
-        state.local_deadline = local_deadline;
+        state.local_authority = local_authority;
         was_leader
     }
 
@@ -96,7 +129,21 @@ impl Leadership {
     pub(crate) fn assume_leader(&self, addr: &str) {
         self.publish(
             Some(addr.to_owned()),
-            Some(Instant::now() + Duration::from_mins(1)),
+            Some(LocalAuthority {
+                deadline: Instant::now() + Duration::from_mins(1),
+                guard:    LeaseGuard::new(1, Vec::new()),
+            }),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assume_guarded_leader(&self, addr: &str, guard: LeaseGuard, lifetime: Duration) {
+        self.publish(
+            Some(addr.to_owned()),
+            Some(LocalAuthority {
+                deadline: Instant::now() + lifetime,
+                guard,
+            }),
         );
     }
 }
@@ -131,6 +178,7 @@ pub(crate) async fn run_campaign_loop_until(
         }
     }
 
+    let _transition = leadership.begin_authority_transition().await;
     if let Err(err) = election.resign().await {
         tracing::warn!(
             node_id = election.node_id(),
@@ -142,6 +190,7 @@ pub(crate) async fn run_campaign_loop_until(
 }
 
 async fn campaign_once(election: &LeaseElection, leadership: &Leadership) {
+    let _transition = leadership.begin_authority_transition().await;
     // Bound local authority from the start of the store round-trip. This
     // is conservative when the store is slow and immune to wall-clock
     // jumps after the lease is written.
@@ -150,11 +199,14 @@ async fn campaign_once(election: &LeaseElection, leadership: &Leadership) {
     // most another 40% of the lease on store I/O leaves a 10% demotion
     // margin before the previously published deadline.
     let campaign_timeout = election.ttl() * 2 / 5;
-    let (leader, local_deadline) =
+    let (leader, local_authority) =
         match tokio::time::timeout(campaign_timeout, election.campaign()).await {
-            Ok(Ok(LeaseStatus::Leader { .. })) => (
+            Ok(Ok(LeaseStatus::Leader { guard, .. })) => (
                 Some(election.node_id().to_string()),
-                Some(campaign_started + election.ttl()),
+                Some(LocalAuthority {
+                    deadline: campaign_started + election.ttl(),
+                    guard,
+                }),
             ),
             Ok(Ok(LeaseStatus::Follower { current_holder })) => {
                 // An empty holder means the lease vanished under a lost race;
@@ -181,8 +233,10 @@ async fn campaign_once(election: &LeaseElection, leadership: &Leadership) {
             }
         };
 
-    let now_leader = local_deadline.is_some_and(|deadline| Instant::now() < deadline);
-    let was_leader = leadership.publish(leader, local_deadline);
+    let now_leader = local_authority
+        .as_ref()
+        .is_some_and(|authority| Instant::now() < authority.deadline);
+    let was_leader = leadership.publish(leader, local_authority);
     if now_leader != was_leader {
         if now_leader {
             tracing::info!(node_id = election.node_id(), "acquired metasrv leadership");
@@ -197,10 +251,55 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use async_trait::async_trait;
-    use lake_meta::{MetaStore, MetaStoreRef, RocksMeta};
+    use lake_meta::{GuardedMutation, MetaStore, MetaStoreRef, RocksMeta};
+    use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::fenced_meta::FencedMetaStore;
+
+    struct PausedLeaseCasMeta {
+        inner:                MetaStoreRef,
+        pause_next_lease_cas: AtomicBool,
+        lease_written:        Notify,
+        release_renewal:      Notify,
+    }
+
+    #[async_trait]
+    impl MetaStore for PausedLeaseCasMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            let changed = self.inner.cas(key, expected, new).await?;
+            if changed
+                && key == crate::election::LEASE_KEY
+                && self.pause_next_lease_cas.swap(false, Ordering::SeqCst)
+            {
+                self.lease_written.notify_one();
+                self.release_renewal.notified().await;
+            }
+            Ok(changed)
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
+        }
+
+        async fn guarded_mutate(&self, mutation: GuardedMutation<'_>) -> lake_meta::Result<bool> {
+            self.inner.guarded_mutate(mutation).await
+        }
+    }
 
     #[tokio::test]
     async fn write_gate_expires_without_a_completed_renewal() {
@@ -224,6 +323,78 @@ mod tests {
             "a completed campaign must not authorize writes past its lease deadline"
         );
         campaign.abort();
+    }
+
+    #[tokio::test]
+    async fn leadership_publishes_latest_exact_lease_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(dir.path()).unwrap());
+        let election = LeaseElection::new(meta.clone(), "node-a", Duration::from_millis(100));
+        let leadership = Leadership::new();
+
+        campaign_once(&election, &leadership).await;
+        let first = leadership.current_guard().expect("first live guard");
+        assert_eq!(first.epoch(), 1);
+        assert_eq!(
+            meta.get(crate::election::LEASE_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(first.bytes())
+        );
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        campaign_once(&election, &leadership).await;
+        let renewed = leadership.current_guard().expect("renewed live guard");
+        assert_eq!(renewed.epoch(), first.epoch());
+        assert_ne!(renewed.bytes(), first.bytes());
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            leadership.current_guard().is_none(),
+            "expired local authority must not yield a durable guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn renewal_does_not_reject_a_concurrent_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let rocks: MetaStoreRef = Arc::new(RocksMeta::open(dir.path()).unwrap());
+        let raw = Arc::new(PausedLeaseCasMeta {
+            inner:                rocks,
+            pause_next_lease_cas: AtomicBool::new(false),
+            lease_written:        Notify::new(),
+            release_renewal:      Notify::new(),
+        });
+        let meta: MetaStoreRef = raw.clone();
+        let election = LeaseElection::new(meta.clone(), "node-a", Duration::from_secs(10));
+        let leadership = Arc::new(Leadership::new());
+        campaign_once(&election, &leadership).await;
+        raw.pause_next_lease_cas.store(true, Ordering::SeqCst);
+
+        let renewal = tokio::spawn({
+            let leadership = leadership.clone();
+            async move { campaign_once(&election, &leadership).await }
+        });
+        raw.lease_written.notified().await;
+
+        let publication = tokio::spawn({
+            let fenced = FencedMetaStore::new(meta, leadership);
+            async move { fenced.cas("target", None, b"published").await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !publication.is_finished(),
+            "publication must wait while renewal rotates the exact guard bytes"
+        );
+
+        raw.release_renewal.notify_one();
+        renewal.await.unwrap();
+        assert!(publication.await.unwrap().unwrap());
+        assert_eq!(
+            raw.get("target").await.unwrap().as_deref(),
+            Some(&b"published"[..])
+        );
     }
 
     struct HangingMeta {
