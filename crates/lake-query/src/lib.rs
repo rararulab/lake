@@ -41,6 +41,7 @@ use lake_engine::TableEngineRef;
 use lake_flight::{ClientSecurity, ServerSecurity};
 use lake_meta::MetaStoreRef;
 use snafu::{ResultExt, Snafu};
+use tokio_util::sync::CancellationToken;
 
 use crate::flight::FlightSqlServiceImpl;
 
@@ -79,6 +80,15 @@ pub enum QueryError {
 
     #[snafu(display("invalid Query limits: {message}"))]
     InvalidLimits { message: String },
+
+    #[snafu(display("Flight SQL connections did not drain within {grace:?}"))]
+    DrainTimeout { grace: Duration },
+
+    #[snafu(display("Query background task '{task}' failed"))]
+    BackgroundTask {
+        task:   &'static str,
+        source: tokio::task::JoinError,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, QueryError>;
@@ -162,6 +172,7 @@ pub struct QueryServerConfig {
     server_security:   ServerSecurity,
     allow_insecure:    bool,
     limits:            QueryLimits,
+    shutdown_grace:    Duration,
 }
 
 impl QueryServerConfig {
@@ -175,6 +186,7 @@ impl QueryServerConfig {
             server_security:   ServerSecurity::insecure(),
             allow_insecure:    false,
             limits:            QueryLimits::default(),
+            shutdown_grace:    Duration::from_secs(30),
         }
     }
 
@@ -212,6 +224,13 @@ impl QueryServerConfig {
     #[must_use]
     pub const fn with_limits(mut self, limits: QueryLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Bound tonic's drain window after shutdown begins.
+    #[must_use]
+    pub const fn with_shutdown_grace(mut self, grace: Duration) -> Self {
+        self.shutdown_grace = grace;
         self
     }
 }
@@ -309,20 +328,26 @@ pub async fn serve_with_config(
     addr: &str,
     config: QueryServerConfig,
 ) -> Result<()> {
+    serve_with_config_and_shutdown(engine, addr, config, std::future::pending()).await
+}
+
+/// Run Query until `shutdown` fires, then cancel owned background work and
+/// drain Flight connections within the configured grace period.
+pub async fn serve_with_config_and_shutdown<F>(
+    engine: Arc<QueryEngine>,
+    addr: &str,
+    config: QueryServerConfig,
+    shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     engine.refresh().await?;
-    let refresher = engine.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(CATALOG_MAX_AGE);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Consume the immediate first tick: `serve` just warmed the catalog.
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            if let Err(err) = refresher.refresh_if_stale().await {
-                tracing::warn!(error = %err, "background catalog refresh failed");
-            }
-        }
-    });
+    let cancellation = CancellationToken::new();
+    let refresher = tokio::spawn(run_catalog_refresh_loop(
+        engine.clone(),
+        cancellation.clone(),
+    ));
 
     let socket = addr.parse().context(AddressSnafu { addr })?;
     config
@@ -342,14 +367,55 @@ pub async fn serve_with_config(
     if let Some(tls) = config.server_security.tls_config() {
         server = server.tls_config(tls).context(ServeSnafu)?;
     }
-    server
+    let server_shutdown = cancellation.clone();
+    let server = server
         .layer(tonic::service::InterceptorLayer::new(
             config.server_security.interceptor(),
         ))
         .add_service(service)
-        .serve(socket)
+        .serve_with_shutdown(socket, async move {
+            server_shutdown.cancelled().await;
+        });
+    tokio::pin!(server);
+    tokio::pin!(shutdown);
+
+    let server_result = tokio::select! {
+        result = &mut server => result.context(ServeSnafu),
+        () = &mut shutdown => {
+            cancellation.cancel();
+            match tokio::time::timeout(config.shutdown_grace, &mut server).await {
+                Ok(result) => result.context(ServeSnafu),
+                Err(_) => Err(QueryError::DrainTimeout { grace: config.shutdown_grace }),
+            }
+        }
+    };
+    cancellation.cancel();
+    let refresher_result = refresher
         .await
-        .context(ServeSnafu)
+        .map_err(|source| QueryError::BackgroundTask {
+            task: "catalog-refresh",
+            source,
+        });
+    server_result?;
+    refresher_result?;
+    Ok(())
+}
+
+async fn run_catalog_refresh_loop(engine: Arc<QueryEngine>, shutdown: CancellationToken) {
+    let mut interval = tokio::time::interval(CATALOG_MAX_AGE);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick: serve just warmed the catalog.
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            _ = interval.tick() => {
+                if let Err(err) = engine.refresh_if_stale().await {
+                    tracing::warn!(error = %err, "background catalog refresh failed");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -359,14 +425,30 @@ mod tests {
         time::Duration,
     };
 
-    use arrow_flight::{Action, flight_service_client::FlightServiceClient};
+    use arrow_flight::{
+        Action, flight_service_client::FlightServiceClient, sql::client::FlightSqlServiceClient,
+    };
     use async_trait::async_trait;
-    use futures::TryStreamExt;
+    use datafusion::{
+        arrow::{
+            array::Int64Array,
+            datatypes::{DataType, Field, Schema, SchemaRef},
+            record_batch::RecordBatch,
+        },
+        catalog::streaming::StreamingTable,
+        error::DataFusionError,
+        execution::TaskContext,
+        physical_plan::{
+            SendableRecordBatchStream, stream::RecordBatchStreamAdapter, streaming::PartitionStream,
+        },
+    };
+    use futures::{StreamExt, TryStreamExt};
     use lake_common::{MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor};
     use lake_engine_lance::LanceEngine;
     use lake_flight::{ClientSecurity, ServerSecurity};
     use lake_meta::{MetaStore, MetaStoreRef};
     use rcgen::generate_simple_self_signed;
+    use tokio::sync::Notify;
     use tonic::Request;
 
     use super::*;
@@ -374,6 +456,97 @@ mod tests {
     #[derive(Default)]
     struct CountingMeta {
         scans: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct ShutdownPartition {
+        schema:  SchemaRef,
+        release: Arc<Notify>,
+    }
+
+    impl PartitionStream for ShutdownPartition {
+        fn schema(&self) -> &SchemaRef { &self.schema }
+
+        fn execute(&self, _context: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let first = RecordBatch::try_new(
+                self.schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1]))],
+            )
+            .expect("first batch");
+            let second = RecordBatch::try_new(
+                self.schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![2]))],
+            )
+            .expect("second batch");
+            let release = self.release.clone();
+            let batches = futures::stream::once(async move { Ok(first) }).chain(
+                futures::stream::once(async move {
+                    release.notified().await;
+                    Ok::<_, DataFusionError>(second)
+                }),
+            );
+            Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), batches))
+        }
+    }
+
+    fn shutdown_query_engine(release: Arc<Notify>) -> Arc<QueryEngine> {
+        let meta: MetaStoreRef = Arc::new(CountingMeta::default());
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let engine = Arc::new(QueryEngine::new(meta, storage));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let table = StreamingTable::try_new(
+            schema.clone(),
+            vec![Arc::new(ShutdownPartition { schema, release })],
+        )
+        .expect("streaming table");
+        engine
+            .context()
+            .register_table("shutdown_stream", Arc::new(table))
+            .expect("register table");
+        engine
+    }
+
+    fn free_addr() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        listener.local_addr().expect("listen address")
+    }
+
+    async fn connect_sql(
+        addr: std::net::SocketAddr,
+    ) -> FlightSqlServiceClient<tonic::transport::Channel> {
+        let endpoint = format!("http://{addr}");
+        let channel = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(channel) = ClientSecurity::new().connect(endpoint.clone()).await {
+                    break channel;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Query starts");
+        FlightSqlServiceClient::new(channel)
+    }
+
+    async fn open_shutdown_stream(
+        client: &mut FlightSqlServiceClient<tonic::transport::Channel>,
+    ) -> arrow_flight::decode::FlightRecordBatchStream {
+        let info = client
+            .execute("SELECT * FROM shutdown_stream".to_owned(), None)
+            .await
+            .expect("FlightInfo");
+        let ticket = info
+            .endpoint
+            .into_iter()
+            .next()
+            .expect("endpoint")
+            .ticket
+            .expect("ticket");
+        client.do_get(ticket).await.expect("DoGet")
     }
 
     #[async_trait]
@@ -517,5 +690,132 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn query_shutdown_releases_listener_and_joins_refresher() {
+        let meta = Arc::new(CountingMeta::default());
+        let meta_ref: MetaStoreRef = meta.clone();
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let engine = Arc::new(QueryEngine::new(meta_ref, storage));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let addr = listener.local_addr().expect("listen address");
+        drop(listener);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            serve_with_config_and_shutdown(
+                engine,
+                &addr.to_string(),
+                QueryServerConfig::new().with_shutdown_grace(Duration::from_millis(250)),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        let endpoint = format!("http://{addr}");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if ClientSecurity::new()
+                    .connect(endpoint.clone())
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Query starts");
+        shutdown_tx.send(()).expect("trigger shutdown");
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("serve returns")
+            .expect("serve task")
+            .expect("graceful shutdown");
+
+        let rebound = std::net::TcpListener::bind(addr).expect("listen address released");
+        drop(rebound);
+        assert_eq!(
+            Arc::strong_count(&meta),
+            1,
+            "serve must join the refresher and drop its QueryEngine"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_shutdown_drains_inflight_stream_within_grace() {
+        let release = Arc::new(Notify::new());
+        let engine = shutdown_query_engine(release.clone());
+        let addr = free_addr();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            serve_with_config_and_shutdown(
+                engine,
+                &addr.to_string(),
+                QueryServerConfig::new().with_shutdown_grace(Duration::from_millis(500)),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+        let mut client = connect_sql(addr).await;
+        let mut stream = open_shutdown_stream(&mut client).await;
+        assert!(stream.try_next().await.expect("first batch").is_some());
+
+        shutdown_tx.send(()).expect("trigger shutdown");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        release.notify_waiters();
+        assert!(stream.try_next().await.expect("second batch").is_some());
+        assert!(
+            stream
+                .try_next()
+                .await
+                .expect("stream completion")
+                .is_none()
+        );
+        drop(stream);
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("serve returns")
+            .expect("serve task")
+            .expect("drained inside grace");
+    }
+
+    #[tokio::test]
+    async fn query_shutdown_reports_drain_timeout() {
+        let release = Arc::new(Notify::new());
+        let engine = shutdown_query_engine(release.clone());
+        let addr = free_addr();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            serve_with_config_and_shutdown(
+                engine,
+                &addr.to_string(),
+                QueryServerConfig::new().with_shutdown_grace(Duration::from_millis(50)),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+        let mut client = connect_sql(addr).await;
+        let mut stream = open_shutdown_stream(&mut client).await;
+        assert!(stream.try_next().await.expect("first batch").is_some());
+
+        shutdown_tx.send(()).expect("trigger shutdown");
+        let error = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("serve returns")
+            .expect("serve task")
+            .expect_err("stuck stream exceeds grace");
+        assert!(matches!(error, QueryError::DrainTimeout { .. }));
+        let rebound = std::net::TcpListener::bind(addr).expect("listen address released");
+        drop(rebound);
+        release.notify_waiters();
     }
 }
