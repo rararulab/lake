@@ -28,8 +28,10 @@ use tokio::io::AsyncRead;
 mod checkpoint;
 mod gc;
 mod local;
+mod reference_index;
 pub use gc::{GcPlanPage, GcPlanner, ObjectCandidate};
 pub use local::LocalObjectStore;
+pub use reference_index::{LiveReferenceIndex, LiveReferenceIndexBuilder};
 mod s3;
 pub use s3::S3ObjectStore;
 
@@ -116,6 +118,27 @@ pub enum ObjectError {
 
     #[snafu(display("object GC {input} input is not strictly URI-sorted"))]
     GcInputUnsorted { input: &'static str },
+
+    #[snafu(display("object GC reference index I/O failed while {action} {path:?}"))]
+    GcReferenceIndexIo {
+        action: &'static str,
+        path:   PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("object GC reference index {path:?} is corrupt"))]
+    GcReferenceIndexCorrupt {
+        path:   PathBuf,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display("object URI '{uri}' has conflicting immutable identities"))]
+    GcIdentityConflict { uri: String },
+
+    #[snafu(display(
+        "object GC refuses reference removals until retained-snapshot removal semantics exist"
+    ))]
+    GcReferenceRemovalsUnsupported,
 
     #[snafu(display(
         "byte range {start}..{end} is invalid for DataLocation '{uri}' with size {size_bytes}"
