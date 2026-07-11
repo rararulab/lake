@@ -23,6 +23,7 @@
 
 use std::{
     future::Future,
+    ops::Bound::{Excluded, Unbounded},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -51,7 +52,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use lake_catalog::CatalogGeneration;
 use lake_common::{
     FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION,
-    ManagedStageDescriptor, Principal, PrincipalRole,
+    ManagedStageDescriptor, Namespace, Principal, PrincipalRole, TableName,
 };
 use lake_flight::{ClientSecurity, DELEGATED_NAMESPACE_HEADER, DELEGATED_TENANT_HEADER};
 use prost::Message;
@@ -127,43 +128,133 @@ fn apply_delegated_append_scope(
     Ok(())
 }
 
-fn build_table_discovery(
-    query: CommandGetTables,
-    principal: &Principal,
-    generation: &CatalogGeneration,
-) -> std::result::Result<RecordBatch, Status> {
-    let include_schema = query.include_schema;
-    let catalog_matches = query
-        .catalog
-        .as_deref()
-        .map_or(true, |catalog| catalog == "lake");
-    let schema_pattern = query.db_schema_filter_pattern.clone();
-    let table_pattern = query.table_name_filter_pattern.clone();
-    let table_type_matches =
-        query.table_types.is_empty() || query.table_types.iter().any(|kind| kind == "TABLE");
-    let mut builder = query.into_builder();
-    let empty_schema = Schema::empty();
-    if !catalog_matches || !table_type_matches {
-        return builder.build().map_err(Status::from);
-    }
-    for (namespace, tables) in generation.listings() {
-        if !principal.can_access_namespace(&namespace.0)
-            || schema_pattern
-                .as_deref()
-                .is_some_and(|pattern| !flight_sql_pattern_matches(&namespace.0, pattern))
-        {
-            continue;
+type DiscoveryRecordBatchStream =
+    Pin<Box<dyn Stream<Item = std::result::Result<RecordBatch, FlightError>> + Send>>;
+
+#[derive(Default)]
+struct TableCursor {
+    namespace:   Option<Namespace>,
+    table_index: usize,
+}
+
+impl TableCursor {
+    fn next(&mut self, generation: &CatalogGeneration) -> Option<(Namespace, TableName)> {
+        if self.namespace.is_none() {
+            self.namespace = generation
+                .listings()
+                .first_key_value()
+                .map(|(key, _)| key.clone());
         }
-        for table in tables {
-            if table_pattern
-                .as_deref()
-                .is_some_and(|pattern| !flight_sql_pattern_matches(&table.0, pattern))
+        loop {
+            let next_namespace = {
+                let namespace = self.namespace.as_ref()?;
+                let tables = generation
+                    .listings()
+                    .get(namespace)
+                    .expect("cursor namespace comes from generation");
+                if let Some(table) = tables.get(self.table_index) {
+                    self.table_index += 1;
+                    return Some((namespace.clone(), table.clone()));
+                }
+                generation
+                    .listings()
+                    .range((Excluded(namespace), Unbounded))
+                    .next()
+                    .map(|(key, _)| key.clone())
+            };
+            self.namespace = next_namespace;
+            self.table_index = 0;
+        }
+    }
+}
+
+#[derive(Default)]
+struct NamespaceCursor {
+    last: Option<Namespace>,
+}
+
+impl NamespaceCursor {
+    fn next(&mut self, generation: &CatalogGeneration) -> Option<Namespace> {
+        let next = match self.last.as_ref() {
+            Some(last) => generation
+                .listings()
+                .range((Excluded(last), Unbounded))
+                .next()
+                .map(|(key, _)| key.clone()),
+            None => generation
+                .listings()
+                .first_key_value()
+                .map(|(key, _)| key.clone()),
+        }?;
+        self.last = Some(next.clone());
+        Some(next)
+    }
+}
+
+struct TableDiscoveryState {
+    query:               CommandGetTables,
+    principal:           Principal,
+    generation:          Arc<CatalogGeneration>,
+    limits:              DiscoveryLimits,
+    cursor:              TableCursor,
+    emitted:             usize,
+    pending_limit_error: bool,
+    finished:            bool,
+}
+
+impl TableDiscoveryState {
+    fn next_batch(&mut self) -> std::result::Result<Option<RecordBatch>, Status> {
+        if self.pending_limit_error {
+            return Err(Status::resource_exhausted("discovery row limit reached"));
+        }
+        if self.finished {
+            return Ok(None);
+        }
+        let catalog_matches = self
+            .query
+            .catalog
+            .as_deref()
+            .map_or(true, |catalog| catalog == "lake");
+        let table_type_matches = self.query.table_types.is_empty()
+            || self.query.table_types.iter().any(|kind| kind == "TABLE");
+        if !catalog_matches || !table_type_matches {
+            self.finished = true;
+            return Ok(None);
+        }
+
+        let mut builder = self.query.clone().into_builder();
+        let empty_schema = Schema::empty();
+        let mut batch_rows = 0;
+        while batch_rows < self.limits.batch_rows() {
+            let Some((namespace, table)) = self.cursor.next(&self.generation) else {
+                self.finished = true;
+                break;
+            };
+            if !self.principal.can_access_namespace(&namespace.0)
+                || self
+                    .query
+                    .db_schema_filter_pattern
+                    .as_deref()
+                    .is_some_and(|pattern| !flight_sql_pattern_matches(&namespace.0, pattern))
+                || self
+                    .query
+                    .table_name_filter_pattern
+                    .as_deref()
+                    .is_some_and(|pattern| !flight_sql_pattern_matches(&table.0, pattern))
             {
                 continue;
             }
+            if self.emitted == self.limits.max_rows() {
+                if batch_rows == 0 {
+                    return Err(Status::resource_exhausted("discovery row limit reached"));
+                }
+                self.pending_limit_error = true;
+                break;
+            }
+
             let table_ref = lake_common::TableRef::new(&namespace.0, &table.0);
-            let cached_schema = generation.table_schema(&table_ref);
-            if include_schema && cached_schema.is_none() {
+            let cached_schema = self.generation.table_schema(&table_ref);
+            if self.query.include_schema && cached_schema.is_none() {
                 return Err(Status::failed_precondition(
                     "table schema is unavailable; migrate the legacy registration",
                 ));
@@ -177,9 +268,162 @@ fn build_table_discovery(
                     cached_schema.map_or(&empty_schema, AsRef::as_ref),
                 )
                 .map_err(Status::from)?;
+            self.emitted += 1;
+            batch_rows += 1;
+        }
+
+        if batch_rows == 0 {
+            Ok(None)
+        } else {
+            builder.build().map(Some).map_err(Status::from)
         }
     }
-    builder.build().map_err(Status::from)
+}
+
+struct SchemaDiscoveryState {
+    query:               CommandGetDbSchemas,
+    principal:           Principal,
+    generation:          Arc<CatalogGeneration>,
+    limits:              DiscoveryLimits,
+    cursor:              NamespaceCursor,
+    emitted:             usize,
+    pending_limit_error: bool,
+    finished:            bool,
+}
+
+impl SchemaDiscoveryState {
+    fn next_batch(&mut self) -> std::result::Result<Option<RecordBatch>, Status> {
+        if self.pending_limit_error {
+            return Err(Status::resource_exhausted("discovery row limit reached"));
+        }
+        if self.finished {
+            return Ok(None);
+        }
+        if self
+            .query
+            .catalog
+            .as_deref()
+            .is_some_and(|catalog| catalog != "lake")
+        {
+            self.finished = true;
+            return Ok(None);
+        }
+
+        let mut builder = self.query.clone().into_builder();
+        let mut batch_rows = 0;
+        while batch_rows < self.limits.batch_rows() {
+            let Some(namespace) = self.cursor.next(&self.generation) else {
+                self.finished = true;
+                break;
+            };
+            if !self.principal.can_access_namespace(&namespace.0)
+                || self
+                    .query
+                    .db_schema_filter_pattern
+                    .as_deref()
+                    .is_some_and(|pattern| !flight_sql_pattern_matches(&namespace.0, pattern))
+            {
+                continue;
+            }
+            if self.emitted == self.limits.max_rows() {
+                if batch_rows == 0 {
+                    return Err(Status::resource_exhausted("discovery row limit reached"));
+                }
+                self.pending_limit_error = true;
+                break;
+            }
+            builder.append("lake", &namespace.0);
+            self.emitted += 1;
+            batch_rows += 1;
+        }
+
+        if batch_rows == 0 {
+            Ok(None)
+        } else {
+            builder.build().map(Some).map_err(Status::from)
+        }
+    }
+}
+
+fn table_discovery_batches(
+    query: CommandGetTables,
+    principal: Principal,
+    generation: Arc<CatalogGeneration>,
+    limits: DiscoveryLimits,
+) -> DiscoveryRecordBatchStream {
+    let state = TableDiscoveryState {
+        query,
+        principal,
+        generation,
+        limits,
+        cursor: TableCursor::default(),
+        emitted: 0,
+        pending_limit_error: false,
+        finished: false,
+    };
+    Box::pin(futures::stream::unfold(Some(state), |state| async move {
+        let mut state = state?;
+        match state.next_batch() {
+            Ok(Some(batch)) => Some((Ok(batch), Some(state))),
+            Ok(None) => None,
+            Err(status) => Some((Err(FlightError::from(status)), None)),
+        }
+    }))
+}
+
+fn schema_discovery_batches(
+    query: CommandGetDbSchemas,
+    principal: Principal,
+    generation: Arc<CatalogGeneration>,
+    limits: DiscoveryLimits,
+) -> DiscoveryRecordBatchStream {
+    let state = SchemaDiscoveryState {
+        query,
+        principal,
+        generation,
+        limits,
+        cursor: NamespaceCursor::default(),
+        emitted: 0,
+        pending_limit_error: false,
+        finished: false,
+    };
+    Box::pin(futures::stream::unfold(Some(state), |state| async move {
+        let mut state = state?;
+        match state.next_batch() {
+            Ok(Some(batch)) => Some((Ok(batch), Some(state))),
+            Ok(None) => None,
+            Err(status) => Some((Err(FlightError::from(status)), None)),
+        }
+    }))
+}
+
+#[cfg(test)]
+fn build_table_discovery(
+    query: CommandGetTables,
+    principal: &Principal,
+    generation: &Arc<CatalogGeneration>,
+) -> std::result::Result<RecordBatch, Status> {
+    let empty_query = query.clone();
+    let rows = generation
+        .listings()
+        .values()
+        .map(Vec::len)
+        .sum::<usize>()
+        .max(1);
+    let mut state = TableDiscoveryState {
+        query,
+        principal: principal.clone(),
+        generation: generation.clone(),
+        limits: DiscoveryLimits::try_new(rows, rows).expect("positive test limits"),
+        cursor: TableCursor::default(),
+        emitted: 0,
+        pending_limit_error: false,
+        finished: false,
+    };
+    state.next_batch()?.map_or_else(
+        || empty_query.into_builder().build().map_err(Status::from),
+        Ok,
+    )
 }
 
 fn flight_sql_pattern_matches(value: &str, pattern: &str) -> bool {
@@ -450,18 +694,12 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let principal = self.principal(&request)?;
         let permit = self.admission.acquire().await?;
         let deadline = self.admission.execution_deadline();
-        let mut builder = query.into_builder();
+        let schema = query.clone().into_builder().schema();
         let generation = self.engine.cached_catalog_generation();
-        for namespace in generation.listings().keys() {
-            if principal.can_access_namespace(&namespace.0) {
-                builder.append("lake", &namespace.0);
-            }
-        }
-        let schema = builder.schema();
-        let batch = builder.build();
+        let batches = schema_discovery_batches(query, principal, generation, self.discovery_limits);
         let stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
-            .build(futures::stream::once(async { batch }))
+            .build(batches)
             .map_err(Status::from);
         Ok(Response::new(Box::pin(AdmittedFlightStream::new(
             Box::pin(stream),
@@ -478,12 +716,12 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let principal = self.principal(&request)?;
         let permit = self.admission.acquire().await?;
         let deadline = self.admission.execution_deadline();
+        let schema = query.clone().into_builder().schema();
         let generation = self.engine.cached_catalog_generation();
-        let batch = build_table_discovery(query, &principal, &generation)?;
-        let schema = batch.schema();
+        let batches = table_discovery_batches(query, principal, generation, self.discovery_limits);
         let stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
-            .build(futures::stream::once(async { Ok::<_, FlightError>(batch) }))
+            .build(batches)
             .map_err(Status::from);
         Ok(Response::new(Box::pin(AdmittedFlightStream::new(
             Box::pin(stream),
@@ -725,6 +963,37 @@ mod tests {
             schema_ipc.to_vec(),
         ))
         .unwrap()
+    }
+
+    async fn discovery_service(
+        table_keys: &[&str],
+        discovery_limits: DiscoveryLimits,
+    ) -> FlightSqlServiceImpl {
+        let schema = Schema::new(vec![Field::new("value", DataType::Utf8, false)]);
+        let entries = table_keys
+            .iter()
+            .map(|key| ((*key).to_owned(), registration_with_schema(&schema)))
+            .collect();
+        let meta: MetaStoreRef = Arc::new(SchemaDiscoveryMeta::new(entries));
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let engine = Arc::new(QueryEngine::new(meta, storage));
+        engine.refresh().await.expect("warm discovery catalog");
+        FlightSqlServiceImpl {
+            engine,
+            metadata_addr: None,
+            metadata_security: ClientSecurity::new(),
+            managed_stage: None,
+            admission: QueryAdmission::new(QueryLimits::default()),
+            discovery_limits,
+        }
+    }
+
+    fn admin_ticket_request() -> Request<Ticket> {
+        let mut request = Request::new(Ticket::default());
+        request
+            .extensions_mut()
+            .insert(Principal::deployment_admin());
+        request
     }
 
     #[async_trait]
@@ -993,6 +1262,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flight_table_discovery_streams_bounded_batches() {
+        let service = discovery_service(
+            &[
+                "alpha/events_0",
+                "alpha/events_1",
+                "alpha/events_2",
+                "alpha/events_3",
+                "alpha/events_4",
+            ],
+            DiscoveryLimits::try_new(10, 2).expect("limits"),
+        )
+        .await;
+        let stream = service
+            .do_get_tables(
+                CommandGetTables {
+                    catalog:                   Some("lake".to_owned()),
+                    db_schema_filter_pattern:  Some("alpha".to_owned()),
+                    table_name_filter_pattern: Some("events_%".to_owned()),
+                    table_types:               vec!["TABLE".to_owned()],
+                    include_schema:            false,
+                },
+                admin_ticket_request(),
+            )
+            .await
+            .expect("table discovery")
+            .into_inner();
+        let batches = FlightRecordBatchStream::new_from_flight_data(
+            stream.map_err(arrow_flight::error::FlightError::from),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("decode table discovery");
+
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![2, 2, 1]
+        );
+        let names = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("table names")
+                    .iter()
+                    .flatten()
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["events_0", "events_1", "events_2", "events_3", "events_4"]
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_schema_discovery_streams_bounded_batches() {
+        let service = discovery_service(
+            &[
+                "alpha/events",
+                "bravo/events",
+                "charlie/events",
+                "delta/events",
+                "echo/events",
+            ],
+            DiscoveryLimits::try_new(10, 2).expect("limits"),
+        )
+        .await;
+        let stream = service
+            .do_get_schemas(
+                CommandGetDbSchemas {
+                    catalog:                  Some("lake".to_owned()),
+                    db_schema_filter_pattern: Some("%".to_owned()),
+                },
+                admin_ticket_request(),
+            )
+            .await
+            .expect("schema discovery")
+            .into_inner();
+        let batches = FlightRecordBatchStream::new_from_flight_data(
+            stream.map_err(arrow_flight::error::FlightError::from),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("decode schema discovery");
+
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![2, 2, 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_discovery_stops_at_configured_row_limit() {
+        let service = discovery_service(
+            &["alpha/events_0", "alpha/events_1", "alpha/events_2"],
+            DiscoveryLimits::try_new(2, 2).expect("limits"),
+        )
+        .await;
+        let mut stream = service
+            .do_get_tables(
+                CommandGetTables {
+                    catalog:                   None,
+                    db_schema_filter_pattern:  None,
+                    table_name_filter_pattern: None,
+                    table_types:               Vec::new(),
+                    include_schema:            false,
+                },
+                admin_ticket_request(),
+            )
+            .await
+            .expect("table discovery admitted")
+            .into_inner();
+
+        let mut failure = None;
+        while let Some(item) = stream.next().await {
+            if let Err(status) = item {
+                failure = Some(status);
+                break;
+            }
+        }
+        let failure = failure.expect("row limit must terminate the stream");
+        assert_eq!(failure.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(failure.message(), "discovery row limit reached");
+    }
+
+    #[tokio::test]
     async fn flight_table_discovery_returns_cached_real_schema() {
         let alpha_schema = Schema::new(vec![Field::new("episode_id", DataType::Utf8, false)]);
         let beta_schema = Schema::new(vec![Field::new("secret", DataType::Int64, false)]);
@@ -1196,7 +1599,7 @@ mod tests {
         let mut request = Request::new(Ticket::default());
         request.extensions_mut().insert(principal);
 
-        let error = service
+        let mut stream = service
             .do_get_tables(
                 CommandGetTables {
                     catalog:                   None,
@@ -1208,8 +1611,16 @@ mod tests {
                 request,
             )
             .await
-            .err()
-            .expect("legacy schema must not be represented as empty");
+            .expect("discovery stream")
+            .into_inner();
+        let mut error = None;
+        while let Some(item) = stream.next().await {
+            if let Err(status) = item {
+                error = Some(status);
+                break;
+            }
+        }
+        let error = error.expect("legacy schema must not be represented as empty");
 
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert_eq!(meta.operations.load(Ordering::Relaxed), 0);
