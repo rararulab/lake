@@ -13,7 +13,12 @@ first.
   second copy of cargo / formatter / linter commands.
 - Rust stays under `rustup` and `rust-toolchain.toml`; mise does not manage
   Rust for this repo.
-- CI is a backstop for the local gate, not the first place quality checks run.
+- **Local-first**: the comprehensive gate runs LOCALLY (`mise run ship`, which
+  runs `mise run ci` — gate + doc + spec-selftest + LocalStack integration —
+  then a conventional-commit check, then push through the jj-pre-push fmt/clippy
+  gate). CI (`ci.yml`) triggers on `push: [main]` + `workflow_dispatch` only; it
+  is a post-merge Linux backstop, NOT run on PRs and NOT the first place checks
+  run. Local covers *more* than CI (Docker, no ephemeral limits).
 - TypeScript scripts use Bun Shell deliberately: safe interpolation, explicit
   error handling, and structured parsing instead of fragile text pipelines.
 

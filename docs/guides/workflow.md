@@ -25,9 +25,10 @@ Lane 1 (spec-driven — feature, bugfix, anything with testable behavior):
                        → escalate)
   4. REVIEW         →  reviewer reads workspace diff + spec; verdict
                        (loop until APPROVE)
-  5. PUSH + PR      →  implementer pushes (jj git push --bookmark);
-                       gh pr create; gh pr checks --watch
-  6. MERGE          →  gh pr merge --squash --delete-branch (when CI green)
+  5. PUSH + PR      →  implementer runs `mise run ship` (full local gate +
+                       push through the jj-pre-push fmt/clippy gate); gh pr create
+  6. MERGE          →  gh pr merge --squash --delete-branch (on local-gate PASS
+                       + review APPROVE; CI is a post-merge backstop on main)
   7. CLEANUP        →  jj workspace forget + delete the dir
 
 Lane 2 (lightweight chore — structural, cleanup, CI, rename, config):
@@ -110,9 +111,8 @@ Everything else runs without a confirmation round-trip:
 - **Re-dispatching a stalled subagent** — if a subagent stops mid-task,
   the parent re-dispatches with the carried-over context.
 - **Routine workspace / jj tool calls inside an approved change** —
-  `jj commit`, `jj rebase -d main` inside the workspace,
-  `gh pr create`, `gh pr checks --watch`, `gh pr merge` (subject to
-  gate (a)).
+  `jj commit`, `jj rebase -d main` inside the workspace, `mise run ship`,
+  `gh pr create`, `gh pr merge` (subject to gate (a)).
 - **PR label adjustments** — adding / removing type / component labels
   on a PR the agent owns.
 
@@ -162,15 +162,25 @@ implementer with one quality gate. The implementer:
    commit SHAs, outcome verification (concrete evidence), and any
    decisions surfaced.
 
-### The gate is manual — jj fires no git hooks
+### The gate — jj fires no git hooks, so it runs on push (not commit)
 
-The quality checks live in [prek](https://github.com/j178/prek) hooks
-(`.pre-commit-config.yaml`), but jj does not trigger git hooks: nothing
-runs automatically at commit time. Running the gate before push is the
-implementer's responsibility:
+jj has no staging area and no commit-time hooks. Two layers cover this:
+
+1. **`jj push`** (a global alias → [jj-pre-push](https://github.com/acarapetis/jj-pre-push))
+   automatically runs the [prek](https://github.com/j178/prek) hooks in
+   `.pre-commit-config.yaml` (fmt + clippy) on the to-be-pushed commits and
+   only pushes if green. Raw `jj git push` bypasses it. This is the fast,
+   automatic gate.
+2. **`mise run ship`** runs the *comprehensive* local gate before pushing:
+   `mise run ci` (gate + doc + spec-selftest + **integration/LocalStack**) +
+   `mise run check-commits` + push. This is deliberately broader than CI —
+   local has Docker and no ephemeral limits, so it covers more than the
+   `main`-only CI backstop.
 
 ```bash
-mise run gate        # hooks + Rust tests + e2e + site
+mise run gate        # fast: hooks + Rust tests + e2e + site
+mise run ci          # comprehensive: + doc + spec-selftest + integration
+mise run ship        # mise run ci + conventional-commit check + push
 ```
 
 `mise run hooks` runs prek against all files:
@@ -180,9 +190,9 @@ mise run gate        # hooks + Rust tests + e2e + site
 - `cargo clippy --all-targets --all-features --no-deps -- -D warnings`
 - `RUSTDOCFLAGS="-D warnings" cargo +nightly doc --no-deps --document-private-items`
 
-Conventional Commit messages are enforced by CI
-(`bun scripts/check-conventional-commit.ts --range`) and by the reviewer —
-not by a local commit-msg hook.
+Conventional Commit messages are enforced locally by `mise run ship`
+(`mise run check-commits`) and by the reviewer — not by a commit-msg hook
+(jj fires none) and no longer by CI (CI is `main`-only now).
 
 Tooling comes from `mise install` (the user installs only mise); check
 the environment with `mise run doctor`.
@@ -260,16 +270,16 @@ Verdict:
 Only after reviewer APPROVE:
 
 ```bash
-# in the workspace
+# in the workspace — mise run ship runs the full local gate (ci + integration
+# + conventional-commit check) then pushes through the jj-pre-push fmt/clippy
+# gate. It pushes the current bookmark; create it first.
 jj bookmark create issue-{N}-{short-name} -r @-
-jj git push --bookmark issue-{N}-{short-name} --allow-new
+mise run ship
 
 gh pr create --base main \
   --title "<type>(<scope>): <description> (#N)" \
   --body "..." \
   --label "<type>" --label "<component>"
-
-gh pr checks {PR-number} --watch
 ```
 
 PR body must include the step-3 verification report path + verdict
@@ -281,32 +291,33 @@ PR body must include the step-3 verification report path + verdict
 
 Commit message must include `Closes #N` so the issue auto-closes on merge.
 
-CI (`.github/workflows/ci.yml`) runs fmt, clippy, doc, `cargo test
---workspace --all-targets`, and the `cargo run -p lake-cli` e2e
-self-check in the `Check` job — the same gate as local, so a change that
-passed step 2 and step 3 should be green. A separate job enforces
-Conventional Commits over the PR range
-(`bun scripts/check-conventional-commit.ts --range`).
+**CI is `main`-only now (local-first).** `.github/workflows/ci.yml` triggers
+on `push: [main]` (+ `workflow_dispatch`), NOT on PRs — the local gate
+(`mise run ship`) is the pre-merge check, and CI is a post-merge backstop that
+re-runs the parallel matrix (clippy / test / doc / fmt / e2e / integration /
+cargo-deny / cargo-shear) on Linux to catch macOS-vs-Linux platform
+differences. So there is no PR-level CI to watch; run `workflow_dispatch`
+manually if you want a Linux run on a branch before merge.
 
-If a CI check fails: read the failure log, diagnose root cause, fix in
-the workspace, point the bookmark at the new commit, push again. Do not
-mark tests `#[ignore]` to make CI green.
-For genuine flakes (same test failed recently on `main`):
-`gh run rerun <id> --failed`. Cap reruns at 1.
+If the **post-merge** CI backstop on `main` fails: read the failure log,
+diagnose root cause, fix it as a new lane-2 change on `main`. Do not mark
+tests `#[ignore]` to make CI green. For genuine flakes (same test failed
+recently on `main`): `gh run rerun <id> --failed`. Cap reruns at 1. To catch
+a Linux platform difference *before* merge, run the CI workflow on the branch
+manually with `workflow_dispatch`.
 
-**Why review-before-push:** CI catches platform issues (Linux runner
-behavior vs your local macOS) and integration regressions. Review catches
-design issues, regression-decision reversals, and scope creep. They don't
-catch the same things, but pushing only after review APPROVE means
-PR-level CI runs on already-reviewed code — no force-pushes after review,
-no PRs lingering with "needs another round of review" comments. The
-trade-off: any platform-only failure is caught after push, which is fine
-because it's typically a one-line fix.
+**Why review-before-push:** the local gate (`mise run ship`) catches
+functional regressions locally — with Docker and no ephemeral limits it
+covers *more* than CI. Review catches design issues, regression-decision
+reversals, and scope creep. The `main`-only CI backstop only adds Linux
+platform coverage on top; a platform-only failure lands post-merge and is
+typically a one-line lane-2 fix.
 
 ## Step 6: Merge
 
-Green CI + already-APPROVE'd review = merge — but always confirm with the
-user first (gate (a)).
+Local gate PASS (`mise run ship`) + already-APPROVE'd review = merge — but
+always confirm with the user first (gate (a)). CI runs as a backstop *after*
+the squash lands on `main`.
 
 ```bash
 gh pr merge {N} --squash --delete-branch

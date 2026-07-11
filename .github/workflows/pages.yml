@@ -19,7 +19,7 @@ permissions:
 jobs:
   build:
     name: Build site
-    runs-on: namespace-profile-rara
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,7 +47,7 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: namespace-profile-rara
+    runs-on: ubuntu-latest
     steps:
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
