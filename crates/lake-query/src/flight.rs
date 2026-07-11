@@ -35,7 +35,8 @@ use arrow_flight::{
     error::FlightError,
     flight_service_server::FlightService,
     sql::{
-        Any, CommandStatementQuery, ProstMessageExt, SqlInfo, TicketStatementQuery,
+        Any, CommandGetDbSchemas, CommandGetTables, CommandStatementQuery, ProstMessageExt,
+        SqlInfo, TicketStatementQuery,
         server::{FlightSqlService, PeekableFlightDataStream},
     },
 };
@@ -265,6 +266,36 @@ impl FlightSqlService for FlightSqlServiceImpl {
         Ok(Response::new(info))
     }
 
+    async fn get_flight_info_schemas(
+        &self,
+        query: CommandGetDbSchemas,
+        request: Request<FlightDescriptor>,
+    ) -> std::result::Result<Response<FlightInfo>, Status> {
+        let endpoint =
+            FlightEndpoint::new().with_ticket(Ticket::new(query.as_any().encode_to_vec()));
+        let info = FlightInfo::new()
+            .try_with_schema(&query.clone().into_builder().schema())
+            .map_err(|error| Status::internal(format!("encode schema discovery: {error}")))?
+            .with_endpoint(endpoint)
+            .with_descriptor(request.into_inner());
+        Ok(Response::new(info))
+    }
+
+    async fn get_flight_info_tables(
+        &self,
+        query: CommandGetTables,
+        request: Request<FlightDescriptor>,
+    ) -> std::result::Result<Response<FlightInfo>, Status> {
+        let endpoint =
+            FlightEndpoint::new().with_ticket(Ticket::new(query.as_any().encode_to_vec()));
+        let info = FlightInfo::new()
+            .try_with_schema(&query.clone().into_builder().schema())
+            .map_err(|error| Status::internal(format!("encode table discovery: {error}")))?
+            .with_endpoint(endpoint)
+            .with_descriptor(request.into_inner());
+        Ok(Response::new(info))
+    }
+
     async fn do_get_statement(
         &self,
         ticket: TicketStatementQuery,
@@ -296,6 +327,54 @@ impl FlightSqlService for FlightSqlServiceImpl {
             deadline,
             permit,
         ))))
+    }
+
+    async fn do_get_schemas(
+        &self,
+        query: CommandGetDbSchemas,
+        request: Request<Ticket>,
+    ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let principal = self.principal(&request);
+        let mut builder = query.into_builder();
+        for (namespace, _) in self.engine.cached_catalog_snapshot() {
+            if principal.can_access_namespace(&namespace.0) {
+                builder.append("lake", namespace.0);
+            }
+        }
+        let schema = builder.schema();
+        let batch = builder.build();
+        let stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(futures::stream::once(async { batch }))
+            .map_err(Status::from);
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn do_get_tables(
+        &self,
+        query: CommandGetTables,
+        request: Request<Ticket>,
+    ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let principal = self.principal(&request);
+        let mut builder = query.into_builder();
+        let empty_schema = Schema::empty();
+        for (namespace, tables) in self.engine.cached_catalog_snapshot() {
+            if !principal.can_access_namespace(&namespace.0) {
+                continue;
+            }
+            for table in tables {
+                builder
+                    .append("lake", &namespace.0, table.0, "TABLE", &empty_schema)
+                    .map_err(Status::from)?;
+            }
+        }
+        let schema = builder.schema();
+        let batch = builder.build();
+        let stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(futures::stream::once(async { batch }))
+            .map_err(Status::from);
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn do_put_fallback(
@@ -382,10 +461,14 @@ mod tests {
         time::Duration,
     };
 
+    use arrow_flight::{
+        decode::FlightRecordBatchStream,
+        sql::{CommandGetDbSchemas, CommandGetTables},
+    };
     use async_trait::async_trait;
     use datafusion::{
         arrow::{
-            array::Int64Array,
+            array::{Int64Array, StringArray},
             datatypes::{DataType, Field},
             record_batch::RecordBatch,
         },
@@ -433,6 +516,36 @@ mod tests {
     #[derive(Default)]
     struct PlanningMeta {
         scans: AtomicUsize,
+    }
+
+    struct DiscoveryMeta;
+
+    #[async_trait]
+    impl MetaStore for DiscoveryMeta {
+        async fn get(&self, _key: &str) -> lake_meta::Result<Option<Vec<u8>>> { Ok(None) }
+
+        async fn cas(
+            &self,
+            _key: &str,
+            _expected: Option<&[u8]>,
+            _new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            Ok(true)
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            Ok(match prefix {
+                "tbl/" => vec![
+                    "alpha_episodes/events".to_owned(),
+                    "beta_episodes/secrets".to_owned(),
+                ],
+                "tbl/alpha_episodes/" => vec!["events".to_owned()],
+                "tbl/beta_episodes/" => vec!["secrets".to_owned()],
+                _ => Vec::new(),
+            })
+        }
+
+        async fn delete(&self, _key: &str, _expected: &[u8]) -> lake_meta::Result<bool> { Ok(true) }
     }
 
     #[async_trait]
@@ -566,6 +679,87 @@ mod tests {
             0,
             "authorization must not consult the metastore"
         );
+    }
+
+    #[tokio::test]
+    async fn query_discovery_filters_unauthorized_namespaces() {
+        let meta: MetaStoreRef = Arc::new(DiscoveryMeta);
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let engine = Arc::new(QueryEngine::new(meta, storage));
+        engine.refresh().await.unwrap();
+        let service = FlightSqlServiceImpl {
+            engine,
+            metadata_addr: None,
+            metadata_security: ClientSecurity::new(),
+            managed_stage: None,
+            admission: QueryAdmission::new(QueryLimits::default()),
+        };
+        let principal = Principal::try_new(
+            PrincipalId::try_new("alpha-reader").unwrap(),
+            TenantId::try_new("tenant-alpha").unwrap(),
+            PrincipalRole::User,
+            ["alpha_episodes"],
+        )
+        .unwrap();
+        let request = || {
+            let mut request = Request::new(Ticket::default());
+            request.extensions_mut().insert(principal.clone());
+            request
+        };
+
+        let schema_stream = service
+            .do_get_schemas(
+                CommandGetDbSchemas {
+                    catalog:                  None,
+                    db_schema_filter_pattern: None,
+                },
+                request(),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        let schema_batches = FlightRecordBatchStream::new_from_flight_data(
+            schema_stream.map_err(arrow_flight::error::FlightError::from),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        let namespaces = schema_batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            namespaces.iter().collect::<Vec<_>>(),
+            vec![Some("alpha_episodes")]
+        );
+
+        let table_stream = service
+            .do_get_tables(
+                CommandGetTables {
+                    catalog:                   None,
+                    db_schema_filter_pattern:  None,
+                    table_name_filter_pattern: None,
+                    table_types:               Vec::new(),
+                    include_schema:            false,
+                },
+                request(),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        let table_batches = FlightRecordBatchStream::new_from_flight_data(
+            table_stream.map_err(arrow_flight::error::FlightError::from),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        let table_names = table_batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(table_names.iter().collect::<Vec<_>>(), vec![Some("events")]);
     }
 
     #[tokio::test]

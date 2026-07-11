@@ -269,6 +269,12 @@ impl QueryEngine {
         self.catalog.invalidate_registration(table).await;
     }
 
+    pub(crate) fn cached_catalog_snapshot(
+        &self,
+    ) -> std::collections::BTreeMap<lake_common::Namespace, Vec<lake_common::TableName>> {
+        self.catalog.cached_snapshot()
+    }
+
     /// Execute a SQL statement and collect the results.
     pub async fn execute_sql(&self, sql: &str) -> Result<Vec<RecordBatch>> {
         let df = self.plan_sql(sql).await?;
