@@ -243,6 +243,18 @@ impl ServerSecurity {
         })
     }
 
+    /// Require one of the supplied opaque credential-to-principal bindings.
+    pub fn with_bearer_principals<I>(bindings: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = BearerPrincipalBinding>,
+    {
+        Ok(Self {
+            bearer:                Some(BearerAuthenticator::from_bindings(bindings)?),
+            development_principal: None,
+            tls_identity:          None,
+        })
+    }
+
     /// Install a PEM certificate chain and private key for server TLS.
     #[must_use]
     pub fn with_tls_identity_pem(mut self, certificate: &[u8], private_key: &[u8]) -> Self {

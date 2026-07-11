@@ -430,6 +430,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         &self,
         request: Request<Action>,
     ) -> std::result::Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        let principal = self.principal(&request);
         let action = request.into_inner();
         if action.r#type != MANAGED_STAGE_DISCOVERY_ACTION {
             return Err(Status::invalid_argument(format!(
@@ -447,6 +448,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("managed FILE stage is not configured"))?;
         let body = descriptor
+            .scope_to_tenant(principal.tenant())
             .to_wire()
             .map_err(|error| Status::internal(error.to_string()))?;
         let stream = futures::stream::once(async move { Ok(FlightResult { body: body.into() }) });
@@ -644,7 +646,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(
             ManagedStageDescriptor::from_wire(&results[0].body).expect("decode result"),
-            descriptor
+            descriptor.scope_to_tenant(&TenantId::try_new("deployment").unwrap())
         );
     }
 
