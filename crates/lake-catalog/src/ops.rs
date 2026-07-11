@@ -15,8 +15,8 @@
 //! Catalog write operations (create table). Read paths live on the
 //! DataFusion providers; writes are explicit calls the metadata layer makes.
 
-use arrow_flight::{IpcMessage, IpcWriteOptions, SchemaAsIpc};
-use datafusion::arrow::{datatypes::SchemaRef, error::ArrowError};
+use arrow_flight::{IpcMessage, SchemaAsIpc};
+use datafusion::arrow::{datatypes::SchemaRef, error::ArrowError, ipc::writer::IpcWriteOptions};
 use lake_common::{TableLocation, TableRef};
 use lake_engine::TableEngineRef;
 use lake_meta::{MetaStoreRef, registry, registry::TableRegistration};

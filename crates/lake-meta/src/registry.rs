@@ -135,6 +135,22 @@ pub async fn list_namespaces(meta: &dyn MetaStore) -> Result<Vec<Namespace>> {
     Ok(seen.into_iter().map(Namespace).collect())
 }
 
+/// Scan every table registration in one metastore prefix operation.
+pub async fn scan_tables(meta: &dyn MetaStore) -> Result<Vec<(TableRef, TableRegistration)>> {
+    let mut tables = Vec::new();
+    for (rest, bytes) in meta.scan_prefix("tbl/").await? {
+        let Some((namespace, name)) = rest.split_once('/') else {
+            continue;
+        };
+        let registration = serde_json::from_slice(&bytes).context(CorruptEntrySnafu {
+            key: format!("tbl/{rest}"),
+        })?;
+        tables.push((TableRef::new(namespace, name), registration));
+    }
+    tables.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(tables)
+}
+
 /// Advance a table's current-version pointer, CAS-guarded on the expected
 /// prior registration. Losers of the race get [`crate::MetaError::Conflict`].
 pub async fn set_version(

@@ -4127,6 +4127,7 @@ dependencies = [
  "lake-meta",
  "moka",
  "snafu",
+ "tempfile",
  "tokio",
 ]
 
