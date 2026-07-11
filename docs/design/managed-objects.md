@@ -11,12 +11,19 @@ large-file proxy.
 
 ## Rust SDK vertical slice
 
-The current Rust SDK connects only to a query Flight endpoint and accepts one
-deliberately narrow SQL form:
+The current Rust SDK connects only to a query Flight endpoint. The query
+service advertises a versioned, credential-free managed-stage descriptor once
+at connection time, and the SDK constructs the matching storage client:
 
 ```rust
-let client = LakeClient::connect(query_endpoint, managed_stage).await?;
+let client = LakeClient::connect(query_endpoint).await?;
 ```
+
+The descriptor contains only storage topology: local root, or S3 bucket,
+prefix, region, endpoint, and path-style policy. S3 credentials come from the
+SDK process's AWS default credential chain or workload identity. Tests and
+embedders retain `LakeClient::connect_with_store(query_endpoint, store)` as an
+explicit injection seam.
 
 It then binds a `FILE` through a parameterized insert:
 
@@ -55,10 +62,11 @@ other query nodes retain the normal bounded-staleness contract.
 
 `ManagedObjectStore` is the SDK's object-safe storage boundary. The local
 backend publishes `file://` locations after an atomic rename. The production
-S3 backend accepts an already-configured AWS SDK client plus one Lake-owned
-bucket/prefix. It uses multipart upload for non-empty objects, keeps at most
-one 5 MiB part plus a small read buffer in memory, and incrementally computes
-size and SHA-256. Any source, part, or completion failure triggers
+S3 backend uses the discovered Lake-owned bucket/prefix and an AWS SDK client
+configured from the descriptor plus the process credential chain. It uses
+multipart upload for non-empty objects, keeps at most one 5 MiB part plus a
+small read buffer in memory, and incrementally computes size and SHA-256. Any
+source, part, or completion failure triggers
 `AbortMultipartUpload`; only a successful completion produces the returned
 `DataLocation`. Empty objects use one ordinary `PutObject`.
 
@@ -83,12 +91,12 @@ managed stage is the only storage namespace accepted by this SDK; public SQL
 never accepts arbitrary storage URIs or credentials. Local locations use
 `file://`; cloud locations use `s3://bucket/key`. The S3 reader validates the
 exact configured bucket and path-segment prefix before `GetObject`, preventing
-one SDK stage from becoming an arbitrary S3 reader. Endpoint, region,
-credentials, path-style behavior, and future presigning policy stay in the
-caller-configured AWS client. No raw object bytes travel over Flight SQL or
-the metasrv control plane.
+one SDK stage from becoming an arbitrary S3 reader. Endpoint, region, and
+path-style behavior come from the query descriptor; credentials stay in the
+SDK process and never cross the discovery protocol. No raw object bytes travel
+over Flight SQL or the metasrv control plane.
 
-Range reads use the same containment check and caller-configured credentials
+Range reads use the same containment check and process credentials
 as sequential reads. They do not introduce a query endpoint, signed URL, or
 arbitrary URI escape hatch.
 

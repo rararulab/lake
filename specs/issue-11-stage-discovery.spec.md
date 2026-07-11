@@ -49,10 +49,13 @@ directly between the SDK and storage.
 - `**/.github/**`
 - `**/AGENT.md`
 - `**/mise.toml`
+- `**/CLAUDE.md`
+- `**/docs/guides/mise-ci.md`
+- `**/docs/guides/workflow.md`
 
-The final three patterns account for shared-checkout history from merged issue
-6 that the repository-wide worktree verifier still reports. This workspace
-does not edit root CI or mise configuration.
+The final six patterns account for shared-checkout history from merged issue 6
+that the repository-wide worktree verifier still reports. This workspace does
+not edit root CI, mise configuration, or those workflow guides.
 
 ### Forbidden
 - `crates/lake-meta/**`
