@@ -6,7 +6,7 @@ Issue: #37
 
 For an exact table registration `R` with incarnation `I`:
 
-1. CAS-create immutable `drop/<namespace>/<name>/<I> = Tombstone(R)` through
+1. CAS-create immutable `drop/<namespace>/<name> = Tombstone(I, R)` through
    the lease-fenced production metastore.
 2. Conditionally delete the registry pointer only if it is still exactly `R`.
    A missing pointer is already converged; a different incarnation is never

@@ -13,10 +13,10 @@ same-name replacement.
 
 ## Decisions
 
-- Persist one immutable tombstone under `drop/<namespace>/<name>/<incarnation>`
+- Persist one immutable tombstone under `drop/<namespace>/<name>`
   before deleting the exact registry registration or touching table objects.
-  The tombstone contains the exact registration, including its incarnation and
-  old dataset location.
+  The fixed per-table key is point-readable on DynamoDB; its immutable value
+  contains the exact registration, including incarnation and old location.
 - Execute steps in this order: guarded tombstone create, guarded conditional
   registry delete, idempotent engine remove, guarded exact tombstone delete.
   Retrying any prefix of the sequence must converge.

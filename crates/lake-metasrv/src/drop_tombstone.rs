@@ -1,6 +1,16 @@
 // Copyright 2026 Rararulab
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Durable, incarnation-bound table-drop intent records.
 
@@ -10,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu, ensure};
 
 pub(crate) const DROP_PREFIX: &str = "drop/";
-const MAX_TOMBSTONES_PER_TABLE: usize = 1;
 
 #[derive(Debug, Snafu)]
 pub(crate) enum DropTombstoneError {
@@ -57,12 +66,8 @@ impl DropTombstone {
 
     pub(crate) fn key(&self) -> String {
         format!(
-            "{DROP_PREFIX}{}/{}/{}",
-            self.table.namespace.0,
-            self.table.name.0,
-            self.registration
-                .incarnation_id()
-                .expect("constructor requires an incarnation")
+            "{DROP_PREFIX}{}/{}",
+            self.table.namespace.0, self.table.name.0,
         )
     }
 
@@ -85,8 +90,8 @@ impl DropTombstone {
     }
 }
 
-fn table_prefix(table: &TableRef) -> String {
-    format!("{DROP_PREFIX}{}/{}/", table.namespace.0, table.name.0)
+fn table_key(table: &TableRef) -> String {
+    format!("{DROP_PREFIX}{}/{}", table.namespace.0, table.name.0)
 }
 
 /// Idempotently persist the exact immutable intent before object mutation.
@@ -120,24 +125,11 @@ pub(crate) async fn list_for_table(
     meta: &dyn MetaStore,
     table: &TableRef,
 ) -> Result<Vec<DropTombstone>> {
-    let prefix = table_prefix(table);
-    let page = meta
-        .scan_prefix_page(&prefix, None, MAX_TOMBSTONES_PER_TABLE + 1)
-        .await
-        .context(StoreSnafu)?;
-    let (entries, continuation) = page.into_parts();
-    ensure!(
-        continuation.is_none() && entries.len() <= MAX_TOMBSTONES_PER_TABLE,
-        ConflictSnafu {
-            key: prefix.clone(),
-        }
-    );
-    let mut tombstones = Vec::new();
-    for (suffix, bytes) in entries {
-        tombstones.push(DropTombstone::decode(&format!("{prefix}{suffix}"), &bytes)?);
+    let key = table_key(table);
+    match meta.get(&key).await.context(StoreSnafu)? {
+        Some(bytes) => Ok(vec![DropTombstone::decode(&key, &bytes)?]),
+        None => Ok(Vec::new()),
     }
-    tombstones.sort_unstable_by_key(DropTombstone::key);
-    Ok(tombstones)
 }
 
 pub(crate) async fn scan_page(
@@ -173,8 +165,9 @@ pub(crate) async fn finish(meta: &dyn MetaStore, tombstone: &DropTombstone) -> R
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use lake_common::{TableLocation, TableRef, Version};
-    use lake_meta::{MetaStore, RocksMeta, registry::TableRegistration};
+    use lake_meta::{MetaScanPage, MetaStore, RocksMeta, registry::TableRegistration};
 
     use super::{DropTombstone, list_for_table, prepare};
 
@@ -185,6 +178,43 @@ mod tests {
             Version(1),
             vec![1, 2, 3],
         )
+    }
+
+    struct PointOnlyMeta {
+        inner: RocksMeta,
+    }
+
+    #[async_trait]
+    impl MetaStore for PointOnlyMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn scan_prefix_page(
+            &self,
+            _prefix: &str,
+            _continuation: Option<&str>,
+            _limit: usize,
+        ) -> lake_meta::Result<MetaScanPage> {
+            panic!("per-table tombstone lookup must not use a Dynamo-style filtered scan")
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
+        }
     }
 
     #[tokio::test]
@@ -202,7 +232,27 @@ mod tests {
         );
 
         let replacement = DropTombstone::new(table.clone(), registration("mem://new")).unwrap();
-        assert_ne!(original.key(), replacement.key());
+        assert_eq!(original.key(), replacement.key());
+        assert_ne!(original, replacement);
+        prepare(&meta, &replacement)
+            .await
+            .expect_err("a replacement cannot overwrite the old incarnation tombstone");
         assert_eq!(meta.list_prefix("drop/").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn per_table_tombstone_lookup_uses_point_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = PointOnlyMeta {
+            inner: RocksMeta::open(dir.path()).unwrap(),
+        };
+        let table = TableRef::new("robots", "episodes");
+        let tombstone = DropTombstone::new(table.clone(), registration("mem://old")).unwrap();
+        prepare(&meta, &tombstone).await.unwrap();
+
+        assert_eq!(
+            list_for_table(&meta, &table).await.unwrap(),
+            vec![tombstone]
+        );
     }
 }

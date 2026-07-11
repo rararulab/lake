@@ -27,7 +27,10 @@
 //! Hermetic: no external services, only two loopback ports and two tempdirs.
 
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -35,27 +38,31 @@ use arrow_flight::{
     Action, FlightDescriptor, encode::FlightDataEncoderBuilder,
     flight_service_client::FlightServiceClient,
 };
+use async_trait::async_trait;
 use datafusion::arrow::{
     array::{Float64Array, Int64Array},
-    datatypes::{DataType, Field, Schema},
+    datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
 use futures::TryStreamExt;
 use lake_common::{AppendOperationId, FILE_APPEND_TYPE_URL, FileAppendRequest, TableRef, Version};
-use lake_engine::TableEngineRef;
+use lake_engine::{
+    ObjectReferencePage, ObjectReferenceRequest, Result as EngineResult, TableEngine,
+    TableEngineRef, TableHandleRef,
+};
 use lake_engine_lance::LanceEngine;
 use lake_flight::{ClientSecurity, ServerSecurity, append_flight_payload_digest};
 use lake_meta::{MetaStoreRef, RocksMeta, registry};
 use lake_metasrv::{
     Metasrv, MetasrvServerConfig, TablePlacement,
-    election::{LEASE_KEY, LeaseValue},
+    election::{LEASE_KEY, LeaseElection, LeaseStatus, LeaseValue},
     serve_with_config, serve_with_config_and_shutdown,
 };
 use prost::Message;
 use prost_types::Any;
 use rcgen::generate_simple_self_signed;
 use serde_json::json;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tonic::{Code, Request, Status, transport::Channel};
 
 /// Grab a currently-free loopback address by binding an ephemeral port and
@@ -74,6 +81,59 @@ fn now_ms() -> u64 {
             .as_millis(),
     )
     .expect("millis fit u64")
+}
+
+struct PauseFirstRemoveEngine {
+    inner:   LanceEngine,
+    first:   AtomicBool,
+    started: Notify,
+    resume:  Notify,
+}
+
+#[async_trait]
+impl TableEngine for PauseFirstRemoveEngine {
+    fn kind(&self) -> &'static str { self.inner.kind() }
+
+    async fn create(
+        &self,
+        location: &lake_common::TableLocation,
+        schema: SchemaRef,
+    ) -> EngineResult<TableHandleRef> {
+        self.inner.create(location, schema).await
+    }
+
+    async fn open(
+        &self,
+        location: &lake_common::TableLocation,
+    ) -> EngineResult<Option<TableHandleRef>> {
+        self.inner.open(location).await
+    }
+
+    async fn remove(&self, location: &lake_common::TableLocation) -> EngineResult<()> {
+        if self.first.swap(false, Ordering::SeqCst) {
+            self.started.notify_one();
+            self.resume.notified().await;
+        }
+        self.inner.remove(location).await
+    }
+
+    async fn maintain(
+        &self,
+        location: &lake_common::TableLocation,
+        version: Version,
+    ) -> EngineResult<Option<Version>> {
+        self.inner.maintain(location, version).await
+    }
+
+    async fn retained_object_references(
+        &self,
+        location: &lake_common::TableLocation,
+        request: ObjectReferenceRequest,
+    ) -> EngineResult<ObjectReferencePage> {
+        self.inner
+            .retained_object_references(location, request)
+            .await
+    }
 }
 
 /// Open a fresh Flight client to `addr`.
@@ -303,7 +363,13 @@ async fn remote_drop_is_idempotent_across_leader_handoff() {
     let meta_dir = tempfile::tempdir().expect("meta tempdir");
     let table_dir = tempfile::tempdir().expect("table tempdir");
     let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).expect("open RocksMeta"));
-    let engine: TableEngineRef = Arc::new(LanceEngine::with_manifest_store(meta.clone()));
+    let pausing_engine = Arc::new(PauseFirstRemoveEngine {
+        inner:   LanceEngine::with_manifest_store(meta.clone()),
+        first:   AtomicBool::new(true),
+        started: Notify::new(),
+        resume:  Notify::new(),
+    });
+    let engine: TableEngineRef = pausing_engine.clone();
     let addr_a = free_addr();
     let addr_b = free_addr();
     let (shutdown_a_tx, shutdown_a_rx) = oneshot::channel();
@@ -375,29 +441,54 @@ async fn remote_drop_is_idempotent_across_leader_handoff() {
         .expect("registry get")
         .expect("created registration")
         .location;
-    forward_with_retry(
-        &leader,
-        "drop_table",
-        json!({ "namespace": "robots", "name": "drop_handoff" }),
-    )
-    .await
-    .expect("first remote drop");
+    let first_drop = tokio::spawn({
+        let leader = leader.clone();
+        async move {
+            do_action(
+                &leader,
+                "drop_table",
+                json!({ "namespace": "robots", "name": "drop_handoff" }),
+            )
+            .await
+        }
+    });
+    pausing_engine.started.notified().await;
+    assert!(
+        registry::get(meta.as_ref(), &table)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(meta.list_prefix("drop/").await.unwrap().len(), 1);
 
-    if leader == addr_a {
-        shutdown_a_tx.take().unwrap().send(()).unwrap();
-        server_a.take().unwrap().await.unwrap().unwrap();
-    } else {
-        shutdown_b_tx.take().unwrap().send(()).unwrap();
-        server_b.take().unwrap().await.unwrap().unwrap();
-    }
+    let forced = LeaseElection::new(meta.clone(), standby.clone(), Duration::from_secs(10))
+        .campaign_at(now_ms().saturating_add(20_000))
+        .await
+        .expect("force standby takeover during drop");
+    assert!(matches!(forced, LeaseStatus::Leader { .. }));
+    pausing_engine.resume.notify_one();
+    first_drop
+        .await
+        .unwrap()
+        .expect_err("former leader cannot finalize the tombstone");
     assert_eq!(wait_for_leader(&meta, &[&standby]).await, standby);
-    forward_with_retry(
-        &standby,
-        "drop_table",
-        json!({ "namespace": "robots", "name": "drop_handoff" }),
-    )
-    .await
-    .expect("repeated drop through successor");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match do_action(
+            &standby,
+            "drop_table",
+            json!({ "namespace": "robots", "name": "drop_handoff" }),
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(error) if Instant::now() < deadline => {
+                tracing::debug!(%error, "waiting for standby local authority");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(error) => panic!("successor did not resume remote drop: {error}"),
+        }
+    }
 
     assert!(
         registry::get(meta.as_ref(), &table)
@@ -408,13 +499,10 @@ async fn remote_drop_is_idempotent_across_leader_handoff() {
     assert!(engine.open(&location).await.unwrap().is_none());
     assert!(meta.list_prefix("drop/").await.unwrap().is_empty());
 
-    if leader == addr_a {
-        shutdown_b_tx.take().unwrap().send(()).unwrap();
-        server_b.take().unwrap().await.unwrap().unwrap();
-    } else {
-        shutdown_a_tx.take().unwrap().send(()).unwrap();
-        server_a.take().unwrap().await.unwrap().unwrap();
-    }
+    shutdown_a_tx.take().unwrap().send(()).unwrap();
+    shutdown_b_tx.take().unwrap().send(()).unwrap();
+    server_a.take().unwrap().await.unwrap().unwrap();
+    server_b.take().unwrap().await.unwrap().unwrap();
 }
 
 #[tokio::test]

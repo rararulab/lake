@@ -129,7 +129,7 @@ There are three distinct pieces of metadata, owned by different layers:
    payload digest, base/result versions, state, and timestamps. Arrow rows,
    object bytes, credentials, and signed URLs are forbidden.
 3. **Drop coordination** (lake's, in `lake-meta`): immutable tombstones keyed
-   `drop/<namespace>/<name>/<incarnation>`. A tombstone retains the exact old
+   `drop/<namespace>/<name>`. A tombstone retains the exact old incarnation and
    registration needed to conditionally detach the registry and resume
    idempotent engine cleanup after a crash.
 4. **Per-table manifest** (the engine's): the file list, schema, and

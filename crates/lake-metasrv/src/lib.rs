@@ -903,7 +903,7 @@ mod tests {
         TableEngineRef, TableHandleRef,
     };
     use lake_engine_lance::LanceEngine;
-    use lake_meta::{GuardedMutation, MetaStore, RocksMeta};
+    use lake_meta::{DynamoMeta, GuardedMutation, MetaScanPage, MetaStore, RocksMeta};
     use tokio::sync::{Notify, oneshot};
 
     use super::*;
@@ -914,6 +914,71 @@ mod tests {
         ordinary_cas:    AtomicUsize,
         ordinary_delete: AtomicUsize,
         guarded:         AtomicUsize,
+    }
+
+    struct RegistryDeleteProbeMeta {
+        inner:          MetaStoreRef,
+        table:          TableRef,
+        expected:       TableRegistration,
+        race_version:   bool,
+        tombstone_seen: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MetaStore for RegistryDeleteProbeMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn scan_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<(String, Vec<u8>)>> {
+            self.inner.scan_prefix(prefix).await
+        }
+
+        async fn scan_prefix_page(
+            &self,
+            prefix: &str,
+            continuation: Option<&str>,
+            limit: usize,
+        ) -> lake_meta::Result<MetaScanPage> {
+            self.inner
+                .scan_prefix_page(prefix, continuation, limit)
+                .await
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            if key.starts_with("tbl/") {
+                let tombstone_key =
+                    format!("drop/{}/{}", self.table.namespace.0, self.table.name.0);
+                assert!(
+                    self.inner.get(&tombstone_key).await?.is_some(),
+                    "tombstone must be durable before registry deletion"
+                );
+                self.tombstone_seen.fetch_add(1, Ordering::SeqCst);
+                if self.race_version {
+                    registry::set_version(
+                        self.inner.as_ref(),
+                        &self.table,
+                        &self.expected,
+                        Version(2),
+                    )
+                    .await?;
+                }
+            }
+            self.inner.delete(key, expected).await
+        }
     }
 
     #[async_trait]
@@ -1241,6 +1306,146 @@ mod tests {
         successor.drop_table(&table).await.unwrap();
 
         assert!(successor.resolve(&table).await.unwrap().is_none());
+        assert!(engine.open(&location).await.unwrap().is_none());
+        assert!(
+            drop_tombstone::list_for_table(meta.as_ref(), &table)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_persists_tombstone_before_registry_or_object_delete() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let table_dir = tempfile::tempdir().unwrap();
+        let raw: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let table = TableRef::new("robots", "episodes");
+        let location = TableLocation::new(table_dir.path().join("old.lance").to_string_lossy());
+        let schema = Arc::new(Schema::new(vec![Field::new("ep", DataType::Int64, false)]));
+        let initial = Metasrv::new(raw.clone(), engine.clone());
+        initial
+            .create_table(&table, location, schema)
+            .await
+            .unwrap();
+        let expected = initial.resolve(&table).await.unwrap().unwrap();
+        let probe = Arc::new(RegistryDeleteProbeMeta {
+            inner: raw,
+            table: table.clone(),
+            expected,
+            race_version: false,
+            tombstone_seen: AtomicUsize::new(0),
+        });
+        let meta: MetaStoreRef = probe.clone();
+
+        Metasrv::new(meta, engine).drop_table(&table).await.unwrap();
+
+        assert_eq!(probe.tombstone_seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn same_incarnation_version_race_preserves_table_and_tombstone() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let table_dir = tempfile::tempdir().unwrap();
+        let raw: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let table = TableRef::new("robots", "episodes");
+        let location = TableLocation::new(table_dir.path().join("old.lance").to_string_lossy());
+        let schema = Arc::new(Schema::new(vec![Field::new("ep", DataType::Int64, false)]));
+        let initial = Metasrv::new(raw.clone(), engine.clone());
+        initial
+            .create_table(&table, location.clone(), schema)
+            .await
+            .unwrap();
+        let expected = initial.resolve(&table).await.unwrap().unwrap();
+        let incarnation = expected.incarnation_id().unwrap().to_owned();
+        let probe = Arc::new(RegistryDeleteProbeMeta {
+            inner: raw.clone(),
+            table: table.clone(),
+            expected,
+            race_version: true,
+            tombstone_seen: AtomicUsize::new(0),
+        });
+        let meta: MetaStoreRef = probe.clone();
+
+        Metasrv::new(meta, engine.clone())
+            .drop_table(&table)
+            .await
+            .expect_err("exact registry delete must lose the injected version race");
+
+        let current = registry::get(raw.as_ref(), &table)
+            .await
+            .unwrap()
+            .expect("racing registration remains");
+        assert_eq!(current.incarnation_id(), Some(incarnation.as_str()));
+        assert_eq!(current.current_version, Version(2));
+        assert!(engine.open(&location).await.unwrap().is_some());
+        assert_eq!(
+            drop_tombstone::list_for_table(raw.as_ref(), &table)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(probe.tombstone_seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires localstack DynamoDB; set LAKE_DYNAMODB_ENDPOINT and run with --ignored"]
+    async fn dynamo_drop_resume_uses_point_tombstone_lookup() {
+        let Ok(endpoint) = std::env::var("LAKE_DYNAMODB_ENDPOINT") else {
+            return;
+        };
+        let dynamo_table = format!(
+            "lake_drop_test_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dynamo = Arc::new(
+            DynamoMeta::connect(Some(&endpoint), &dynamo_table)
+                .await
+                .unwrap(),
+        );
+        dynamo.ensure_table().await.unwrap();
+        for index in 0..12 {
+            assert!(
+                dynamo
+                    .cas(&format!("unrelated/{index:02}"), None, b"value")
+                    .await
+                    .unwrap()
+            );
+        }
+        let meta: MetaStoreRef = dynamo;
+        let table_dir = tempfile::tempdir().unwrap();
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let table = TableRef::new("robots", "episodes");
+        let location = TableLocation::new(table_dir.path().join("old.lance").to_string_lossy());
+        let schema = Arc::new(Schema::new(vec![Field::new("ep", DataType::Int64, false)]));
+        let first = Metasrv::new(meta.clone(), engine.clone());
+        first
+            .create_table(&table, location.clone(), schema)
+            .await
+            .unwrap();
+        let registration = first.resolve(&table).await.unwrap().unwrap();
+        let tombstone = drop_tombstone::DropTombstone::new(table.clone(), registration).unwrap();
+        drop_tombstone::prepare(meta.as_ref(), &tombstone)
+            .await
+            .unwrap();
+
+        Metasrv::new(meta.clone(), engine.clone())
+            .drop_table(&table)
+            .await
+            .unwrap();
+
+        assert!(
+            registry::get(meta.as_ref(), &table)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(engine.open(&location).await.unwrap().is_none());
         assert!(
             drop_tombstone::list_for_table(meta.as_ref(), &table)
