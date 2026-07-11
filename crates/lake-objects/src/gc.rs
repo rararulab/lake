@@ -17,12 +17,13 @@
 use std::iter::Peekable;
 
 use lake_common::ObjectIdentity;
+use serde::{Deserialize, Serialize};
 
 use crate::{ObjectError, Result};
 
 const MAX_PLAN_PAGE_SIZE: usize = 1_024;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ObjectCandidate {
     pub uri:              String,
     pub size_bytes:       u64,

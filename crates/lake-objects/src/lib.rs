@@ -27,10 +27,12 @@ use tokio::io::AsyncRead;
 
 mod checkpoint;
 mod gc;
+mod gc_plan;
 mod inventory;
 mod local;
 mod reference_index;
 pub use gc::{GcPlanPage, GcPlanner, ObjectCandidate};
+pub use gc_plan::{GcPlan, GcPlanWriter};
 pub use inventory::{InventoryPage, InventoryRequest, ManagedObjectInventory};
 pub use local::LocalObjectStore;
 pub use reference_index::{LiveReferenceIndex, LiveReferenceIndexBuilder};
@@ -141,6 +143,22 @@ pub enum ObjectError {
         "object GC refuses reference removals until retained-snapshot removal semantics exist"
     ))]
     GcReferenceRemovalsUnsupported,
+
+    #[snafu(display("object GC plan I/O failed while {action} {path:?}"))]
+    GcPlanIo {
+        action: &'static str,
+        path:   PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("object GC plan document {path:?} is corrupt"))]
+    GcPlanCorrupt {
+        path:   PathBuf,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display("object GC plan does not match {field}"))]
+    GcPlanMismatch { field: &'static str },
 
     #[snafu(display(
         "byte range {start}..{end} is invalid for DataLocation '{uri}' with size {size_bytes}"
