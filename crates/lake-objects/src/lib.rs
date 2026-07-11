@@ -26,7 +26,9 @@ use snafu::{OptionExt, Snafu};
 use tokio::io::AsyncRead;
 
 mod checkpoint;
+mod gc;
 mod local;
+pub use gc::{GcPlanPage, GcPlanner, ObjectCandidate};
 pub use local::LocalObjectStore;
 mod s3;
 pub use s3::S3ObjectStore;
@@ -102,6 +104,18 @@ pub enum ObjectError {
 
     #[snafu(display("this managed object store does not support resumable uploads"))]
     ResumeUnsupported,
+
+    #[snafu(display("object GC cannot plan while retained reference lineage is incomplete"))]
+    GcLineageIncomplete,
+
+    #[snafu(display("invalid object GC configuration: {message}"))]
+    InvalidGcConfig { message: String },
+
+    #[snafu(display("GC candidate '{uri}' is outside managed stage '{stage}'"))]
+    GcCandidateOutsideStage { uri: String, stage: String },
+
+    #[snafu(display("object GC {input} input is not strictly URI-sorted"))]
+    GcInputUnsorted { input: &'static str },
 
     #[snafu(display(
         "byte range {start}..{end} is invalid for DataLocation '{uri}' with size {size_bytes}"
