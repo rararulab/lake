@@ -66,6 +66,15 @@ directly by the server cancellation token. All fallible address/security/TLS
 setup precedes task creation; a drop guard also cancels and aborts both refresh
 paths if the serve future itself is cancelled.
 
+The published listing is an immutable `Arc<CatalogGeneration>` containing both
+namespace/table names and their registry schemas. DataFusion sync listing and
+each Flight discovery request clone only that Arc, then read names and schemas
+from the pinned allocation. Refresh builds a private replacement and swaps one
+pointer after the complete scan, so an in-flight response cannot combine two
+generations and request startup does not deep-clone the full catalog. Flight
+table discovery applies catalog/schema/table/type filters before schema
+resolution and row allocation, so filtered requests pay for matching rows.
+
 ### Why the tiers scale differently
 
 - **Query layer is stateless** — no durable state, no coordination. HA and

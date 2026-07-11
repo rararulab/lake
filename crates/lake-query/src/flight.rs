@@ -41,10 +41,14 @@ use arrow_flight::{
     },
 };
 use datafusion::{
-    arrow::datatypes::{Schema, SchemaRef},
+    arrow::{
+        datatypes::{Schema, SchemaRef},
+        record_batch::RecordBatch,
+    },
     common::{TableReference, config::Dialect},
 };
 use futures::{Stream, StreamExt, TryStreamExt};
+use lake_catalog::CatalogGeneration;
 use lake_common::{
     FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION,
     ManagedStageDescriptor, Principal, PrincipalRole,
@@ -121,6 +125,91 @@ fn apply_delegated_append_scope(
             .map_err(|_| Status::internal("authenticated tenant is not valid metadata"))?,
     );
     Ok(())
+}
+
+fn build_table_discovery(
+    query: CommandGetTables,
+    principal: &Principal,
+    generation: &CatalogGeneration,
+) -> std::result::Result<RecordBatch, Status> {
+    let include_schema = query.include_schema;
+    let catalog_matches = query
+        .catalog
+        .as_deref()
+        .map_or(true, |catalog| catalog == "lake");
+    let schema_pattern = query.db_schema_filter_pattern.clone();
+    let table_pattern = query.table_name_filter_pattern.clone();
+    let table_type_matches =
+        query.table_types.is_empty() || query.table_types.iter().any(|kind| kind == "TABLE");
+    let mut builder = query.into_builder();
+    let empty_schema = Schema::empty();
+    if !catalog_matches || !table_type_matches {
+        return builder.build().map_err(Status::from);
+    }
+    for (namespace, tables) in generation.listings() {
+        if !principal.can_access_namespace(&namespace.0)
+            || schema_pattern
+                .as_deref()
+                .is_some_and(|pattern| !flight_sql_pattern_matches(&namespace.0, pattern))
+        {
+            continue;
+        }
+        for table in tables {
+            if table_pattern
+                .as_deref()
+                .is_some_and(|pattern| !flight_sql_pattern_matches(&table.0, pattern))
+            {
+                continue;
+            }
+            let table_ref = lake_common::TableRef::new(&namespace.0, &table.0);
+            let cached_schema = generation.table_schema(&table_ref);
+            if include_schema && cached_schema.is_none() {
+                return Err(Status::failed_precondition(
+                    "table schema is unavailable; migrate the legacy registration",
+                ));
+            }
+            builder
+                .append(
+                    "lake",
+                    &namespace.0,
+                    &table.0,
+                    "TABLE",
+                    cached_schema.map_or(&empty_schema, AsRef::as_ref),
+                )
+                .map_err(Status::from)?;
+        }
+    }
+    builder.build().map_err(Status::from)
+}
+
+fn flight_sql_pattern_matches(value: &str, pattern: &str) -> bool {
+    let value = value.chars().collect::<Vec<_>>();
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let (mut value_index, mut pattern_index) = (0, 0);
+    let (mut wildcard_index, mut retry_value_index) = (None, 0);
+
+    while value_index < value.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '_' || pattern[pattern_index] == value[value_index])
+        {
+            value_index += 1;
+            pattern_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '%' {
+            wildcard_index = Some(pattern_index);
+            pattern_index += 1;
+            retry_value_index = value_index;
+        } else if let Some(wildcard_index) = wildcard_index {
+            retry_value_index += 1;
+            value_index = retry_value_index;
+            pattern_index = wildcard_index + 1;
+        } else {
+            return false;
+        }
+    }
+
+    pattern[pattern_index..]
+        .iter()
+        .all(|character| *character == '%')
 }
 
 impl AdmittedFlightStream {
@@ -358,9 +447,10 @@ impl FlightSqlService for FlightSqlServiceImpl {
     ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let principal = self.principal(&request)?;
         let mut builder = query.into_builder();
-        for (namespace, _) in self.engine.cached_catalog_snapshot() {
+        let generation = self.engine.cached_catalog_generation();
+        for namespace in generation.listings().keys() {
             if principal.can_access_namespace(&namespace.0) {
-                builder.append("lake", namespace.0);
+                builder.append("lake", &namespace.0);
             }
         }
         let schema = builder.schema();
@@ -378,37 +468,12 @@ impl FlightSqlService for FlightSqlServiceImpl {
         request: Request<Ticket>,
     ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let principal = self.principal(&request)?;
-        let include_schema = query.include_schema;
-        let mut builder = query.into_builder();
-        let empty_schema = Schema::empty();
-        for (namespace, tables) in self.engine.cached_catalog_snapshot() {
-            if !principal.can_access_namespace(&namespace.0) {
-                continue;
-            }
-            for table in tables {
-                let table_ref = lake_common::TableRef::new(&namespace.0, &table.0);
-                let cached_schema = self.engine.cached_table_schema(&table_ref);
-                if include_schema && cached_schema.is_none() {
-                    return Err(Status::failed_precondition(
-                        "table schema is unavailable; migrate the legacy registration",
-                    ));
-                }
-                builder
-                    .append(
-                        "lake",
-                        &namespace.0,
-                        table.0,
-                        "TABLE",
-                        cached_schema.as_deref().unwrap_or(&empty_schema),
-                    )
-                    .map_err(Status::from)?;
-            }
-        }
-        let schema = builder.schema();
-        let batch = builder.build();
+        let generation = self.engine.cached_catalog_generation();
+        let batch = build_table_discovery(query, &principal, &generation)?;
+        let schema = batch.schema();
         let stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
-            .build(futures::stream::once(async { batch }))
+            .build(futures::stream::once(async { Ok::<_, FlightError>(batch) }))
             .map_err(Status::from);
         Ok(Response::new(Box::pin(stream)))
     }
@@ -500,7 +565,10 @@ impl FlightSqlService for FlightSqlServiceImpl {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            RwLock,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -536,6 +604,27 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn flight_sql_patterns_follow_percent_and_underscore_semantics() {
+        for (value, pattern, expected) in [
+            ("events", "events", true),
+            ("events", "event", false),
+            ("alpha_episodes", "alpha_%", true),
+            ("alpha_episodes", "%episode_", true),
+            ("episodes", "e%z", false),
+            ("模型_v2", "模型__2", true),
+            ("模型_v2", "模型_2", false),
+            ("", "%", true),
+            ("", "_", false),
+        ] {
+            assert_eq!(
+                flight_sql_pattern_matches(value, pattern),
+                expected,
+                "value={value:?}, pattern={pattern:?}"
+            );
+        }
+    }
+
     struct EmptyMeta;
 
     #[async_trait]
@@ -566,14 +655,14 @@ mod tests {
     struct DiscoveryMeta;
 
     struct SchemaDiscoveryMeta {
-        entries:    Vec<(String, Vec<u8>)>,
+        entries:    RwLock<Vec<(String, Vec<u8>)>>,
         operations: AtomicUsize,
     }
 
     impl SchemaDiscoveryMeta {
         fn new(entries: Vec<(String, Vec<u8>)>) -> Self {
             Self {
-                entries,
+                entries:    RwLock::new(entries),
                 operations: AtomicUsize::new(0),
             }
         }
@@ -603,7 +692,7 @@ mod tests {
         async fn scan_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<(String, Vec<u8>)>> {
             self.operations.fetch_add(1, Ordering::Relaxed);
             assert_eq!(prefix, "tbl/");
-            Ok(self.entries.clone())
+            Ok(self.entries.read().unwrap().clone())
         }
 
         async fn delete(&self, _key: &str, _expected: &[u8]) -> lake_meta::Result<bool> {
@@ -957,6 +1046,107 @@ mod tests {
         assert_eq!(names.iter().collect::<Vec<_>>(), vec![Some("events")]);
         assert_eq!(actual, alpha_schema);
         assert_eq!(meta.operations.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn flight_table_discovery_reads_one_catalog_generation() {
+        let old_schema = Schema::new(vec![Field::new("episode_id", DataType::Utf8, false)]);
+        let new_schema = Schema::new(vec![Field::new("run_id", DataType::Int64, false)]);
+        let meta = Arc::new(SchemaDiscoveryMeta::new(vec![(
+            "alpha_episodes/events".to_owned(),
+            registration_with_schema(&old_schema),
+        )]));
+        let meta_ref: MetaStoreRef = meta.clone();
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let engine = QueryEngine::new(meta_ref, storage);
+        engine.refresh().await.unwrap();
+        let request_generation = engine.cached_catalog_generation();
+        *meta.entries.write().unwrap() = vec![(
+            "alpha_episodes/runs".to_owned(),
+            registration_with_schema(&new_schema),
+        )];
+        engine.refresh().await.unwrap();
+        let principal = Principal::try_new(
+            PrincipalId::try_new("alpha-reader").unwrap(),
+            TenantId::try_new("tenant-alpha").unwrap(),
+            PrincipalRole::User,
+            ["alpha_episodes"],
+        )
+        .unwrap();
+
+        let batch = build_table_discovery(
+            CommandGetTables {
+                catalog:                   None,
+                db_schema_filter_pattern:  None,
+                table_name_filter_pattern: None,
+                table_types:               Vec::new(),
+                include_schema:            true,
+            },
+            &principal,
+            &request_generation,
+        )
+        .unwrap();
+        let names = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let schemas = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let actual = Schema::try_from(IpcMessage(schemas.value(0).to_vec().into())).unwrap();
+
+        assert_eq!(names.iter().collect::<Vec<_>>(), vec![Some("events")]);
+        assert_eq!(actual, old_schema);
+    }
+
+    #[tokio::test]
+    async fn flight_table_discovery_prefilters_before_schema_resolution() {
+        let schema = Schema::new(vec![Field::new("episode_id", DataType::Utf8, false)]);
+        let meta = Arc::new(SchemaDiscoveryMeta::new(vec![
+            (
+                "alpha_episodes/events".to_owned(),
+                registration_with_schema(&schema),
+            ),
+            (
+                "alpha_episodes/legacy".to_owned(),
+                br#"{"location":"mem://legacy","engine":"lance","current_version":1}"#.to_vec(),
+            ),
+        ]));
+        let meta_ref: MetaStoreRef = meta;
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let engine = QueryEngine::new(meta_ref, storage);
+        engine.refresh().await.unwrap();
+        let generation = engine.cached_catalog_generation();
+        let principal = Principal::try_new(
+            PrincipalId::try_new("alpha-reader").unwrap(),
+            TenantId::try_new("tenant-alpha").unwrap(),
+            PrincipalRole::User,
+            ["alpha_episodes"],
+        )
+        .unwrap();
+
+        let batch = build_table_discovery(
+            CommandGetTables {
+                catalog:                   Some("lake".to_owned()),
+                db_schema_filter_pattern:  Some("alpha_%".to_owned()),
+                table_name_filter_pattern: Some("events".to_owned()),
+                table_types:               vec!["TABLE".to_owned()],
+                include_schema:            true,
+            },
+            &principal,
+            &generation,
+        )
+        .expect("nonmatching legacy tables must not be resolved");
+        let names = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(names.iter().collect::<Vec<_>>(), vec![Some("events")]);
     }
 
     #[tokio::test]

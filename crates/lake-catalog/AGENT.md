@@ -14,6 +14,9 @@ authority.
 - DataFusion providers are cached per exact table generation (name, engine,
   location, incarnation, version); concurrent misses coalesce and the cache is
   capacity-bounded.
+- Listing names and schemas are published together as one immutable
+  `Arc<CatalogGeneration>`; request readers pin the Arc and never mix refresh
+  generations.
 - Listing and registration caches have bounded staleness; refreshes coalesce
   so concurrent queries cannot stampede the metastore.
 - Initial listing warm is synchronous and fail-closed. After warm, stale SQL
@@ -24,7 +27,7 @@ authority.
 
 ## Layout
 
-- `catalog.rs` — `CatalogState` + `LakeCatalog` (`CatalogProvider`, snapshot,
+- `catalog.rs` — `CatalogState` + `LakeCatalog` (`CatalogProvider`, immutable generation,
   registration/provider caches, `refresh`)
 - `schema.rs` — `LakeSchema` (`SchemaProvider`: snapshot listing + live
   `table()` resolution)

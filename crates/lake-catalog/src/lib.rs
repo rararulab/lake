@@ -25,5 +25,5 @@ mod catalog;
 mod ops;
 mod schema;
 
-pub use catalog::{CatalogRefreshHealth, CatalogState, LakeCatalog};
+pub use catalog::{CatalogGeneration, CatalogRefreshHealth, CatalogState, LakeCatalog};
 pub use ops::{CatalogError, create_table};

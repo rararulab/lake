@@ -40,7 +40,7 @@ use datafusion::{
     execution::{memory_pool::FairSpillPool, runtime_env::RuntimeEnvBuilder},
     prelude::{SQLOptions, SessionConfig, SessionContext},
 };
-use lake_catalog::{CatalogRefreshHealth, LakeCatalog};
+use lake_catalog::{CatalogGeneration, CatalogRefreshHealth, LakeCatalog};
 use lake_common::ManagedStageDescriptor;
 use lake_engine::TableEngineRef;
 use lake_flight::{ClientSecurity, ServerSecurity};
@@ -387,17 +387,8 @@ impl QueryEngine {
 
     async fn shutdown_catalog_revalidation(&self) { self.catalog.shutdown_revalidation().await; }
 
-    pub(crate) fn cached_catalog_snapshot(
-        &self,
-    ) -> std::collections::BTreeMap<lake_common::Namespace, Vec<lake_common::TableName>> {
-        self.catalog.cached_snapshot()
-    }
-
-    pub(crate) fn cached_table_schema(
-        &self,
-        table: &lake_common::TableRef,
-    ) -> Option<datafusion::arrow::datatypes::SchemaRef> {
-        self.catalog.cached_table_schema(table)
+    pub(crate) fn cached_catalog_generation(&self) -> Arc<CatalogGeneration> {
+        self.catalog.cached_generation()
     }
 
     /// Execute a SQL statement and collect the results.

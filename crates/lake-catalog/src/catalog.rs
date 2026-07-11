@@ -115,7 +115,7 @@ pub struct CatalogState {
     pub(crate) engine:    TableEngineRef,
     /// namespace -> table names. Read by DataFusion's sync listing methods,
     /// so it must never require I/O. Refreshed by [`LakeCatalog::refresh`].
-    pub(crate) snapshot:  RwLock<CatalogSnapshot>,
+    pub(crate) snapshot:  RwLock<Arc<CatalogGeneration>>,
     /// table -> registration; shields the registry from per-query load.
     regs:                 Cache<RegistrationCacheKey, Arc<TableRegistration>>,
     /// Local invalidation generations fence stale in-flight registration
@@ -137,10 +137,21 @@ pub struct CatalogState {
     refresh_shutdown:     AtomicBool,
 }
 
+/// One immutable, atomically published catalog listing/schema generation.
 #[derive(Default)]
-pub(crate) struct CatalogSnapshot {
-    pub(crate) listings: BTreeMap<Namespace, Vec<TableName>>,
-    pub(crate) schemas:  BTreeMap<TableRef, SchemaRef>,
+pub struct CatalogGeneration {
+    listings: BTreeMap<Namespace, Vec<TableName>>,
+    schemas:  BTreeMap<TableRef, SchemaRef>,
+}
+
+impl CatalogGeneration {
+    /// Borrow namespace/table listings from this pinned generation.
+    #[must_use]
+    pub const fn listings(&self) -> &BTreeMap<Namespace, Vec<TableName>> { &self.listings }
+
+    /// Borrow one table schema from the same generation as [`Self::listings`].
+    #[must_use]
+    pub fn table_schema(&self, table: &TableRef) -> Option<&SchemaRef> { self.schemas.get(table) }
 }
 
 impl CatalogState {
@@ -223,7 +234,7 @@ impl LakeCatalog {
             state: Arc::new(CatalogState {
                 meta,
                 engine,
-                snapshot: RwLock::new(CatalogSnapshot::default()),
+                snapshot: RwLock::new(Arc::new(CatalogGeneration::default())),
                 regs: Cache::builder()
                     .max_capacity(100_000)
                     .time_to_live(REGISTRATION_CACHE_TTL)
@@ -264,6 +275,16 @@ impl LakeCatalog {
 
     pub fn state(&self) -> Arc<CatalogState> { self.state.clone() }
 
+    /// Pin the current immutable listing/schema generation in O(1).
+    #[must_use]
+    pub fn cached_generation(&self) -> Arc<CatalogGeneration> {
+        self.state
+            .snapshot
+            .read()
+            .expect("snapshot lock poisoned")
+            .clone()
+    }
+
     /// Snapshot bounded local refresh health without authority I/O.
     #[must_use]
     pub fn refresh_health(&self) -> CatalogRefreshHealth {
@@ -284,29 +305,6 @@ impl LakeCatalog {
             consecutive_failures: self.state.refresh_failures.load(Ordering::Acquire),
             last_failure_age:     last_failure.map(|instant| instant.elapsed()),
         }
-    }
-
-    /// Clone the warmed listing snapshot without performing metadata I/O.
-    #[must_use]
-    pub fn cached_snapshot(&self) -> BTreeMap<Namespace, Vec<TableName>> {
-        self.state
-            .snapshot
-            .read()
-            .expect("snapshot lock poisoned")
-            .listings
-            .clone()
-    }
-
-    /// Return one schema from the same immutable generation as the listing.
-    #[must_use]
-    pub fn cached_table_schema(&self, table: &TableRef) -> Option<SchemaRef> {
-        self.state
-            .snapshot
-            .read()
-            .expect("snapshot lock poisoned")
-            .schemas
-            .get(table)
-            .cloned()
     }
 
     /// Evict one resolved registration after this query node proxies a
@@ -432,7 +430,7 @@ impl LakeCatalog {
                 return Err(error);
             }
         };
-        let mut snapshot = CatalogSnapshot::default();
+        let mut snapshot = CatalogGeneration::default();
         for (table, registration) in registrations {
             snapshot
                 .listings
@@ -445,7 +443,7 @@ impl LakeCatalog {
                 snapshot.schemas.insert(table, Arc::new(schema));
             }
         }
-        *self.state.snapshot.write().expect("snapshot lock poisoned") = snapshot;
+        *self.state.snapshot.write().expect("snapshot lock poisoned") = Arc::new(snapshot);
         *self
             .state
             .refreshed_at
@@ -471,11 +469,8 @@ impl CatalogProvider for LakeCatalog {
     fn as_any(&self) -> &dyn Any { self }
 
     fn schema_names(&self) -> Vec<String> {
-        self.state
-            .snapshot
-            .read()
-            .expect("snapshot lock poisoned")
-            .listings
+        self.cached_generation()
+            .listings()
             .keys()
             .map(|ns| ns.0.clone())
             .collect()
@@ -635,15 +630,113 @@ mod tests {
         let catalog = LakeCatalog::new(meta_ref, engine);
 
         catalog.refresh().await.unwrap();
+        let generation = catalog.cached_generation();
 
         assert_eq!(
-            catalog.cached_table_schema(&table).as_deref(),
+            generation.table_schema(&table).map(AsRef::as_ref),
             Some(&expected)
         );
         assert_eq!(
-            catalog.cached_snapshot(),
-            BTreeMap::from([(table.namespace.clone(), vec![table.name.clone()])])
+            generation.listings(),
+            &BTreeMap::from([(table.namespace.clone(), vec![table.name.clone()])])
         );
+    }
+
+    #[tokio::test]
+    async fn cached_generation_clones_only_the_arc() {
+        let root = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path()).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let catalog = LakeCatalog::new(meta, engine);
+        catalog.refresh().await.unwrap();
+
+        let first = catalog.cached_generation();
+        let second = catalog.cached_generation();
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn pinned_generation_keeps_names_and_schemas_together() {
+        let root = tempfile::tempdir().unwrap();
+        let meta = Arc::new(RocksMeta::open(root.path()).unwrap());
+        let old_table = TableRef::new("robots", "episodes");
+        let old_schema = Schema::new(vec![Field::new("episode_id", DataType::Utf8, false)]);
+        let IpcMessage(old_ipc) = SchemaAsIpc::new(&old_schema, &IpcWriteOptions::default())
+            .try_into()
+            .unwrap();
+        let old_registration = TableRegistration::new(
+            TableLocation::new("mem://episodes"),
+            "lance",
+            lake_common::Version(1),
+            old_ipc.to_vec(),
+        );
+        registry::register(meta.as_ref(), &old_table, &old_registration)
+            .await
+            .unwrap();
+        let meta_ref: MetaStoreRef = meta.clone();
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let catalog = LakeCatalog::new(meta_ref, engine);
+        catalog.refresh().await.unwrap();
+        let pinned = catalog.cached_generation();
+
+        registry::delete(meta.as_ref(), &old_table, &old_registration)
+            .await
+            .unwrap();
+        let new_table = TableRef::new("robots", "runs");
+        let new_schema = Schema::new(vec![Field::new("run_id", DataType::Int64, false)]);
+        let IpcMessage(new_ipc) = SchemaAsIpc::new(&new_schema, &IpcWriteOptions::default())
+            .try_into()
+            .unwrap();
+        registry::register(
+            meta.as_ref(),
+            &new_table,
+            &TableRegistration::new(
+                TableLocation::new("mem://runs"),
+                "lance",
+                lake_common::Version(1),
+                new_ipc.to_vec(),
+            ),
+        )
+        .await
+        .unwrap();
+        catalog.refresh().await.unwrap();
+        let current = catalog.cached_generation();
+
+        assert!(!Arc::ptr_eq(&pinned, &current));
+        assert_eq!(
+            pinned.listings(),
+            &BTreeMap::from([(old_table.namespace.clone(), vec![old_table.name.clone()])])
+        );
+        assert_eq!(
+            pinned.table_schema(&old_table).map(AsRef::as_ref),
+            Some(&old_schema)
+        );
+        assert!(pinned.table_schema(&new_table).is_none());
+        assert_eq!(
+            current.listings(),
+            &BTreeMap::from([(new_table.namespace.clone(), vec![new_table.name.clone()])])
+        );
+        assert_eq!(
+            current.table_schema(&new_table).map(AsRef::as_ref),
+            Some(&new_schema)
+        );
+        assert!(current.table_schema(&old_table).is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_preserves_generation_identity() {
+        let meta = Arc::new(ControlledScanMeta::new());
+        let meta_ref: MetaStoreRef = meta.clone();
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let catalog = LakeCatalog::new(meta_ref, engine);
+        catalog.refresh().await.unwrap();
+        let last_good = catalog.cached_generation();
+        meta.mode.store(SCAN_FAIL, Ordering::SeqCst);
+
+        catalog.refresh().await.unwrap_err();
+
+        assert!(Arc::ptr_eq(&last_good, &catalog.cached_generation()));
     }
 
     #[tokio::test]
@@ -710,7 +803,7 @@ mod tests {
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
         let catalog = LakeCatalog::new(meta_ref, engine);
         catalog.refresh().await.unwrap();
-        let last_good = catalog.cached_snapshot();
+        let last_good = catalog.cached_generation();
         meta.mode.store(SCAN_FAIL, Ordering::SeqCst);
 
         catalog.refresh_if_stale(Duration::ZERO).await.unwrap();
@@ -722,12 +815,15 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(catalog.cached_snapshot(), last_good);
+        assert!(Arc::ptr_eq(&catalog.cached_generation(), &last_good));
         let health = catalog.refresh_health();
         assert!(health.warmed());
         assert_eq!(health.consecutive_failures(), 1);
         assert!(health.last_failure_age().is_some());
-        assert_eq!(last_good.get(&table.namespace), Some(&vec![table.name]));
+        assert_eq!(
+            last_good.listings().get(&table.namespace),
+            Some(&vec![table.name])
+        );
     }
 
     #[tokio::test]
@@ -758,7 +854,10 @@ mod tests {
         catalog.refresh_if_stale(Duration::ZERO).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while catalog.refresh_health().consecutive_failures() != 0
-                || !catalog.cached_snapshot().contains_key(&table.namespace)
+                || !catalog
+                    .cached_generation()
+                    .listings()
+                    .contains_key(&table.namespace)
             {
                 tokio::task::yield_now().await;
             }
@@ -767,8 +866,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            catalog.cached_snapshot(),
-            BTreeMap::from([(table.namespace, vec![table.name])])
+            catalog.cached_generation().listings(),
+            &BTreeMap::from([(table.namespace, vec![table.name])])
         );
         assert!(catalog.refresh_health().last_failure_age().is_none());
     }

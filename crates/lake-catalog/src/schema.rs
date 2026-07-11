@@ -59,11 +59,14 @@ impl SchemaProvider for LakeSchema {
 
     fn table_names(&self) -> Vec<String> {
         // Reads the cached snapshot — never blocks on the metastore.
-        self.state
+        let generation = self
+            .state
             .snapshot
             .read()
             .expect("snapshot lock poisoned")
-            .listings
+            .clone();
+        generation
+            .listings()
             .get(&self.namespace)
             .map(|tables| tables.iter().map(|t| t.0.clone()).collect())
             .unwrap_or_default()
@@ -87,11 +90,14 @@ impl SchemaProvider for LakeSchema {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.state
+        let generation = self
+            .state
             .snapshot
             .read()
             .expect("snapshot lock poisoned")
-            .listings
+            .clone();
+        generation
+            .listings()
             .get(&self.namespace)
             .is_some_and(|tables| tables.iter().any(|t| t.0 == name))
     }
