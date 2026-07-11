@@ -20,6 +20,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  # Skip full debuginfo in CI: ~20-40% faster compiles of the big
+  # datafusion / arrow / lance dependency tree and a smaller target dir, so
+  # Swatinem/rust-cache save+restore is faster too. line-tables-only keeps
+  # readable backtraces (RUST_BACKTRACE=1 above) — see matklad's "Fast Rust
+  # Builds" and the rustc perf book.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   # Local dev keeps incremental builds (see mise.toml); CI disables them.
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: "10"
