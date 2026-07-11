@@ -962,15 +962,18 @@ where
     );
     let mut shutdown = Box::pin(shutdown);
 
+    let mut shutdown_deadline = None;
     let server_result = tokio::select! {
         result = server.as_mut() => result.context(ServeSnafu),
         () = shutdown.as_mut() => {
+            let deadline = tokio::time::Instant::now() + config.shutdown_grace;
+            shutdown_deadline = Some(deadline);
             maintenance_shutdown.cancel();
             server_shutdown.cancel();
             if crash {
                 Ok(())
             } else {
-                match tokio::time::timeout(config.shutdown_grace, server.as_mut()).await {
+                match tokio::time::timeout_at(deadline, server.as_mut()).await {
                     Ok(result) => result.context(ServeSnafu),
                     Err(_) => Err(MetasrvError::DrainTimeout { grace: config.shutdown_grace }),
                 }
@@ -990,21 +993,17 @@ where
     }
     maintenance_shutdown.cancel();
     campaign_shutdown.cancel();
-    let maintenance_result = maintenance
-        .await
-        .map_err(|source| MetasrvError::BackgroundTask {
-            task: "maintenance",
-            source,
-        });
-    let campaign_result = campaign
-        .await
-        .map_err(|source| MetasrvError::BackgroundTask {
-            task: "leadership-campaign",
-            source,
-        });
+    let cleanup_deadline =
+        shutdown_deadline.unwrap_or_else(|| tokio::time::Instant::now() + config.shutdown_grace);
+    let background_result = join_background_tasks_until(
+        maintenance,
+        campaign,
+        cleanup_deadline,
+        config.shutdown_grace,
+    )
+    .await;
     server_result?;
-    maintenance_result?;
-    campaign_result?;
+    background_result?;
     Ok(())
 }
 

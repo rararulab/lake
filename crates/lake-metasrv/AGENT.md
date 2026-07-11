@@ -30,6 +30,9 @@ write path — create tables, resolve/list, and the append commit protocol.
 - Production inbound RPCs and follower-to-leader forwarding share the
   `lake-flight` TLS/auth boundary; a follower must never downgrade to anonymous
   hard-coded HTTP.
+- Shutdown has one finite process deadline covering Flight drain, maintenance,
+  and leadership-campaign cleanup. Maintenance stops at table boundaries;
+  unfinished owned tasks are aborted and reaped at the deadline.
 
 ## Layout
 

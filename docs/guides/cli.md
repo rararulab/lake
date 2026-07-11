@@ -52,6 +52,12 @@ values must fit weighted semaphore permits. Each request reserves its complete
 per-stream maximum until forwarding or local commit finishes, so saturation
 returns gRPC `ResourceExhausted` before payload polling.
 
+`LAKE_SHUTDOWN_GRACE_MS` (default `30000`) is the total Metasrv shutdown
+budget, beginning when SIGINT or SIGTERM is received. It covers Flight
+connection drain plus maintenance and leadership-campaign cleanup; unfinished
+owned background tasks are aborted at the deadline and the process returns a
+typed error instead of waiting indefinitely.
+
 ## Async Runtime
 
 - The CLI is async-first. Use `#[tokio::main]` at the binary boundary and keep
