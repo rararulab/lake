@@ -23,17 +23,18 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use aws_sdk_dynamodb::{
     Client,
+    operation::transact_write_items::TransactWriteItemsError,
     primitives::Blob,
     types::{
-        AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType,
-        ScalarAttributeType,
+        AttributeDefinition, AttributeValue, BillingMode, ConditionCheck, Delete, KeySchemaElement,
+        KeyType, Put, ScalarAttributeType, TransactWriteItem,
     },
 };
 use snafu::IntoError;
 
 use crate::{
     error::{DynamoSnafu, MetaError, Result},
-    store::{MetaScanPage, MetaStore},
+    store::{GuardedMutation, GuardedTarget, MetaScanPage, MetaStore},
 };
 
 /// Wrap any AWS SDK error into a [`MetaError::Dynamo`] carrying `message`.
@@ -47,6 +48,21 @@ where
         }
         .into_error(Box::new(source))
     }
+}
+
+fn transaction_condition_mismatch(error: &TransactWriteItemsError) -> bool {
+    let TransactWriteItemsError::TransactionCanceledException(cancelled) = error else {
+        return false;
+    };
+    let mut mismatch = false;
+    for reason in cancelled.cancellation_reasons() {
+        match reason.code() {
+            None | Some("None") => {}
+            Some("ConditionalCheckFailed") => mismatch = true,
+            Some(_) => return false,
+        }
+    }
+    mismatch
 }
 
 pub struct DynamoMeta {
@@ -122,6 +138,55 @@ impl DynamoMeta {
             Err(err) => Err(dynamo_err("create_table")(err)),
         }
     }
+
+    fn guarded_transaction_items(&self, mutation: GuardedMutation<'_>) -> Vec<TransactWriteItem> {
+        let guard = ConditionCheck::builder()
+            .table_name(&self.table)
+            .key("pk", AttributeValue::S(mutation.guard_key.to_owned()))
+            .condition_expression("val = :guard")
+            .expression_attribute_values(
+                ":guard",
+                AttributeValue::B(Blob::new(mutation.guard_expected.to_vec())),
+            )
+            .build()
+            .expect("guard condition check is complete");
+        let target = match mutation.target {
+            GuardedTarget::Put { expected, value } => {
+                let mut put = Put::builder()
+                    .table_name(&self.table)
+                    .item("pk", AttributeValue::S(mutation.target_key.to_owned()))
+                    .item("val", AttributeValue::B(Blob::new(value.to_vec())));
+                put = match expected {
+                    None => put.condition_expression("attribute_not_exists(pk)"),
+                    Some(bytes) => put
+                        .condition_expression("val = :target")
+                        .expression_attribute_values(
+                            ":target",
+                            AttributeValue::B(Blob::new(bytes.to_vec())),
+                        ),
+                };
+                TransactWriteItem::builder()
+                    .put(put.build().expect("guarded target put is complete"))
+            }
+            GuardedTarget::Delete { expected } => {
+                let delete = Delete::builder()
+                    .table_name(&self.table)
+                    .key("pk", AttributeValue::S(mutation.target_key.to_owned()))
+                    .condition_expression("val = :target")
+                    .expression_attribute_values(
+                        ":target",
+                        AttributeValue::B(Blob::new(expected.to_vec())),
+                    )
+                    .build()
+                    .expect("guarded target delete is complete");
+                TransactWriteItem::builder().delete(delete)
+            }
+        };
+        vec![
+            TransactWriteItem::builder().condition_check(guard).build(),
+            target.build(),
+        ]
+    }
 }
 
 #[async_trait]
@@ -170,6 +235,30 @@ impl MetaStore for DynamoMeta {
                 Ok(false)
             }
             Err(err) => Err(dynamo_err(format!("put_item on '{key}'"))(err)),
+        }
+    }
+
+    async fn guarded_mutate(&self, mutation: GuardedMutation<'_>) -> Result<bool> {
+        let mutation = mutation.validate()?;
+        let target_key = mutation.target_key.to_owned();
+        let result = self
+            .client
+            .transact_write_items()
+            .set_transact_items(Some(self.guarded_transaction_items(mutation)))
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(true),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(transaction_condition_mismatch) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(dynamo_err(format!(
+                "transact_write_items guarding target '{target_key}'"
+            ))(error)),
         }
     }
 
@@ -315,5 +404,82 @@ impl MetaStore for DynamoMeta {
             }
             Err(err) => Err(dynamo_err(format!("delete_item on '{key}'"))(err)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aws_sdk_dynamodb::{
+        config::Region,
+        types::{CancellationReason, error::TransactionCanceledException},
+    };
+
+    use super::*;
+
+    fn test_meta() -> DynamoMeta {
+        let config = aws_sdk_dynamodb::Config::builder()
+            .region(Region::new("us-east-1"))
+            .behavior_version_latest()
+            .build();
+        DynamoMeta::new(Client::from_conf(config), "meta")
+    }
+
+    #[test]
+    fn dynamo_guarded_mutation_is_wired() {
+        let meta = test_meta();
+        let create = GuardedMutation::create("lease", b"epoch-1", "target", b"value");
+        let items = meta.guarded_transaction_items(create);
+        assert_eq!(items.len(), 2);
+        assert!(items[0].condition_check().is_some());
+        assert!(items[1].put().is_some());
+        assert_eq!(
+            items[0]
+                .condition_check()
+                .expect("guard item")
+                .condition_expression(),
+            "val = :guard"
+        );
+
+        let delete = GuardedMutation::delete("lease", b"epoch-1", "target", b"value");
+        let items = meta.guarded_transaction_items(delete);
+        assert!(items[1].delete().is_some());
+
+        let conditional = TransactionCanceledException::builder()
+            .cancellation_reasons(
+                CancellationReason::builder()
+                    .code("ConditionalCheckFailed")
+                    .build(),
+            )
+            .build();
+        assert!(transaction_condition_mismatch(
+            &TransactWriteItemsError::TransactionCanceledException(conditional)
+        ));
+
+        let conflict = TransactionCanceledException::builder()
+            .cancellation_reasons(
+                CancellationReason::builder()
+                    .code("TransactionConflict")
+                    .build(),
+            )
+            .build();
+        assert!(!transaction_condition_mismatch(
+            &TransactWriteItemsError::TransactionCanceledException(conflict)
+        ));
+
+        let mixed = TransactionCanceledException::builder()
+            .cancellation_reasons(
+                CancellationReason::builder()
+                    .code("ConditionalCheckFailed")
+                    .build(),
+            )
+            .cancellation_reasons(
+                CancellationReason::builder()
+                    .code("TransactionConflict")
+                    .build(),
+            )
+            .build();
+        assert!(!transaction_condition_mismatch(
+            &TransactWriteItemsError::TransactionCanceledException(mixed)
+        ));
     }
 }

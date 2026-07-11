@@ -26,7 +26,7 @@
 //! When `LAKE_DYNAMODB_ENDPOINT` is unset the test is a no-op (returns early),
 //! so it is safe to invoke via `--run-ignored all` without the env present.
 
-use lake_meta::{DynamoMeta, MetaStore};
+use lake_meta::{DynamoMeta, GuardedMutation, MetaStore};
 
 #[tokio::test]
 #[ignore = "requires localstack DynamoDB; set LAKE_DYNAMODB_ENDPOINT and run with --ignored"]
@@ -105,5 +105,45 @@ async fn dynamo_meta_roundtrip() {
             ("a".to_owned(), b"v".to_vec()),
             ("b".to_owned(), b"v".to_vec()),
         ]
+    );
+
+    assert!(meta.cas("lease", None, b"epoch-1").await.unwrap());
+    assert!(
+        meta.guarded_mutate(GuardedMutation::create(
+            "lease", b"epoch-1", "guarded", b"one",
+        ))
+        .await
+        .unwrap()
+    );
+    assert!(
+        meta.guarded_mutate(GuardedMutation::update(
+            "lease", b"epoch-1", "guarded", b"one", b"two",
+        ))
+        .await
+        .unwrap()
+    );
+    assert!(
+        meta.cas("lease", Some(b"epoch-1"), b"epoch-2")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !meta
+            .guarded_mutate(GuardedMutation::delete(
+                "lease", b"epoch-1", "guarded", b"two",
+            ))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        meta.get("guarded").await.unwrap().as_deref(),
+        Some(&b"two"[..])
+    );
+    assert!(
+        meta.guarded_mutate(GuardedMutation::delete(
+            "lease", b"epoch-2", "guarded", b"two",
+        ))
+        .await
+        .unwrap()
     );
 }

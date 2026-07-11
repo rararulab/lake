@@ -20,12 +20,12 @@ use std::{
 };
 
 use async_trait::async_trait;
-use rocksdb::{Direction, IteratorMode};
+use rocksdb::{Direction, IteratorMode, WriteBatch};
 use snafu::ResultExt;
 
 use crate::{
     error::{BackendSnafu, Result},
-    store::{MetaScanPage, MetaStore},
+    store::{GuardedMutation, GuardedTarget, MetaScanPage, MetaStore},
 };
 
 pub struct RocksMeta {
@@ -67,6 +67,38 @@ impl MetaStore for RocksMeta {
             return Ok(false);
         }
         self.db.put(key, new).context(BackendSnafu { key })?;
+        Ok(true)
+    }
+
+    async fn guarded_mutate(&self, mutation: GuardedMutation<'_>) -> Result<bool> {
+        let mutation = mutation.validate()?;
+        let _guard = self.lock();
+        let guard = self.db.get(mutation.guard_key).context(BackendSnafu {
+            key: mutation.guard_key,
+        })?;
+        if guard.as_deref() != Some(mutation.guard_expected) {
+            return Ok(false);
+        }
+
+        let current = self.db.get(mutation.target_key).context(BackendSnafu {
+            key: mutation.target_key,
+        })?;
+        let matches = match mutation.target {
+            GuardedTarget::Put { expected, .. } => current.as_deref() == expected,
+            GuardedTarget::Delete { expected } => current.as_deref() == Some(expected),
+        };
+        if !matches {
+            return Ok(false);
+        }
+
+        let mut batch = WriteBatch::default();
+        match mutation.target {
+            GuardedTarget::Put { value, .. } => batch.put(mutation.target_key, value),
+            GuardedTarget::Delete { .. } => batch.delete(mutation.target_key),
+        }
+        self.db.write(batch).context(BackendSnafu {
+            key: mutation.target_key,
+        })?;
         Ok(true)
     }
 
@@ -148,6 +180,7 @@ impl MetaStore for RocksMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GuardedMutation;
 
     fn open_temp() -> (tempfile::TempDir, RocksMeta) {
         let dir = tempfile::tempdir().unwrap();
@@ -213,5 +246,78 @@ mod tests {
             .unwrap();
         assert_eq!(second.entries(), &[("c".to_owned(), b"op/c".to_vec())]);
         assert!(second.continuation().is_none());
+    }
+
+    #[tokio::test]
+    async fn guarded_mutation_applies_all_target_transitions() {
+        let (_dir, meta) = open_temp();
+        assert!(meta.cas("lease", None, b"epoch-1").await.unwrap());
+
+        assert!(
+            meta.guarded_mutate(GuardedMutation::create(
+                "lease", b"epoch-1", "target", b"one",
+            ))
+            .await
+            .unwrap()
+        );
+        assert!(
+            meta.guarded_mutate(GuardedMutation::update(
+                "lease", b"epoch-1", "target", b"one", b"two",
+            ))
+            .await
+            .unwrap()
+        );
+        assert!(
+            meta.guarded_mutate(GuardedMutation::delete(
+                "lease", b"epoch-1", "target", b"two",
+            ))
+            .await
+            .unwrap()
+        );
+        assert_eq!(meta.get("target").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn guarded_mutation_rejects_stale_guard_without_target_change() {
+        let (_dir, meta) = open_temp();
+        assert!(meta.cas("lease", None, b"epoch-1").await.unwrap());
+        assert!(meta.cas("target", None, b"original").await.unwrap());
+        assert!(
+            meta.cas("lease", Some(b"epoch-1"), b"epoch-2")
+                .await
+                .unwrap()
+        );
+
+        for mutation in [
+            GuardedMutation::create("lease", b"epoch-1", "missing", b"created"),
+            GuardedMutation::update("lease", b"epoch-1", "target", b"original", b"updated"),
+            GuardedMutation::delete("lease", b"epoch-1", "target", b"original"),
+        ] {
+            assert!(!meta.guarded_mutate(mutation).await.unwrap());
+        }
+
+        assert_eq!(
+            meta.get("target").await.unwrap().as_deref(),
+            Some(&b"original"[..])
+        );
+        assert_eq!(meta.get("missing").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn guarded_mutation_rejects_same_key() {
+        let (_dir, meta) = open_temp();
+        assert!(meta.cas("lease", None, b"epoch-1").await.unwrap());
+
+        let error = meta
+            .guarded_mutate(GuardedMutation::update(
+                "lease", b"epoch-1", "lease", b"epoch-1", b"corrupt",
+            ))
+            .await
+            .expect_err("one transaction cannot guard and mutate the same key");
+        assert!(matches!(error, crate::MetaError::InvalidGuardedMutation));
+        assert_eq!(
+            meta.get("lease").await.unwrap().as_deref(),
+            Some(&b"epoch-1"[..])
+        );
     }
 }
