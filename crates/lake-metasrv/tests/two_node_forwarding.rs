@@ -39,22 +39,28 @@ use arrow_flight::{
     flight_service_client::FlightServiceClient,
 };
 use async_trait::async_trait;
-use datafusion::arrow::{
-    array::{Float64Array, Int64Array},
-    datatypes::{DataType, Field, Schema, SchemaRef},
-    record_batch::RecordBatch,
+use datafusion::{
+    arrow::{
+        array::{Float64Array, Int64Array},
+        datatypes::{DataType, Field, Schema, SchemaRef},
+        record_batch::RecordBatch,
+    },
+    datasource::TableProvider,
+    execution::SendableRecordBatchStream,
 };
 use futures::TryStreamExt;
-use lake_common::{AppendOperationId, FILE_APPEND_TYPE_URL, FileAppendRequest, TableRef, Version};
+use lake_common::{
+    AppendOperation, AppendOperationId, FILE_APPEND_TYPE_URL, FileAppendRequest, TableRef, Version,
+};
 use lake_engine::{
     ObjectReferencePage, ObjectReferenceRequest, Result as EngineResult, TableEngine,
-    TableEngineRef, TableHandleRef,
+    TableEngineRef, TableHandle, TableHandleRef,
 };
 use lake_engine_lance::LanceEngine;
 use lake_flight::{ClientSecurity, ServerSecurity, append_flight_payload_digest};
 use lake_meta::{MetaStoreRef, RocksMeta, registry};
 use lake_metasrv::{
-    Metasrv, MetasrvServerConfig, TablePlacement,
+    AppendLimits, Metasrv, MetasrvServerConfig, TablePlacement,
     election::{LEASE_KEY, LeaseElection, LeaseStatus, LeaseValue},
     serve_with_config, serve_with_config_and_shutdown,
 };
@@ -88,6 +94,108 @@ struct PauseFirstRemoveEngine {
     first:   AtomicBool,
     started: Notify,
     resume:  Notify,
+}
+
+struct AppendPause {
+    first:   AtomicBool,
+    started: Notify,
+    resume:  Notify,
+}
+
+struct PauseFirstAppendEngine {
+    inner: LanceEngine,
+    pause: Arc<AppendPause>,
+}
+
+struct PauseFirstAppendHandle {
+    inner: TableHandleRef,
+    pause: Arc<AppendPause>,
+}
+
+#[async_trait]
+impl TableHandle for PauseFirstAppendHandle {
+    fn schema(&self) -> SchemaRef { self.inner.schema() }
+
+    fn current_version(&self) -> Version { self.inner.current_version() }
+
+    async fn table_provider(&self, version: Version) -> EngineResult<Arc<dyn TableProvider>> {
+        self.inner.table_provider(version).await
+    }
+
+    async fn append(
+        &self,
+        operation: &AppendOperation,
+        batches: SendableRecordBatchStream,
+    ) -> EngineResult<Version> {
+        self.inner.append(operation, batches).await
+    }
+
+    async fn append_reserved(
+        &self,
+        operation: &AppendOperation,
+        batches: SendableRecordBatchStream,
+    ) -> EngineResult<Version> {
+        if self.pause.first.swap(false, Ordering::SeqCst) {
+            self.pause.started.notify_one();
+            self.pause.resume.notified().await;
+        }
+        self.inner.append_reserved(operation, batches).await
+    }
+
+    async fn reconcile_append(&self, operation: &AppendOperation) -> EngineResult<Option<Version>> {
+        self.inner.reconcile_append(operation).await
+    }
+}
+
+#[async_trait]
+impl TableEngine for PauseFirstAppendEngine {
+    fn kind(&self) -> &'static str { self.inner.kind() }
+
+    async fn create(
+        &self,
+        location: &lake_common::TableLocation,
+        schema: SchemaRef,
+    ) -> EngineResult<TableHandleRef> {
+        let inner = self.inner.create(location, schema).await?;
+        Ok(Arc::new(PauseFirstAppendHandle {
+            inner,
+            pause: self.pause.clone(),
+        }))
+    }
+
+    async fn open(
+        &self,
+        location: &lake_common::TableLocation,
+    ) -> EngineResult<Option<TableHandleRef>> {
+        Ok(self.inner.open(location).await?.map(|inner| {
+            Arc::new(PauseFirstAppendHandle {
+                inner,
+                pause: self.pause.clone(),
+            }) as TableHandleRef
+        }))
+    }
+
+    async fn remove(&self, location: &lake_common::TableLocation) -> EngineResult<()> {
+        self.inner.remove(location).await
+    }
+
+    async fn maintain(
+        &self,
+        location: &lake_common::TableLocation,
+        version: Version,
+    ) -> EngineResult<Option<Version>> {
+        self.inner.maintain(location, version).await
+    }
+
+    async fn retained_object_references(
+        &self,
+        location: &lake_common::TableLocation,
+        request: ObjectReferenceRequest,
+    ) -> EngineResult<ObjectReferencePage> {
+        self.inner
+            .retained_object_references(location, request)
+            .await
+    }
 }
 
 #[async_trait]
@@ -356,6 +464,103 @@ async fn follower_forwards_write_to_leader() {
         .await
         .expect("registry get after drop");
     assert!(reg_after.is_none(), "durable drop must detach robots.arm");
+}
+
+#[tokio::test]
+async fn forwarded_append_holds_admission_until_commit_finishes() {
+    let meta_dir = tempfile::tempdir().expect("meta tempdir");
+    let table_dir = tempfile::tempdir().expect("table tempdir");
+    let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).expect("open RocksMeta"));
+    let pause = Arc::new(AppendPause {
+        first:   AtomicBool::new(true),
+        started: Notify::new(),
+        resume:  Notify::new(),
+    });
+    let engine: TableEngineRef = Arc::new(PauseFirstAppendEngine {
+        inner: LanceEngine::with_manifest_store(meta.clone()),
+        pause: pause.clone(),
+    });
+    let addr_a = free_addr();
+    let addr_b = free_addr();
+    let placement = TablePlacement::local(table_dir.path().to_path_buf());
+    let limits = AppendLimits::try_new(1, Duration::from_millis(20), 1024 * 1024, 1024 * 1024)
+        .expect("append limits");
+
+    tokio::spawn({
+        let node = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
+        let addr = addr_a.clone();
+        let placement = placement.clone();
+        async move {
+            serve_with_config(
+                node,
+                &addr,
+                MetasrvServerConfig::new()
+                    .with_table_placement(placement)
+                    .with_append_limits(limits),
+            )
+            .await
+        }
+    });
+    tokio::spawn({
+        let node = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
+        let addr = addr_b.clone();
+        async move {
+            serve_with_config(
+                node,
+                &addr,
+                MetasrvServerConfig::new()
+                    .with_table_placement(placement)
+                    .with_append_limits(limits),
+            )
+            .await
+        }
+    });
+
+    wait_serving(&addr_a).await;
+    wait_serving(&addr_b).await;
+    let leader = wait_for_leader(&meta, &[&addr_a, &addr_b]).await;
+    let follower = if leader == addr_a {
+        addr_b.clone()
+    } else {
+        addr_a.clone()
+    };
+    let table = TableRef::new("robots", "admitted_append");
+    forward_with_retry(
+        &follower,
+        "create_table",
+        json!({
+            "namespace": "robots",
+            "name": "admitted_append",
+            "columns": ["ts:i64", "reward:f64"],
+        }),
+    )
+    .await
+    .expect("create table through follower");
+
+    let first = tokio::spawn({
+        let follower = follower.clone();
+        let table = table.clone();
+        async move { do_file_append(&follower, table).await }
+    });
+    pause.started.notified().await;
+
+    let saturated = tokio::time::timeout(
+        Duration::from_millis(250),
+        do_file_append(&follower, table.clone()),
+    )
+    .await
+    .expect("saturated request must fail within its queue timeout")
+    .expect_err("second append must be rejected while first commit is paused");
+    assert_eq!(saturated.code(), Code::ResourceExhausted);
+
+    pause.resume.notify_one();
+    first
+        .await
+        .expect("first append task")
+        .expect("first append succeeds after release");
+    do_file_append(&follower, table)
+        .await
+        .expect("permit is released after the first response");
 }
 
 #[tokio::test]

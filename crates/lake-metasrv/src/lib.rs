@@ -57,7 +57,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 
 use crate::{
-    control::MetasrvFlightService,
+    control::{AppendAdmission, MetasrvFlightService},
     election::LeaseElection,
     fenced_meta::FencedMetaStore,
     leadership::{Leadership, run_campaign_loop_until},
@@ -906,6 +906,7 @@ where
         own_addr: addr.to_string(),
         peer_security: config.peer_security,
         table_placement: config.table_placement,
+        append_admission: AppendAdmission::new(config.append_limits),
         #[cfg(feature = "test")]
         append_result_gate: config.append_result_gate,
     };
