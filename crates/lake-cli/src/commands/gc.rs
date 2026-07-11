@@ -115,7 +115,7 @@ async fn dry_run_in(
     work_dir: &Path,
     cutoff_ms: u64,
 ) -> anyhow::Result<GcPlan> {
-    let roots = registry_snapshot(ctx).await?;
+    let roots = registry_snapshot(ctx.meta.as_ref()).await?;
     let root_fingerprint = registry_fingerprint(&roots)?;
     let references = build_reference_index(ctx, &roots, work_dir).await?;
     let inventory_path = work_dir.join("inventory.jsonl");
@@ -125,7 +125,7 @@ async fn dry_run_in(
     // concurrent table creates, drops, appends, and maintenance commits before
     // any immutable plan is published.
     ensure!(
-        registry_snapshot(ctx).await? == roots,
+        registry_snapshot(ctx.meta.as_ref()).await? == roots,
         "registry changed during GC planning; retry from a fresh snapshot"
     );
 
@@ -193,20 +193,10 @@ async fn fill_reference_index(
     build.finish().map_err(Into::into)
 }
 
-async fn registry_snapshot(ctx: &Context) -> anyhow::Result<BTreeMap<TableRef, TableRegistration>> {
-    let mut snapshot = BTreeMap::new();
-    for namespace in registry::list_namespaces(ctx.meta.as_ref()).await? {
-        for name in registry::list(ctx.meta.as_ref(), &namespace).await? {
-            let table = TableRef {
-                namespace: namespace.clone(),
-                name,
-            };
-            if let Some(registration) = registry::get(ctx.meta.as_ref(), &table).await? {
-                snapshot.insert(table, registration);
-            }
-        }
-    }
-    Ok(snapshot)
+async fn registry_snapshot(
+    meta: &dyn lake_meta::MetaStore,
+) -> anyhow::Result<BTreeMap<TableRef, TableRegistration>> {
+    Ok(registry::scan_tables(meta).await?.into_iter().collect())
 }
 
 fn registry_fingerprint(roots: &BTreeMap<TableRef, TableRegistration>) -> anyhow::Result<String> {
@@ -261,13 +251,13 @@ async fn apply(ctx: &Context, store: &GcStore, command: GcCmd) -> anyhow::Result
         .context("GC plan has no registry-root fingerprint")?
         .to_owned();
     ensure!(
-        registry_fingerprint(&registry_snapshot(ctx).await?)? == planned_roots,
+        registry_fingerprint(&registry_snapshot(ctx.meta.as_ref()).await?)? == planned_roots,
         "registry no longer matches the GC plan; create a fresh dry-run plan"
     );
     let mut applier = GcPlanApplier::open(&command.plan, checkpoint).await?;
     let progress = loop {
         ensure!(
-            registry_fingerprint(&registry_snapshot(ctx).await?)? == planned_roots,
+            registry_fingerprint(&registry_snapshot(ctx.meta.as_ref()).await?)? == planned_roots,
             "registry changed during GC apply; create a fresh dry-run plan"
         );
         let progress = applier.apply_next(store).await?;
@@ -449,9 +439,95 @@ impl Iterator for CandidateIter {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::FileTimes, time::Duration};
+    use std::{
+        fs::FileTimes,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use async_trait::async_trait;
+    use lake_common::{TableLocation, Version};
+    use lake_meta::{MetaStore, MetaStoreRef, RocksMeta};
 
     use super::*;
+
+    struct RecordingMeta {
+        inner:      MetaStoreRef,
+        scan_calls: AtomicUsize,
+        list_calls: AtomicUsize,
+        get_calls:  AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MetaStore for RecordingMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(key).await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn scan_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<(String, Vec<u8>)>> {
+            self.scan_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.scan_prefix(prefix).await
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
+        }
+    }
+
+    #[tokio::test]
+    async fn gc_registry_snapshot_uses_single_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let meta = RecordingMeta {
+            inner:      Arc::new(RocksMeta::open(temp.path()).unwrap()),
+            scan_calls: AtomicUsize::new(0),
+            list_calls: AtomicUsize::new(0),
+            get_calls:  AtomicUsize::new(0),
+        };
+        let registrations = [
+            (TableRef::new("beta", "episodes"), 3),
+            (TableRef::new("alpha", "video"), 2),
+            (TableRef::new("alpha", "models"), 1),
+        ]
+        .into_iter()
+        .map(|(table, version)| {
+            let registration = TableRegistration::new(
+                TableLocation::new(format!("mem://{table}")),
+                "lance",
+                Version(version),
+                Vec::new(),
+            );
+            (table, registration)
+        })
+        .collect::<BTreeMap<_, _>>();
+        for (table, registration) in &registrations {
+            registry::register(&meta, table, registration)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(registry_snapshot(&meta).await.unwrap(), registrations);
+        assert_eq!(meta.scan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(meta.list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(meta.get_calls.load(Ordering::SeqCst), 0);
+    }
 
     #[tokio::test]
     async fn local_gc_dry_run_then_apply_uses_no_server() {

@@ -464,7 +464,9 @@ design-level ones:
   live URIs with bounded memory/open files, age-gates candidates, and publishes
   an immutable content-addressed plan only after full validation. Explicit
   apply verifies the stage and registry-root fingerprint before each bounded
-  page and fsyncs a resumable checkpoint. Missing lineage, registry movement,
+  page and fsyncs a resumable checkpoint. Each complete registry-root
+  validation uses one typed metastore prefix scan, rather than namespace
+  listing plus one point read per table. Missing lineage, registry movement,
   stale/corrupt plans, prefix escapes, and future removal deltas all fail
   closed. The operational safety horizon must exceed upload-to-commit retries;
   apply runs in a write-quiescent window.

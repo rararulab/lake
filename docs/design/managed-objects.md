@@ -122,7 +122,10 @@ Apply reopens and verifies the full plan before mutation, checks the registry
 fingerprint before each page, validates the next content hash from its durable
 checkpoint, deletes only that bounded page, and atomically fsyncs progress.
 Local `NotFound` and S3's idempotent `DeleteObject` are success. This worker is
-owned by `lake gc`; it never runs in Query or Metasrv maintenance.
+owned by `lake gc`; it never runs in Query or Metasrv maintenance. A root
+validation reads every table registration through one typed metastore prefix
+scan and canonicalizes it into table order before equality or fingerprinting;
+it does not list namespaces or point-read registrations individually.
 
 The cost is linear in retained reference sidecars plus managed inventory, not
 table row count. Memory is bounded by one reference run, a finite merge fan-in,
