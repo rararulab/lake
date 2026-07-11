@@ -16,8 +16,10 @@ leader release its lease immediately.
 - Shutdown-aware serve entry points accept an injected future; existing serve
   helpers preserve their forever-running embedding API by using a pending
   future.
-- One serve invocation owns one cancellation token and every background task
-  it spawns. Shutdown always joins those tasks before returning.
+- One serve invocation owns its cancellation tokens and every background task
+  it spawns. Metasrv separates listener, maintenance, and campaign cancellation
+  so accepted writes drain before leadership is released. Shutdown always joins
+  every owned task before returning.
 - Tonic begins graceful connection drain when shutdown fires. A finite
   `shutdown_grace` bounds drain; exceeding it closes the server and returns a
   typed error.
@@ -93,7 +95,7 @@ Scenario: Metasrv campaign shutdown resigns and clears leadership
     Filter: campaign_shutdown_resigns_and_clears_leadership
   Given a node holding a valid metadata lease
   When campaign cancellation fires
-  Then the lease is removed immediately, local writes are no longer authorized,
+  Then the lease is invalidated immediately, local writes are no longer authorized,
   and the campaign task returns
 
 Scenario: Metasrv server joins campaign and maintenance on shutdown

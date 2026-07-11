@@ -4150,6 +4150,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
+ "tracing",
 ]
 
 [[package]]

@@ -231,6 +231,14 @@ design-level ones:
   deadline, and pre-planning SQL/ticket size checks. This protects one replica
   without adding metadata traffic. Tenant quotas, fair queuing, and distributed
   admission remain production policy work.
+- Query and Metasrv expose injected shutdown futures; the CLI maps SIGINT and
+  SIGTERM into them. Tonic stops accepting connections and drains existing
+  Flight RPCs within a finite deployment-configured grace period. Query joins
+  catalog refresh before return. Metasrv stops maintenance immediately, keeps
+  renewing leadership while accepted writes drain, drops the server on clean
+  completion or timeout, and only then resigns and joins the campaign. This
+  ordering prevents an accepted write from committing after the node has
+  released authority. Drain timeout is a typed process error, not a clean exit.
 - Managed large objects have a query-connected Rust SDK vertical slice:
   `INSERT ... VALUES (?, ?)` binds `InsertValue::File(FileUpload)`, streams it
   into either a local or S3 Lake-owned managed stage, and stores an immutable

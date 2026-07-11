@@ -19,6 +19,25 @@ use std::{str::FromStr, time::Duration};
 use anyhow::Context as _;
 use lake_query::QueryLimits;
 
+const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+pub(crate) fn shutdown_grace_from_env() -> anyhow::Result<Duration> {
+    shutdown_grace_from_value(env_value("LAKE_SHUTDOWN_GRACE_MS")?.as_deref())
+}
+
+fn shutdown_grace_from_value(value: Option<&str>) -> anyhow::Result<Duration> {
+    let millis = parse_or(
+        "LAKE_SHUTDOWN_GRACE_MS",
+        value,
+        u64::try_from(DEFAULT_SHUTDOWN_GRACE.as_millis()).expect("default grace fits u64"),
+    )?;
+    anyhow::ensure!(
+        millis > 0,
+        "LAKE_SHUTDOWN_GRACE_MS must be greater than zero"
+    );
+    Ok(Duration::from_millis(millis))
+}
+
 pub(crate) fn query_limits_from_env() -> anyhow::Result<QueryLimits> {
     let max_concurrent = env_value("LAKE_QUERY_MAX_CONCURRENT")?;
     let queue_ms = env_value("LAKE_QUERY_QUEUE_TIMEOUT_MS")?;
@@ -94,7 +113,7 @@ fn env_value(name: &str) -> anyhow::Result<Option<String>> {
 mod tests {
     use std::time::Duration;
 
-    use super::query_limits_from_values;
+    use super::{query_limits_from_values, shutdown_grace_from_value};
 
     #[test]
     fn query_limit_values_are_validated_before_serving() {
@@ -108,5 +127,19 @@ mod tests {
         assert_eq!(limits.queue_wait(), Duration::from_millis(250));
         assert_eq!(limits.execution_time(), Duration::from_secs(5));
         assert_eq!(limits.max_sql_bytes(), 4096);
+    }
+
+    #[test]
+    fn shutdown_grace_is_positive_and_defaults_to_thirty_seconds() {
+        assert_eq!(
+            shutdown_grace_from_value(None).unwrap(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            shutdown_grace_from_value(Some("1250")).unwrap(),
+            Duration::from_millis(1250)
+        );
+        assert!(shutdown_grace_from_value(Some("0")).is_err());
+        assert!(shutdown_grace_from_value(Some("later")).is_err());
     }
 }
