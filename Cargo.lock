@@ -4124,9 +4124,11 @@ dependencies = [
  "lake-engine-lance",
  "lake-meta",
  "moka",
+ "serde_json",
  "snafu",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
