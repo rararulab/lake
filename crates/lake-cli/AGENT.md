@@ -37,6 +37,15 @@ tables. clap derive, thin `main.rs`, one handler module per command.
 - Credential files may end in a newline; values are trimmed at that boundary
   and never logged or accepted as command-line flags.
 
+## Query admission
+
+- `LAKE_QUERY_MAX_CONCURRENT` (default 64)
+- `LAKE_QUERY_QUEUE_TIMEOUT_MS` (default 100)
+- `LAKE_QUERY_EXECUTION_TIMEOUT_MS` (default 1800000)
+- `LAKE_QUERY_MAX_SQL_BYTES` (default 1048576)
+
+All values are positive integers parsed once before serving.
+
 ## Layout
 
 - `main.rs` — clap `Cli` + dispatch

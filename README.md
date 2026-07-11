@@ -157,5 +157,23 @@ mesh terminates both TLS and authentication before Lake. Metasrv nodes use
 `LAKE_PEER_AUTH_TOKEN_FILE`, `LAKE_PEER_CA_FILE`, and
 `LAKE_PEER_SERVER_NAME` for follower-to-leader forwarding.
 
+Each Query replica also enforces finite admission limits. Defaults are 64
+concurrent queries, 100 ms queue wait, 30 minutes execution time, and 1 MiB of
+SQL/ticket text. Override them at process startup:
+
+```bash
+LAKE_QUERY_MAX_CONCURRENT=32 \
+LAKE_QUERY_QUEUE_TIMEOUT_MS=250 \
+LAKE_QUERY_EXECUTION_TIMEOUT_MS=900000 \
+LAKE_QUERY_MAX_SQL_BYTES=262144 \
+lake query ...
+```
+
+Saturation returns gRPC `ResourceExhausted`; execution expiry terminates the
+result stream with `DeadlineExceeded`. The concurrency permit remains owned by
+the DoGet stream, so completing, timing out, or dropping the stream releases
+capacity. These are per-replica safety limits; tenant quotas and distributed
+fair queuing remain separate policy layers.
+
 For the design and invariants, see [managed objects](docs/design/managed-objects.md)
 and [architecture](docs/architecture.md).

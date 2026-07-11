@@ -226,6 +226,11 @@ design-level ones:
   cloud mode.
 - No client-side SDK cache yet — the query layer caches, the SDK does not.
   Add SDK-side catalog caching when fleet-node QPS demands another tier.
+- Each stateless Query replica has finite process-local admission: bounded
+  concurrent planning/execution, bounded queue wait, a stream-held execution
+  deadline, and pre-planning SQL/ticket size checks. This protects one replica
+  without adding metadata traffic. Tenant quotas, fair queuing, and distributed
+  admission remain production policy work.
 - Managed large objects have a query-connected Rust SDK vertical slice:
   `INSERT ... VALUES (?, ?)` binds `InsertValue::File(FileUpload)`, streams it
   into either a local or S3 Lake-owned managed stage, and stores an immutable

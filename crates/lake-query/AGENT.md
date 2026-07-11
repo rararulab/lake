@@ -19,6 +19,9 @@ The query layer: stateless SQL compute. `QueryEngine` wires a DataFusion
 - Caches the catalog with a bounded-staleness refresh window; concurrent
   refreshes coalesce and the server refreshes in the background so metadata
   scans stay off the per-query hot path.
+- `QueryLimits` bounds concurrency, queue wait, execution duration, and SQL
+  bytes per replica. A DoGet permit lives until its stream completes, expires,
+  or is dropped; admission never calls the metadata tier.
 
 ## Layout
 
