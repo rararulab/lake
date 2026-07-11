@@ -260,7 +260,9 @@ principal; a caller-supplied tenant string is never trusted.
 The original object bytes never enter query or metadata.
 
 After a query node receives the metadata leader's append acknowledgement, it
-evicts that table's local registration entry. The same SDK Flight connection
+advances that table's local registration epoch and evicts the prior entry.
+An older in-flight cache fill is confined to its old epoch and cannot repopulate
+the post-ack lookup generation. The same SDK Flight connection
 therefore observes its own write immediately; independent query nodes retain
 the normal bounded-staleness window until their cache refreshes.
 

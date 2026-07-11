@@ -100,7 +100,7 @@ impl SchemaProvider for LakeSchema {
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
@@ -115,7 +115,8 @@ mod tests {
         EngineError, ObjectReferencePage, ObjectReferenceRequest, TableEngine, TableEngineRef,
         TableHandle, TableHandleRef,
     };
-    use lake_meta::{MetaStoreRef, RocksMeta, registry, registry::TableRegistration};
+    use lake_meta::{MetaStore, MetaStoreRef, RocksMeta, registry, registry::TableRegistration};
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::LakeCatalog;
@@ -124,6 +125,7 @@ mod tests {
         opens:      AtomicUsize,
         providers:  Arc<AtomicUsize>,
         fail_next:  Arc<AtomicBool>,
+        versions:   Arc<StdMutex<Vec<Version>>>,
         open_delay: std::time::Duration,
     }
 
@@ -133,6 +135,7 @@ mod tests {
                 opens: AtomicUsize::new(0),
                 providers: Arc::new(AtomicUsize::new(0)),
                 fail_next: Arc::new(AtomicBool::new(false)),
+                versions: Arc::new(StdMutex::new(Vec::new())),
                 open_delay,
             }
         }
@@ -141,6 +144,7 @@ mod tests {
     struct CountingHandle {
         providers: Arc<AtomicUsize>,
         fail_next: Arc<AtomicBool>,
+        versions:  Arc<StdMutex<Vec<Version>>>,
         schema:    SchemaRef,
     }
 
@@ -165,6 +169,7 @@ mod tests {
             Ok(Some(Arc::new(CountingHandle {
                 providers: self.providers.clone(),
                 fail_next: self.fail_next.clone(),
+                versions:  self.versions.clone(),
                 schema:    Arc::new(Schema::empty()),
             })))
         }
@@ -198,9 +203,10 @@ mod tests {
 
         async fn table_provider(
             &self,
-            _version: Version,
+            version: Version,
         ) -> lake_engine::Result<Arc<dyn TableProvider>> {
             self.providers.fetch_add(1, Ordering::SeqCst);
+            self.versions.lock().unwrap().push(version);
             if self.fail_next.swap(false, Ordering::SeqCst) {
                 return Err(EngineError::backend(std::io::Error::other(
                     "injected provider failure",
@@ -222,6 +228,42 @@ mod tests {
             _operation: &AppendOperation,
         ) -> lake_engine::Result<Option<Version>> {
             unreachable!()
+        }
+    }
+
+    struct PausingMeta {
+        inner:   Arc<RocksMeta>,
+        pause:   AtomicBool,
+        entered: Notify,
+        release: Notify,
+    }
+
+    #[async_trait]
+    impl MetaStore for PausingMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            let captured = self.inner.get(key).await?;
+            if key == "tbl/robots/episodes" && self.pause.swap(false, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(captured)
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
         }
     }
 
@@ -362,5 +404,55 @@ mod tests {
         catalog.maintain_test_provider_cache().await;
 
         assert!(catalog.test_provider_cache_entry_count() <= 2);
+    }
+
+    #[tokio::test]
+    async fn invalidation_fences_an_inflight_stale_registration_fill() {
+        let root = tempfile::tempdir().unwrap();
+        let inner = Arc::new(RocksMeta::open(root.path()).unwrap());
+        let table = TableRef::new("robots", "episodes");
+        let initial = TableRegistration::new(
+            TableLocation::new("mem://episodes"),
+            "counting",
+            Version(1),
+            Vec::new(),
+        );
+        registry::register(inner.as_ref(), &table, &initial)
+            .await
+            .unwrap();
+        let meta = Arc::new(PausingMeta {
+            inner:   inner.clone(),
+            pause:   AtomicBool::new(true),
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let engine = Arc::new(CountingEngine::new(std::time::Duration::ZERO));
+        let meta_ref: MetaStoreRef = meta.clone();
+        let engine_ref: TableEngineRef = engine.clone();
+        let catalog = LakeCatalog::new(meta_ref, engine_ref);
+        let schema = catalog.schema("robots").unwrap();
+        let entered = meta.entered.notified();
+
+        let stale_lookup =
+            tokio::spawn(async move { schema.table("episodes").await.unwrap().unwrap() });
+        entered.await;
+        registry::set_version(inner.as_ref(), &table, &initial, Version(2))
+            .await
+            .unwrap();
+        catalog.invalidate_registration(&table).await;
+        meta.release.notify_one();
+        stale_lookup.await.unwrap();
+
+        catalog
+            .schema("robots")
+            .unwrap()
+            .table("episodes")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            engine.versions.lock().unwrap().as_slice(),
+            &[Version(1), Version(2)]
+        );
     }
 }

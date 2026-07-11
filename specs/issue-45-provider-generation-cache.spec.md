@@ -76,6 +76,14 @@ Scenario: Failed provider loads remain retryable
   When a later resolution retries the same generation
   Then the storage engine is called again and the successful provider is cached
 
+Scenario: Write acknowledgement fences stale registration fills
+  Test:
+    Package: lake-catalog
+    Filter: invalidation_fences_an_inflight_stale_registration_fill
+  Given an old registration lookup pauses after reading the pre-append version
+  When append publishes a new version and the query replica invalidates the table
+  Then the old lookup cannot repopulate the registration generation used by later queries
+
 Scenario: Provider cache is bounded
   Test:
     Package: lake-catalog

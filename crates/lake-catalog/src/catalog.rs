@@ -43,6 +43,12 @@ const REGISTRATION_CACHE_TTL: Duration = Duration::from_secs(5);
 const PROVIDER_CACHE_CAPACITY: u64 = 100_000;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RegistrationCacheKey {
+    table: TableRef,
+    epoch: u64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ProviderGeneration {
     table:          TableRef,
     location:       TableLocation,
@@ -81,7 +87,10 @@ pub struct CatalogState {
     /// so it must never require I/O. Refreshed by [`LakeCatalog::refresh`].
     pub(crate) snapshot: RwLock<CatalogSnapshot>,
     /// table -> registration; shields the registry from per-query load.
-    pub(crate) regs:     Cache<TableRef, Arc<TableRegistration>>,
+    regs:                Cache<RegistrationCacheKey, Arc<TableRegistration>>,
+    /// Local invalidation generations fence stale in-flight registration
+    /// fills after a proxied write acknowledgement.
+    registration_epochs: RwLock<BTreeMap<TableRef, u64>>,
     /// immutable table generation -> provider; coalesces concurrent planning
     /// misses and avoids reopening storage metadata on every query.
     providers:           Cache<ProviderGeneration, Arc<dyn TableProvider>>,
@@ -100,14 +109,25 @@ impl CatalogState {
         &self,
         table: &TableRef,
     ) -> lake_meta::Result<Option<Arc<TableRegistration>>> {
-        if let Some(hit) = self.regs.get(table).await {
+        let epoch = self
+            .registration_epochs
+            .read()
+            .expect("registration epoch lock poisoned")
+            .get(table)
+            .copied()
+            .unwrap_or_default();
+        let key = RegistrationCacheKey {
+            table: table.clone(),
+            epoch,
+        };
+        if let Some(hit) = self.regs.get(&key).await {
             return Ok(Some(hit));
         }
         let Some(reg) = registry::get(self.meta.as_ref(), table).await? else {
             return Ok(None);
         };
         let reg = Arc::new(reg);
-        self.regs.insert(table.clone(), reg.clone()).await;
+        self.regs.insert(key, reg.clone()).await;
         Ok(Some(reg))
     }
 
@@ -169,6 +189,7 @@ impl LakeCatalog {
                     .max_capacity(100_000)
                     .time_to_live(REGISTRATION_CACHE_TTL)
                     .build(),
+                registration_epochs: RwLock::new(BTreeMap::new()),
                 providers: Cache::builder()
                     .max_capacity(provider_cache_capacity)
                     .build(),
@@ -224,7 +245,24 @@ impl LakeCatalog {
     /// Evict one resolved registration after this query node proxies a
     /// successful write, so the same client connection observes its commit.
     pub async fn invalidate_registration(&self, table: &TableRef) {
-        self.state.regs.invalidate(table).await;
+        let old_epoch = {
+            let mut epochs = self
+                .state
+                .registration_epochs
+                .write()
+                .expect("registration epoch lock poisoned");
+            let epoch = epochs.entry(table.clone()).or_default();
+            let old_epoch = *epoch;
+            *epoch = epoch.checked_add(1).expect("registration epoch exhausted");
+            old_epoch
+        };
+        self.state
+            .regs
+            .invalidate(&RegistrationCacheKey {
+                table: table.clone(),
+                epoch: old_epoch,
+            })
+            .await;
     }
 
     /// Reload the listing snapshot from the registry. Call on startup and on

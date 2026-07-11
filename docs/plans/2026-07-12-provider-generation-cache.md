@@ -29,3 +29,5 @@ select fresh providers.
 - Cache eviction changes performance only; immutable providers remain safe for
   in-flight readers holding an `Arc`.
 - Initializer errors and missing engine handles do not poison future reads.
+- A per-table local registration epoch makes write invalidation linearizable
+  against earlier in-flight cache fills.
