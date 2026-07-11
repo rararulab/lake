@@ -35,6 +35,15 @@ reader-proportional metadata traffic or weakening tenant discovery filtering.
 - `docs/architecture.md`
 - `docs/plans/**`
 - `specs/**`
+- `**/.github/**`
+- `**/AGENT.md`
+- `**/CLAUDE.md`
+- `**/docs/guides/mise-ci.md`
+- `**/docs/guides/workflow.md`
+- `**/mise.toml`
+
+The final six patterns account for shared-checkout workflow history already
+present before this workspace. This issue does not edit those files.
 
 ### Forbidden
 - Per-discovery metastore or storage-engine lookups
@@ -77,4 +86,3 @@ Scenario: legacy unknown schemas fail honestly
   Given a visible legacy registration without schema bytes
   When `include_schema=true` is requested
   Then discovery returns FailedPrecondition rather than an empty schema
-

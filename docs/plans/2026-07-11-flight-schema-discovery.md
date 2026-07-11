@@ -100,9 +100,10 @@ Expected: compile failure because the schema snapshot accessor is absent.
 **Step 3: Implement atomic snapshot replacement**
 
 Add `registry::scan_tables` to decode `(TableRef, TableRegistration)` pairs from
-one `tbl/` scan. Build names and decoded `SchemaRef`s off-lock, fail refresh on
-corrupt IPC, then replace one `CatalogSnapshot` under a single `RwLock` so names
-and schemas cannot come from different refresh generations.
+one `tbl/` scan. Build names and decoded `SchemaRef`s off-lock, treat missing or
+invalid legacy IPC as schema-unavailable, then replace one `CatalogSnapshot`
+under a single `RwLock` so names and schemas cannot come from different refresh
+generations.
 
 **Step 4: Verify and commit**
 
