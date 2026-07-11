@@ -34,6 +34,9 @@ pub trait MetaStore: Send + Sync {
     /// List keys under a prefix, prefix stripped.
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>>;
 
+    /// Scan key-value entries under a prefix, returning stripped keys.
+    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>>;
+
     /// Delete `key` only when its current value exactly matches `expected`.
     /// Returns false when the key is absent or has changed.
     async fn delete(&self, key: &str, expected: &[u8]) -> Result<bool>;

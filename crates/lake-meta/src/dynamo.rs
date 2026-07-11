@@ -208,6 +208,43 @@ impl MetaStore for DynamoMeta {
         Ok(out)
     }
 
+    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut out = Vec::new();
+        let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+        loop {
+            let resp = self
+                .client
+                .scan()
+                .table_name(&self.table)
+                .consistent_read(true)
+                .projection_expression("pk,val")
+                .filter_expression("begins_with(pk, :prefix)")
+                .expression_attribute_values(":prefix", AttributeValue::S(prefix.to_owned()))
+                .set_exclusive_start_key(start_key.take())
+                .send()
+                .await
+                .map_err(dynamo_err(format!("scan entries for prefix '{prefix}'")))?;
+
+            for item in resp.items() {
+                let (Some(AttributeValue::S(pk)), Some(AttributeValue::B(value))) =
+                    (item.get("pk"), item.get("val"))
+                else {
+                    continue;
+                };
+                if let Some(stripped) = pk.strip_prefix(prefix) {
+                    out.push((stripped.to_owned(), value.as_ref().to_vec()));
+                }
+            }
+
+            match resp.last_evaluated_key() {
+                Some(key) if !key.is_empty() => start_key = Some(key.clone()),
+                _ => break,
+            }
+        }
+        out.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        Ok(out)
+    }
+
     async fn delete(&self, key: &str, expected: &[u8]) -> Result<bool> {
         let result = self
             .client

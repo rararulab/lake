@@ -82,6 +82,19 @@ impl MetaStore for RocksMeta {
         Ok(out)
     }
 
+    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for item in self.db.prefix_iterator(prefix) {
+            let (key, value) = item.context(BackendSnafu { key: prefix })?;
+            let key = String::from_utf8_lossy(&key);
+            let Some(stripped) = key.strip_prefix(prefix) else {
+                break;
+            };
+            out.push((stripped.to_owned(), value.to_vec()));
+        }
+        Ok(out)
+    }
+
     async fn delete(&self, key: &str, expected: &[u8]) -> Result<bool> {
         let _guard = self.lock();
         let current = self.db.get(key).context(BackendSnafu { key })?;
@@ -126,5 +139,21 @@ mod tests {
             assert!(meta.cas(k, None, b"v").await.unwrap());
         }
         assert_eq!(meta.list_prefix("ptr/").await.unwrap(), vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn prefix_entry_scan_returns_stripped_keys_and_values() {
+        let (_dir, meta) = open_temp();
+        assert!(meta.cas("tbl/a/x", None, b"schema-x").await.unwrap());
+        assert!(meta.cas("tbl/a/y", None, b"schema-y").await.unwrap());
+        assert!(meta.cas("other/z", None, b"hidden").await.unwrap());
+
+        assert_eq!(
+            meta.scan_prefix("tbl/a/").await.unwrap(),
+            vec![
+                ("x".to_owned(), b"schema-x".to_vec()),
+                ("y".to_owned(), b"schema-y".to_vec()),
+            ]
+        );
     }
 }
