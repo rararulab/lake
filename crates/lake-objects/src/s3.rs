@@ -287,6 +287,10 @@ impl ManagedObjectStore for S3ObjectStore {
     async fn open_reader(&self, location: &DataLocation) -> Result<ObjectReader> {
         S3ObjectStore::open_reader(self, location).await
     }
+
+    async fn open_range(&self, location: &DataLocation, range: Range<u64>) -> Result<ObjectReader> {
+        S3ObjectStore::open_range(self, location, range).await
+    }
 }
 
 async fn read_part(input: &mut ObjectReader) -> Result<Vec<u8>> {

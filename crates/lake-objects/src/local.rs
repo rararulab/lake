@@ -251,4 +251,10 @@ impl ManagedObjectStore for LocalObjectStore {
             LocalObjectStore::open_reader(self, location).await?,
         ))
     }
+
+    async fn open_range(&self, location: &DataLocation, range: Range<u64>) -> Result<ObjectReader> {
+        Ok(Box::pin(
+            LocalObjectStore::open_range(self, location, range).await?,
+        ))
+    }
 }

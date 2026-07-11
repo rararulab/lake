@@ -106,6 +106,9 @@ pub trait ManagedObjectStore: Send + Sync {
     /// Open a direct reader after validating the location belongs to this
     /// managed stage.
     async fn open_reader(&self, location: &DataLocation) -> Result<ObjectReader>;
+
+    /// Open exactly one non-empty half-open byte range.
+    async fn open_range(&self, location: &DataLocation, range: Range<u64>) -> Result<ObjectReader>;
 }
 
 fn validate_range(location: &DataLocation, range: &Range<u64>) -> Result<u64> {
