@@ -83,19 +83,31 @@ pub(crate) fn maintenance_items(stage: &'static str, outcome: &'static str, coun
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
+    use lake_engine::TableEngineRef;
+    use lake_engine_lance::LanceEngine;
+    use lake_meta::{MetaStoreRef, RocksMeta};
     use metrics_exporter_prometheus::PrometheusBuilder;
+    use tokio::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
+    use tonic_health::server::health_reporter;
 
-    use super::*;
-    use crate::{AppendLimits, control::AppendAdmission};
+    use crate::{
+        AppendLimits, Metasrv,
+        control::AppendAdmission,
+        election::LeaseElection,
+        leadership::{Leadership, campaign_once},
+        maintenance::sweep,
+        run_health_readiness_until,
+    };
 
     #[tokio::test(flavor = "current_thread")]
     async fn metasrv_metrics_cover_append_leadership_and_maintenance() {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _recorder = metrics::set_default_local_recorder(&recorder);
-        describe();
+        super::describe();
 
         let admission = AppendAdmission::new(
             AppendLimits::try_new(1, Duration::from_millis(1), 1024, 1024).unwrap(),
@@ -107,13 +119,42 @@ mod tests {
         assert!(admission.acquire().await.is_err());
         drop(permit);
 
-        campaign("leader");
-        campaign("timeout");
-        write_ready(true);
-        write_ready(false);
-        maintenance_page("tables");
-        maintenance_items("tables", "maintained", 2);
-        maintenance_items("tables", "failed", 1);
+        let dir = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(dir.path()).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::new(meta.clone(), engine);
+        let leadership = Arc::new(Leadership::new());
+        let election = LeaseElection::new(meta, "node-a", Duration::from_secs(1));
+        campaign_once(&election, &leadership).await;
+        sweep(&metasrv).await;
+
+        let (reporter, _service) = health_reporter();
+        let shutdown = CancellationToken::new();
+        let monitor = run_health_readiness_until(
+            reporter,
+            leadership,
+            "node-a".to_owned(),
+            shutdown.clone(),
+            Arc::new(Mutex::new(())),
+        );
+        let readiness_handle = handle.clone();
+        let drive_readiness = async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if readiness_handle
+                        .render()
+                        .contains("lake_metasrv_write_ready 1")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("production readiness becomes ready");
+            shutdown.cancel();
+        };
+        tokio::join!(monitor, drive_readiness);
 
         let rendered = handle.render();
         for expected in [
@@ -122,10 +163,9 @@ mod tests {
             "lake_metasrv_inflight_appends 0",
             "lake_metasrv_reserved_append_bytes 0",
             "lake_metasrv_campaign_total{outcome=\"leader\"} 1",
-            "lake_metasrv_campaign_total{outcome=\"timeout\"} 1",
             "lake_metasrv_write_ready 0",
-            "lake_metasrv_maintenance_pages_total{stage=\"tables\"} 1",
-            "lake_metasrv_maintenance_items_total{stage=\"tables\",outcome=\"maintained\"} 2",
+            "lake_metasrv_maintenance_pages_total{stage=\"tables\"}",
+            "lake_metasrv_maintenance_items_total{stage=\"tables\",outcome=\"maintained\"} 0",
         ] {
             assert!(
                 rendered.contains(expected),

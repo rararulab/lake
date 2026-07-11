@@ -23,16 +23,22 @@ use std::{
 };
 
 use anyhow::{Context as _, anyhow, bail};
-use axum::{Router, http::header, routing::get};
+use axum::{
+    Router,
+    http::{Method, StatusCode, header},
+    response::IntoResponse,
+    routing::any,
+};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 const METRICS_ADDR_ENV: &str = "LAKE_METRICS_ADDR";
 const UPKEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 struct MetricsRuntime {
-    task: JoinHandle<anyhow::Result<()>>,
+    listener: TcpListener,
+    handle:   PrometheusHandle,
 }
 
 enum Stop<T> {
@@ -52,33 +58,52 @@ where
     S: Future<Output = anyhow::Result<()>>,
 {
     let cancellation = CancellationToken::new();
-    let mut metrics = MetricsRuntime::start_from_env(service, cancellation.clone()).await?;
+    let metrics = MetricsRuntime::start_from_env(service).await?;
     let server = make_server(cancellation.clone());
+    run_owned(server, shutdown, metrics, cancellation).await
+}
+
+async fn run_owned<S, F>(
+    server: S,
+    shutdown: F,
+    metrics: Option<MetricsRuntime>,
+    cancellation: CancellationToken,
+) -> anyhow::Result<()>
+where
+    S: Future<Output = anyhow::Result<()>>,
+    F: Future<Output = ()>,
+{
+    let metrics_enabled = metrics.is_some();
+    let metrics_shutdown = cancellation.clone();
+    let metrics = async move {
+        match metrics {
+            Some(runtime) => runtime.run(metrics_shutdown).await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::pin!(server);
     tokio::pin!(shutdown);
+    tokio::pin!(metrics);
 
-    let stop = if let Some(runtime) = metrics.as_mut() {
-        tokio::select! {
-            result = &mut server => Stop::Server(result),
-            () = &mut shutdown => Stop::Shutdown,
-            result = &mut runtime.task => Stop::Metrics(flatten_join(result)),
-        }
-    } else {
-        tokio::select! {
-            result = &mut server => Stop::Server(result),
-            () = &mut shutdown => Stop::Shutdown,
-        }
+    let stop = tokio::select! {
+        result = &mut server => Stop::Server(result),
+        () = &mut shutdown => Stop::Shutdown,
+        result = &mut metrics => Stop::Metrics(result),
     };
 
     cancellation.cancel();
     match stop {
         Stop::Server(result) => {
-            join_metrics(metrics).await?;
+            if metrics_enabled {
+                (&mut metrics).await?;
+            }
             result
         }
         Stop::Shutdown => {
             let result = (&mut server).await;
-            join_metrics(metrics).await?;
+            if metrics_enabled {
+                (&mut metrics).await?;
+            }
             result
         }
         Stop::Metrics(result) => {
@@ -91,10 +116,7 @@ where
 }
 
 impl MetricsRuntime {
-    async fn start_from_env(
-        service: &'static str,
-        shutdown: CancellationToken,
-    ) -> anyhow::Result<Option<Self>> {
+    async fn start_from_env(service: &'static str) -> anyhow::Result<Option<Self>> {
         let Some(addr) = metrics_addr_from_env()? else {
             return Ok(None);
         };
@@ -110,21 +132,12 @@ impl MetricsRuntime {
         describe_process_metrics();
         metrics::gauge!("lake_process_info").set(1.0);
         tracing::info!(%addr, service, "Prometheus metrics listener ready");
-        Ok(Some(Self {
-            task: tokio::spawn(run_metrics(listener, handle, shutdown)),
-        }))
+        Ok(Some(Self { listener, handle }))
     }
-}
 
-async fn join_metrics(metrics: Option<MetricsRuntime>) -> anyhow::Result<()> {
-    if let Some(mut runtime) = metrics {
-        flatten_join((&mut runtime.task).await)?;
+    async fn run(self, shutdown: CancellationToken) -> anyhow::Result<()> {
+        run_metrics(self.listener, self.handle, shutdown).await
     }
-    Ok(())
-}
-
-fn flatten_join(result: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyhow::Result<()> {
-    result.map_err(|error| anyhow!("metrics task failed: {error}"))?
 }
 
 async fn run_metrics(
@@ -135,9 +148,12 @@ async fn run_metrics(
     let scrape_handle = handle.clone();
     let app = Router::new().route(
         "/metrics",
-        get(move || {
+        any(move |method: Method| {
             let handle = scrape_handle.clone();
             async move {
+                if method != Method::GET {
+                    return StatusCode::METHOD_NOT_ALLOWED.into_response();
+                }
                 (
                     [(
                         header::CONTENT_TYPE,
@@ -145,6 +161,7 @@ async fn run_metrics(
                     )],
                     handle.render(),
                 )
+                    .into_response()
             }
         }),
     );
@@ -193,12 +210,29 @@ fn parse_metrics_addr(value: &OsStr) -> anyhow::Result<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::{
+        net::{Ipv4Addr, SocketAddrV4},
+        time::Duration,
+    };
 
     use metrics_exporter_prometheus::PrometheusBuilder;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
+
+    async fn request(addr: SocketAddr, method: &str, path: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8(response).unwrap()
+    }
 
     #[tokio::test]
     async fn metrics_endpoint_is_loopback_only_and_owned_by_shutdown() {
@@ -214,24 +248,45 @@ mod tests {
         let handle = recorder.handle();
         let _recorder = metrics::set_default_local_recorder(&recorder);
         metrics::counter!("lake_test_scrapes_total").increment(3);
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(run_metrics(listener, handle, shutdown.clone()));
+        let cancellation = CancellationToken::new();
+        let runtime = MetricsRuntime { listener, handle };
+        let task = tokio::spawn(run_owned(
+            std::future::pending::<anyhow::Result<()>>(),
+            std::future::pending::<()>(),
+            Some(runtime),
+            cancellation,
+        ));
 
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        stream
-            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).await.unwrap();
-        let response = String::from_utf8(response).unwrap();
+        let response = request(addr, "GET", "/metrics").await;
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("lake_test_scrapes_total 3"));
+        assert!(
+            request(addr, "HEAD", "/metrics")
+                .await
+                .starts_with("HTTP/1.1 405")
+        );
+        assert!(
+            request(addr, "POST", "/metrics")
+                .await
+                .starts_with("HTTP/1.1 405")
+        );
+        assert!(
+            request(addr, "GET", "/nope")
+                .await
+                .starts_with("HTTP/1.1 404")
+        );
 
-        shutdown.cancel();
-        task.await.unwrap().unwrap();
-        TcpListener::bind(addr)
-            .await
-            .expect("metrics listener released");
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match TcpListener::bind(addr).await {
+                    Ok(listener) => break listener,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .expect("outer future drop releases metrics listener");
     }
 }

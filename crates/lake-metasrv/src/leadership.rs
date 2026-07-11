@@ -234,7 +234,7 @@ pub(crate) async fn run_campaign_loop_until(
     leadership.publish(None, None);
 }
 
-async fn campaign_once(election: &LeaseElection, leadership: &Leadership) {
+pub(crate) async fn campaign_once(election: &LeaseElection, leadership: &Leadership) {
     let _transition = leadership.begin_authority_transition().await;
     // Bound local authority from the start of the store round-trip. This
     // is conservative when the store is slow and immune to wall-clock

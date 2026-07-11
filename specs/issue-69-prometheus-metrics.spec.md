@@ -18,7 +18,8 @@ creating a public anonymous endpoint or detached process work.
 - Metrics are opt-in through `LAKE_METRICS_ADDR`. The value must be an IP
   loopback socket. Production collection uses a localhost sidecar or node
   agent; hostname and non-loopback addresses fail before listeners bind.
-- `GET /metrics` serves text exposition. The HTTP listener and periodic
+- Only `GET /metrics` serves text exposition; HEAD, other methods, and other
+  paths return non-success. The HTTP listener and periodic
   recorder upkeep share command cancellation and are joined before return.
 - Metric labels are finite enums only. SQL, table, namespace, tenant, URI,
   credential, operation ID, and arbitrary request paths are forbidden labels.
@@ -61,7 +62,7 @@ Scenario: Metrics endpoint is private and lifecycle-owned
     Filter: metrics_endpoint_is_loopback_only_and_owned_by_shutdown
   Given an opt-in metrics listener and a process cancellation token
   When configuration, scraping, and shutdown are exercised
-  Then only loopback is accepted, GET metrics is exposed, tasks join, and the socket is released
+  Then only loopback and GET metrics succeed, outer cancellation releases the socket, and no task detaches
 
 Scenario: Query exports bounded saturation and refresh signals
   Test:

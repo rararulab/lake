@@ -68,22 +68,135 @@ pub(crate) fn ready(ready: bool) { metrics::gauge!("lake_query_ready").set(f64::
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
+    use async_trait::async_trait;
+    use lake_engine::TableEngineRef;
+    use lake_engine_lance::LanceEngine;
+    use lake_flight::ClientSecurity;
+    use lake_meta::{MetaError, MetaStore, MetaStoreRef};
     use metrics_exporter_prometheus::PrometheusBuilder;
 
-    use super::*;
-    use crate::{QueryLimits, flight::QueryAdmission};
+    use crate::{
+        QueryEngine, QueryLimits, QueryServerConfig, flight::QueryAdmission,
+        run_catalog_refresh_loop, serve_with_config_and_shutdown,
+    };
+
+    #[derive(Default)]
+    struct EmptyMeta;
+
+    #[async_trait]
+    impl MetaStore for EmptyMeta {
+        async fn get(&self, _key: &str) -> lake_meta::Result<Option<Vec<u8>>> { Ok(None) }
+
+        async fn cas(
+            &self,
+            _key: &str,
+            _expected: Option<&[u8]>,
+            _new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            Ok(true)
+        }
+
+        async fn list_prefix(&self, _prefix: &str) -> lake_meta::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn delete(&self, _key: &str, _expected: &[u8]) -> lake_meta::Result<bool> { Ok(true) }
+    }
+
+    struct FailingScanMeta;
+
+    #[async_trait]
+    impl MetaStore for FailingScanMeta {
+        async fn get(&self, _key: &str) -> lake_meta::Result<Option<Vec<u8>>> { Ok(None) }
+
+        async fn cas(
+            &self,
+            _key: &str,
+            _expected: Option<&[u8]>,
+            _new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            Ok(true)
+        }
+
+        async fn list_prefix(&self, _prefix: &str) -> lake_meta::Result<Vec<String>> {
+            Err(MetaError::Conflict {
+                table: "metrics-test".to_owned(),
+            })
+        }
+
+        async fn delete(&self, _key: &str, _expected: &[u8]) -> lake_meta::Result<bool> { Ok(true) }
+    }
+
+    fn engine(meta: MetaStoreRef) -> Arc<QueryEngine> {
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        Arc::new(QueryEngine::new(meta, storage))
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn query_metrics_cover_admission_and_catalog_refresh() {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _recorder = metrics::set_default_local_recorder(&recorder);
-        describe();
-        ready(false);
-        catalog_refresh("initial", "success");
-        catalog_refresh("background", "error");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let readiness_handle = handle.clone();
+        let server_addr = addr.to_string();
+        let server = serve_with_config_and_shutdown(
+            engine(Arc::new(EmptyMeta)),
+            &server_addr,
+            QueryServerConfig::new().with_shutdown_grace(Duration::from_secs(1)),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        );
+        let driver = async move {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if ClientSecurity::new()
+                        .connect(format!("http://{addr}"))
+                        .await
+                        .is_ok()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("Query starts");
+            assert!(readiness_handle.render().contains("lake_query_ready 1"));
+            shutdown_tx.send(()).unwrap();
+        };
+        let (server_result, ()) = tokio::join!(server, driver);
+        server_result.unwrap();
+
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let loop_cancellation = cancellation.clone();
+        let refresh =
+            run_catalog_refresh_loop(engine(Arc::new(FailingScanMeta)), loop_cancellation);
+        let refresh_handle = handle.clone();
+        let drive_refresh = async {
+            tokio::time::timeout(Duration::from_secs(7), async {
+                loop {
+                    if refresh_handle.render().contains(
+                        "lake_query_catalog_refresh_total{phase=\"background\",outcome=\"error\"} \
+                         1",
+                    ) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("background refresh failure is recorded");
+            cancellation.cancel();
+        };
+        tokio::join!(refresh, drive_refresh);
 
         let limits =
             QueryLimits::try_new(1, Duration::from_millis(1), Duration::from_secs(1), 4).unwrap();
@@ -94,7 +207,6 @@ mod tests {
         assert!(admission.acquire().await.is_err());
         assert!(admission.validate_sql_size(b"12345").is_err());
         drop(permit);
-        ready(true);
 
         let rendered = handle.render();
         for expected in [
@@ -104,7 +216,7 @@ mod tests {
             "lake_query_rejections_total{reason=\"sql_too_large\"} 1",
             "lake_query_catalog_refresh_total{phase=\"initial\",outcome=\"success\"} 1",
             "lake_query_catalog_refresh_total{phase=\"background\",outcome=\"error\"} 1",
-            "lake_query_ready 1",
+            "lake_query_ready 0",
         ] {
             assert!(
                 rendered.contains(expected),

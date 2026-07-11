@@ -96,6 +96,7 @@ The value must be an IP loopback socket. Hostnames, wildcard addresses, and
 non-loopback IPs fail startup before the Flight listener binds. In a production
 pod, use a localhost Prometheus sidecar or node agent to scrape and forward the
 endpoint; Lake does not create an anonymous network-wide telemetry surface.
+Only `GET /metrics` succeeds; HEAD, other methods, and other paths are rejected.
 
 Core series are:
 
@@ -110,8 +111,9 @@ Core series are:
 
 Labels are finite state-machine values such as `success`, `error`, `leader`,
 or `saturated`. SQL, tenant, namespace, table, operation ID, URI, and credential
-values are never metric labels. The listener and exporter upkeep task share
-the server cancellation lifecycle and are joined before process exit.
+values are never metric labels. The listener and exporter upkeep future share
+the server future directly: normal shutdown joins it, while dropping the outer
+server future drops the listener without leaving detached work.
 
 ## Process logging
 
