@@ -14,7 +14,11 @@
 
 //! S3-backed managed object stage.
 
-use std::ops::Range;
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+    time::UNIX_EPOCH,
+};
 
 use async_trait::async_trait;
 use aws_sdk_s3::{
@@ -24,10 +28,16 @@ use aws_sdk_s3::{
 };
 use lake_common::DataLocation;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use url::Url;
 
-use crate::{ManagedObjectStore, ObjectError, ObjectReader, Result, validate_range};
+use crate::{
+    ManagedObjectStore, ObjectError, ObjectReader, Result,
+    checkpoint::{
+        CheckpointBinding, CheckpointLock, CheckpointPart, SourceIdentity, UploadCheckpointV1,
+    },
+    validate_range,
+};
 
 const MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024;
 
@@ -246,6 +256,265 @@ impl S3ObjectStore {
             .send()
             .await;
     }
+
+    async fn put_path_resumable(
+        &self,
+        source: &Path,
+        content_type: String,
+        checkpoint_path: &Path,
+    ) -> Result<DataLocation> {
+        let _lock = CheckpointLock::acquire(checkpoint_path).await?;
+        let mut input = tokio::fs::File::open(source)
+            .await
+            .map_err(|source_error| ObjectError::Io {
+                action: "opening".to_owned(),
+                path:   source.to_path_buf(),
+                source: source_error,
+            })?;
+        let metadata = input
+            .metadata()
+            .await
+            .map_err(|source_error| ObjectError::Io {
+                action: "reading metadata for".to_owned(),
+                path:   source.to_path_buf(),
+                source: source_error,
+            })?;
+        let modified = metadata
+            .modified()
+            .and_then(|value| {
+                value
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(std::io::Error::other)
+            })
+            .map_err(|source_error| ObjectError::Io {
+                action: "reading modification time for".to_owned(),
+                path:   source.to_path_buf(),
+                source: source_error,
+            })?;
+        let binding = CheckpointBinding {
+            bucket:          self.bucket.clone(),
+            prefix:          self.prefix.clone(),
+            content_type:    content_type.clone(),
+            part_size_bytes: MULTIPART_PART_BYTES,
+            source:          SourceIdentity {
+                size_bytes:          metadata.len(),
+                modified_unix_nanos: u64::try_from(modified.as_nanos()).map_err(|_| {
+                    ObjectError::CheckpointMismatch {
+                        field: "source modification time",
+                    }
+                })?,
+            },
+        };
+
+        if metadata.len() == 0 {
+            if checkpoint_path.exists() {
+                return Err(ObjectError::CheckpointMismatch {
+                    field: "empty source checkpoint",
+                });
+            }
+            let key = format!("{}/{}", self.prefix, uuid::Uuid::now_v7());
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .content_type(&content_type)
+                .body(ByteStream::from_static(&[]))
+                .send()
+                .await
+                .map_err(|error| ObjectError::S3 {
+                    action:  "put_object",
+                    message: error.to_string(),
+                })?;
+            return Ok(DataLocation::builder()
+                .uri(format!("s3://{}/{key}", self.bucket))
+                .content_type(content_type)
+                .size_bytes(0)
+                .sha256(format!("{:x}", Sha256::digest([])))
+                .build());
+        }
+
+        let mut checkpoint = if checkpoint_path.exists() {
+            let checkpoint = UploadCheckpointV1::load(checkpoint_path).await?;
+            checkpoint.validate(&binding)?;
+            checkpoint
+        } else {
+            let key = format!("{}/{}", self.prefix, uuid::Uuid::now_v7());
+            let created = self
+                .client
+                .create_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&key)
+                .content_type(&content_type)
+                .checksum_algorithm(ChecksumAlgorithm::Crc32)
+                .send()
+                .await
+                .map_err(|error| ObjectError::S3 {
+                    action:  "create_multipart_upload",
+                    message: error.to_string(),
+                })?;
+            let upload_id = created.upload_id().ok_or_else(|| ObjectError::S3 {
+                action:  "create_multipart_upload",
+                message: "S3 response omitted upload_id".to_owned(),
+            })?;
+            let checkpoint = UploadCheckpointV1::new(binding, key, upload_id.to_owned());
+            if let Err(error) = checkpoint.save_atomic(checkpoint_path).await {
+                self.abort(checkpoint.object_key(), checkpoint.upload_id())
+                    .await;
+                return Err(error);
+            }
+            checkpoint
+        };
+
+        self.reconcile_parts(&checkpoint).await?;
+        let mut hasher = Sha256::new();
+        for completed in checkpoint.parts() {
+            let part = read_part(&mut input).await?;
+            if part.len() != completed.size_bytes
+                || format!("{:x}", Sha256::digest(&part)) != completed.sha256
+            {
+                return Err(ObjectError::CheckpointMismatch {
+                    field: "completed source part",
+                });
+            }
+            hasher.update(&part);
+        }
+
+        loop {
+            let part = read_part(&mut input).await?;
+            if part.is_empty() {
+                break;
+            }
+            let number =
+                i32::try_from(checkpoint.parts().len() + 1).map_err(|_| ObjectError::S3 {
+                    action:  "upload_part",
+                    message: "multipart upload exceeded the S3 part limit".to_owned(),
+                })?;
+            let part_sha256 = format!("{:x}", Sha256::digest(&part));
+            hasher.update(&part);
+            let size_bytes = part.len();
+            let uploaded = self
+                .client
+                .upload_part()
+                .bucket(&self.bucket)
+                .key(checkpoint.object_key())
+                .upload_id(checkpoint.upload_id())
+                .part_number(number)
+                .body(ByteStream::from(part))
+                .send()
+                .await
+                .map_err(|error| ObjectError::S3 {
+                    action:  "upload_part",
+                    message: format!("{error:?}"),
+                })?;
+            checkpoint.push_part(CheckpointPart {
+                number,
+                size_bytes,
+                e_tag: uploaded
+                    .e_tag()
+                    .ok_or_else(|| ObjectError::S3 {
+                        action:  "upload_part",
+                        message: "S3 response omitted ETag".to_owned(),
+                    })?
+                    .to_owned(),
+                checksum_crc32: uploaded.checksum_crc32().map(ToOwned::to_owned),
+                sha256: part_sha256,
+            });
+            checkpoint.save_atomic(checkpoint_path).await?;
+        }
+
+        let completed = CompletedMultipartUpload::builder()
+            .set_parts(Some(
+                checkpoint
+                    .parts()
+                    .iter()
+                    .map(|part| {
+                        CompletedPart::builder()
+                            .part_number(part.number)
+                            .e_tag(&part.e_tag)
+                            .set_checksum_crc32(part.checksum_crc32.clone())
+                            .build()
+                    })
+                    .collect(),
+            ))
+            .build();
+        self.client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(checkpoint.object_key())
+            .upload_id(checkpoint.upload_id())
+            .multipart_upload(completed)
+            .send()
+            .await
+            .map_err(|error| ObjectError::S3 {
+                action:  "complete_multipart_upload",
+                message: error.to_string(),
+            })?;
+        tokio::fs::remove_file(checkpoint_path)
+            .await
+            .map_err(|source| ObjectError::CheckpointIo {
+                action: "removing completed",
+                path: checkpoint_path.to_path_buf(),
+                source,
+            })?;
+        Ok(DataLocation::builder()
+            .uri(format!("s3://{}/{}", self.bucket, checkpoint.object_key()))
+            .content_type(content_type)
+            .size_bytes(metadata.len())
+            .sha256(format!("{:x}", hasher.finalize()))
+            .build())
+    }
+
+    async fn reconcile_parts(&self, checkpoint: &UploadCheckpointV1) -> Result<()> {
+        let mut remote_parts = Vec::new();
+        let mut marker = None;
+        loop {
+            let output = self
+                .client
+                .list_parts()
+                .bucket(&self.bucket)
+                .key(checkpoint.object_key())
+                .upload_id(checkpoint.upload_id())
+                .set_part_number_marker(marker)
+                .send()
+                .await
+                .map_err(|error| ObjectError::S3 {
+                    action:  "list_parts",
+                    message: error.to_string(),
+                })?;
+            remote_parts.extend(output.parts().iter().cloned());
+            if output.is_truncated() != Some(true) {
+                break;
+            }
+            marker = Some(
+                output
+                    .next_part_number_marker()
+                    .ok_or(ObjectError::CheckpointMismatch {
+                        field: "remote part pagination",
+                    })?
+                    .to_owned(),
+            );
+        }
+
+        if !(remote_parts.len() == checkpoint.parts().len()
+            || remote_parts.len() == checkpoint.parts().len() + 1)
+            || !remote_parts
+                .iter()
+                .take(checkpoint.parts().len())
+                .zip(checkpoint.parts())
+                .all(|(remote, local)| {
+                    remote.part_number() == Some(local.number)
+                        && remote.e_tag() == Some(local.e_tag.as_str())
+                        && remote.size().and_then(|size| usize::try_from(size).ok())
+                            == Some(local.size_bytes)
+                        && remote.checksum_crc32() == local.checksum_crc32.as_deref()
+                })
+        {
+            return Err(ObjectError::CheckpointMismatch {
+                field: "remote completed parts",
+            });
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -288,12 +557,66 @@ impl ManagedObjectStore for S3ObjectStore {
         S3ObjectStore::open_reader(self, location).await
     }
 
+    async fn put_path(
+        &self,
+        path: PathBuf,
+        content_type: String,
+        checkpoint: Option<PathBuf>,
+    ) -> Result<DataLocation> {
+        match checkpoint {
+            Some(checkpoint) => {
+                self.put_path_resumable(&path, content_type, &checkpoint)
+                    .await
+            }
+            None => {
+                let input =
+                    tokio::fs::File::open(&path)
+                        .await
+                        .map_err(|source| ObjectError::Io {
+                            action: "opening".to_owned(),
+                            path,
+                            source,
+                        })?;
+                self.put_reader(Box::pin(input), content_type).await
+            }
+        }
+    }
+
+    async fn cancel_upload(&self, checkpoint: PathBuf) -> Result<()> {
+        let _lock = CheckpointLock::acquire(&checkpoint).await?;
+        let state = UploadCheckpointV1::load(&checkpoint).await?;
+        if !state.stage_matches(&self.bucket, &self.prefix) {
+            return Err(ObjectError::CheckpointMismatch { field: "stage" });
+        }
+        self.client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(state.object_key())
+            .upload_id(state.upload_id())
+            .send()
+            .await
+            .map_err(|error| ObjectError::S3 {
+                action:  "abort_multipart_upload",
+                message: error.to_string(),
+            })?;
+        tokio::fs::remove_file(&checkpoint)
+            .await
+            .map_err(|source| ObjectError::CheckpointIo {
+                action: "removing cancelled",
+                path: checkpoint,
+                source,
+            })
+    }
+
     async fn open_range(&self, location: &DataLocation, range: Range<u64>) -> Result<ObjectReader> {
         S3ObjectStore::open_range(self, location, range).await
     }
 }
 
-async fn read_part(input: &mut ObjectReader) -> Result<Vec<u8>> {
+async fn read_part<R>(input: &mut R) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
     let mut part = Vec::with_capacity(MULTIPART_PART_BYTES);
     let mut buffer = vec![0_u8; 64 * 1024];
     while part.len() < MULTIPART_PART_BYTES {

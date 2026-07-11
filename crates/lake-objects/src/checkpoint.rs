@@ -117,6 +117,16 @@ impl UploadCheckpointV1 {
 
     pub(crate) fn push_part(&mut self, part: CheckpointPart) { self.parts.push(part); }
 
+    pub(crate) fn object_key(&self) -> &str { &self.object_key }
+
+    pub(crate) fn upload_id(&self) -> &str { &self.upload_id }
+
+    pub(crate) fn parts(&self) -> &[CheckpointPart] { &self.parts }
+
+    pub(crate) fn stage_matches(&self, bucket: &str, prefix: &str) -> bool {
+        self.bucket == bucket && self.prefix == prefix
+    }
+
     pub(crate) fn validate(&self, binding: &CheckpointBinding) -> Result<()> {
         if self.version != CHECKPOINT_VERSION {
             return Err(ObjectError::CheckpointMismatch { field: "version" });
