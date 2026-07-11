@@ -16,6 +16,7 @@ futures = { workspace = true }
 lake-catalog = { workspace = true }
 lake-common = { workspace = true }
 lake-engine = { workspace = true }
+lake-flight = { workspace = true }
 lake-meta = { workspace = true }
 lake-objects.workspace = true
 prost = { workspace = true }
@@ -32,6 +33,7 @@ tracing = { workspace = true }
 # materialize tables; every other crate it uses (arrow-flight, tonic, datafusion,
 # lake-meta, …) is already a normal dependency and thus available to tests.
 lake-engine-lance = { workspace = true }
+rcgen = "^0.13"
 tempfile = "3"
 
 [lints]

@@ -25,6 +25,7 @@
 
 pub mod client;
 pub mod ingest;
+mod security;
 pub mod selftest;
 pub mod serve;
 pub mod sql;

@@ -39,19 +39,22 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use lake_common::{
     FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor,
 };
+use lake_flight::ClientSecurity;
 use prost::Message;
-use tonic::{Request, Response, Status, Streaming, transport::Channel};
+use tonic::{Request, Response, Status, Streaming};
 
 use crate::QueryEngine;
 
 /// A Flight SQL service backed by a stateless [`QueryEngine`].
 pub struct FlightSqlServiceImpl {
     /// The warmed query engine that plans and executes incoming SQL.
-    pub engine:        Arc<QueryEngine>,
+    pub engine:            Arc<QueryEngine>,
     /// Metadata Flight address used only for stateless FILE append forwarding.
-    pub metadata_addr: Option<String>,
+    pub metadata_addr:     Option<String>,
+    /// TLS and service credential for the Query-to-Metasrv hop.
+    pub metadata_security: ClientSecurity,
     /// Immutable, credential-free stage metadata advertised to SDK clients.
-    pub managed_stage: Option<ManagedStageDescriptor>,
+    pub managed_stage:     Option<ManagedStageDescriptor>,
 }
 
 impl FlightSqlServiceImpl {
@@ -144,12 +147,15 @@ impl FlightSqlService for FlightSqlServiceImpl {
             .metadata_addr
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("FILE writes are not configured"))?;
-        let channel = Channel::from_shared(addr.clone())
-            .map_err(|error| Status::unavailable(error.to_string()))?
-            .connect()
+        let channel = self
+            .metadata_security
+            .connect(addr.clone())
             .await
             .map_err(|error| Status::unavailable(error.to_string()))?;
         let mut client = FlightClient::new(channel);
+        self.metadata_security
+            .apply_to_flight_client(&mut client)
+            .map_err(|error| Status::internal(error.to_string()))?;
         let results = client
             .do_put(request.into_inner().map(|item| {
                 item.map_err(|error| arrow_flight::error::FlightError::protocol(error.to_string()))
@@ -294,9 +300,10 @@ mod tests {
             false,
         );
         let service = FlightSqlServiceImpl {
-            engine:        Arc::new(QueryEngine::new(meta, storage)),
-            metadata_addr: None,
-            managed_stage: Some(descriptor.clone()),
+            engine:            Arc::new(QueryEngine::new(meta, storage)),
+            metadata_addr:     None,
+            metadata_security: ClientSecurity::new(),
+            managed_stage:     Some(descriptor.clone()),
         };
         let request = Request::new(arrow_flight::Action {
             r#type: MANAGED_STAGE_DISCOVERY_ACTION.to_owned(),
@@ -346,6 +353,7 @@ mod tests {
         let service = FlightSqlServiceImpl {
             engine,
             metadata_addr: None,
+            metadata_security: ClientSecurity::new(),
             managed_stage: None,
         };
         let ticket = TicketStatementQuery {

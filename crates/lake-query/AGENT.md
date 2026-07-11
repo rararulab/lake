@@ -14,6 +14,8 @@ The query layer: stateless SQL compute. `QueryEngine` wires a DataFusion
   query does not persist rows or receive the original object bytes.
 - Managed-stage discovery returns one versioned, credential-free descriptor;
   it never proxies object bytes or exposes SDK process credentials.
+- Production `serve_with_config` authenticates every inbound Flight RPC and
+  uses one TLS/auth `ClientSecurity` for Query-to-Metasrv forwarding.
 - Caches the catalog with a bounded-staleness refresh window; concurrent
   refreshes coalesce and the server refreshes in the background so metadata
   scans stay off the per-query hot path.

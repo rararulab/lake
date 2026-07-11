@@ -13,6 +13,8 @@ tables. clap derive, thin `main.rs`, one handler module per command.
   `--format json` output is a planned addition.)
 - `selftest` must keep proving the whole path (create → ingest → SQL) in one
   command on a laptop — the goal.md working signal.
+- Non-loopback serving fails without inbound TLS + bearer authentication unless
+  `LAKE_ALLOW_INSECURE=true` explicitly declares a trusted terminating proxy.
 
 ## Storage modes (`commands/mod.rs::Context`)
 
@@ -23,6 +25,17 @@ tables. clap derive, thin `main.rs`, one handler module per command.
   an ambient `PROXY_URL` for the endpoint;
   behind a proxy also set the standard `NO_PROXY` so the drop path's direct
   object_store client bypasses it too).
+
+## Flight security
+
+- Inbound: `LAKE_AUTH_TOKEN_FILE`, `LAKE_TLS_CERT_FILE`,
+  `LAKE_TLS_KEY_FILE`.
+- Query/admin→Metasrv: `LAKE_METADATA_AUTH_TOKEN_FILE`,
+  `LAKE_METADATA_CA_FILE`, `LAKE_METADATA_SERVER_NAME`.
+- Metasrv follower→leader: `LAKE_PEER_AUTH_TOKEN_FILE`, `LAKE_PEER_CA_FILE`,
+  `LAKE_PEER_SERVER_NAME`.
+- Credential files may end in a newline; values are trimmed at that boundary
+  and never logged or accepted as command-line flags.
 
 ## Layout
 

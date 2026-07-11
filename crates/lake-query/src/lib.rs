@@ -38,6 +38,7 @@ use datafusion::{
 use lake_catalog::LakeCatalog;
 use lake_common::ManagedStageDescriptor;
 use lake_engine::TableEngineRef;
+use lake_flight::{ClientSecurity, ServerSecurity};
 use lake_meta::MetaStoreRef;
 use snafu::{ResultExt, Snafu};
 
@@ -70,9 +71,72 @@ pub enum QueryError {
 
     #[snafu(display("Flight SQL server failed"))]
     Serve { source: tonic::transport::Error },
+
+    #[snafu(display("invalid Flight security configuration"))]
+    Security {
+        source: lake_flight::FlightSecurityError,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, QueryError>;
+
+/// Complete network configuration for one stateless Query server.
+#[derive(Clone, Debug)]
+pub struct QueryServerConfig {
+    metadata_endpoint: Option<String>,
+    metadata_security: ClientSecurity,
+    managed_stage:     Option<ManagedStageDescriptor>,
+    server_security:   ServerSecurity,
+    allow_insecure:    bool,
+}
+
+impl QueryServerConfig {
+    /// Explicit loopback development configuration.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            metadata_endpoint: None,
+            metadata_security: ClientSecurity::new(),
+            managed_stage:     None,
+            server_security:   ServerSecurity::insecure(),
+            allow_insecure:    false,
+        }
+    }
+
+    /// Configure stateless FILE append forwarding through Metasrv.
+    #[must_use]
+    pub fn with_metadata(mut self, endpoint: impl Into<String>, security: ClientSecurity) -> Self {
+        self.metadata_endpoint = Some(endpoint.into());
+        self.metadata_security = security;
+        self
+    }
+
+    /// Advertise one immutable, credential-free managed stage.
+    #[must_use]
+    pub fn with_managed_stage(mut self, stage: ManagedStageDescriptor) -> Self {
+        self.managed_stage = Some(stage);
+        self
+    }
+
+    /// Authenticate inbound RPCs and optionally enable server TLS.
+    #[must_use]
+    pub fn with_server_security(mut self, security: ServerSecurity) -> Self {
+        self.server_security = security;
+        self
+    }
+
+    /// Explicit deployment escape hatch for service-mesh or isolated-network
+    /// environments terminating security before Lake.
+    #[must_use]
+    pub const fn allow_insecure(mut self, allow: bool) -> Self {
+        self.allow_insecure = allow;
+        self
+    }
+}
+
+impl Default for QueryServerConfig {
+    fn default() -> Self { Self::new() }
+}
 
 /// A stateless SQL execution context over the lake catalog.
 pub struct QueryEngine {
@@ -127,7 +191,7 @@ impl QueryEngine {
 /// Warms the catalog, then binds a tonic server exposing the Flight SQL
 /// statement path. Runs until the server stops or the process is killed.
 pub async fn serve(engine: Arc<QueryEngine>, addr: &str) -> Result<()> {
-    serve_inner(engine, addr, None, None).await
+    serve_with_config(engine, addr, QueryServerConfig::new()).await
 }
 
 /// Run the Flight SQL server with stateless FILE-write forwarding.
@@ -139,7 +203,8 @@ pub async fn serve_with_metadata(
     addr: &str,
     metadata_addr: &str,
 ) -> Result<()> {
-    serve_inner(engine, addr, Some(metadata_addr.to_owned()), None).await
+    let config = QueryServerConfig::new().with_metadata(metadata_addr, ClientSecurity::new());
+    serve_with_config(engine, addr, config).await
 }
 
 /// Run the Flight SQL server with FILE-write forwarding and managed-stage
@@ -150,20 +215,17 @@ pub async fn serve_with_metadata_and_stage(
     metadata_addr: &str,
     managed_stage: ManagedStageDescriptor,
 ) -> Result<()> {
-    serve_inner(
-        engine,
-        addr,
-        Some(metadata_addr.to_owned()),
-        Some(managed_stage),
-    )
-    .await
+    let config = QueryServerConfig::new()
+        .with_metadata(metadata_addr, ClientSecurity::new())
+        .with_managed_stage(managed_stage);
+    serve_with_config(engine, addr, config).await
 }
 
-async fn serve_inner(
+/// Run Query with an explicit production or loopback security configuration.
+pub async fn serve_with_config(
     engine: Arc<QueryEngine>,
     addr: &str,
-    metadata_addr: Option<String>,
-    managed_stage: Option<ManagedStageDescriptor>,
+    config: QueryServerConfig,
 ) -> Result<()> {
     engine.refresh().await?;
     let refresher = engine.clone();
@@ -181,14 +243,26 @@ async fn serve_inner(
     });
 
     let socket = addr.parse().context(AddressSnafu { addr })?;
+    config
+        .server_security
+        .validate_exposure(socket, config.allow_insecure)
+        .context(SecuritySnafu)?;
     let service = FlightServiceServer::new(FlightSqlServiceImpl {
         engine,
-        metadata_addr,
-        managed_stage,
+        metadata_addr: config.metadata_endpoint,
+        metadata_security: config.metadata_security,
+        managed_stage: config.managed_stage,
     });
 
     tracing::info!(%addr, "Flight SQL server ready");
-    tonic::transport::Server::builder()
+    let mut server = tonic::transport::Server::builder();
+    if let Some(tls) = config.server_security.tls_config() {
+        server = server.tls_config(tls).context(ServeSnafu)?;
+    }
+    server
+        .layer(tonic::service::InterceptorLayer::new(
+            config.server_security.interceptor(),
+        ))
         .add_service(service)
         .serve(socket)
         .await
@@ -197,11 +271,20 @@ async fn serve_inner(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
 
+    use arrow_flight::{Action, flight_service_client::FlightServiceClient};
     use async_trait::async_trait;
+    use futures::TryStreamExt;
+    use lake_common::{MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor};
     use lake_engine_lance::LanceEngine;
+    use lake_flight::{ClientSecurity, ServerSecurity};
     use lake_meta::{MetaStore, MetaStoreRef};
+    use rcgen::generate_simple_self_signed;
+    use tonic::Request;
 
     use super::*;
 
@@ -287,5 +370,69 @@ mod tests {
             ddl.to_string().contains("DDL not supported"),
             "public SQL must reject arbitrary object-store registration: {ddl}"
         );
+    }
+
+    #[tokio::test]
+    async fn secured_query_rejects_anonymous_discovery() {
+        let secret = "query-test-credential";
+        let certified =
+            generate_simple_self_signed(vec!["localhost".to_owned()]).expect("test identity");
+        let certificate = certified.cert.pem();
+        let private_key = certified.key_pair.serialize_pem();
+        let server_security = ServerSecurity::with_bearer_token(secret)
+            .expect("bearer")
+            .with_tls_identity_pem(certificate.as_bytes(), private_key.as_bytes());
+        let descriptor = ManagedStageDescriptor::local("/tmp/lake-secured-stage");
+        let meta: MetaStoreRef = Arc::new(CountingMeta::default());
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let engine = Arc::new(QueryEngine::new(meta, storage));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let addr = listener.local_addr().expect("listen address");
+        drop(listener);
+        let config = QueryServerConfig::new()
+            .with_managed_stage(descriptor.clone())
+            .with_server_security(server_security);
+        let server =
+            tokio::spawn(async move { serve_with_config(engine, &addr.to_string(), config).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let endpoint = format!("https://localhost:{}", addr.port());
+        let transport = ClientSecurity::new()
+            .with_ca_certificate_pem(certificate.as_bytes().to_vec())
+            .with_server_name("localhost");
+        let channel = transport
+            .connect(endpoint.clone())
+            .await
+            .expect("TLS connect");
+        let mut anonymous = FlightServiceClient::new(channel);
+        let action = Action {
+            r#type: MANAGED_STAGE_DISCOVERY_ACTION.to_owned(),
+            body:   Vec::new().into(),
+        };
+        let error = anonymous
+            .do_action(Request::new(action.clone()))
+            .await
+            .expect_err("anonymous request rejected");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+
+        let authenticated = transport.with_bearer_token(secret).expect("client bearer");
+        let channel = authenticated.connect(endpoint).await.expect("TLS connect");
+        let mut client = FlightServiceClient::new(channel);
+        let results = client
+            .do_action(authenticated.authorize_request(Request::new(action)))
+            .await
+            .expect("authenticated discovery")
+            .into_inner()
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("discovery results");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            ManagedStageDescriptor::from_wire(&results[0].body).expect("descriptor"),
+            descriptor
+        );
+
+        server.abort();
     }
 }

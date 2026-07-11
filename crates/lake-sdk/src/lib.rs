@@ -39,6 +39,7 @@ use lake_common::{
     DataLocation, FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION,
     ManagedStageBackend, ManagedStageDescriptor, TableRef, Version,
 };
+use lake_flight::ClientSecurity;
 use lake_objects::{
     LocalObjectStore, ManagedObjectStore, ObjectReader, S3ObjectStore, data_location_array,
     data_location_field, data_location_from_array,
@@ -125,6 +126,11 @@ pub enum SdkError {
 
     #[snafu(display("could not build INSERT record batch"))]
     Arrow { source: ArrowError },
+
+    #[snafu(display("invalid query Flight security configuration"))]
+    Security {
+        source: lake_flight::FlightSecurityError,
+    },
 }
 
 /// The result type for Rust SDK operations.
@@ -193,17 +199,97 @@ pub enum InsertValue {
 /// A Rust SDK client connected to the stateless query endpoint.
 #[derive(Clone)]
 pub struct LakeClient {
-    query:   Channel,
-    objects: Arc<dyn ManagedObjectStore>,
+    query:    Channel,
+    objects:  Arc<dyn ManagedObjectStore>,
+    security: ClientSecurity,
+}
+
+/// Builder for authenticated and TLS-verified SDK connections.
+#[derive(Clone, Debug)]
+pub struct LakeClientBuilder {
+    query_endpoint: String,
+    security:       ClientSecurity,
+}
+
+impl LakeClientBuilder {
+    /// Attach the bearer credential sent on every Query Flight RPC.
+    pub fn with_bearer_token(mut self, value: impl Into<String>) -> Result<Self> {
+        self.security = self
+            .security
+            .with_bearer_token(value)
+            .context(SecuritySnafu)?;
+        Ok(self)
+    }
+
+    /// Trust an additional PEM CA certificate for the Query endpoint.
+    #[must_use]
+    pub fn with_ca_certificate_pem(mut self, certificate: Vec<u8>) -> Self {
+        self.security = self.security.with_ca_certificate_pem(certificate);
+        self
+    }
+
+    /// Override the TLS certificate DNS name for internal service routing.
+    #[must_use]
+    pub fn with_server_name(mut self, server_name: impl Into<String>) -> Self {
+        self.security = self.security.with_server_name(server_name);
+        self
+    }
+
+    /// Require TLS using enabled public trust roots.
+    #[must_use]
+    pub fn with_tls(mut self) -> Self {
+        self.security = self.security.with_tls();
+        self
+    }
+
+    /// Connect and discover the managed `FILE` stage once.
+    pub async fn connect(self) -> Result<LakeClient> {
+        let query = self
+            .security
+            .connect(self.query_endpoint)
+            .await
+            .context(SecuritySnafu)?;
+        let descriptor = discover_managed_stage(query.clone(), &self.security).await?;
+        let objects = open_managed_stage(&descriptor).await?;
+        Ok(LakeClient {
+            query,
+            objects,
+            security: self.security,
+        })
+    }
+
+    /// Connect with an explicitly injected stage while retaining TLS/auth.
+    pub async fn connect_with_store<S>(self, objects: S) -> Result<LakeClient>
+    where
+        S: ManagedObjectStore + 'static,
+    {
+        let query = self
+            .security
+            .connect(self.query_endpoint)
+            .await
+            .context(SecuritySnafu)?;
+        Ok(LakeClient {
+            query,
+            objects: Arc::new(objects),
+            security: self.security,
+        })
+    }
 }
 
 impl LakeClient {
+    /// Configure an authenticated and optionally TLS-verified Query connection.
+    pub fn builder(query_endpoint: impl Into<String>) -> LakeClientBuilder {
+        LakeClientBuilder {
+            query_endpoint: query_endpoint.into(),
+            security:       ClientSecurity::new(),
+        }
+    }
+
     /// Connect through query and discover the managed `FILE` stage once.
     pub async fn connect(query_endpoint: impl AsRef<str>) -> Result<Self> {
-        let query = connect_query(query_endpoint.as_ref()).await?;
-        let descriptor = discover_managed_stage(query.clone()).await?;
-        let objects = open_managed_stage(&descriptor).await?;
-        Ok(Self { query, objects })
+        Self::builder(query_endpoint.as_ref().to_owned())
+            .connect()
+            .await
     }
 
     /// Connect with an explicitly injected managed stage for tests and
@@ -212,11 +298,9 @@ impl LakeClient {
     where
         S: ManagedObjectStore + 'static,
     {
-        let query = connect_query(query_endpoint.as_ref()).await?;
-        Ok(Self {
-            query,
-            objects: Arc::new(objects),
-        })
+        Self::builder(query_endpoint.as_ref().to_owned())
+            .connect_with_store(objects)
+            .await
     }
 
     /// Execute a parameterized, single-row INSERT with typed scalar/`FILE`
@@ -260,6 +344,9 @@ impl LakeClient {
             .with_flight_descriptor(Some(descriptor))
             .build(futures::stream::iter(vec![Ok(batch)]));
         let mut client = FlightClient::new(self.query.clone());
+        self.security
+            .apply_to_flight_client(&mut client)
+            .context(SecuritySnafu)?;
         let result = client
             .do_put(stream)
             .await
@@ -275,6 +362,7 @@ impl LakeClient {
     /// record batches as they arrive.
     pub async fn query(&self, sql: &str) -> Result<FlightRecordBatchStream> {
         let mut client = FlightSqlServiceClient::new(self.query.clone());
+        self.security.apply_to_sql_client(&mut client);
         let info = client
             .execute(sql.to_owned(), None)
             .await
@@ -310,6 +398,7 @@ impl LakeClient {
 
     async fn table_schema(&self, table: &TableRef) -> Result<SchemaRef> {
         let mut client = FlightSqlServiceClient::new(self.query.clone());
+        self.security.apply_to_sql_client(&mut client);
         let info = client
             .execute(format!("SELECT * FROM lake.{table} LIMIT 0"), None)
             .await
@@ -352,18 +441,14 @@ impl LakeClient {
     }
 }
 
-async fn connect_query(query_endpoint: &str) -> Result<Channel> {
-    Channel::from_shared(query_endpoint.to_owned())
-        .map_err(|error| SdkError::InvalidEndpoint {
-            message: error.to_string(),
-        })?
-        .connect()
-        .await
-        .context(ConnectSnafu)
-}
-
-async fn discover_managed_stage(query: Channel) -> Result<ManagedStageDescriptor> {
+async fn discover_managed_stage(
+    query: Channel,
+    security: &ClientSecurity,
+) -> Result<ManagedStageDescriptor> {
     let mut client = FlightClient::new(query);
+    security
+        .apply_to_flight_client(&mut client)
+        .context(SecuritySnafu)?;
     let mut results = client
         .do_action(Action {
             r#type: MANAGED_STAGE_DISCOVERY_ACTION.to_owned(),
@@ -569,13 +654,15 @@ mod tests {
     use lake_common::{ManagedStageDescriptor, TableLocation, TableRef};
     use lake_engine::TableEngineRef;
     use lake_engine_lance::LanceEngine;
+    use lake_flight::{ClientSecurity, ServerSecurity};
     use lake_meta::{MetaStoreRef, RocksMeta};
-    use lake_metasrv::Metasrv;
+    use lake_metasrv::{Metasrv, MetasrvServerConfig};
     use lake_objects::{
         LocalObjectStore, ManagedObjectStore, ObjectReader, Result as ObjectResult, S3ObjectStore,
         data_location_field, data_location_from_array,
     };
-    use lake_query::QueryEngine;
+    use lake_query::{QueryEngine, QueryServerConfig};
+    use rcgen::generate_simple_self_signed;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
     use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
@@ -679,6 +766,116 @@ mod tests {
 
         assert_eq!(full, expected);
         assert_eq!(range, b"456789");
+    }
+
+    #[tokio::test]
+    async fn sdk_tls_bearer_roundtrip_reaches_secured_query_and_meta() {
+        let root = tempdir().expect("fixture root");
+        let certified =
+            generate_simple_self_signed(vec!["localhost".to_owned()]).expect("test identity");
+        let certificate = certified.cert.pem();
+        let private_key = certified.key_pair.serialize_pem();
+        let query_credential = "query-sdk-credential";
+        let meta_credential = "query-to-meta-credential";
+
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).expect("meta"));
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
+        let table = TableRef::new("robots", "secure_episodes");
+        metasrv
+            .create_table(
+                &table,
+                TableLocation::new(
+                    root.path()
+                        .join("tables/secure-episodes.lance")
+                        .to_string_lossy(),
+                ),
+                Arc::new(Schema::new(vec![
+                    Field::new("episode_id", DataType::Utf8, false),
+                    data_location_field("video", false),
+                ])),
+            )
+            .await
+            .expect("create table");
+
+        let meta_addr = free_addr();
+        let query_addr = free_addr();
+        let meta_server_security = ServerSecurity::with_bearer_token(meta_credential)
+            .expect("meta bearer")
+            .with_tls_identity_pem(certificate.as_bytes(), private_key.as_bytes());
+        let meta_client_security = ClientSecurity::new()
+            .with_ca_certificate_pem(certificate.as_bytes().to_vec())
+            .with_server_name("localhost")
+            .with_bearer_token(meta_credential)
+            .expect("meta client bearer");
+        tokio::spawn({
+            let addr = meta_addr.clone();
+            let config = MetasrvServerConfig::new()
+                .with_server_security(meta_server_security)
+                .with_peer_security(meta_client_security.clone());
+            async move { lake_metasrv::serve_with_config(metasrv, &addr, config).await }
+        });
+
+        let descriptor = ManagedStageDescriptor::local(
+            root.path().join("objects").to_string_lossy().into_owned(),
+        );
+        let query_server_security = ServerSecurity::with_bearer_token(query_credential)
+            .expect("query bearer")
+            .with_tls_identity_pem(certificate.as_bytes(), private_key.as_bytes());
+        tokio::spawn({
+            let addr = query_addr.clone();
+            let query = Arc::new(QueryEngine::new(meta, engine));
+            let config = QueryServerConfig::new()
+                .with_metadata(
+                    format!(
+                        "https://localhost:{}",
+                        meta_addr.split(':').next_back().unwrap()
+                    ),
+                    meta_client_security,
+                )
+                .with_managed_stage(descriptor)
+                .with_server_security(query_server_security);
+            async move { lake_query::serve_with_config(query, &addr, config).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let client = LakeClient::builder(format!(
+            "https://localhost:{}",
+            query_addr.split(':').next_back().unwrap()
+        ))
+        .with_bearer_token(query_credential)
+        .expect("SDK bearer")
+        .with_ca_certificate_pem(certificate.as_bytes().to_vec())
+        .with_server_name("localhost")
+        .connect()
+        .await
+        .expect("secured SDK connect");
+        let expected = b"secured direct object bytes";
+        client
+            .insert(
+                "INSERT INTO robots.secure_episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    InsertValue::Utf8("secure-episode".to_owned()),
+                    InsertValue::File(FileUpload::from_reader(
+                        std::io::Cursor::new(expected),
+                        "video/mp4",
+                    )),
+                ],
+            )
+            .await
+            .expect("secured FILE insert");
+        let mut results = client
+            .query("SELECT video FROM lake.robots.secure_episodes")
+            .await
+            .expect("secured SQL query");
+        let batch = results.try_next().await.expect("stream").expect("batch");
+        let location = data_location(&batch, "video", 0).expect("DataLocation");
+        let mut reader = client.open(&location).await.expect("direct object reader");
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).await.expect("direct read");
+
+        assert_eq!(actual, expected);
+        assert!(location.uri.starts_with("file://"));
     }
 
     #[tokio::test]

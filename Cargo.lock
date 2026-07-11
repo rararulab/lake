@@ -4141,11 +4141,13 @@ dependencies = [
  "lake-common",
  "lake-engine",
  "lake-engine-lance",
+ "lake-flight",
  "lake-meta",
  "lake-metasrv",
  "lake-objects",
  "lake-query",
  "serde_json",
+ "tempfile",
  "tokio",
  "tonic",
 ]
@@ -4193,6 +4195,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lake-flight"
+version = "0.0.1"
+dependencies = [
+ "arrow-flight",
+ "rustls 0.23.41",
+ "snafu",
+ "subtle",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "lake-meta"
 version = "0.0.1"
 dependencies = [
@@ -4220,10 +4234,12 @@ dependencies = [
  "lake-common",
  "lake-engine",
  "lake-engine-lance",
+ "lake-flight",
  "lake-meta",
  "lake-objects",
  "prost",
  "prost-types",
+ "rcgen",
  "serde",
  "serde_json",
  "snafu",
@@ -4262,10 +4278,12 @@ dependencies = [
  "lake-common",
  "lake-engine",
  "lake-engine-lance",
+ "lake-flight",
  "lake-meta",
  "lake-metasrv",
  "prost",
  "prost-types",
+ "rcgen",
  "snafu",
  "tempfile",
  "tokio",
@@ -4286,12 +4304,14 @@ dependencies = [
  "lake-common",
  "lake-engine",
  "lake-engine-lance",
+ "lake-flight",
  "lake-meta",
  "lake-metasrv",
  "lake-objects",
  "lake-query",
  "prost",
  "prost-types",
+ "rcgen",
  "serde_json",
  "sha2 0.10.9",
  "snafu",
@@ -6453,6 +6473,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "pem",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "yasna",
+]
+
+[[package]]
 name = "recursive"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6947,6 +6980,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -7980,11 +8014,13 @@ dependencies = [
  "socket2 0.6.4",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tokio-stream",
  "tower",
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -8908,6 +8944,15 @@ name = "xxhash-rust"
 version = "0.8.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d93c89cdc2d3a63c3ec48ffe926931bdc069eafa8e4402fe6d8f790c9d1e576"
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
+ "time",
+]
 
 [[package]]
 name = "yoke"

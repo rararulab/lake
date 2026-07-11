@@ -165,6 +165,7 @@ security boundary are in
 | Crate | Owns | Tier |
 |-------|------|------|
 | `lake-common` | shared newtypes: `Namespace`, `TableName`, `Version`, `TableLocation` | — |
+| `lake-flight` | shared Flight TLS, bearer authentication, exposure policy, and secure Channel construction | transport |
 | `lake-objects` | SQL `FILE` physical representation (`DataLocation`), Arrow encoding, direct object I/O | storage |
 | `lake-meta` | `MetaStore` (KvBackend) trait; `RocksMeta` (dev), `DynamoMeta` (prod); Lance `ExternalManifestStore` adapter | metastore |
 | `lake-engine` | `TableEngine` / `TableHandle` traits + shared types | storage |
@@ -210,6 +211,12 @@ design-level ones:
   writes to the observed leader, serializes mutations per table, and gates
   maintenance on the same lease. Ceiling: there is no durable query scheduler
   or asynchronous large-result service yet.
+- Every production Flight hop shares `lake-flight`: a server interceptor
+  authenticates every RPC, TLS configuration is verified by the client, and
+  non-loopback plaintext/anonymous listeners fail closed. This covers
+  SDK→Query, Query→Metasrv, and follower→leader. The current opaque deployment
+  bearer establishes service identity; tenant authorization and token rotation
+  remain later policy/operations layers.
 - The full prod path (Lance on S3 + DynamoDB commit pointer via
   `ExternalManifestStore`) is wired end to end: `LanceEngine::for_object_store`
   threads S3 storage options + the commit handler through create/open/append,
