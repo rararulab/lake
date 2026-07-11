@@ -10,11 +10,13 @@ The query layer: stateless SQL compute. `QueryEngine` wires a DataFusion
   load balancer. All persistence is in the metastore + object storage.
 - Reads go directly to storage (disaggregated compute/storage) — the query
   layer never asks a datanode.
+- Typed SQL `FILE` writes are metadata-only Flight streams proxied to metasrv;
+  query does not persist rows or receive the original object bytes.
 - Caches the catalog with a bounded-staleness refresh window; concurrent
   refreshes coalesce and the server refreshes in the background so metadata
   scans stay off the per-query hot path.
 
 ## Layout
 
-- `lib.rs` — read-only `QueryEngine` (`new`/`refresh`/`execute_sql`) + `serve`
-- `flight.rs` — streaming Flight SQL statement path (`GetFlightInfo`/`DoGet`)
+- `lib.rs` — read-only `QueryEngine` plus server wiring with optional metadata forwarding
+- `flight.rs` — streaming Flight SQL reads and typed FILE `DoPut` proxy

@@ -15,15 +15,11 @@
 //! The metadata layer: the stateful registry authority.
 //!
 //! [`Metasrv`] owns the write path for the db→table registry — create,
-//! resolve, list, and (future) commit coordination. It is a bounded,
+//! resolve, list, and commit coordination. It is a bounded,
 //! leader-elected tier, NOT a fan-out one: the query layer shields it behind
 //! a cache, so it sees only cache-miss and write traffic. See
 //! `docs/architecture.md`.
 //!
-//! ponytail: v0 is a single instance with no leader election and an
-//! in-process API. The gRPC wire surface and lease-in-KV election are v1/v2
-//! — the authority logic here is what they will wrap.
-
 //! [`election`] adds the lease-in-KV leader election that gives this tier HA
 //! (leader + standby) over the [`MetaStore`](lake_meta::MetaStore) CAS
 //! primitive — no self-built consensus. `control` wraps the authority in an

@@ -141,12 +141,23 @@ reads — acceptable for training/eval, see `goal.md`.
 
 ## SQL over object storage
 
-The public query protocol is read-only Arrow Flight SQL. Query nodes resolve
-the exact registry version and stream its files directly from S3; SQL text
-cannot register arbitrary object-store locations. Interactive results stream
-over `DoGet`. The planned large-result tier materializes Arrow/Parquet parts to
-a service-owned S3 prefix and publishes short-lived HTTPS locations through
-`PollFlightInfo`. The complete API and security boundary are in
+The public query protocol keeps arbitrary SQL execution read-only. Query nodes
+resolve the exact registry version and stream its files directly from S3; SQL
+text cannot register arbitrary object-store locations. The one typed write
+surface is a Flight `DoPut` command for already-uploaded SQL `FILE` rows:
+the SDK sends `DataLocation` Arrow values to query, query proxies the stream
+without persisting it, and the metadata leader performs append + registry CAS.
+The original object bytes never enter query or metadata.
+
+After a query node receives the metadata leader's append acknowledgement, it
+evicts that table's local registration entry. The same SDK Flight connection
+therefore observes its own write immediately; independent query nodes retain
+the normal bounded-staleness window until their cache refreshes.
+
+Interactive results stream over `DoGet`. The planned large-result tier
+materializes Arrow/Parquet parts to a service-owned S3 prefix and publishes
+short-lived HTTPS locations through `PollFlightInfo`. The complete API and
+security boundary are in
 [`docs/design/sql-api-over-s3.md`](design/sql-api-over-s3.md).
 
 ## Crate map
@@ -154,6 +165,7 @@ a service-owned S3 prefix and publishes short-lived HTTPS locations through
 | Crate | Owns | Tier |
 |-------|------|------|
 | `lake-common` | shared newtypes: `Namespace`, `TableName`, `Version`, `TableLocation` | — |
+| `lake-objects` | SQL `FILE` physical representation (`DataLocation`), Arrow encoding, direct object I/O | storage |
 | `lake-meta` | `MetaStore` (KvBackend) trait; `RocksMeta` (dev), `DynamoMeta` (prod); Lance `ExternalManifestStore` adapter | metastore |
 | `lake-engine` | `TableEngine` / `TableHandle` traits + shared types | storage |
 | `lake-engine-lance` | Lance impl; the ONLY crate that names `lance::` | storage |
@@ -161,6 +173,7 @@ a service-owned S3 prefix and publishes short-lived HTTPS locations through
 | `lake-query` | stateless query-layer server (Flight SQL, DataFusion execution) | query |
 | `lake-metasrv` | stateful metadata-layer server (registry authority, write coordination, leader election) | metadata |
 | `lake-cli` | thin `clap` binary: subcommands to run each server + client | — |
+| `lake-sdk` | Rust streaming SQL query, parameterized `FILE` INSERT, `DataLocation` decoding, and direct reader | client |
 
 Conventions: **thin libs** (`lib.rs` is module docs + re-exports; logic in
 sub-files), **async-first** (engine, metastore, catalog, servers are async;
@@ -189,8 +202,10 @@ from lease-election over an already-HA KV.
 Grep for `ponytail:` in code for shortcuts with known ceilings. Current
 design-level ones:
 
-- Both servers speak real Arrow Flight: `lake-query` a read-only, streaming
-  Flight SQL endpoint, and `lake-metasrv` a Flight `do_action` control plane.
+- Both servers speak real Arrow Flight: `lake-query` a streaming Flight SQL
+  read endpoint plus a typed metadata-only FILE `DoPut` proxy, and
+  `lake-metasrv` a Flight control plane accepting DDL actions and leader-aware
+  FILE append streams.
   `lake-metasrv::serve` runs deadline-aware lease election, forwards follower
   writes to the observed leader, serializes mutations per table, and gates
   maintenance on the same lease. Ceiling: there is no durable query scheduler
@@ -204,6 +219,12 @@ design-level ones:
   cloud mode.
 - No client-side SDK cache yet — the query layer caches, the SDK does not.
   Add SDK-side catalog caching when fleet-node QPS demands another tier.
+- Managed large objects have a query-connected Rust SDK vertical slice:
+  `INSERT ... VALUES (?, ?)` binds `InsertValue::File(FileUpload)`, streams it
+  into a Lake-owned managed stage, and stores an immutable `DataLocation`
+  physical representation in Lance. The SDK receives only query endpoint +
+  stage; query forwards metadata to the leader-aware metasrv. S3 multipart
+  presigning, authenticated expiring locations, and object GC are deferred.
 
 ## Phasing
 

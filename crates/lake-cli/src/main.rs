@@ -57,7 +57,10 @@ enum Command {
     /// Run the stateless query-layer server.
     Query {
         #[arg(long, default_value = "127.0.0.1:50051")]
-        addr: String,
+        addr:          String,
+        /// Metadata Flight endpoint used for leader-aware FILE appends.
+        #[arg(long, default_value = "http://127.0.0.1:50052")]
+        metadata_addr: String,
     },
     /// Run the stateful metadata-layer server.
     Meta {
@@ -93,8 +96,41 @@ async fn run_with_context(data_dir: &str, command: Command) -> anyhow::Result<()
         Command::Sql { query } => commands::sql::run(&ctx, &query).await,
         Command::Ingest { table, file } => commands::ingest::run(&ctx, &table, &file).await,
         Command::Table(cmd) => commands::table::run(&ctx, cmd).await,
-        Command::Query { addr } => commands::serve::query(&ctx, &addr).await,
+        Command::Query {
+            addr,
+            metadata_addr,
+        } => commands::serve::query(&ctx, &addr, &metadata_addr).await,
         Command::Meta { addr } => commands::serve::meta(&ctx, &addr).await,
         Command::Client { .. } => unreachable!("Client is dispatched before Context::open"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    #[test]
+    fn query_accepts_metadata_address() {
+        let cli = Cli::try_parse_from([
+            "lake",
+            "query",
+            "--addr",
+            "127.0.0.1:60051",
+            "--metadata-addr",
+            "http://meta.internal:60052",
+        ])
+        .unwrap();
+
+        let Command::Query {
+            addr,
+            metadata_addr,
+        } = cli.command
+        else {
+            panic!("expected query command");
+        };
+        assert_eq!(addr, "127.0.0.1:60051");
+        assert_eq!(metadata_addr, "http://meta.internal:60052");
     }
 }

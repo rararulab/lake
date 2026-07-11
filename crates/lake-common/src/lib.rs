@@ -19,8 +19,12 @@
 //! `Namespace` is expected. Nothing here does I/O or pulls in a tier's
 //! dependencies, so every crate can depend on `lake-common` freely.
 
+mod data_location;
+mod file_write;
 mod ids;
 mod location;
 
+pub use data_location::DataLocation;
+pub use file_write::{FILE_APPEND_TYPE_URL, FileAppendRequest};
 pub use ids::{Namespace, TableName, TableRef, Version};
 pub use location::TableLocation;

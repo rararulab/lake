@@ -24,26 +24,30 @@
 use std::{pin::Pin, sync::Arc};
 
 use arrow_flight::{
-    FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, Ticket,
+    FlightClient, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest,
+    HandshakeResponse, Ticket,
     encode::FlightDataEncoderBuilder,
     error::FlightError,
     flight_service_server::FlightService,
     sql::{
-        CommandStatementQuery, ProstMessageExt, SqlInfo, TicketStatementQuery,
-        server::FlightSqlService,
+        Any, CommandStatementQuery, ProstMessageExt, SqlInfo, TicketStatementQuery,
+        server::{FlightSqlService, PeekableFlightDataStream},
     },
 };
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
+use lake_common::{FILE_APPEND_TYPE_URL, FileAppendRequest};
 use prost::Message;
-use tonic::{Request, Response, Status, Streaming};
+use tonic::{Request, Response, Status, Streaming, transport::Channel};
 
 use crate::QueryEngine;
 
 /// A Flight SQL service backed by a stateless [`QueryEngine`].
 pub struct FlightSqlServiceImpl {
     /// The warmed query engine that plans and executes incoming SQL.
-    pub engine: Arc<QueryEngine>,
+    pub engine:        Arc<QueryEngine>,
+    /// Metadata Flight address used only for stateless FILE append forwarding.
+    pub metadata_addr: Option<String>,
 }
 
 impl FlightSqlServiceImpl {
@@ -120,6 +124,41 @@ impl FlightSqlService for FlightSqlServiceImpl {
             .build(batches)
             .map_err(Status::from);
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn do_put_fallback(
+        &self,
+        request: Request<PeekableFlightDataStream>,
+        message: Any,
+    ) -> std::result::Result<Response<<Self as FlightService>::DoPutStream>, Status> {
+        if message.type_url != FILE_APPEND_TYPE_URL {
+            return Err(Status::invalid_argument("invalid FILE append command"));
+        }
+        let append = FileAppendRequest::from_command_payload(&message.value)
+            .ok_or_else(|| Status::invalid_argument("invalid FILE append command"))?;
+        let addr = self
+            .metadata_addr
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("FILE writes are not configured"))?;
+        let channel = Channel::from_shared(addr.clone())
+            .map_err(|error| Status::unavailable(error.to_string()))?
+            .connect()
+            .await
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        let mut client = FlightClient::new(channel);
+        let results = client
+            .do_put(request.into_inner().map(|item| {
+                item.map_err(|error| arrow_flight::error::FlightError::protocol(error.to_string()))
+            }))
+            .await
+            .map_err(|error| Status::unavailable(error.to_string()))?
+            .map_err(|error| Status::internal(error.to_string()))
+            .try_collect::<Vec<_>>()
+            .await?;
+        self.engine.invalidate_registration(append.table()).await;
+        Ok(Response::new(Box::pin(futures::stream::iter(
+            results.into_iter().map(Ok),
+        ))))
     }
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
@@ -228,7 +267,10 @@ mod tests {
             .register_table("delayed", Arc::new(table))
             .unwrap();
 
-        let service = FlightSqlServiceImpl { engine };
+        let service = FlightSqlServiceImpl {
+            engine,
+            metadata_addr: None,
+        };
         let ticket = TicketStatementQuery {
             statement_handle: b"SELECT * FROM delayed".to_vec().into(),
         };

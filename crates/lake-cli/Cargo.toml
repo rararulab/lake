@@ -25,6 +25,7 @@ lake-engine = { workspace = true }
 lake-engine-lance = { workspace = true }
 lake-meta = { workspace = true }
 lake-metasrv = { workspace = true }
+lake-objects.workspace = true
 lake-query = { workspace = true }
 prost = { workspace = true }
 serde_json = { workspace = true }

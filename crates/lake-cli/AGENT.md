@@ -30,3 +30,5 @@ tables. clap derive, thin `main.rs`, one handler module per command.
   + metasrv)
 - `commands/{selftest,sql,ingest,table,serve}.rs` — one per subcommand group
   (`table` covers create/list/drop; `ingest` loads a Parquet file)
+- `lake query --metadata-addr <URI>` — metadata target for typed FILE append
+  forwarding; SDK clients still receive only the query endpoint

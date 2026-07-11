@@ -13,3 +13,4 @@ nothing in the workspace, so everyone can depend on it.
 
 - `ids.rs` — `Namespace`, `TableName`, `TableRef`, `Version`
 - `location.rs` — `TableLocation` (a table's dataset URI)
+- `file_write.rs` — transport-neutral FILE append command payload

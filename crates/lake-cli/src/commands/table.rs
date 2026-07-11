@@ -20,6 +20,7 @@ use anyhow::{Context as _, bail};
 use clap::Subcommand;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use lake_common::{Namespace, TableRef};
+use lake_objects::data_location_field;
 
 use super::Context;
 
@@ -29,7 +30,8 @@ pub enum TableCmd {
     Create {
         /// `<namespace>.<name>`, e.g. `robots.arm_left`.
         table:   String,
-        /// Columns as `name:type` (types: i64, f64, utf8, bool). Repeatable.
+        /// Columns as `name:type` (types: i64, f64, utf8, bool, file).
+        /// Repeatable.
         #[arg(long = "column", value_name = "name:type", required = true)]
         columns: Vec<String>,
     },
@@ -65,14 +67,15 @@ fn parse_schema(columns: &[String]) -> anyhow::Result<Arc<Schema>> {
         .iter()
         .map(|c| {
             let (name, ty) = c.split_once(':').context("column must be name:type")?;
-            let dt = match ty {
-                "i64" => DataType::Int64,
-                "f64" => DataType::Float64,
-                "utf8" => DataType::Utf8,
-                "bool" => DataType::Boolean,
-                other => bail!("unknown column type '{other}' (use i64|f64|utf8|bool)"),
+            let field = match ty {
+                "i64" => Field::new(name, DataType::Int64, false),
+                "f64" => Field::new(name, DataType::Float64, false),
+                "utf8" => Field::new(name, DataType::Utf8, false),
+                "bool" => Field::new(name, DataType::Boolean, false),
+                "file" => data_location_field(name, false),
+                other => bail!("unknown column type '{other}' (use i64|f64|utf8|bool|file)"),
             };
-            Ok(Field::new(name, dt, false))
+            Ok(field)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(Arc::new(Schema::new(fields)))
@@ -115,4 +118,18 @@ async fn list(ctx: &Context, namespace: Option<&str>) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use lake_objects::data_location_field;
+
+    use super::parse_schema;
+
+    #[test]
+    fn local_schema_dsl_accepts_file() {
+        let schema = parse_schema(&["video:file".to_owned()]).unwrap();
+
+        assert_eq!(schema.field(0), &data_location_field("video", false));
+    }
 }

@@ -13,8 +13,10 @@ write path — create tables, resolve/list, and the append commit protocol.
   registry conflict the caller retries.
 - Never bypass the engine trait — table creation/append delegate to
   `TableEngine`, so the storage engine stays swappable.
+- FILE `DoPut` contains Arrow `DataLocation` rows only. Followers forward the
+  stream to the observed leader; metasrv never accepts the object payload.
 
 ## Layout
 
 - `lib.rs` — `Metasrv` (`create_table`/`append`/`resolve`/`list_*`) + `serve`
-  (v1 gRPC wire is a ponytail stub)
+- `control.rs` — Flight actions, FILE append decoding, and follower forwarding
