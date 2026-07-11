@@ -107,6 +107,22 @@ pub trait TableHandle: Send + Sync {
 }
 ```
 
+Lance-on-S3 commit arbitration stores one mutable current manifest pointer per
+physical dataset plus immutable historical records. The current pointer is a
+single O(1) metastore read. To advance it, the adapter archives the exact prior
+pointer and CASes current from exact old bytes to the new staging manifest;
+Lance has already durably written staging before that call. A legacy dataset
+without the fixed pointer performs one history scan and CAS-installs the
+maximum record. External history retention is separate from latest resolution:
+cleanup may delete a record only after Lance's tag/branch-aware cleanup proves
+the corresponding manifest object obsolete (#42).
+
+The fixed pointer is a commit-protocol boundary. A pre-pointer binary can write
+a newer per-version record without advancing it, so commit-capable binaries on
+both sides must not run concurrently. Deployments drain writes, upgrade every
+metadata node that may lead, then resume. Dataset data itself needs no offline
+migration; the first post-upgrade open installs its pointer lazily.
+
 `Version` is an opaque engine-defined identifier; the registry stores it but
 does not interpret it. The Lance impl (`lake-engine-lance`) maps `append`
 and versioning onto Lance's own commit + `ExternalManifestStore` (which is
@@ -228,9 +244,9 @@ security boundary are in
 | `lake-common` | shared newtypes: `Namespace`, `TableName`, `Version`, `TableLocation` | — |
 | `lake-flight` | shared Flight TLS, bearer authentication, exposure policy, and secure Channel construction | transport |
 | `lake-objects` | SQL `FILE` physical representation (`DataLocation`), Arrow encoding, direct object I/O | storage |
-| `lake-meta` | `MetaStore` (KvBackend) trait; `RocksMeta` (dev), `DynamoMeta` (prod); Lance `ExternalManifestStore` adapter | metastore |
+| `lake-meta` | `MetaStore` (KvBackend) trait; `RocksMeta` (dev), `DynamoMeta` (prod) | metastore |
 | `lake-engine` | `TableEngine` / `TableHandle` traits + shared types | storage |
-| `lake-engine-lance` | Lance impl; the ONLY crate that names `lance::` | storage |
+| `lake-engine-lance` | Lance impl and `ExternalManifestStore` adapter; the ONLY crate that names `lance::` | storage |
 | `lake-catalog` | db→table registry logic, DataFusion `CatalogProvider`, moka cache | query + metadata |
 | `lake-query` | stateless query-layer server (Flight SQL, DataFusion execution) | query |
 | `lake-metasrv` | stateful metadata-layer server (registry and table-placement authority, write coordination, leader election) | metadata |

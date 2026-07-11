@@ -14,8 +14,13 @@ Lance dataset.
   digest, and reference-stage identity in Lance transaction properties.
 - Reference lineage is staged before manifest visibility and repaired from
   transaction history before a recovered version is returned.
+- The external manifest store resolves current state through one fixed
+  `{version,path}` pointer. Advancing it archives the exact prior pointer, then
+  CASes latest; legacy per-version-only datasets scan once to install latest.
 
 ## Layout
 
 - `lib.rs` — `LanceEngine` + `LanceTable` handle (create/open/append/version,
   `LanceTableProvider` for reads)
+- `manifest_store.rs` — generic MetaStore-backed Lance commit arbitration,
+  O(1) latest pointer, immutable historical version records

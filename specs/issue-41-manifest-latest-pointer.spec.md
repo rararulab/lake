@@ -32,6 +32,10 @@ may scan once to install the pointer; steady-state reads may not scan.
 - Historical backfill writes a version key without regressing latest.
 - If latest is absent but legacy history exists, scan once, CAS-install the
   maximum record, and let racing migrators converge on the installed value.
+- This commit-protocol boundary is not mixed-writer compatible: pre-#41
+  binaries do not update the fixed pointer. Drain commit-capable nodes before
+  upgrading the metadata group, then resume writes after every possible leader
+  runs #41. Stored datasets need no offline rewrite and migrate on first use.
 - Keep retention cleanup out of this issue; #42 couples it to authoritative
   Lance cleanup outcomes and a durable bounded cursor.
 
@@ -76,6 +80,14 @@ Scenario: Legacy history migrates once
   When latest is first resolved and then resolved again
   Then the first call installs the maximum as fixed latest and the second call performs no history scan
 
+Scenario: Migrated staging history finalizes without blocking advancement
+  Test:
+    Package: lake-engine-lance
+    Filter: legacy_staging_finalize_can_advance
+  Given a legacy maximum version still points at a staging manifest
+  When the fixed pointer is installed, finalized, and the next version is claimed
+  Then both the duplicate legacy archive and latest converge to final before advancement
+
 Scenario: Current and historical reads preserve Lance semantics
   Test:
     Package: lake-engine-lance
@@ -98,3 +110,4 @@ Scenario: Dataset deletion clears both layouts
 - Deleting retained or obsolete external manifest history; tracked by #42.
 - Changing Lance's manifest file format, naming scheme, or commit handler.
 - Query-layer provider caching or catalog refresh behavior.
+- Simultaneous commits from binaries on both sides of the #41 protocol boundary.

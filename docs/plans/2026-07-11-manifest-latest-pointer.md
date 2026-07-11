@@ -22,6 +22,15 @@ version reads remain available.
 6. Delete removes fixed latest and all immutable history, failing if either
    layout changes concurrently.
 
+## Rollout
+
+Pre-#41 binaries write only per-version records and therefore cannot coexist
+as committers after a fixed pointer becomes authoritative. Drain writes,
+upgrade every metadata node that may become leader, and only then resume
+commits. This is a protocol rollout fence, not a data migration window:
+existing datasets remain readable and install their pointer lazily on first
+open.
+
 ## Verification
 
 - `mise run spec-lifecycle specs/issue-41-manifest-latest-pointer.spec.md`
