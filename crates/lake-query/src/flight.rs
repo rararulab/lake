@@ -39,10 +39,14 @@ use arrow_flight::{
         server::{FlightSqlService, PeekableFlightDataStream},
     },
 };
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion::{
+    arrow::datatypes::{Schema, SchemaRef},
+    common::{TableReference, config::Dialect},
+};
 use futures::{Stream, StreamExt, TryStreamExt};
 use lake_common::{
-    FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor,
+    FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION,
+    ManagedStageDescriptor, Principal, PrincipalRole,
 };
 use lake_flight::ClientSecurity;
 use prost::Message;
@@ -162,6 +166,52 @@ impl FlightSqlServiceImpl {
         let df = self.engine.plan_sql(sql).await.map_err(to_status)?;
         Ok(df.schema().as_arrow().clone())
     }
+
+    fn principal<T>(&self, request: &Request<T>) -> Principal {
+        request
+            .extensions()
+            .get::<Principal>()
+            .cloned()
+            .unwrap_or_else(Principal::deployment_admin)
+    }
+
+    fn authorize_namespace(
+        &self,
+        principal: &Principal,
+        namespace: &str,
+    ) -> std::result::Result<(), Status> {
+        if principal.can_access_namespace(namespace) {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("resource is not available"))
+        }
+    }
+
+    fn authorize_sql(&self, principal: &Principal, sql: &str) -> std::result::Result<(), Status> {
+        let state = self.engine.context().state();
+        let statement = state
+            .sql_to_statement(sql, &Dialect::Generic)
+            .map_err(|_| Status::invalid_argument("invalid SQL statement"))?;
+        let references = state
+            .resolve_table_references(&statement)
+            .map_err(|_| Status::invalid_argument("invalid SQL statement"))?;
+        for reference in references {
+            let namespace = match reference {
+                TableReference::Full {
+                    catalog, schema, ..
+                } if catalog.as_ref() == "lake" => schema,
+                TableReference::Partial { schema, .. } => schema,
+                TableReference::Bare { .. } if principal.role() == PrincipalRole::Admin => {
+                    continue;
+                }
+                TableReference::Full { .. } | TableReference::Bare { .. } => {
+                    return Err(Status::permission_denied("resource is not available"));
+                }
+            };
+            self.authorize_namespace(principal, &namespace)?;
+        }
+        Ok(())
+    }
 }
 
 /// Collapse any displayable error into an internal [`Status`].
@@ -192,6 +242,8 @@ impl FlightSqlService for FlightSqlServiceImpl {
     ) -> std::result::Result<Response<FlightInfo>, Status> {
         let CommandStatementQuery { query: sql, .. } = query;
         self.admission.validate_sql_size(sql.as_bytes())?;
+        let principal = self.principal(&request);
+        self.authorize_sql(&principal, &sql)?;
         let _permit = self.admission.acquire().await?;
         let schema =
             tokio::time::timeout_at(self.admission.execution_deadline(), self.plan_schema(&sql))
@@ -216,13 +268,15 @@ impl FlightSqlService for FlightSqlServiceImpl {
     async fn do_get_statement(
         &self,
         ticket: TicketStatementQuery,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         self.admission.validate_sql_size(&ticket.statement_handle)?;
         let permit = self.admission.acquire().await?;
         let deadline = self.admission.execution_deadline();
         let sql = String::from_utf8(ticket.statement_handle.to_vec())
             .map_err(|e| Status::invalid_argument(format!("ticket is not utf-8: {e}")))?;
+        let principal = self.principal(&request);
+        self.authorize_sql(&principal, &sql)?;
 
         let batches = tokio::time::timeout_at(deadline, async {
             let df = self.engine.plan_sql(&sql).await.map_err(to_status)?;
@@ -254,6 +308,8 @@ impl FlightSqlService for FlightSqlServiceImpl {
         }
         let append = FileAppendRequest::from_command_payload(&message.value)
             .ok_or_else(|| Status::invalid_argument("invalid FILE append command"))?;
+        let principal = self.principal(&request);
+        self.authorize_namespace(&principal, &append.table().namespace.0)?;
         let addr = self
             .metadata_addr
             .as_ref()
@@ -341,7 +397,10 @@ mod tests {
         },
     };
     use futures::{StreamExt, TryStreamExt};
-    use lake_common::{MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor};
+    use lake_common::{
+        MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor, Principal, PrincipalId,
+        PrincipalRole, TenantId,
+    };
     use lake_engine::TableEngineRef;
     use lake_engine_lance::LanceEngine;
     use lake_meta::{MetaStore, MetaStoreRef};
@@ -464,6 +523,48 @@ mod tests {
         assert_eq!(
             ManagedStageDescriptor::from_wire(&results[0].body).expect("decode result"),
             descriptor
+        );
+    }
+
+    #[test]
+    fn query_tenant_policy_denies_cross_namespace_before_execution() {
+        let meta = Arc::new(PlanningMeta::default());
+        let meta_ref: MetaStoreRef = meta.clone();
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let service = FlightSqlServiceImpl {
+            engine:            Arc::new(QueryEngine::new(meta_ref, storage)),
+            metadata_addr:     None,
+            metadata_security: ClientSecurity::new(),
+            managed_stage:     None,
+            admission:         QueryAdmission::new(QueryLimits::default()),
+        };
+        let principal = Principal::try_new(
+            PrincipalId::try_new("alpha-reader").unwrap(),
+            TenantId::try_new("tenant-alpha").unwrap(),
+            PrincipalRole::User,
+            ["alpha_episodes"],
+        )
+        .unwrap();
+
+        service
+            .authorize_sql(
+                &principal,
+                "WITH recent AS (SELECT * FROM lake.alpha_episodes.events) SELECT * FROM recent",
+            )
+            .expect("same-tenant CTE is authorized");
+        let denied = service
+            .authorize_sql(
+                &principal,
+                "SELECT * FROM lake.alpha_episodes.events a JOIN lake.beta_episodes.secrets b ON \
+                 a.id = b.id",
+            )
+            .expect_err("cross-tenant join is denied");
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert_eq!(denied.message(), "resource is not available");
+        assert_eq!(
+            meta.scans.load(Ordering::Relaxed),
+            0,
+            "authorization must not consult the metastore"
         );
     }
 
