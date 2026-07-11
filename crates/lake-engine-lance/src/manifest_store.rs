@@ -46,14 +46,16 @@ use std::cmp::Ordering;
 
 use async_trait::async_trait;
 use lake_meta::{GuardedMutation, MetaError, MetaStoreRef};
-use lance::{Error, Result};
+use lance::{Error, Result, io::ObjectStore as LanceObjectStore};
 use lance_table::io::commit::external_manifest::ExternalManifestStore;
+use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// KV key namespace for Lance manifest pointers.
 const KEY_PREFIX: &str = "lance-manifest";
 const LATEST_KEY_PREFIX: &str = "lance-manifest-latest";
+const CLEANUP_KEY_PREFIX: &str = "lance-manifest-cleanup";
 
 /// The JSON value persisted per `(base_uri, version)`.
 #[derive(Serialize, Deserialize)]
@@ -84,6 +86,33 @@ struct DeleteMarker {
     incarnation: String,
 }
 
+#[derive(Deserialize, Serialize)]
+struct CleanupCursor {
+    incarnation:  String,
+    continuation: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ManifestHistoryCleanupStats {
+    pub visited:  usize,
+    pub removed:  usize,
+    pub retained: usize,
+    pub has_more: bool,
+}
+
+#[async_trait]
+pub(crate) trait ManifestExistence: Send + Sync {
+    async fn exists(&self, path: &str) -> Result<bool>;
+}
+
+#[async_trait]
+impl ManifestExistence for LanceObjectStore {
+    async fn exists(&self, path: &str) -> Result<bool> {
+        let path = Path::parse(path).map_err(|error| Error::invalid_input(error.to_string()))?;
+        self.exists(&path).await
+    }
+}
+
 struct LatestState {
     bytes:   Vec<u8>,
     pointer: LatestManifestPointer,
@@ -106,6 +135,7 @@ enum LatestResolution {
 /// A [`ExternalManifestStore`] whose source of truth is a [`MetaStore`].
 ///
 /// [`MetaStore`]: lake_meta::MetaStore
+#[derive(Clone)]
 pub struct MetaManifestStore {
     meta: MetaStoreRef,
 }
@@ -129,6 +159,8 @@ impl MetaManifestStore {
     fn base_prefix(base_uri: &str) -> String { format!("{KEY_PREFIX}/{base_uri}/") }
 
     fn latest_key(base_uri: &str) -> String { format!("{LATEST_KEY_PREFIX}/{base_uri}") }
+
+    fn cleanup_key(base_uri: &str) -> String { format!("{CLEANUP_KEY_PREFIX}/{base_uri}") }
 
     async fn read_latest(&self, base_uri: &str) -> Result<Option<LatestRecord>> {
         let Some(bytes) = self
@@ -322,6 +354,112 @@ impl MetaManifestStore {
                 latest.pointer.version
             ))),
         }
+    }
+
+    pub(crate) async fn reclaim_removed_history(
+        &self,
+        base_uri: &str,
+        objects: &dyn ManifestExistence,
+        limit: usize,
+    ) -> Result<ManifestHistoryCleanupStats> {
+        if limit == 0 {
+            return Err(Error::invalid_input(
+                "manifest history cleanup limit must be positive",
+            ));
+        }
+        let Some(LatestRecord::Pointer(latest)) = self.read_latest(base_uri).await? else {
+            return Ok(ManifestHistoryCleanupStats::default());
+        };
+        let cleanup_key = Self::cleanup_key(base_uri);
+        let cursor_before = self.meta.get(&cleanup_key).await.map_err(store_err)?;
+        let continuation = cursor_before
+            .as_deref()
+            .map(|bytes| {
+                serde_json::from_slice::<CleanupCursor>(bytes)
+                    .map_err(|error| Error::invalid_input(error.to_string()))
+            })
+            .transpose()?
+            .filter(|cursor| cursor.incarnation == latest.pointer.incarnation)
+            .and_then(|cursor| cursor.continuation);
+        let prefix = Self::base_prefix(base_uri);
+        let page = self
+            .meta
+            .scan_prefix_page(&prefix, continuation.as_deref(), limit)
+            .await
+            .map_err(store_err)?;
+        let mut stats = ManifestHistoryCleanupStats {
+            visited: page.entries().len(),
+            has_more: page.continuation().is_some(),
+            ..ManifestHistoryCleanupStats::default()
+        };
+        for (version, bytes) in page.entries() {
+            let pointer = decode_manifest(bytes)?;
+            if pointer
+                .incarnation
+                .as_deref()
+                .is_some_and(|incarnation| incarnation != latest.pointer.incarnation)
+            {
+                return Err(Error::io(format!(
+                    "manifest cleanup crossed incarnation: {base_uri}@{version}"
+                )));
+            }
+            if objects.exists(&pointer.path).await? {
+                stats.retained += 1;
+                continue;
+            }
+            let key = format!("{prefix}{version}");
+            if !self
+                .meta
+                .guarded_mutate(GuardedMutation::delete(
+                    &Self::latest_key(base_uri),
+                    &latest.bytes,
+                    &key,
+                    bytes,
+                ))
+                .await
+                .map_err(store_err)?
+            {
+                return Err(Error::io(format!(
+                    "manifest cleanup raced: {base_uri}@{version}"
+                )));
+            }
+            stats.removed += 1;
+        }
+        let cursor_after = serde_json::to_vec(&CleanupCursor {
+            incarnation:  latest.pointer.incarnation.clone(),
+            continuation: page.continuation().map(str::to_owned),
+        })
+        .map_err(|error| Error::invalid_input(error.to_string()))?;
+        let cursor_updated = match cursor_before.as_deref() {
+            Some(expected) => {
+                self.meta
+                    .guarded_mutate(GuardedMutation::update(
+                        &Self::latest_key(base_uri),
+                        &latest.bytes,
+                        &cleanup_key,
+                        expected,
+                        &cursor_after,
+                    ))
+                    .await
+            }
+            None => {
+                self.meta
+                    .guarded_mutate(GuardedMutation::create(
+                        &Self::latest_key(base_uri),
+                        &latest.bytes,
+                        &cleanup_key,
+                        &cursor_after,
+                    ))
+                    .await
+            }
+        }
+        .map_err(store_err)?;
+        if !cursor_updated {
+            return Err(Error::io(format!(
+                "manifest cleanup cursor raced: {base_uri}"
+            )));
+        }
+        Ok(stats)
     }
 }
 
@@ -620,6 +758,18 @@ impl ExternalManifestStore for MetaManifestStore {
                 "manifest history changed during delete: {base_uri}"
             )));
         }
+        let cleanup_key = Self::cleanup_key(base_uri);
+        if let Some(cursor) = self.meta.get(&cleanup_key).await.map_err(store_err)?
+            && !self
+                .meta
+                .delete(&cleanup_key, &cursor)
+                .await
+                .map_err(store_err)?
+        {
+            return Err(Error::io(format!(
+                "manifest cleanup cursor changed during delete: {base_uri}"
+            )));
+        }
         if self
             .meta
             .cas(&latest_key, Some(&deleting), &deleted)
@@ -643,9 +793,12 @@ impl ExternalManifestStore for MetaManifestStore {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+    use std::{
+        collections::HashSet,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
     };
 
     use lake_meta::{MetaStore, RocksMeta};
@@ -653,6 +806,50 @@ mod tests {
     use tokio::sync::{Notify, Semaphore};
 
     use super::*;
+
+    struct FakeManifestExistence {
+        existing: Mutex<HashSet<String>>,
+        calls:    AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ManifestExistence for FakeManifestExistence {
+        async fn exists(&self, path: &str) -> Result<bool> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.existing.lock().expect("existing paths").contains(path))
+        }
+    }
+
+    async fn history_fixture() -> (
+        MetaManifestStore,
+        Arc<RocksMeta>,
+        tempfile::TempDir,
+        FakeManifestExistence,
+    ) {
+        let dir = tempdir().expect("manifest metadata directory");
+        let meta = Arc::new(RocksMeta::open(dir.path()).expect("RocksMeta"));
+        let store = MetaManifestStore::new(meta.clone());
+        for version in 1..=5 {
+            store
+                .put_if_not_exists(
+                    "cleanup-ds",
+                    version,
+                    &format!("_versions/{version}.manifest"),
+                    4,
+                    None,
+                )
+                .await
+                .expect("claim version");
+        }
+        let objects = FakeManifestExistence {
+            existing: Mutex::new(HashSet::from([
+                "_versions/2.manifest".to_owned(),
+                "_versions/5.manifest".to_owned(),
+            ])),
+            calls:    AtomicUsize::new(0),
+        };
+        (store, meta, dir, objects)
+    }
 
     fn store() -> (MetaManifestStore, tempfile::TempDir) {
         let dir = tempdir().unwrap();
@@ -840,6 +1037,86 @@ mod tests {
             stale_finalize_release: Notify::new(),
         });
         (MetaManifestStore::new(meta.clone()), meta, dir)
+    }
+
+    #[tokio::test]
+    async fn removed_manifest_history_is_reclaimed_boundedly() {
+        let (store, _meta, _dir, objects) = history_fixture().await;
+        let first = store
+            .reclaim_removed_history("cleanup-ds", &objects, 2)
+            .await
+            .expect("first cleanup page");
+        assert_eq!(first.visited, 2);
+        assert_eq!(first.removed, 1);
+        assert_eq!(first.retained, 1);
+        assert!(first.has_more);
+        assert_eq!(objects.calls.load(Ordering::SeqCst), 2);
+
+        let second = store
+            .reclaim_removed_history("cleanup-ds", &objects, 2)
+            .await
+            .expect("second cleanup page");
+        assert_eq!(second.visited, 2);
+        assert_eq!(second.removed, 2);
+        assert!(!second.has_more);
+        assert_eq!(objects.calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn retained_manifest_history_survives_cleanup() {
+        let (store, _meta, _dir, objects) = history_fixture().await;
+        store
+            .reclaim_removed_history("cleanup-ds", &objects, 8)
+            .await
+            .expect("cleanup history");
+        assert_eq!(
+            store.get("cleanup-ds", 2).await.expect("retained v2"),
+            "_versions/2.manifest"
+        );
+        assert!(store.get("cleanup-ds", 1).await.is_err());
+        assert_eq!(
+            store
+                .get_latest_version("cleanup-ds")
+                .await
+                .expect("latest"),
+            Some((5, "_versions/5.manifest".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_cursor_resumes_without_touching_latest() {
+        let (store, meta, _dir, objects) = history_fixture().await;
+        let latest_key = MetaManifestStore::latest_key("cleanup-ds");
+        let latest_before = meta
+            .get(&latest_key)
+            .await
+            .expect("latest read")
+            .expect("latest exists");
+        let first = store
+            .reclaim_removed_history("cleanup-ds", &objects, 1)
+            .await
+            .expect("first bounded page");
+        assert!(first.has_more);
+        let cursor = meta
+            .get(&MetaManifestStore::cleanup_key("cleanup-ds"))
+            .await
+            .expect("cursor read")
+            .expect("cursor exists");
+        assert!(
+            serde_json::from_slice::<CleanupCursor>(&cursor)
+                .expect("cursor JSON")
+                .continuation
+                .is_some()
+        );
+        store
+            .reclaim_removed_history("cleanup-ds", &objects, 1)
+            .await
+            .expect("resumed page");
+        assert_eq!(objects.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            meta.get(&latest_key).await.expect("latest reread"),
+            Some(latest_before)
+        );
     }
 
     #[tokio::test]
