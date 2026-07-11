@@ -102,9 +102,10 @@ policy and resource controls below:
   credentials in a production ticket.
 - Presigned result URLs with the shortest practical expiry, `GET` only, and a
   result prefix unique to the tenant and query.
-- Per-tenant limits for concurrent queries, queue depth, runtime, scanned
-  bytes, result bytes, memory, spill, and egress. Cancellation must propagate
-  to DataFusion and multipart uploads.
+- Per-replica concurrency, queue wait, execution duration, and SQL/ticket size
+  are now bounded. Add per-tenant limits for scanned bytes, result bytes,
+  memory, spill, and egress plus fair queuing. Cancellation must propagate to
+  DataFusion and multipart uploads.
 - Encryption at rest, result-bucket lifecycle deletion, audit logs, and
   metrics for planning, scanning, spilling, materialization, and download.
 

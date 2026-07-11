@@ -21,6 +21,7 @@ use lake_query::{QueryEngine, QueryServerConfig};
 
 use super::{
     Context,
+    limits::query_limits_from_env,
     security::{
         allow_insecure_from_env, metadata_client_security_from_env, peer_client_security_from_env,
         server_security_from_env,
@@ -33,6 +34,7 @@ pub async fn query(ctx: &Context, addr: &str, metadata_addr: &str) -> anyhow::Re
         .with_metadata(metadata_addr, metadata_client_security_from_env()?)
         .with_managed_stage(ctx.managed_stage().clone())
         .with_server_security(server_security_from_env()?)
+        .with_limits(query_limits_from_env()?)
         .allow_insecure(allow_insecure_from_env()?);
     lake_query::serve_with_config(engine, addr, config).await?;
     Ok(())
