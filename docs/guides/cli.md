@@ -63,6 +63,21 @@ and `LAKE_MAINTENANCE_TABLE_PAGE_SIZE` (default `128`, maximum `10000`). Each
 tick reads at most one registry page and resumes from a process-local cursor;
 invalid or zero values fail before the Metasrv listener binds.
 
+## Process logging
+
+The binary installs its tracing subscriber before command parsing, storage
+opening, or listener binding. Logs always use stderr so stdout remains the
+deterministic data channel.
+
+- `LAKE_LOG_FORMAT=json|pretty` selects newline-delimited JSON (the default)
+  or human-readable output. ANSI is disabled in both modes.
+- `RUST_LOG` supplies a standard tracing filter. Without it, lake's binary,
+  query, metasrv, and catalog targets log at INFO while dependencies remain
+  quiet.
+- Invalid explicit values fail startup. Startup records contain the package
+  version only; argv, SQL, paths, environment values, credentials, and tokens
+  are not logging fields.
+
 ## Async Runtime
 
 - The CLI is async-first. Use `#[tokio::main]` at the binary boundary and keep
