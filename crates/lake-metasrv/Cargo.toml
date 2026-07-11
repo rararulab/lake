@@ -17,6 +17,7 @@ lake-catalog = { workspace = true }
 lake-common = { workspace = true }
 lake-engine = { workspace = true }
 lake-meta = { workspace = true }
+lake-objects.workspace = true
 prost = { workspace = true }
 prost-types = { workspace = true }
 serde = { workspace = true }

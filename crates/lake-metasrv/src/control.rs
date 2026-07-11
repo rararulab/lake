@@ -46,6 +46,7 @@ use futures::{Stream, StreamExt};
 use lake_common::{
     FILE_APPEND_TYPE_URL, FileAppendRequest, Namespace, TableLocation, TableRef, Version,
 };
+use lake_objects::data_location_field;
 use prost::Message;
 use prost_types::Any;
 use serde::{Serialize, de::DeserializeOwned};
@@ -157,18 +158,19 @@ fn build_schema(columns: &[String]) -> Result<SchemaRef, Status> {
             let (name, ty) = c.split_once(':').ok_or_else(|| {
                 Status::invalid_argument(format!("column must be name:type: {c}"))
             })?;
-            let dt = match ty {
-                "i64" => DataType::Int64,
-                "f64" => DataType::Float64,
-                "utf8" => DataType::Utf8,
-                "bool" => DataType::Boolean,
+            let field = match ty {
+                "i64" => Field::new(name, DataType::Int64, false),
+                "f64" => Field::new(name, DataType::Float64, false),
+                "utf8" => Field::new(name, DataType::Utf8, false),
+                "bool" => Field::new(name, DataType::Boolean, false),
+                "file" => data_location_field(name, false),
                 other => {
                     return Err(Status::invalid_argument(format!(
-                        "unknown column type '{other}' (use i64|f64|utf8|bool)"
+                        "unknown column type '{other}' (use i64|f64|utf8|bool|file)"
                     )));
                 }
             };
-            Ok(Field::new(name, dt, false))
+            Ok(field)
         })
         .collect::<Result<Vec<_>, Status>>()?;
     Ok(Arc::new(Schema::new(fields)))
@@ -524,5 +526,19 @@ mod file_append_tests {
                 .current_version,
             version
         );
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use lake_objects::data_location_field;
+
+    use super::build_schema;
+
+    #[test]
+    fn remote_schema_dsl_accepts_file() {
+        let schema = build_schema(&["video:file".to_owned()]).unwrap();
+
+        assert_eq!(schema.field(0), &data_location_field("video", false));
     }
 }

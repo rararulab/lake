@@ -38,7 +38,8 @@ pub enum ClientCmd {
     CreateTable {
         /// `<namespace>.<name>`, e.g. `robots.arm_left`.
         table:    String,
-        /// Columns as `name:type` (types: i64, f64, utf8, bool). Repeatable.
+        /// Columns as `name:type` (types: i64, f64, utf8, bool, file).
+        /// Repeatable.
         #[arg(long = "column", value_name = "name:type", required = true)]
         columns:  Vec<String>,
         /// Storage URI for the dataset. Required: the remote metasrv does not
