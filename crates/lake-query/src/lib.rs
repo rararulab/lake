@@ -26,14 +26,19 @@
 
 mod flight;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use datafusion::{
     arrow::array::RecordBatch,
     dataframe::DataFrame,
     error::DataFusionError,
-    prelude::{SQLOptions, SessionContext},
+    execution::{memory_pool::FairSpillPool, runtime_env::RuntimeEnvBuilder},
+    prelude::{SQLOptions, SessionConfig, SessionContext},
 };
 use lake_catalog::LakeCatalog;
 use lake_common::ManagedStageDescriptor;
@@ -80,6 +85,18 @@ pub enum QueryError {
 
     #[snafu(display("invalid Query limits: {message}"))]
     InvalidLimits { message: String },
+
+    #[snafu(display("invalid Query resources: {message}"))]
+    InvalidResources { message: String },
+
+    #[snafu(display("failed to initialize Query execution resources"))]
+    Runtime { source: DataFusionError },
+
+    #[snafu(display("failed to prepare Query spill directory {path:?}"))]
+    SpillDirectory {
+        path:   PathBuf,
+        source: std::io::Error,
+    },
 
     #[snafu(display("Flight SQL connections did not drain within {grace:?}"))]
     DrainTimeout { grace: Duration },
@@ -159,6 +176,79 @@ impl Default for QueryLimits {
             queue_wait:     Duration::from_millis(100),
             execution_time: Duration::from_mins(30),
             max_sql_bytes:  1024 * 1024,
+        }
+    }
+}
+
+const DEFAULT_QUERY_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
+const DEFAULT_QUERY_SPILL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MIN_QUERY_MEMORY_BYTES: usize = 16 * 1024 * 1024;
+const MIN_QUERY_SPILL_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Process-wide DataFusion execution resources for one Query replica.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryResources {
+    memory_bytes: usize,
+    spill_bytes:  u64,
+    spill_root:   PathBuf,
+}
+
+impl QueryResources {
+    /// Validate finite execution-memory and local-spill budgets.
+    pub fn try_new(
+        memory_bytes: usize,
+        spill_bytes: u64,
+        spill_root: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let spill_root = spill_root.into();
+        for (valid, message) in [
+            (
+                memory_bytes >= MIN_QUERY_MEMORY_BYTES,
+                "memory_bytes must be at least 16777216",
+            ),
+            (
+                spill_bytes >= MIN_QUERY_SPILL_BYTES,
+                "spill_bytes must be at least 16777216",
+            ),
+            (
+                !spill_root.as_os_str().is_empty(),
+                "spill_root must not be empty",
+            ),
+        ] {
+            if !valid {
+                return Err(QueryError::InvalidResources {
+                    message: message.to_owned(),
+                });
+            }
+        }
+        Ok(Self {
+            memory_bytes,
+            spill_bytes,
+            spill_root,
+        })
+    }
+
+    #[must_use]
+    pub const fn memory_bytes(&self) -> usize { self.memory_bytes }
+
+    #[must_use]
+    pub const fn spill_bytes(&self) -> u64 { self.spill_bytes }
+
+    #[must_use]
+    pub fn spill_root(&self) -> &Path { &self.spill_root }
+
+    fn sort_spill_reservation_bytes(&self) -> usize {
+        const MAX_RESERVATION: usize = 10 * 1024 * 1024;
+        (self.memory_bytes / 32).min(MAX_RESERVATION)
+    }
+}
+
+impl Default for QueryResources {
+    fn default() -> Self {
+        Self {
+            memory_bytes: DEFAULT_QUERY_MEMORY_BYTES,
+            spill_bytes:  DEFAULT_QUERY_SPILL_BYTES,
+            spill_root:   std::env::temp_dir().join("lake-query-spill"),
         }
     }
 }
@@ -248,10 +338,32 @@ pub struct QueryEngine {
 impl QueryEngine {
     /// Build a query engine registering the lake catalog under `lake`.
     pub fn new(meta: MetaStoreRef, engine: TableEngineRef) -> Self {
+        Self::try_with_resources(meta, engine, QueryResources::default())
+            .expect("default Query resources must initialize")
+    }
+
+    /// Build a query engine with explicit process-wide execution resources.
+    pub fn try_with_resources(
+        meta: MetaStoreRef,
+        engine: TableEngineRef,
+        resources: QueryResources,
+    ) -> Result<Self> {
         let catalog = LakeCatalog::new(meta, engine);
-        let ctx = SessionContext::new();
+        let sort_spill_reservation_bytes = resources.sort_spill_reservation_bytes();
+        std::fs::create_dir_all(&resources.spill_root).context(SpillDirectorySnafu {
+            path: resources.spill_root.clone(),
+        })?;
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(FairSpillPool::new(resources.memory_bytes)))
+            .with_temp_file_path(resources.spill_root)
+            .with_max_temp_directory_size(resources.spill_bytes)
+            .build()
+            .context(RuntimeSnafu)?;
+        let session =
+            SessionConfig::new().with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
+        let ctx = SessionContext::new_with_config_rt(session, Arc::new(runtime));
         ctx.register_catalog("lake", Arc::new(catalog.clone()));
-        Self { ctx, catalog }
+        Ok(Self { ctx, catalog })
     }
 
     /// Force a reload of the catalog's listing snapshot from the registry.
@@ -830,5 +942,162 @@ mod tests {
         let rebound = std::net::TcpListener::bind(addr).expect("listen address released");
         drop(rebound);
         release.notify_waiters();
+    }
+
+    #[test]
+    fn query_resources_reject_invalid_budgets() {
+        let spill_root = tempfile::tempdir().expect("spill root");
+        assert!(QueryResources::try_new(0, 1024, spill_root.path()).is_err());
+        assert!(QueryResources::try_new(1024, 0, spill_root.path()).is_err());
+
+        let file = tempfile::NamedTempFile::new().expect("spill root file");
+        let resources = QueryResources::try_new(16 * 1024 * 1024, 16 * 1024 * 1024, file.path())
+            .expect("valid budgets");
+        let result = QueryEngine::try_with_resources(
+            Arc::new(CountingMeta::default()),
+            Arc::new(LanceEngine::new()),
+            resources,
+        );
+        assert!(matches!(result, Err(QueryError::SpillDirectory { .. })));
+    }
+
+    #[test]
+    fn query_engine_uses_bounded_fair_spill_runtime() {
+        let spill_root = tempfile::tempdir().expect("spill root");
+        let resources =
+            QueryResources::try_new(16 * 1024 * 1024, 16 * 1024 * 1024, spill_root.path())
+                .expect("valid resources");
+        let engine = QueryEngine::try_with_resources(
+            Arc::new(CountingMeta::default()),
+            Arc::new(LanceEngine::new()),
+            resources.clone(),
+        )
+        .expect("bounded Query runtime");
+        let runtime = engine.context().runtime_env();
+
+        assert!(format!("{:?}", runtime.memory_pool).starts_with("FairSpillPool"));
+        assert!(matches!(
+            runtime.memory_pool.memory_limit(),
+            datafusion::execution::memory_pool::MemoryLimit::Finite(limit)
+                if limit == resources.memory_bytes()
+        ));
+        assert_eq!(
+            runtime.disk_manager.max_temp_directory_size(),
+            resources.spill_bytes()
+        );
+        assert!(
+            runtime
+                .disk_manager
+                .temp_dir_paths()
+                .iter()
+                .all(|path| path.starts_with(spill_root.path()))
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_intensive_sort_spills_and_cleans_up() {
+        use datafusion::{
+            arrow::array::StringArray,
+            datasource::MemTable,
+            physical_plan::{ExecutionPlan, collect},
+        };
+
+        fn spill_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
+            let own = plan
+                .metrics()
+                .and_then(|metrics| metrics.spill_count())
+                .unwrap_or(0);
+            own + plan.children().into_iter().map(spill_count).sum::<usize>()
+        }
+
+        let spill_root = tempfile::tempdir().expect("spill root");
+        let resources =
+            QueryResources::try_new(16 * 1024 * 1024, 64 * 1024 * 1024, spill_root.path())
+                .expect("valid resources");
+        let engine = QueryEngine::try_with_resources(
+            Arc::new(CountingMeta::default()),
+            Arc::new(LanceEngine::new()),
+            resources,
+        )
+        .expect("bounded Query runtime");
+        let runtime = engine.context().runtime_env();
+        let context = SessionContext::new_with_config_rt(
+            SessionConfig::new()
+                .with_target_partitions(1)
+                .with_sort_spill_reservation_bytes(512 * 1024),
+            runtime.clone(),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )]));
+        let batches = (0..256)
+            .map(|batch| {
+                let values = (0..1024)
+                    .rev()
+                    .map(|row| format!("{:08}-{}", batch * 1024 + row, "x".repeat(64)))
+                    .collect::<Vec<_>>();
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))])
+                    .expect("input batch")
+            })
+            .collect::<Vec<_>>();
+        context
+            .register_table(
+                "spill_input",
+                Arc::new(MemTable::try_new(schema, vec![batches]).expect("memory table")),
+            )
+            .expect("register input");
+
+        let frame = context
+            .sql("SELECT value FROM spill_input ORDER BY value")
+            .await
+            .expect("plan sort");
+        let plan = frame.create_physical_plan().await.expect("physical sort");
+        let result = collect(plan.clone(), context.task_ctx())
+            .await
+            .expect("external sort");
+        assert_eq!(
+            result.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            256 * 1024
+        );
+        let mut previous = None::<String>;
+        for batch in &result {
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("sorted string column");
+            for value in values.iter().flatten() {
+                if let Some(previous) = previous.as_deref() {
+                    assert!(previous <= value, "sort result must be ordered");
+                }
+                previous = Some(value.to_owned());
+            }
+        }
+        assert!(
+            spill_count(&plan) > 0,
+            "sort must spill under the pool budget"
+        );
+        assert_eq!(runtime.memory_pool.reserved(), 0);
+        assert_eq!(runtime.disk_manager.spilling_progress().current_bytes, 0);
+        assert!(runtime.disk_manager.temp_dir_paths().iter().all(|path| {
+            std::fs::read_dir(path)
+                .expect("read DataFusion spill directory")
+                .next()
+                .is_none()
+        }));
+
+        drop(result);
+        drop(plan);
+        drop(context);
+        drop(engine);
+        drop(runtime);
+        assert!(
+            std::fs::read_dir(spill_root.path())
+                .expect("read spill root")
+                .next()
+                .is_none()
+        );
     }
 }

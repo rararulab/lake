@@ -21,7 +21,7 @@ use lake_query::{QueryEngine, QueryServerConfig};
 
 use super::{
     Context,
-    limits::{query_limits_from_env, shutdown_grace_from_env},
+    limits::{query_limits_from_env, query_resources_from_env, shutdown_grace_from_env},
     security::{
         allow_insecure_from_env, metadata_client_security_from_env, peer_client_security_from_env,
         server_security_from_env,
@@ -41,7 +41,11 @@ async fn query_with_shutdown<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let engine = Arc::new(QueryEngine::new(ctx.meta.clone(), ctx.engine.clone()));
+    let engine = Arc::new(QueryEngine::try_with_resources(
+        ctx.meta.clone(),
+        ctx.engine.clone(),
+        query_resources_from_env()?,
+    )?);
     let config = QueryServerConfig::new()
         .with_metadata(metadata_addr, metadata_client_security_from_env()?)
         .with_managed_stage(ctx.managed_stage().clone())

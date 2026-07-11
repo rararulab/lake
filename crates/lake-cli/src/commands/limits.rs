@@ -14,11 +14,11 @@
 
 //! Startup parsing for immutable Query admission limits.
 
-use std::{str::FromStr, time::Duration};
+use std::{path::PathBuf, str::FromStr, time::Duration};
 
 use anyhow::Context as _;
 use lake_metasrv::DEFAULT_APPEND_OPERATION_RETENTION;
-use lake_query::QueryLimits;
+use lake_query::{QueryLimits, QueryResources};
 
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 const DEFAULT_OPERATION_GC_PAGE_SIZE: usize = 128;
@@ -85,6 +85,40 @@ pub(crate) fn query_limits_from_env() -> anyhow::Result<QueryLimits> {
     )
 }
 
+pub(crate) fn query_resources_from_env() -> anyhow::Result<QueryResources> {
+    let memory_bytes = env_value("LAKE_QUERY_MEMORY_BYTES")?;
+    let spill_bytes = env_value("LAKE_QUERY_SPILL_BYTES")?;
+    let spill_root = env_value("LAKE_QUERY_SPILL_DIR")?;
+    query_resources_from_values(
+        memory_bytes.as_deref(),
+        spill_bytes.as_deref(),
+        spill_root.as_deref(),
+    )
+}
+
+fn query_resources_from_values(
+    memory_bytes: Option<&str>,
+    spill_bytes: Option<&str>,
+    spill_root: Option<&str>,
+) -> anyhow::Result<QueryResources> {
+    let defaults = QueryResources::default();
+    let memory_bytes = parse_or(
+        "LAKE_QUERY_MEMORY_BYTES",
+        memory_bytes,
+        defaults.memory_bytes(),
+    )?;
+    let spill_bytes = parse_or(
+        "LAKE_QUERY_SPILL_BYTES",
+        spill_bytes,
+        defaults.spill_bytes(),
+    )?;
+    let spill_root = spill_root
+        .map(PathBuf::from)
+        .unwrap_or_else(|| defaults.spill_root().to_path_buf());
+    QueryResources::try_new(memory_bytes, spill_bytes, spill_root)
+        .context("invalid Query execution resources")
+}
+
 fn query_limits_from_values(
     max_concurrent: Option<&str>,
     queue_ms: Option<&str>,
@@ -148,7 +182,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        operation_policy_from_values, query_limits_from_values, shutdown_grace_from_value,
+        operation_policy_from_values, query_limits_from_values, query_resources_from_values,
+        shutdown_grace_from_value,
     };
 
     #[test]
@@ -174,6 +209,27 @@ mod tests {
         assert_eq!(limits.queue_wait(), Duration::from_millis(250));
         assert_eq!(limits.execution_time(), Duration::from_secs(5));
         assert_eq!(limits.max_sql_bytes(), 4096);
+    }
+
+    #[test]
+    fn query_resource_values_are_validated_before_serving() {
+        let resources = query_resources_from_values(
+            Some("268435456"),
+            Some("1073741824"),
+            Some("/var/tmp/lake-query-test"),
+        )
+        .expect("valid Query resources");
+        assert_eq!(resources.memory_bytes(), 256 * 1024 * 1024);
+        assert_eq!(resources.spill_bytes(), 1024 * 1024 * 1024);
+        assert_eq!(
+            resources.spill_root(),
+            std::path::Path::new("/var/tmp/lake-query-test")
+        );
+
+        assert!(query_resources_from_values(Some("0"), None, None).is_err());
+        assert!(query_resources_from_values(None, Some("0"), None).is_err());
+        assert!(query_resources_from_values(Some("lots"), None, None).is_err());
+        assert!(query_resources_from_values(None, None, Some("")).is_err());
     }
 
     #[test]
