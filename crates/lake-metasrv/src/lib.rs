@@ -126,6 +126,9 @@ pub enum MetasrvError {
     #[snafu(display("invalid append admission limits: {message}"))]
     InvalidAppendLimits { message: String },
 
+    #[snafu(display("invalid maintenance limits: {message}"))]
+    InvalidMaintenanceLimits { message: String },
+
     #[snafu(display("Metasrv Flight connections did not drain within {grace:?}"))]
     DrainTimeout { grace: Duration },
 
@@ -226,6 +229,50 @@ impl Default for AppendLimits {
     }
 }
 
+/// Immutable cadence and per-tick table-work bound for leader maintenance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaintenanceLimits {
+    interval:        Duration,
+    table_page_size: usize,
+}
+
+impl MaintenanceLimits {
+    /// Validate a positive interval and bounded table page.
+    pub fn try_new(interval: Duration, table_page_size: usize) -> Result<Self> {
+        if interval.is_zero() {
+            return Err(MetasrvError::InvalidMaintenanceLimits {
+                message: "interval must be greater than zero".to_owned(),
+            });
+        }
+        if !(1..=10_000).contains(&table_page_size) {
+            return Err(MetasrvError::InvalidMaintenanceLimits {
+                message: "table_page_size must be within 1..=10000".to_owned(),
+            });
+        }
+        Ok(Self {
+            interval,
+            table_page_size,
+        })
+    }
+
+    /// Delay between leader maintenance ticks.
+    #[must_use]
+    pub const fn interval(&self) -> Duration { self.interval }
+
+    /// Maximum registry candidates handled by one tick.
+    #[must_use]
+    pub const fn table_page_size(&self) -> usize { self.table_page_size }
+}
+
+impl Default for MaintenanceLimits {
+    fn default() -> Self {
+        Self {
+            interval:        Duration::from_mins(1),
+            table_page_size: 128,
+        }
+    }
+}
+
 /// Deterministic post-commit response gate for cross-crate crash tests.
 #[cfg(feature = "test")]
 #[derive(Debug, Default)]
@@ -282,6 +329,7 @@ pub struct MetasrvServerConfig {
     table_placement:    Option<TablePlacement>,
     allow_insecure:     bool,
     append_limits:      AppendLimits,
+    maintenance_limits: MaintenanceLimits,
     shutdown_grace:     Duration,
     #[cfg(feature = "test")]
     append_result_gate: Option<Arc<AppendResultGate>>,
@@ -297,6 +345,7 @@ impl MetasrvServerConfig {
             table_placement: None,
             allow_insecure: false,
             append_limits: AppendLimits::default(),
+            maintenance_limits: MaintenanceLimits::default(),
             shutdown_grace: Duration::from_secs(30),
             #[cfg(feature = "test")]
             append_result_gate: None,
@@ -339,6 +388,13 @@ impl MetasrvServerConfig {
         self
     }
 
+    /// Apply the leader maintenance cadence and per-tick table bound.
+    #[must_use]
+    pub const fn with_maintenance_limits(mut self, limits: MaintenanceLimits) -> Self {
+        self.maintenance_limits = limits;
+        self
+    }
+
     /// Bound how long existing Flight connections may drain during shutdown.
     #[must_use]
     pub const fn with_shutdown_grace(mut self, grace: Duration) -> Self {
@@ -362,15 +418,16 @@ impl Default for MetasrvServerConfig {
 /// The registry authority. Holds the durable metastore and the storage
 /// engine used to materialize new tables.
 struct MetasrvInner {
-    meta:                   MetaStoreRef,
-    engine:                 TableEngineRef,
+    meta:                     MetaStoreRef,
+    engine:                   TableEngineRef,
     /// One coordinator per table. Metadata writes are rare and the catalog's
     /// design ceiling is ~10^4 tables, so retaining these locks is bounded.
-    table_locks:            Mutex<HashMap<TableRef, Arc<Mutex<()>>>>,
-    operation_retention:    Duration,
-    operation_gc_page_size: usize,
-    operation_gc_cursor:    Mutex<Option<String>>,
-    drop_gc_cursor:         Mutex<Option<String>>,
+    table_locks:              Mutex<HashMap<TableRef, Arc<Mutex<()>>>>,
+    operation_retention:      Duration,
+    operation_gc_page_size:   usize,
+    operation_gc_cursor:      Mutex<Option<String>>,
+    drop_gc_cursor:           Mutex<Option<String>>,
+    table_maintenance_cursor: Mutex<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -421,6 +478,7 @@ impl Metasrv {
                 operation_gc_page_size: operation_gc_page_size.max(1),
                 operation_gc_cursor: Mutex::new(None),
                 drop_gc_cursor: Mutex::new(None),
+                table_maintenance_cursor: Mutex::new(None),
             }),
         }
     }
@@ -926,6 +984,7 @@ where
         metasrv.clone(),
         leadership.clone(),
         maintenance_shutdown.clone(),
+        config.maintenance_limits,
     ));
     let campaign = tokio::spawn(run_campaign_loop_until(
         election,

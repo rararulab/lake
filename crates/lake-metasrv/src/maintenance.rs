@@ -24,7 +24,7 @@
 
 use std::{
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use lake_common::TableRef;
@@ -32,21 +32,26 @@ use lake_meta::{MetaError, registry};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Metasrv, MetasrvError,
+    MaintenanceLimits, Metasrv, MetasrvError,
     leadership::Leadership,
     operation::{AppendRecord, AppendState, OPERATION_PREFIX, active_key},
 };
 
-/// How often the maintenance loop wakes to consider a sweep.
-const MAINTENANCE_INTERVAL: Duration = Duration::from_mins(1);
+const DEFAULT_TABLE_MAINTENANCE_PAGE_SIZE: usize = 128;
 
 /// Drive periodic maintenance forever, running a sweep only while `is_leader`.
 ///
-/// Sleeps [`MAINTENANCE_INTERVAL`] between rounds. A round is skipped entirely
-/// unless this node currently holds leadership, so standbys stay idle and only
-/// the leader does housekeeping.
+/// Sleeps for the configured interval between rounds. A round is skipped
+/// entirely unless this node currently holds leadership, so standbys stay idle
+/// and only the leader does housekeeping.
 pub(crate) async fn run_maintenance_loop(metasrv: Arc<Metasrv>, leadership: Arc<Leadership>) {
-    run_maintenance_loop_until(metasrv, leadership, CancellationToken::new()).await;
+    run_maintenance_loop_until(
+        metasrv,
+        leadership,
+        CancellationToken::new(),
+        MaintenanceLimits::default(),
+    )
+    .await;
 }
 
 /// Drive maintenance until shutdown without starting another sweep afterward.
@@ -54,16 +59,17 @@ pub(crate) async fn run_maintenance_loop_until(
     metasrv: Arc<Metasrv>,
     leadership: Arc<Leadership>,
     shutdown: CancellationToken,
+    limits: MaintenanceLimits,
 ) {
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return,
-            () = tokio::time::sleep(MAINTENANCE_INTERVAL) => {}
+            () = tokio::time::sleep(limits.interval()) => {}
         }
         if !leadership.is_leader() {
             continue;
         }
-        sweep_until(&metasrv, &shutdown).await;
+        sweep_until_with_page_size(&metasrv, &shutdown, limits.table_page_size()).await;
     }
 }
 
@@ -76,6 +82,14 @@ pub(crate) async fn sweep(metasrv: &Metasrv) {
 }
 
 async fn sweep_until(metasrv: &Metasrv, shutdown: &CancellationToken) {
+    sweep_until_with_page_size(metasrv, shutdown, DEFAULT_TABLE_MAINTENANCE_PAGE_SIZE).await;
+}
+
+async fn sweep_until_with_page_size(
+    metasrv: &Metasrv,
+    shutdown: &CancellationToken,
+    table_page_size: usize,
+) {
     if shutdown.is_cancelled() {
         return;
     }
@@ -101,102 +115,127 @@ async fn sweep_until(metasrv: &Metasrv, shutdown: &CancellationToken) {
     if shutdown.is_cancelled() {
         return;
     }
-    let namespaces = match metasrv.list_namespaces().await {
-        Ok(namespaces) => namespaces,
-        Err(err) => {
-            tracing::warn!(error = %err, "maintenance sweep: listing namespaces failed");
-            return;
-        }
-    };
+    let tables = sweep_table_page(metasrv, shutdown, table_page_size).await;
+    tracing::debug!(
+        scanned = tables.scanned,
+        attempted = tables.attempted,
+        maintained = tables.maintained,
+        skipped = tables.skipped,
+        failed = tables.failed,
+        "table maintenance page complete"
+    );
+}
 
-    for namespace in namespaces {
+#[derive(Clone, Copy, Debug, Default)]
+struct TableMaintenanceStats {
+    scanned:    usize,
+    attempted:  usize,
+    maintained: usize,
+    skipped:    usize,
+    failed:     usize,
+}
+
+async fn sweep_table_page(
+    metasrv: &Metasrv,
+    shutdown: &CancellationToken,
+    page_size: usize,
+) -> TableMaintenanceStats {
+    let cursor = metasrv.inner.table_maintenance_cursor.lock().await.clone();
+    let page =
+        match registry::scan_tables_page(metasrv.meta().as_ref(), cursor.as_deref(), page_size)
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                tracing::warn!(%error, "table maintenance registry page scan failed");
+                return TableMaintenanceStats::default();
+            }
+        };
+    let (tables, continuation) = page.into_parts();
+    *metasrv.inner.table_maintenance_cursor.lock().await = continuation;
+    let mut stats = TableMaintenanceStats {
+        scanned: tables.len(),
+        ..TableMaintenanceStats::default()
+    };
+    for (table, _scanned_registration) in tables {
         if shutdown.is_cancelled() {
-            return;
+            break;
         }
-        let tables = match metasrv.list_tables(&namespace).await {
-            Ok(tables) => tables,
-            Err(err) => {
-                tracing::warn!(
-                    namespace = %namespace.0,
-                    error = %err,
-                    "maintenance sweep: listing tables failed; skipping namespace"
-                );
+        let _guard = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            guard = metasrv.lock_table(&table) => guard,
+        };
+        if shutdown.is_cancelled() {
+            break;
+        }
+        let registration = match metasrv.resolve(&table).await {
+            Ok(Some(registration)) => registration,
+            Ok(None) => {
+                stats.skipped += 1;
+                continue;
+            }
+            Err(error) => {
+                stats.failed += 1;
+                tracing::warn!(%table, %error, "table maintenance resolve failed");
                 continue;
             }
         };
-
-        for name in tables {
-            if shutdown.is_cancelled() {
-                return;
-            }
-            let table = TableRef::new(namespace.0.clone(), name.0);
-            let _guard = tokio::select! {
-                biased;
-                () = shutdown.cancelled() => return,
-                guard = metasrv.lock_table(&table) => guard,
+        let tombstoned =
+            match crate::drop_tombstone::DropTombstone::new(table.clone(), registration.clone()) {
+                Ok(tombstone) => {
+                    crate::drop_tombstone::exists(metasrv.meta().as_ref(), &tombstone).await
+                }
+                Err(_) => Ok(false),
             };
-            if shutdown.is_cancelled() {
-                return;
+        match tombstoned {
+            Ok(true) => {
+                stats.skipped += 1;
+                tracing::debug!(%table, "maintenance skipped tombstoned table");
+                continue;
             }
-            match metasrv.resolve(&table).await {
-                Ok(Some(reg)) => {
-                    let tombstoned =
-                        match crate::drop_tombstone::DropTombstone::new(table.clone(), reg.clone())
-                        {
-                            Ok(tombstone) => {
-                                crate::drop_tombstone::exists(metasrv.meta().as_ref(), &tombstone)
-                                    .await
-                            }
-                            Err(_) => Ok(false),
-                        };
-                    match tombstoned {
-                        Ok(true) => {
-                            tracing::debug!(%table, "maintenance skipped tombstoned table");
-                            continue;
-                        }
-                        Ok(false) => {}
-                        Err(error) => {
-                            tracing::warn!(%table, %error, "maintenance could not inspect drop tombstone");
-                            continue;
-                        }
+            Ok(false) => {}
+            Err(error) => {
+                stats.failed += 1;
+                tracing::warn!(%table, %error, "maintenance could not inspect drop tombstone");
+                continue;
+            }
+        }
+        stats.attempted += 1;
+        match metasrv
+            .engine()
+            .maintain(&registration.location, registration.current_version)
+            .await
+        {
+            Ok(Some(version)) => {
+                match registry::set_version(metasrv.meta().as_ref(), &table, &registration, version)
+                    .await
+                {
+                    Ok(()) => {
+                        stats.maintained += 1;
+                        tracing::debug!(%table, %version, "maintained table");
                     }
-                    match metasrv
-                        .engine()
-                        .maintain(&reg.location, reg.current_version)
-                        .await
-                    {
-                        Ok(Some(version)) => {
-                            match registry::set_version(
-                                metasrv.meta().as_ref(),
-                                &table,
-                                &reg,
-                                version,
-                            )
-                            .await
-                            {
-                                Ok(()) => tracing::debug!(%table, %version, "maintained table"),
-                                Err(MetaError::Conflict { .. }) => {
-                                    tracing::debug!(%table, %version, "maintenance result lost registry CAS")
-                                }
-                                Err(err) => {
-                                    tracing::warn!(%table, error = %err, "publishing maintenance failed")
-                                }
-                            }
-                        }
-                        Ok(None) => tracing::debug!(%table, "table needs no maintenance"),
-                        Err(err) => {
-                            tracing::warn!(%table, error = %err, "maintenance failed for table");
-                        }
+                    Err(MetaError::Conflict { .. }) => {
+                        stats.skipped += 1;
+                        tracing::debug!(%table, %version, "maintenance result lost registry CAS");
+                    }
+                    Err(error) => {
+                        stats.failed += 1;
+                        tracing::warn!(%table, %error, "publishing maintenance failed");
                     }
                 }
-                // Dropped between listing and resolve — nothing to maintain.
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!(%table, error = %err, "maintenance sweep: resolve failed");
-                }
+            }
+            Ok(None) => {
+                stats.skipped += 1;
+                tracing::debug!(%table, "table needs no maintenance");
+            }
+            Err(error) => {
+                stats.failed += 1;
+                tracing::warn!(%table, %error, "maintenance failed for table");
             }
         }
     }
+    stats
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -427,9 +466,12 @@ async fn delete_operation_record(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        sync::{
+            Arc, Mutex as StdMutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
 
     use async_trait::async_trait;
@@ -450,7 +492,9 @@ mod tests {
         TableEngineRef, TableHandleRef,
     };
     use lake_engine_lance::LanceEngine;
-    use lake_meta::{MetaStoreRef, RocksMeta, registry::TableRegistration};
+    use lake_meta::{
+        MetaScanPage, MetaStore, MetaStoreRef, RocksMeta, registry::TableRegistration,
+    };
 
     use super::*;
     use crate::operation::operation_key;
@@ -465,6 +509,62 @@ mod tests {
         calls:   AtomicUsize,
         started: Arc<tokio::sync::Notify>,
         resume:  Arc<tokio::sync::Notify>,
+    }
+
+    struct CountingMaintenanceEngine {
+        calls:     AtomicUsize,
+        locations: StdMutex<Vec<TableLocation>>,
+    }
+
+    struct RecordingScanMeta {
+        inner:        MetaStoreRef,
+        list_calls:   AtomicUsize,
+        page_calls:   AtomicUsize,
+        get_calls:    AtomicUsize,
+        page_scanned: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[async_trait]
+    impl MetaStore for RecordingScanMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(key).await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn scan_prefix_page(
+            &self,
+            prefix: &str,
+            continuation: Option<&str>,
+            limit: usize,
+        ) -> lake_meta::Result<MetaScanPage> {
+            self.page_calls.fetch_add(1, Ordering::SeqCst);
+            let page = self
+                .inner
+                .scan_prefix_page(prefix, continuation, limit)
+                .await?;
+            if let Some(scanned) = &self.page_scanned {
+                scanned.notify_one();
+            }
+            Ok(page)
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
+        }
     }
 
     #[async_trait]
@@ -551,6 +651,45 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl TableEngine for CountingMaintenanceEngine {
+        fn kind(&self) -> &'static str { "test" }
+
+        async fn create(
+            &self,
+            _location: &TableLocation,
+            _schema: SchemaRef,
+        ) -> EngineResult<TableHandleRef> {
+            panic!("create is not used by paged maintenance test")
+        }
+
+        async fn open(&self, _location: &TableLocation) -> EngineResult<Option<TableHandleRef>> {
+            panic!("open is not used by paged maintenance test")
+        }
+
+        async fn remove(&self, _location: &TableLocation) -> EngineResult<()> {
+            panic!("remove is not used by paged maintenance test")
+        }
+
+        async fn maintain(
+            &self,
+            location: &TableLocation,
+            _version: Version,
+        ) -> EngineResult<Option<Version>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.locations.lock().unwrap().push(location.clone());
+            Ok(None)
+        }
+
+        async fn retained_object_references(
+            &self,
+            _location: &TableLocation,
+            _request: ObjectReferenceRequest,
+        ) -> EngineResult<ObjectReferencePage> {
+            panic!("reference enumeration is not used by paged maintenance test")
+        }
+    }
+
     fn batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("ep", DataType::Int64, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap()
@@ -611,6 +750,119 @@ mod tests {
             .unwrap();
 
         assert_eq!(engine.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn table_maintenance_pages_resume_without_full_registry_sweep() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let inner: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let recording = Arc::new(RecordingScanMeta {
+            inner,
+            list_calls: AtomicUsize::new(0),
+            page_calls: AtomicUsize::new(0),
+            get_calls: AtomicUsize::new(0),
+            page_scanned: None,
+        });
+        let meta: MetaStoreRef = recording.clone();
+        for index in 0..3 {
+            let table = TableRef::new("robots", format!("episodes-{index}"));
+            let registration = TableRegistration::new(
+                TableLocation::new(format!("mem://episodes-{index}")),
+                "test",
+                Version(1),
+                vec![1],
+            );
+            lake_meta::registry::register(meta.as_ref(), &table, &registration)
+                .await
+                .unwrap();
+        }
+        let engine = Arc::new(CountingMaintenanceEngine {
+            calls:     AtomicUsize::new(0),
+            locations: StdMutex::new(Vec::new()),
+        });
+        let metasrv = Metasrv::new(meta, engine.clone());
+        let shutdown = CancellationToken::new();
+
+        let first = sweep_table_page(&metasrv, &shutdown, 2).await;
+        assert_eq!(first.scanned, 2);
+        assert_eq!(first.attempted, 2);
+        assert_eq!(engine.calls.load(Ordering::SeqCst), 2);
+
+        let second = sweep_table_page(&metasrv, &shutdown, 2).await;
+        assert_eq!(second.scanned, 1);
+        assert_eq!(second.attempted, 1);
+        assert_eq!(engine.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(recording.page_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(recording.list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            recording.get_calls.load(Ordering::SeqCst),
+            6,
+            "one current registration and one tombstone point-read per candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn table_maintenance_reresolves_after_scanned_generation_changes() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let inner: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let page_scanned = Arc::new(tokio::sync::Notify::new());
+        let recording = Arc::new(RecordingScanMeta {
+            inner,
+            list_calls: AtomicUsize::new(0),
+            page_calls: AtomicUsize::new(0),
+            get_calls: AtomicUsize::new(0),
+            page_scanned: Some(page_scanned.clone()),
+        });
+        let meta: MetaStoreRef = recording.clone();
+        let table = TableRef::new("robots", "episodes");
+        let old = TableRegistration::new(
+            TableLocation::new("mem://old-generation"),
+            "test",
+            Version(1),
+            vec![1],
+        );
+        lake_meta::registry::register(meta.as_ref(), &table, &old)
+            .await
+            .unwrap();
+        let engine = Arc::new(CountingMaintenanceEngine {
+            calls:     AtomicUsize::new(0),
+            locations: StdMutex::new(Vec::new()),
+        });
+        let metasrv = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
+        let table_guard = metasrv.lock_table(&table).await;
+        let shutdown = CancellationToken::new();
+        let sweep = tokio::spawn({
+            let metasrv = metasrv.clone();
+            let shutdown = shutdown.clone();
+            async move { sweep_table_page(&metasrv, &shutdown, 1).await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), page_scanned.notified())
+            .await
+            .expect("old generation is scanned before lock acquisition");
+        lake_meta::registry::delete(meta.as_ref(), &table, &old)
+            .await
+            .unwrap();
+        let replacement = TableRegistration::new(
+            TableLocation::new("mem://replacement-generation"),
+            "test",
+            Version(1),
+            vec![1],
+        );
+        lake_meta::registry::register(meta.as_ref(), &table, &replacement)
+            .await
+            .unwrap();
+        drop(table_guard);
+
+        let stats = tokio::time::timeout(Duration::from_secs(1), sweep)
+            .await
+            .expect("maintenance finishes after replacement")
+            .unwrap();
+        assert_eq!(stats.attempted, 1);
+        assert_eq!(
+            *engine.locations.lock().unwrap(),
+            vec![replacement.location]
+        );
     }
 
     #[tokio::test]

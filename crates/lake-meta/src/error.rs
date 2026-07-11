@@ -51,6 +51,9 @@ pub enum MetaError {
 
     #[snafu(display("metadata mutation requires a live lease guard"))]
     MutationGuardUnavailable,
+
+    #[snafu(display("registry scan limit must be greater than zero"))]
+    InvalidScanLimit,
 }
 
 pub type Result<T> = std::result::Result<T, MetaError>;

@@ -33,6 +33,9 @@ write path — create tables, resolve/list, and the append commit protocol.
 - Shutdown has one finite process deadline covering Flight drain, maintenance,
   and leadership-campaign cleanup. Maintenance stops at table boundaries;
   unfinished owned tasks are aborted and reaped at the deadline.
+- Leader table maintenance reads one bounded registry page per configured tick,
+  resumes from an opaque process-local cursor, and re-resolves each candidate
+  under its table lock before touching the engine.
 
 ## Layout
 
