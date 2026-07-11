@@ -129,6 +129,9 @@ pub enum MetasrvError {
     #[snafu(display("Metasrv Flight connections did not drain within {grace:?}"))]
     DrainTimeout { grace: Duration },
 
+    #[snafu(display("Metasrv background tasks did not stop within {grace:?}"))]
+    BackgroundDrainTimeout { grace: Duration },
+
     #[snafu(display("Metasrv background task '{task}' failed"))]
     BackgroundTask {
         task:   &'static str,
@@ -847,6 +850,36 @@ where
     serve_with_config_and_termination(metasrv, addr, config, shutdown, false).await
 }
 
+async fn join_background_tasks_until(
+    mut maintenance: tokio::task::JoinHandle<()>,
+    mut campaign: tokio::task::JoinHandle<()>,
+    deadline: tokio::time::Instant,
+    grace: Duration,
+) -> Result<()> {
+    let joined = tokio::time::timeout_at(deadline, async {
+        let (maintenance, campaign) = tokio::join!(&mut maintenance, &mut campaign);
+        maintenance.map_err(|source| MetasrvError::BackgroundTask {
+            task: "maintenance",
+            source,
+        })?;
+        campaign.map_err(|source| MetasrvError::BackgroundTask {
+            task: "leadership-campaign",
+            source,
+        })?;
+        Ok(())
+    })
+    .await;
+    match joined {
+        Ok(result) => result,
+        Err(_) => {
+            maintenance.abort();
+            campaign.abort();
+            let _ = tokio::join!(maintenance, campaign);
+            Err(MetasrvError::BackgroundDrainTimeout { grace })
+        }
+    }
+}
+
 /// Run until `crash` fires, then drop RPCs and campaigns without resigning.
 ///
 /// This test-only entry point models process death: the durable lease remains
@@ -929,15 +962,18 @@ where
     );
     let mut shutdown = Box::pin(shutdown);
 
+    let mut shutdown_deadline = None;
     let server_result = tokio::select! {
         result = server.as_mut() => result.context(ServeSnafu),
         () = shutdown.as_mut() => {
+            let deadline = tokio::time::Instant::now() + config.shutdown_grace;
+            shutdown_deadline = Some(deadline);
             maintenance_shutdown.cancel();
             server_shutdown.cancel();
             if crash {
                 Ok(())
             } else {
-                match tokio::time::timeout(config.shutdown_grace, server.as_mut()).await {
+                match tokio::time::timeout_at(deadline, server.as_mut()).await {
                     Ok(result) => result.context(ServeSnafu),
                     Err(_) => Err(MetasrvError::DrainTimeout { grace: config.shutdown_grace }),
                 }
@@ -957,27 +993,24 @@ where
     }
     maintenance_shutdown.cancel();
     campaign_shutdown.cancel();
-    let maintenance_result = maintenance
-        .await
-        .map_err(|source| MetasrvError::BackgroundTask {
-            task: "maintenance",
-            source,
-        });
-    let campaign_result = campaign
-        .await
-        .map_err(|source| MetasrvError::BackgroundTask {
-            task: "leadership-campaign",
-            source,
-        });
+    let cleanup_deadline =
+        shutdown_deadline.unwrap_or_else(|| tokio::time::Instant::now() + config.shutdown_grace);
+    let background_result = join_background_tasks_until(
+        maintenance,
+        campaign,
+        cleanup_deadline,
+        config.shutdown_grace,
+    )
+    .await;
     server_result?;
-    maintenance_result?;
-    campaign_result?;
+    background_result?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        future::pending,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -1798,6 +1831,43 @@ mod tests {
         assert_eq!(recording.ordinary_cas.load(Ordering::SeqCst), 0);
         assert_eq!(recording.ordinary_delete.load(Ordering::SeqCst), 0);
         assert!(authority.resolve(&table).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn background_shutdown_aborts_owned_tasks_at_total_deadline() {
+        let maintenance_resource = Arc::new(());
+        let campaign_resource = Arc::new(());
+        let maintenance = tokio::spawn({
+            let resource = maintenance_resource.clone();
+            async move {
+                pending::<()>().await;
+                drop(resource);
+            }
+        });
+        let campaign = tokio::spawn({
+            let resource = campaign_resource.clone();
+            async move {
+                pending::<()>().await;
+                drop(resource);
+            }
+        });
+        let grace = Duration::from_millis(20);
+
+        let error = join_background_tasks_until(
+            maintenance,
+            campaign,
+            tokio::time::Instant::now() + grace,
+            grace,
+        )
+        .await
+        .expect_err("stuck owned tasks must time out");
+
+        assert!(matches!(
+            error,
+            MetasrvError::BackgroundDrainTimeout { grace: actual } if actual == grace
+        ));
+        assert_eq!(Arc::strong_count(&maintenance_resource), 1);
+        assert_eq!(Arc::strong_count(&campaign_resource), 1);
     }
 
     #[tokio::test]
