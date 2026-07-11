@@ -23,7 +23,7 @@ mod engine;
 mod error;
 
 pub use engine::{
-    ObjectReferenceCursor, ObjectReferencePage, ObjectReferenceRequest, TableEngine,
-    TableEngineRef, TableHandle, TableHandleRef,
+    MAX_REFERENCE_PAGE_DELTAS, ObjectReferenceCursor, ObjectReferencePage, ObjectReferenceRequest,
+    TableEngine, TableEngineRef, TableHandle, TableHandleRef,
 };
 pub use error::{EngineError, Result};

@@ -28,7 +28,7 @@ pub enum EngineError {
     #[snafu(display("schema mismatch on append to {}", location.0))]
     SchemaMismatch { location: TableLocation },
 
-    #[snafu(display("object reference page size must be positive; got {size}"))]
+    #[snafu(display("object reference page size is outside the supported bound: {size}"))]
     InvalidReferencePageSize { size: usize },
 
     #[snafu(display("object reference lineage is unavailable for {}: {reason}", location.0))]

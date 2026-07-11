@@ -49,6 +49,8 @@ pub struct ObjectReferenceDelta {
     format_version: u16,
     parent_version: Version,
     table_version:  Version,
+    chunk_index:    u32,
+    chunk_count:    u32,
     added:          Vec<ObjectIdentity>,
     removed:        Vec<ObjectIdentity>,
 }
@@ -69,6 +71,9 @@ pub enum ObjectReferenceError {
     #[snafu(display("object identity '{uri}' is both added and removed"))]
     ConflictingIdentity { uri: String },
 
+    #[snafu(display("object reference chunk {index} is invalid for chunk count {count}"))]
+    InvalidChunk { index: u32, count: u32 },
+
     #[snafu(display("object reference delta is not canonically ordered"))]
     NonCanonical,
 }
@@ -80,10 +85,27 @@ impl ObjectReferenceDelta {
         added: Vec<ObjectIdentity>,
         removed: Vec<ObjectIdentity>,
     ) -> Result<Self, ObjectReferenceError> {
+        Self::try_new_chunk(parent_version, table_version, 0, 1, added, removed)
+    }
+
+    pub fn try_new_chunk(
+        parent_version: Version,
+        table_version: Version,
+        chunk_index: u32,
+        chunk_count: u32,
+        added: Vec<ObjectIdentity>,
+        removed: Vec<ObjectIdentity>,
+    ) -> Result<Self, ObjectReferenceError> {
         if parent_version >= table_version {
             return Err(ObjectReferenceError::InvalidVersionEdge {
                 parent: parent_version,
                 child:  table_version,
+            });
+        }
+        if chunk_count == 0 || chunk_index >= chunk_count {
+            return Err(ObjectReferenceError::InvalidChunk {
+                index: chunk_index,
+                count: chunk_count,
             });
         }
         let added = added.into_iter().collect::<BTreeSet<_>>();
@@ -97,6 +119,8 @@ impl ObjectReferenceDelta {
             format_version: FORMAT_VERSION,
             parent_version,
             table_version,
+            chunk_index,
+            chunk_count,
             added: added.into_iter().collect(),
             removed: removed.into_iter().collect(),
         })
@@ -105,6 +129,10 @@ impl ObjectReferenceDelta {
     pub fn parent_version(&self) -> Version { self.parent_version }
 
     pub fn table_version(&self) -> Version { self.table_version }
+
+    pub fn chunk_index(&self) -> u32 { self.chunk_index }
+
+    pub fn chunk_count(&self) -> u32 { self.chunk_count }
 
     pub fn added(&self) -> &[ObjectIdentity] { &self.added }
 
@@ -123,9 +151,11 @@ impl ObjectReferenceDelta {
                 supported: FORMAT_VERSION,
             });
         }
-        let canonical = Self::try_new(
+        let canonical = Self::try_new_chunk(
             wire.parent_version,
             wire.table_version,
+            wire.chunk_index,
+            wire.chunk_count,
             wire.added.clone(),
             wire.removed.clone(),
         )?;
@@ -192,6 +222,29 @@ mod tests {
         assert!(matches!(
             ObjectReferenceDelta::decode(b"not-json"),
             Err(ObjectReferenceError::Corrupt { .. })
+        ));
+
+        let chunk = ObjectReferenceDelta::try_new_chunk(
+            Version(8),
+            Version(9),
+            1,
+            3,
+            vec![object("s3://lake/objects/chunk", "cc")],
+            Vec::new(),
+        )
+        .expect("valid bounded chunk");
+        assert_eq!(chunk.chunk_index(), 1);
+        assert_eq!(chunk.chunk_count(), 3);
+        assert!(matches!(
+            ObjectReferenceDelta::try_new_chunk(
+                Version(8),
+                Version(9),
+                3,
+                3,
+                Vec::new(),
+                Vec::new(),
+            ),
+            Err(ObjectReferenceError::InvalidChunk { index: 3, count: 3 })
         ));
     }
 }

@@ -20,12 +20,13 @@ use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::SchemaRef, catalog::TableProvider, execution::SendableRecordBatchStream,
 };
-use lake_common::{ObjectIdentity, TableLocation, Version};
+use lake_common::{ObjectReferenceDelta, TableLocation, Version};
 
 use crate::error::{EngineError, Result};
 
 pub type TableEngineRef = Arc<dyn TableEngine>;
 pub type TableHandleRef = Arc<dyn TableHandle>;
+pub const MAX_REFERENCE_PAGE_DELTAS: usize = 1_024;
 
 /// Opaque continuation owned and interpreted by one engine implementation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,7 +54,7 @@ impl ObjectReferenceRequest {
         cursor: Option<ObjectReferenceCursor>,
         limit: usize,
     ) -> Result<Self> {
-        if limit == 0 {
+        if limit == 0 || limit > MAX_REFERENCE_PAGE_DELTAS {
             return Err(EngineError::InvalidReferencePageSize { size: limit });
         }
         Ok(Self {
@@ -76,21 +77,24 @@ impl ObjectReferenceRequest {
 /// One deterministic page of live managed-object identities.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObjectReferencePage {
-    objects:     Vec<ObjectIdentity>,
+    deltas:      Vec<ObjectReferenceDelta>,
     next_cursor: Option<ObjectReferenceCursor>,
 }
 
 impl ObjectReferencePage {
     #[must_use]
-    pub fn new(objects: Vec<ObjectIdentity>, next_cursor: Option<ObjectReferenceCursor>) -> Self {
+    pub fn new(
+        deltas: Vec<ObjectReferenceDelta>,
+        next_cursor: Option<ObjectReferenceCursor>,
+    ) -> Self {
         Self {
-            objects,
+            deltas,
             next_cursor,
         }
     }
 
     #[must_use]
-    pub fn objects(&self) -> &[ObjectIdentity] { &self.objects }
+    pub fn deltas(&self) -> &[ObjectReferenceDelta] { &self.deltas }
 
     #[must_use]
     pub fn next_cursor(&self) -> Option<&ObjectReferenceCursor> { self.next_cursor.as_ref() }
@@ -169,6 +173,10 @@ mod tests {
             ObjectReferenceRequest::try_new(Version(7), None, 0),
             Err(EngineError::InvalidReferencePageSize { size: 0 })
         ));
+        assert!(matches!(
+            ObjectReferenceRequest::try_new(Version(7), None, 1_025),
+            Err(EngineError::InvalidReferencePageSize { size: 1_025 })
+        ));
         let request = ObjectReferenceRequest::try_new(
             Version(7),
             Some(ObjectReferenceCursor::new("v7:page-2")),
@@ -178,5 +186,20 @@ mod tests {
         assert_eq!(request.root_version(), Version(7));
         assert_eq!(request.limit(), 512);
         assert_eq!(request.cursor().unwrap().as_str(), "v7:page-2");
+
+        let delta = ObjectReferenceDelta::try_new(
+            Version(7),
+            Version(8),
+            vec![lake_common::ObjectIdentity {
+                uri:          "s3://lake/objects/a".to_owned(),
+                content_type: "video/mp4".to_owned(),
+                size_bytes:   1,
+                sha256:       "aa".to_owned(),
+            }],
+            Vec::new(),
+        )
+        .unwrap();
+        let page = ObjectReferencePage::new(vec![delta.clone()], None);
+        assert_eq!(page.deltas(), &[delta]);
     }
 }

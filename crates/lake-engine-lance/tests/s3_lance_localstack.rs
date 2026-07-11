@@ -53,7 +53,7 @@ use datafusion::{
     physical_plan::stream::RecordBatchStreamAdapter,
     prelude::SessionContext,
 };
-use lake_common::TableLocation;
+use lake_common::{ObjectReferenceDelta, TableLocation};
 use lake_engine::TableEngine;
 use lake_engine_lance::LanceEngine;
 use lake_meta::{DynamoMeta, MetaStoreRef};
@@ -185,6 +185,21 @@ async fn lance_engine_on_s3_with_dynamo_external_manifest() {
         appended.0 > 1,
         "append advances the version (got {appended})"
     );
+    let journal = s3
+        .get_object()
+        .bucket(&bucket)
+        .key(format!("ns/tbl/_lake/object_refs/{}/0.json", appended.0))
+        .send()
+        .await
+        .expect("append reference journal exists on S3")
+        .body
+        .collect()
+        .await
+        .expect("read append reference journal")
+        .into_bytes();
+    let journal = ObjectReferenceDelta::decode(&journal).expect("valid S3 reference journal");
+    assert_eq!(journal.table_version(), appended);
+    assert!(journal.added().is_empty(), "Int64 rows contain no FILEs");
 
     // 6. Reopen through the engine and read back via DataFusion.
     let reopened = engine
