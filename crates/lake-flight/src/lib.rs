@@ -238,6 +238,7 @@ pub struct ClientSecurity {
     bearer:      Option<BearerToken>,
     ca:          Option<Certificate>,
     server_name: Option<String>,
+    use_tls:     bool,
 }
 
 impl ClientSecurity {
@@ -248,6 +249,7 @@ impl ClientSecurity {
             bearer:      None,
             ca:          None,
             server_name: None,
+            use_tls:     false,
         }
     }
 
@@ -261,6 +263,7 @@ impl ClientSecurity {
     #[must_use]
     pub fn with_ca_certificate_pem(mut self, certificate: Vec<u8>) -> Self {
         self.ca = Some(Certificate::from_pem(certificate));
+        self.use_tls = true;
         self
     }
 
@@ -268,7 +271,22 @@ impl ClientSecurity {
     #[must_use]
     pub fn with_server_name(mut self, server_name: impl Into<String>) -> Self {
         self.server_name = Some(server_name.into());
+        self.use_tls = true;
         self
+    }
+
+    /// Require TLS using the enabled public trust roots.
+    #[must_use]
+    pub const fn with_tls(mut self) -> Self {
+        self.use_tls = true;
+        self
+    }
+
+    /// Build a full endpoint URI from a discovered host-and-port authority.
+    #[must_use]
+    pub fn endpoint_for_authority(&self, authority: &str) -> String {
+        let scheme = if self.use_tls { "https" } else { "http" };
+        format!("{scheme}://{authority}")
     }
 
     /// Build the tonic endpoint shared by eager and lazy connections.
@@ -276,7 +294,7 @@ impl ClientSecurity {
         let endpoint = Endpoint::from_shared(endpoint.into())
             .map_err(|source| FlightSecurityError::InvalidEndpoint { source })?;
         let is_https = endpoint.uri().scheme_str() == Some("https");
-        if !is_https && (self.ca.is_some() || self.server_name.is_some()) {
+        if !is_https && self.use_tls {
             return Err(FlightSecurityError::TlsRequiresHttps);
         }
         let endpoint = if is_https {
@@ -346,6 +364,7 @@ impl fmt::Debug for ClientSecurity {
             .field("authenticated", &self.bearer.is_some())
             .field("custom_ca", &self.ca.is_some())
             .field("server_name", &self.server_name)
+            .field("tls", &self.use_tls)
             .finish()
     }
 }

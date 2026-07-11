@@ -47,11 +47,12 @@ use futures::{Stream, StreamExt};
 use lake_common::{
     FILE_APPEND_TYPE_URL, FileAppendRequest, Namespace, TableLocation, TableRef, Version,
 };
+use lake_flight::ClientSecurity;
 use lake_objects::data_location_field;
 use prost::Message;
 use prost_types::Any;
 use serde::{Serialize, de::DeserializeOwned};
-use tonic::{Request, Response, Status, Streaming, transport::Channel};
+use tonic::{Request, Response, Status, Streaming};
 
 use crate::{Metasrv, leadership::Leadership};
 
@@ -112,12 +113,14 @@ where
 /// [`Leadership`] flag it gates writes on.
 pub(crate) struct MetasrvFlightService {
     /// The registry authority every action dispatches to.
-    pub(crate) metasrv:    Arc<Metasrv>,
+    pub(crate) metasrv:       Arc<Metasrv>,
     /// The shared leadership state consulted before serving a write.
-    pub(crate) leadership: Arc<Leadership>,
+    pub(crate) leadership:    Arc<Leadership>,
     /// This node's own Flight address, used to tell "the leader is me" apart
     /// from "forward to another node" when the leader flag is briefly stale.
-    pub(crate) own_addr:   String,
+    pub(crate) own_addr:      String,
+    /// TLS and service identity for forwarding writes to the elected leader.
+    pub(crate) peer_security: ClientSecurity,
 }
 
 /// `create_table` action body: the table to materialize and register.
@@ -211,13 +214,17 @@ impl MetasrvFlightService {
     /// Forward `action` to the leader at `addr` over Flight `DoAction`,
     /// relaying its streamed result as this call's response.
     async fn forward(&self, addr: &str, action: &Action) -> Result<Response<ActionStream>, Status> {
-        let channel = Channel::from_shared(format!("http://{addr}"))
-            .map_err(|e| Status::unavailable(format!("invalid leader address '{addr}': {e}")))?
-            .connect()
+        let endpoint = self.peer_security.endpoint_for_authority(addr);
+        let channel = self
+            .peer_security
+            .connect(endpoint)
             .await
             .map_err(|e| Status::unavailable(format!("cannot reach leader '{addr}': {e}")))?;
         let mut client = FlightServiceClient::new(channel);
-        let response = client.do_action(Request::new(action.clone())).await?;
+        let request = self
+            .peer_security
+            .authorize_request(Request::new(action.clone()));
+        let response = client.do_action(request).await?;
         let stream: ActionStream = Box::pin(response.into_inner());
         Ok(Response::new(stream))
     }
@@ -227,12 +234,16 @@ impl MetasrvFlightService {
         addr: &str,
         input: Streaming<FlightData>,
     ) -> Result<Response<BoxStream<PutResult>>, Status> {
-        let channel = Channel::from_shared(format!("http://{addr}"))
-            .map_err(|error| Status::unavailable(error.to_string()))?
-            .connect()
+        let endpoint = self.peer_security.endpoint_for_authority(addr);
+        let channel = self
+            .peer_security
+            .connect(endpoint)
             .await
             .map_err(|error| Status::unavailable(error.to_string()))?;
         let mut client = FlightClient::new(channel);
+        self.peer_security
+            .apply_to_flight_client(&mut client)
+            .map_err(|error| Status::internal(error.to_string()))?;
         let results = client
             .do_put(input.map(|item| {
                 item.map_err(|error| arrow_flight::error::FlightError::protocol(error.to_string()))

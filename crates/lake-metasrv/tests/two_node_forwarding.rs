@@ -43,14 +43,16 @@ use futures::{StreamExt, TryStreamExt};
 use lake_common::{FILE_APPEND_TYPE_URL, FileAppendRequest, TableRef};
 use lake_engine::TableEngineRef;
 use lake_engine_lance::LanceEngine;
+use lake_flight::{ClientSecurity, ServerSecurity};
 use lake_meta::{MetaStoreRef, RocksMeta, registry};
 use lake_metasrv::{
-    Metasrv,
+    Metasrv, MetasrvServerConfig,
     election::{LEASE_KEY, LeaseValue},
-    serve,
+    serve, serve_with_config,
 };
 use prost::Message;
 use prost_types::Any;
+use rcgen::generate_simple_self_signed;
 use serde_json::json;
 use tonic::{Code, Request, Status, transport::Channel};
 
@@ -273,5 +275,107 @@ async fn follower_forwards_write_to_leader() {
     assert!(
         reg_after.is_none(),
         "robots.arm still registered after a forwarded drop_table"
+    );
+}
+
+async fn secure_do_action(
+    addr: &str,
+    security: &ClientSecurity,
+    r#type: &str,
+    body: serde_json::Value,
+) -> Result<(), Status> {
+    let endpoint = security.endpoint_for_authority(addr);
+    let channel = security
+        .connect(endpoint)
+        .await
+        .map_err(|error| Status::unavailable(error.to_string()))?;
+    let mut client = FlightServiceClient::new(channel);
+    let action = Action {
+        r#type: r#type.to_owned(),
+        body:   serde_json::to_vec(&body).expect("encode body").into(),
+    };
+    let response = client
+        .do_action(security.authorize_request(Request::new(action)))
+        .await?;
+    response.into_inner().try_collect::<Vec<_>>().await?;
+    Ok(())
+}
+
+async fn wait_secure_serving(addr: &str, security: &ClientSecurity) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if secure_do_action(addr, security, "list_namespaces", json!(null))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "secured server {addr} did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn secured_follower_forwards_with_peer_identity() {
+    let credential = "metasrv-peer-credential";
+    let certified =
+        generate_simple_self_signed(vec!["localhost".to_owned()]).expect("test identity");
+    let certificate = certified.cert.pem();
+    let private_key = certified.key_pair.serialize_pem();
+    let server_security = ServerSecurity::with_bearer_token(credential)
+        .expect("bearer")
+        .with_tls_identity_pem(certificate.as_bytes(), private_key.as_bytes());
+    let client_security = ClientSecurity::new()
+        .with_ca_certificate_pem(certificate.as_bytes().to_vec())
+        .with_server_name("localhost")
+        .with_bearer_token(credential)
+        .expect("client bearer");
+
+    let meta_dir = tempfile::tempdir().expect("meta tempdir");
+    let table_dir = tempfile::tempdir().expect("table tempdir");
+    let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).expect("open RocksMeta"));
+    let engine: TableEngineRef = Arc::new(LanceEngine::with_manifest_store(meta.clone()));
+    let addr_a = free_addr();
+    let addr_b = free_addr();
+
+    for (node, addr) in [
+        (
+            Arc::new(Metasrv::new(meta.clone(), engine.clone())),
+            addr_a.clone(),
+        ),
+        (
+            Arc::new(Metasrv::new(meta.clone(), engine.clone())),
+            addr_b.clone(),
+        ),
+    ] {
+        let config = MetasrvServerConfig::new()
+            .with_server_security(server_security.clone())
+            .with_peer_security(client_security.clone());
+        tokio::spawn(async move { serve_with_config(node, &addr, config).await });
+    }
+
+    wait_secure_serving(&addr_a, &client_security).await;
+    wait_secure_serving(&addr_b, &client_security).await;
+    let leader = wait_for_leader(&meta, &[&addr_a, &addr_b]).await;
+    let follower = if leader == addr_a { &addr_b } else { &addr_a };
+    let location = format!("{}/robots/secure-arm.lance", table_dir.path().display());
+    let body = json!({
+        "namespace": "robots",
+        "name": "secure_arm",
+        "columns": ["ts:i64", "reward:f64"],
+        "location": location,
+    });
+
+    secure_do_action(follower, &client_security, "create_table", body)
+        .await
+        .expect("secured follower forwards to leader");
+    assert!(
+        registry::get(meta.as_ref(), &TableRef::new("robots", "secure_arm"))
+            .await
+            .expect("registry")
+            .is_some()
     );
 }

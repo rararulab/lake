@@ -39,6 +39,7 @@ use datafusion::{arrow::datatypes::SchemaRef, execution::SendableRecordBatchStre
 use lake_catalog::create_table;
 use lake_common::{Namespace, TableLocation, TableName, TableRef, Version};
 use lake_engine::TableEngineRef;
+use lake_flight::{ClientSecurity, ServerSecurity};
 use lake_meta::{MetaStoreRef, registry, registry::TableRegistration};
 use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -74,9 +75,60 @@ pub enum MetasrvError {
 
     #[snafu(display("metasrv control plane server failed"))]
     Serve { source: tonic::transport::Error },
+
+    #[snafu(display("invalid Flight security configuration"))]
+    Security {
+        source: lake_flight::FlightSecurityError,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, MetasrvError>;
+
+/// Network security for one Metasrv node and its follower-to-leader hop.
+#[derive(Clone, Debug)]
+pub struct MetasrvServerConfig {
+    server_security: ServerSecurity,
+    peer_security:   ClientSecurity,
+    allow_insecure:  bool,
+}
+
+impl MetasrvServerConfig {
+    /// Explicit loopback development configuration.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            server_security: ServerSecurity::insecure(),
+            peer_security:   ClientSecurity::new(),
+            allow_insecure:  false,
+        }
+    }
+
+    /// Authenticate inbound RPCs and optionally enable server TLS.
+    #[must_use]
+    pub fn with_server_security(mut self, security: ServerSecurity) -> Self {
+        self.server_security = security;
+        self
+    }
+
+    /// Configure TLS and service identity for follower forwarding.
+    #[must_use]
+    pub fn with_peer_security(mut self, security: ClientSecurity) -> Self {
+        self.peer_security = security;
+        self
+    }
+
+    /// Explicit deployment escape hatch when a trusted proxy terminates both
+    /// TLS and authentication before Lake.
+    #[must_use]
+    pub const fn allow_insecure(mut self, allow: bool) -> Self {
+        self.allow_insecure = allow;
+        self
+    }
+}
+
+impl Default for MetasrvServerConfig {
+    fn default() -> Self { Self::new() }
+}
 
 /// The registry authority. Holds the durable metastore and the storage
 /// engine used to materialize new tables.
@@ -222,6 +274,15 @@ impl Metasrv {
 /// enough per instance in dev. Runs until the server stops or the process is
 /// killed.
 pub async fn serve(metasrv: Arc<Metasrv>, addr: &str) -> Result<()> {
+    serve_with_config(metasrv, addr, MetasrvServerConfig::new()).await
+}
+
+/// Run Metasrv with explicit inbound and peer Flight security.
+pub async fn serve_with_config(
+    metasrv: Arc<Metasrv>,
+    addr: &str,
+    config: MetasrvServerConfig,
+) -> Result<()> {
     let election = LeaseElection::new(metasrv.meta().clone(), addr, Duration::from_secs(10));
     let leadership = Arc::new(Leadership::new());
     // The maintenance sweep gates on the same deadline-aware leadership state
@@ -233,14 +294,26 @@ pub async fn serve(metasrv: Arc<Metasrv>, addr: &str) -> Result<()> {
         metasrv,
         leadership,
         own_addr: addr.to_string(),
+        peer_security: config.peer_security,
     };
 
     let socket = addr.parse().context(AddressSnafu { addr })?;
+    config
+        .server_security
+        .validate_exposure(socket, config.allow_insecure)
+        .context(SecuritySnafu)?;
     tracing::info!(
         %addr,
         "metasrv control plane ready (Flight do_action; writes gated on leadership)"
     );
-    Server::builder()
+    let mut server = Server::builder();
+    if let Some(tls) = config.server_security.tls_config() {
+        server = server.tls_config(tls).context(ServeSnafu)?;
+    }
+    server
+        .layer(tonic::service::InterceptorLayer::new(
+            config.server_security.interceptor(),
+        ))
         .add_service(FlightServiceServer::new(svc))
         .serve(socket)
         .await
