@@ -16,14 +16,19 @@ Issue: #42
   manifest paths and fixed latest remain readable.
 - `cleanup_cursor_resumes_without_touching_latest` proves durable continuation
   and byte-for-byte latest preservation.
+- `concurrent_delete_cannot_cross_recreate` pauses a resumed old deleter,
+  completes delete/recreate plus new history/cursor, then proves exact deleting
+  guards preserve the replacement incarnation.
 - `maintenance_reclaims_external_manifest_history` runs real Lance cleanup on
   local storage, reclaims obsolete history, and preserves a tagged v1 record.
-- Real LocalStack `external_manifest_cleanup_localstack`: PASS; S3 manifest
-  absence is checked for every Dynamo history record removed by maintenance.
-- Spec lifecycle: 4/4 PASS.
+- Real LocalStack `external_manifest_cleanup_localstack`: PASS; tagged v1 keeps
+  its S3 manifest, Dynamo record, and readable snapshot, while every removed
+  Dynamo record is checked against exact S3 manifest absence.
+- Spec lifecycle: 5/5 PASS.
 - Strict clippy: PASS with `-D warnings`.
-- `mise run gate`: PASS (workspace tests, e2e, hooks, and site); 270.21s
-  from the issue workspace's cold all-target build.
+- `lake-engine-lance --lib`: 28/28 PASS.
+- Post-review `mise run gate`: PASS (workspace tests, e2e, hooks, and site);
+  88.62s after guarded delete-resume repair.
 
 ## Protocol
 

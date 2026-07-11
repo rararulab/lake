@@ -79,6 +79,14 @@ Scenario: S3 and Dynamo cleanup agree on physical outcomes
   When maintenance removes obsolete manifests and reconciles one or more pages
   Then only Dynamo records whose S3 manifest paths are absent are removed
 
+Scenario: A resumed delete cannot cross recreate
+  Test:
+    Package: lake-engine-lance
+    Filter: concurrent_delete_cannot_cross_recreate
+  Given a second deleter pauses after observing the old deleting marker
+  When the first delete finishes and a new incarnation creates history and a cursor
+  Then the stale deleter fails its exact marker guard and preserves all new state
+
 ## Out of Scope
 
 - Changing Lance tag, branch, or time-retention semantics.

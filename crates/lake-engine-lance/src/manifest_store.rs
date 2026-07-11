@@ -740,7 +740,17 @@ impl ExternalManifestStore for MetaManifestStore {
             let Some(value) = self.meta.get(&key).await.map_err(store_err)? else {
                 continue;
             };
-            if !self.meta.delete(&key, &value).await.map_err(store_err)? {
+            if !self
+                .meta
+                .guarded_mutate(GuardedMutation::delete(
+                    &latest_key,
+                    &deleting,
+                    &key,
+                    &value,
+                ))
+                .await
+                .map_err(store_err)?
+            {
                 return Err(Error::io(format!(
                     "manifest delete raced with a writer: {base_uri}@{version}"
                 )));
@@ -762,7 +772,12 @@ impl ExternalManifestStore for MetaManifestStore {
         if let Some(cursor) = self.meta.get(&cleanup_key).await.map_err(store_err)?
             && !self
                 .meta
-                .delete(&cleanup_key, &cursor)
+                .guarded_mutate(GuardedMutation::delete(
+                    &latest_key,
+                    &deleting,
+                    &cleanup_key,
+                    &cursor,
+                ))
                 .await
                 .map_err(store_err)?
         {
@@ -781,9 +796,9 @@ impl ExternalManifestStore for MetaManifestStore {
         match self.read_latest(base_uri).await? {
             Some(LatestRecord::Delete {
                 state: DeleteState::Deleted,
+                incarnation: installed,
                 ..
-            })
-            | Some(LatestRecord::Pointer(_)) => Ok(()),
+            }) if installed == incarnation => Ok(()),
             _ => Err(Error::io(format!(
                 "manifest deletion did not finalize: {base_uri}"
             ))),
@@ -1116,6 +1131,84 @@ mod tests {
         assert_eq!(
             meta.get(&latest_key).await.expect("latest reread"),
             Some(latest_before)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_delete_cannot_cross_recreate() {
+        let (store, meta, _dir) = blocking_store();
+        let store = Arc::new(store);
+        store
+            .put_if_not_exists("delete-resume", 1, "old-v1", 4, None)
+            .await
+            .unwrap();
+        store
+            .put_if_not_exists("delete-resume", 2, "old-v2", 4, None)
+            .await
+            .unwrap();
+        let old = match store.read_latest("delete-resume").await.unwrap().unwrap() {
+            LatestRecord::Pointer(latest) => latest,
+            LatestRecord::Delete { .. } => panic!("expected live pointer"),
+        };
+        let deleting = encode_delete_marker(DeleteState::Deleting, &old.pointer.incarnation)
+            .expect("deleting marker");
+        assert!(
+            meta.cas(
+                &MetaManifestStore::latest_key("delete-resume"),
+                Some(&old.bytes),
+                &deleting,
+            )
+            .await
+            .unwrap()
+        );
+
+        meta.block_history_list.store(true, Ordering::SeqCst);
+        let stale_delete = {
+            let store = store.clone();
+            tokio::spawn(async move { store.delete("delete-resume").await })
+        };
+        meta.history_list_entered.notified().await;
+        store
+            .delete("delete-resume")
+            .await
+            .expect("first delete finishes");
+        store
+            .put_if_not_exists("delete-resume", 1, "new-v1", 4, None)
+            .await
+            .expect("recreate v1");
+        store
+            .put_if_not_exists("delete-resume", 2, "new-v2", 4, None)
+            .await
+            .expect("recreate v2");
+        let objects = FakeManifestExistence {
+            existing: Mutex::new(HashSet::from(["new-v1".to_owned()])),
+            calls:    AtomicUsize::new(0),
+        };
+        store
+            .reclaim_removed_history("delete-resume", &objects, 1)
+            .await
+            .expect("new cleanup cursor");
+        let history_before = meta.list_prefix("lance-manifest/").await.unwrap();
+        let cursor_before = meta
+            .get(&MetaManifestStore::cleanup_key("delete-resume"))
+            .await
+            .unwrap();
+
+        meta.history_list_release.notify_one();
+        assert!(stale_delete.await.expect("stale delete task").is_err());
+        assert_eq!(
+            meta.list_prefix("lance-manifest/").await.unwrap(),
+            history_before
+        );
+        assert_eq!(
+            meta.get(&MetaManifestStore::cleanup_key("delete-resume"))
+                .await
+                .unwrap(),
+            cursor_before
+        );
+        assert_eq!(
+            store.get_latest_version("delete-resume").await.unwrap(),
+            Some((2, "new-v2".to_owned()))
         );
     }
 

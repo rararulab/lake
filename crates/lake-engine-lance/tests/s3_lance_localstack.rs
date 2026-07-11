@@ -55,11 +55,15 @@ use datafusion::{
 };
 use lake_common::{
     AppendOperation, AppendOperationId, AppendPayloadDigest, ObjectReferenceDelta, TableLocation,
-    TenantId,
+    TenantId, Version,
 };
 use lake_engine::TableEngine;
-use lake_engine_lance::LanceEngine;
+use lake_engine_lance::{LanceEngine, MetaManifestStore};
 use lake_meta::{DynamoMeta, MetaStoreRef};
+use lance::dataset::builder::DatasetBuilder;
+use lance_table::io::commit::external_manifest::{
+    ExternalManifestCommitHandler, ExternalManifestStore,
+};
 
 /// A unique suffix so parallel/repeat runs never collide on bucket, table, or
 /// dataset paths.
@@ -423,6 +427,25 @@ async fn external_manifest_cleanup_localstack() {
             value["path"].as_str().expect("manifest path").to_owned(),
         );
     }
+    let v1_key = before_keys
+        .iter()
+        .find(|key| key.ends_with("/1"))
+        .expect("v1 history key")
+        .clone();
+    let external_store: Arc<dyn ExternalManifestStore> =
+        Arc::new(MetaManifestStore::new(meta.clone()));
+    DatasetBuilder::from_uri(location.as_str())
+        .with_storage_options(s3_storage_options(&endpoint))
+        .with_commit_handler(Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: external_store,
+        }))
+        .load()
+        .await
+        .expect("open dataset for tag")
+        .tags()
+        .create("retain-v1", 1_u64)
+        .await
+        .expect("tag v1");
 
     engine
         .maintain(&location, version)
@@ -437,6 +460,21 @@ async fn external_manifest_cleanup_localstack() {
         after_keys.len() < before_keys.len(),
         "Dynamo history shrank"
     );
+    assert!(after_keys.contains(&v1_key), "tagged v1 history remains");
+    s3.head_object()
+        .bucket(&bucket)
+        .key(&before_paths[&v1_key])
+        .send()
+        .await
+        .expect("tagged v1 manifest remains on S3");
+    engine
+        .open(&location)
+        .await
+        .expect("open after cleanup")
+        .expect("dataset remains")
+        .table_provider(Version(1))
+        .await
+        .expect("tagged v1 snapshot remains readable");
     for removed in before_keys.iter().filter(|key| !after_keys.contains(key)) {
         let path = &before_paths[removed];
         assert!(
