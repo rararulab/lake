@@ -112,7 +112,9 @@ pub trait ManagedObjectStore: Send + Sync {
 }
 
 fn validate_range(location: &DataLocation, range: &Range<u64>) -> Result<u64> {
-    if range.start >= range.end || range.end > location.size_bytes {
+    let is_non_empty = range.start < range.end;
+    let is_in_bounds = range.end <= location.size_bytes;
+    if !is_non_empty || !is_in_bounds {
         return Err(ObjectError::InvalidRange {
             uri:        location.uri.clone(),
             start:      range.start,
@@ -278,7 +280,9 @@ mod tests {
             .sha256("unused")
             .build();
 
-        for range in [0..0, 8..4, 0..11] {
+        let reversed_start = 8;
+        let reversed_end = 4;
+        for range in [0..0, reversed_start..reversed_end, 0..11] {
             assert!(matches!(
                 store.open_range(&missing, range).await,
                 Err(ObjectError::InvalidRange { .. })

@@ -224,9 +224,11 @@ design-level ones:
   into either a local or S3 Lake-owned managed stage, and stores an immutable
   `DataLocation` physical representation in Lance. S3 uses bounded multipart
   upload with abort-on-error and exact bucket/prefix validation for direct
-  reads. The SDK receives only query endpoint + stage; query forwards metadata
-  to the leader-aware metasrv. Resumable uploads, browser presigning,
-  authenticated expiring locations, and object GC are deferred.
+  reads. Sequential and half-open byte-range readers share the same SDK/storage
+  boundary; local ranges seek + limit and S3 ranges issue one bounded GET. The
+  SDK receives only query endpoint + stage; query forwards metadata to the
+  leader-aware metasrv. Resumable uploads, browser presigning, authenticated
+  expiring locations, codec indexes, and object GC are deferred.
 
 ## Phasing
 

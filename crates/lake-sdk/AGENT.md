@@ -14,6 +14,8 @@ The Rust SDK's typed write and direct-read surface.
   the production crate must not depend on, construct, or start `lake-metasrv`.
 - `query` streams Flight RecordBatches; `data_location` decodes a logical
   `FILE`, and `open` reads its bytes directly from the managed stage.
+- `open_range` delegates one validated half-open interval directly to the
+  configured stage; query and metasrv never proxy range bytes.
 
 ## Layout
 

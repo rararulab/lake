@@ -10,6 +10,8 @@ Managed large-object values and direct storage access for the Rust SDK.
 - Arrow conversion is the only bridge between object values and Lance tables.
 - Storage backends must stream files in bounded chunks; never buffer whole
   videos or models in memory.
+- Byte ranges are non-empty half-open intervals checked against immutable
+  `DataLocation.size_bytes` before local or S3 I/O.
 
 ## Layout
 

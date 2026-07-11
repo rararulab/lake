@@ -36,6 +36,16 @@ abstraction while query and metasrv continue carrying metadata only.
 - `specs/**`
 - `verification/**`
 - `scripts/test-integration.ts`
+- `**/.github/actionlint.yaml`
+- `**/.github/workflows/ci.yml`
+- `**/.github/workflows/pages.yml`
+- `**/AGENT.md`
+- `**/mise.toml`
+
+The root CI/config paths are shared-checkout history owned by merged issue 6.
+This workspace modifies only the crate `AGENT.md` cards listed above, but the
+repository-wide worktree verifier also reports issue 6's pre-squash branch
+commits as changes.
 
 ### Forbidden
 - Sending object bytes through query or metasrv

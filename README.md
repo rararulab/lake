@@ -92,6 +92,20 @@ let location = lake_sdk::data_location(&batch, "video", 0)?;
 let reader = client.open(&location).await?;
 ```
 
+Video decoders and model loaders can fetch only the bytes they need. Ranges
+are half-open (`start..end`), validated against the immutable object size, and
+stream directly from local storage or one S3 Range GET:
+
+```rust
+// Read exactly 1 MiB starting at byte 8 MiB; no prefix download.
+let reader = client
+    .open_range(&location, 8 * 1024 * 1024..9 * 1024 * 1024)
+    .await?;
+```
+
+Empty, reversed, and out-of-bounds ranges return a typed SDK object error
+before storage I/O.
+
 The example performs insert, query, `DataLocation` decoding, and direct open
 through `LakeClient`. Local development uses a `file://` stage; production can
 use a caller-configured `s3://` stage. Non-empty S3 objects stream through
