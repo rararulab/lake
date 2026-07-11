@@ -25,17 +25,57 @@ use arrow_flight::IpcMessage;
 use datafusion::{
     arrow::datatypes::{Schema, SchemaRef},
     catalog::{CatalogProvider, SchemaProvider},
+    datasource::TableProvider,
 };
-use lake_common::{Namespace, TableName, TableRef};
+use lake_common::{Namespace, TableLocation, TableName, TableRef};
 use lake_engine::TableEngineRef;
 use lake_meta::{MetaStoreRef, registry, registry::TableRegistration};
 use moka::future::Cache;
+use snafu::Snafu;
 use tokio::{sync::Mutex, time::Instant};
 
 use crate::schema::LakeSchema;
 
 /// Bound how long a resolved registration can hide a registry version update.
 const REGISTRATION_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// One provider per catalog table at the target deployment scale.
+const PROVIDER_CACHE_CAPACITY: u64 = 100_000;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RegistrationCacheKey {
+    table: TableRef,
+    epoch: u64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ProviderGeneration {
+    table:          TableRef,
+    location:       TableLocation,
+    engine:         String,
+    incarnation_id: Option<String>,
+    version:        u64,
+}
+
+impl ProviderGeneration {
+    fn new(table: &TableRef, registration: &TableRegistration) -> Self {
+        Self {
+            table:          table.clone(),
+            location:       registration.location.clone(),
+            engine:         registration.engine.clone(),
+            incarnation_id: registration.incarnation_id().map(str::to_owned),
+            version:        registration.current_version.0,
+        }
+    }
+}
+
+#[derive(Debug, Snafu)]
+pub(crate) enum ProviderLoadError {
+    #[snafu(display("no table exists at {}", location.0))]
+    Missing { location: TableLocation },
+    #[snafu(transparent)]
+    Engine { source: lake_engine::EngineError },
+}
 
 /// Shared state behind the catalog: the metastore (registry authority), the
 /// storage engine, a cached listing snapshot, and a per-table registration
@@ -47,7 +87,13 @@ pub struct CatalogState {
     /// so it must never require I/O. Refreshed by [`LakeCatalog::refresh`].
     pub(crate) snapshot: RwLock<CatalogSnapshot>,
     /// table -> registration; shields the registry from per-query load.
-    pub(crate) regs:     Cache<TableRef, Arc<TableRegistration>>,
+    regs:                Cache<RegistrationCacheKey, Arc<TableRegistration>>,
+    /// Local invalidation generations fence stale in-flight registration
+    /// fills after a proxied write acknowledgement.
+    registration_epochs: RwLock<BTreeMap<TableRef, u64>>,
+    /// immutable table generation -> provider; coalesces concurrent planning
+    /// misses and avoids reopening storage metadata on every query.
+    providers:           Cache<ProviderGeneration, Arc<dyn TableProvider>>,
     /// Serializes refreshes and records when the listing snapshot was loaded.
     refreshed_at:        Mutex<Option<Instant>>,
 }
@@ -63,15 +109,52 @@ impl CatalogState {
         &self,
         table: &TableRef,
     ) -> lake_meta::Result<Option<Arc<TableRegistration>>> {
-        if let Some(hit) = self.regs.get(table).await {
+        let epoch = self
+            .registration_epochs
+            .read()
+            .expect("registration epoch lock poisoned")
+            .get(table)
+            .copied()
+            .unwrap_or_default();
+        let key = RegistrationCacheKey {
+            table: table.clone(),
+            epoch,
+        };
+        if let Some(hit) = self.regs.get(&key).await {
             return Ok(Some(hit));
         }
         let Some(reg) = registry::get(self.meta.as_ref(), table).await? else {
             return Ok(None);
         };
         let reg = Arc::new(reg);
-        self.regs.insert(table.clone(), reg.clone()).await;
+        self.regs.insert(key, reg.clone()).await;
         Ok(Some(reg))
+    }
+
+    pub(crate) async fn provider(
+        &self,
+        table: &TableRef,
+        registration: &TableRegistration,
+    ) -> Result<Arc<dyn TableProvider>, Arc<ProviderLoadError>> {
+        let generation = ProviderGeneration::new(table, registration);
+        let engine = self.engine.clone();
+        let location = registration.location.clone();
+        let version = registration.current_version;
+        self.providers
+            .try_get_with(generation, async move {
+                let handle = engine
+                    .open(&location)
+                    .await
+                    .map_err(|source| ProviderLoadError::Engine { source })?
+                    .ok_or_else(|| ProviderLoadError::Missing {
+                        location: location.clone(),
+                    })?;
+                handle
+                    .table_provider(version)
+                    .await
+                    .map_err(|source| ProviderLoadError::Engine { source })
+            })
+            .await
     }
 }
 
@@ -89,6 +172,14 @@ impl std::fmt::Debug for LakeCatalog {
 
 impl LakeCatalog {
     pub fn new(meta: MetaStoreRef, engine: TableEngineRef) -> Self {
+        Self::with_provider_cache_capacity(meta, engine, PROVIDER_CACHE_CAPACITY)
+    }
+
+    fn with_provider_cache_capacity(
+        meta: MetaStoreRef,
+        engine: TableEngineRef,
+        provider_cache_capacity: u64,
+    ) -> Self {
         Self {
             state: Arc::new(CatalogState {
                 meta,
@@ -98,9 +189,32 @@ impl LakeCatalog {
                     .max_capacity(100_000)
                     .time_to_live(REGISTRATION_CACHE_TTL)
                     .build(),
+                registration_epochs: RwLock::new(BTreeMap::new()),
+                providers: Cache::builder()
+                    .max_capacity(provider_cache_capacity)
+                    .build(),
                 refreshed_at: Mutex::new(None),
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_provider_cache_capacity(
+        meta: MetaStoreRef,
+        engine: TableEngineRef,
+        capacity: u64,
+    ) -> Self {
+        Self::with_provider_cache_capacity(meta, engine, capacity)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn maintain_test_provider_cache(&self) {
+        self.state.providers.run_pending_tasks().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_provider_cache_entry_count(&self) -> u64 {
+        self.state.providers.entry_count()
     }
 
     pub fn state(&self) -> Arc<CatalogState> { self.state.clone() }
@@ -131,7 +245,24 @@ impl LakeCatalog {
     /// Evict one resolved registration after this query node proxies a
     /// successful write, so the same client connection observes its commit.
     pub async fn invalidate_registration(&self, table: &TableRef) {
-        self.state.regs.invalidate(table).await;
+        let old_epoch = {
+            let mut epochs = self
+                .state
+                .registration_epochs
+                .write()
+                .expect("registration epoch lock poisoned");
+            let epoch = epochs.entry(table.clone()).or_default();
+            let old_epoch = *epoch;
+            *epoch = epoch.checked_add(1).expect("registration epoch exhausted");
+            old_epoch
+        };
+        self.state
+            .regs
+            .invalidate(&RegistrationCacheKey {
+                table: table.clone(),
+                epoch: old_epoch,
+            })
+            .await;
     }
 
     /// Reload the listing snapshot from the registry. Call on startup and on
