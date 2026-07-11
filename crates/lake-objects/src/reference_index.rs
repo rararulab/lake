@@ -64,65 +64,99 @@ impl LiveReferenceIndexBuilder {
     where
         I: IntoIterator<Item = ObjectReferenceDelta>,
     {
+        let mut build = self.begin()?;
+        for delta in deltas {
+            build.push_delta(delta)?;
+        }
+        build.finish()
+    }
+
+    pub fn begin(&self) -> Result<LiveReferenceIndexBuild> {
         create_dir_all(&self.work_root)?;
         let work_dir = self
             .work_root
             .join(format!("live-reference-index-{}", Uuid::new_v4()));
         create_dir_all(&work_dir)?;
-        match self.build_in(&work_dir, deltas) {
-            Ok(index) => Ok(index),
-            Err(error) => {
-                let _ = fs::remove_dir_all(&work_dir);
-                Err(error)
+        Ok(LiveReferenceIndexBuild {
+            work_dir,
+            run_capacity: self.run_capacity,
+            merge_fan_in: self.merge_fan_in,
+            buffer: Vec::with_capacity(self.run_capacity),
+            runs: Vec::new(),
+            sequence: 0,
+            preserve: false,
+        })
+    }
+}
+
+pub struct LiveReferenceIndexBuild {
+    work_dir:     PathBuf,
+    run_capacity: usize,
+    merge_fan_in: usize,
+    buffer:       Vec<ObjectIdentity>,
+    runs:         Vec<PathBuf>,
+    sequence:     usize,
+    preserve:     bool,
+}
+
+impl LiveReferenceIndexBuild {
+    pub fn push_delta(&mut self, delta: ObjectReferenceDelta) -> Result<()> {
+        if !delta.removed().is_empty() {
+            return Err(ObjectError::GcReferenceRemovalsUnsupported);
+        }
+        for identity in delta.added() {
+            self.buffer.push(identity.clone());
+            if self.buffer.len() == self.run_capacity {
+                self.flush_run()?;
             }
         }
+        Ok(())
     }
 
-    fn build_in<I>(&self, work_dir: &Path, deltas: I) -> Result<LiveReferenceIndex>
-    where
-        I: IntoIterator<Item = ObjectReferenceDelta>,
-    {
-        let mut runs = Vec::new();
-        let mut buffer = Vec::with_capacity(self.run_capacity);
-        let mut sequence = 0_usize;
-        for delta in deltas {
-            if !delta.removed().is_empty() {
-                return Err(ObjectError::GcReferenceRemovalsUnsupported);
-            }
-            for identity in delta.added() {
-                buffer.push(identity.clone());
-                if buffer.len() == self.run_capacity {
-                    runs.push(write_run(work_dir, sequence, &mut buffer)?);
-                    sequence += 1;
-                }
-            }
-        }
-        if !buffer.is_empty() {
-            runs.push(write_run(work_dir, sequence, &mut buffer)?);
-            sequence += 1;
+    pub fn finish(mut self) -> Result<LiveReferenceIndex> {
+        if !self.buffer.is_empty() {
+            self.flush_run()?;
         }
 
-        while runs.len() > 1 {
-            let mut merged = Vec::with_capacity(runs.len().div_ceil(self.merge_fan_in));
-            for group in runs.chunks(self.merge_fan_in) {
-                let output = work_dir.join(format!("run-{sequence:020}.jsonl"));
-                sequence += 1;
+        while self.runs.len() > 1 {
+            let mut merged = Vec::with_capacity(self.runs.len().div_ceil(self.merge_fan_in));
+            for group in self.runs.chunks(self.merge_fan_in) {
+                let output = self
+                    .work_dir
+                    .join(format!("run-{:020}.jsonl", self.sequence));
+                self.sequence += 1;
                 merge_runs(group, &output)?;
                 for input in group {
                     remove_file(input)?;
                 }
                 merged.push(output);
             }
-            runs = merged;
+            self.runs = merged;
         }
 
-        let final_path = work_dir.join("live.jsonl");
-        if let Some(run) = runs.pop() {
+        let final_path = self.work_dir.join("live.jsonl");
+        if let Some(run) = self.runs.pop() {
             rename(&run, &final_path)?;
         } else {
             create_file(&final_path)?;
         }
+        self.preserve = true;
         Ok(LiveReferenceIndex { path: final_path })
+    }
+
+    fn flush_run(&mut self) -> Result<()> {
+        self.runs
+            .push(write_run(&self.work_dir, self.sequence, &mut self.buffer)?);
+        self.sequence += 1;
+        Ok(())
+    }
+}
+
+impl Drop for LiveReferenceIndexBuild {
+    fn drop(&mut self) {
+        if !self.preserve {
+            let _ = fs::remove_dir_all(&self.work_dir);
+        }
     }
 }
 

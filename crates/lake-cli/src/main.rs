@@ -54,6 +54,8 @@ enum Command {
     /// Table administration.
     #[command(subcommand)]
     Table(commands::table::TableCmd),
+    /// Plan or apply managed-object garbage collection.
+    Gc(commands::gc::GcCmd),
     /// Run the stateless query-layer server.
     Query {
         #[arg(long, default_value = "127.0.0.1:50051")]
@@ -96,6 +98,7 @@ async fn run_with_context(data_dir: &str, command: Command) -> anyhow::Result<()
         Command::Sql { query } => commands::sql::run(&ctx, &query).await,
         Command::Ingest { table, file } => commands::ingest::run(&ctx, &table, &file).await,
         Command::Table(cmd) => commands::table::run(&ctx, cmd).await,
+        Command::Gc(cmd) => commands::gc::run(&ctx, cmd).await,
         Command::Query {
             addr,
             metadata_addr,
@@ -132,5 +135,48 @@ mod tests {
         };
         assert_eq!(addr, "127.0.0.1:60051");
         assert_eq!(metadata_addr, "http://meta.internal:60052");
+    }
+
+    #[test]
+    fn gc_command_is_dry_run_unless_apply_is_explicit() {
+        let dry_run = Cli::try_parse_from([
+            "lake",
+            "gc",
+            "--plan",
+            "gc-plan",
+            "--safety-age-secs",
+            "3600",
+        ])
+        .unwrap();
+        let Command::Gc(dry_run) = dry_run.command else {
+            panic!("expected gc command");
+        };
+        assert!(!dry_run.apply);
+        assert!(dry_run.checkpoint.is_none());
+
+        let apply = Cli::try_parse_from([
+            "lake",
+            "gc",
+            "--plan",
+            "gc-plan",
+            "--apply",
+            "--checkpoint",
+            "gc-apply.json",
+        ])
+        .unwrap();
+        let Command::Gc(apply) = apply.command else {
+            panic!("expected gc command");
+        };
+        assert!(apply.apply);
+        assert_eq!(
+            apply.checkpoint.as_deref(),
+            Some(std::path::Path::new("gc-apply.json"))
+        );
+
+        assert!(Cli::try_parse_from(["lake", "gc", "--plan", "gc-plan", "--apply"]).is_err());
+        assert!(
+            Cli::try_parse_from(["lake", "gc", "--plan", "gc-plan", "--safety-age-secs", "0",])
+                .is_err()
+        );
     }
 }

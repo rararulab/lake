@@ -37,7 +37,7 @@ pub use gc_apply::{DeleteOutcome, GcApplyProgress, GcPlanApplier, ManagedObjectD
 pub use gc_plan::{GcPlan, GcPlanWriter};
 pub use inventory::{InventoryPage, InventoryRequest, ManagedObjectInventory};
 pub use local::LocalObjectStore;
-pub use reference_index::{LiveReferenceIndex, LiveReferenceIndexBuilder};
+pub use reference_index::{LiveReferenceIndex, LiveReferenceIndexBuild, LiveReferenceIndexBuilder};
 mod s3;
 pub use s3::S3ObjectStore;
 

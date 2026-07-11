@@ -4135,6 +4135,9 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "arrow-flight",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
  "clap",
  "datafusion",
  "futures",
@@ -4147,10 +4150,12 @@ dependencies = [
  "lake-objects",
  "lake-query",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tonic",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -14,7 +14,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 arrow-flight = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
 clap = { version = "^4.5", features = ["derive"] }
 datafusion = { workspace = true }
 futures = { workspace = true }
@@ -27,9 +30,11 @@ lake-metasrv = { workspace = true }
 lake-objects.workspace = true
 lake-query = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

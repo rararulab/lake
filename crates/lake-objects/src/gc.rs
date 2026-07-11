@@ -23,6 +23,9 @@ use crate::{ObjectError, Result};
 
 const MAX_PLAN_PAGE_SIZE: usize = 1_024;
 
+type CandidateResults<I> = std::iter::Map<I, fn(ObjectCandidate) -> Result<ObjectCandidate>>;
+type IdentityResults<I> = std::iter::Map<I, fn(ObjectIdentity) -> Result<ObjectIdentity>>;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ObjectCandidate {
     pub uri:              String,
@@ -75,13 +78,35 @@ impl GcPlanner {
         })
     }
 
-    pub fn plan<C, L>(&self, candidates: C, live: L) -> GcPlanPages<C::IntoIter, L::IntoIter>
+    pub fn plan<C, L>(
+        &self,
+        candidates: C,
+        live: L,
+    ) -> GcPlanPages<CandidateResults<C::IntoIter>, IdentityResults<L::IntoIter>>
     where
         C: IntoIterator<Item = ObjectCandidate>,
         L: IntoIterator<Item = ObjectIdentity>,
     {
+        self.plan_fallible(
+            candidates
+                .into_iter()
+                .map(candidate_ok as fn(ObjectCandidate) -> Result<ObjectCandidate>),
+            live.into_iter()
+                .map(identity_ok as fn(ObjectIdentity) -> Result<ObjectIdentity>),
+        )
+    }
+
+    pub fn plan_fallible<C, L>(
+        &self,
+        candidates: C,
+        live: L,
+    ) -> GcPlanPages<C::IntoIter, L::IntoIter>
+    where
+        C: IntoIterator<Item = Result<ObjectCandidate>>,
+        L: IntoIterator<Item = Result<ObjectIdentity>>,
+    {
         GcPlanPages {
-            candidates:     candidates.into_iter().peekable(),
+            candidates:     candidates.into_iter(),
             live:           live.into_iter().peekable(),
             managed_prefix: self.managed_prefix.clone(),
             cutoff_ms:      self.cutoff_ms,
@@ -93,12 +118,16 @@ impl GcPlanner {
     }
 }
 
+fn candidate_ok(candidate: ObjectCandidate) -> Result<ObjectCandidate> { Ok(candidate) }
+
+fn identity_ok(identity: ObjectIdentity) -> Result<ObjectIdentity> { Ok(identity) }
+
 pub struct GcPlanPages<C, L>
 where
-    C: Iterator<Item = ObjectCandidate>,
-    L: Iterator<Item = ObjectIdentity>,
+    C: Iterator<Item = Result<ObjectCandidate>>,
+    L: Iterator<Item = Result<ObjectIdentity>>,
 {
-    candidates:     Peekable<C>,
+    candidates:     C,
     live:           Peekable<L>,
     managed_prefix: String,
     cutoff_ms:      u64,
@@ -110,13 +139,14 @@ where
 
 impl<C, L> GcPlanPages<C, L>
 where
-    C: Iterator<Item = ObjectCandidate>,
-    L: Iterator<Item = ObjectIdentity>,
+    C: Iterator<Item = Result<ObjectCandidate>>,
+    L: Iterator<Item = Result<ObjectIdentity>>,
 {
     fn pop_live(&mut self) -> Result<Option<ObjectIdentity>> {
         let Some(identity) = self.live.next() else {
             return Ok(None);
         };
+        let identity = identity?;
         if self
             .last_live
             .as_deref()
@@ -136,8 +166,8 @@ where
 
 impl<C, L> Iterator for GcPlanPages<C, L>
 where
-    C: Iterator<Item = ObjectCandidate>,
-    L: Iterator<Item = ObjectIdentity>,
+    C: Iterator<Item = Result<ObjectCandidate>>,
+    L: Iterator<Item = Result<ObjectIdentity>>,
 {
     type Item = Result<GcPlanPage>;
 
@@ -158,6 +188,10 @@ where
                     candidates: planned,
                 }));
             };
+            let candidate = match candidate {
+                Ok(candidate) => candidate,
+                Err(error) => return self.finish_with_error(error),
+            };
             if self
                 .last_candidate
                 .as_deref()
@@ -173,19 +207,26 @@ where
                 });
             }
 
-            while self
-                .live
-                .peek()
-                .is_some_and(|identity| identity.uri.as_str() < candidate.uri.as_str())
-            {
+            while self.live.peek().is_some_and(|identity| {
+                identity
+                    .as_ref()
+                    .is_ok_and(|identity| identity.uri.as_str() < candidate.uri.as_str())
+            }) {
                 if let Err(error) = self.pop_live() {
                     return self.finish_with_error(error);
                 }
             }
-            let is_live = self
-                .live
-                .peek()
-                .is_some_and(|identity| identity.uri == candidate.uri);
+            let is_live = self.live.peek().is_some_and(|identity| {
+                identity
+                    .as_ref()
+                    .is_ok_and(|identity| identity.uri == candidate.uri)
+            });
+            if self.live.peek().is_some_and(Result::is_err) {
+                let error = self
+                    .pop_live()
+                    .expect_err("peeked live reference error must be returned");
+                return self.finish_with_error(error);
+            }
             if is_live {
                 if let Err(error) = self.pop_live() {
                     return self.finish_with_error(error);

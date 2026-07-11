@@ -31,10 +31,11 @@ const MANIFEST_FILE: &str = "manifest.json";
 
 #[derive(Clone, Debug)]
 pub struct GcPlanWriter {
-    plan_path:      PathBuf,
-    managed_prefix: String,
-    cutoff_ms:      u64,
-    page_size:      usize,
+    plan_path:          PathBuf,
+    managed_prefix:     String,
+    cutoff_ms:          u64,
+    page_size:          usize,
+    source_fingerprint: Option<String>,
 }
 
 impl GcPlanWriter {
@@ -60,7 +61,14 @@ impl GcPlanWriter {
             managed_prefix,
             cutoff_ms,
             page_size,
+            source_fingerprint: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_source_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.source_fingerprint = Some(fingerprint.into());
+        self
     }
 
     pub fn write<I>(self, pages: I) -> Result<GcPlan>
@@ -176,6 +184,7 @@ impl GcPlanWriter {
             candidate_count,
             total_size_bytes,
             first_page_hash: next_page_hash,
+            source_fingerprint: self.source_fingerprint.clone(),
         };
         let digest = sha256_hex(&encode_json(&temporary.join(MANIFEST_FILE), &binding)?);
         let manifest = GcPlanManifest { binding, digest };
@@ -219,6 +228,11 @@ impl GcPlan {
 
     #[must_use]
     pub fn managed_prefix(&self) -> &str { &self.manifest.binding.managed_prefix }
+
+    #[must_use]
+    pub fn source_fingerprint(&self) -> Option<&str> {
+        self.manifest.binding.source_fingerprint.as_deref()
+    }
 
     pub(crate) fn page(&self, index: usize, expected_hash: &str) -> Result<GcPlanPageEnvelope> {
         validate_hash(expected_hash)?;
@@ -322,14 +336,15 @@ struct GcPlanManifest {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct GcPlanBinding {
-    version:          u8,
-    managed_prefix:   String,
-    cutoff_ms:        u64,
-    page_size:        usize,
-    page_count:       usize,
-    candidate_count:  u64,
-    total_size_bytes: u64,
-    first_page_hash:  Option<String>,
+    version:            u8,
+    managed_prefix:     String,
+    cutoff_ms:          u64,
+    page_size:          usize,
+    page_count:         usize,
+    candidate_count:    u64,
+    total_size_bytes:   u64,
+    first_page_hash:    Option<String>,
+    source_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
