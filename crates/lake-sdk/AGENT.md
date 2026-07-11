@@ -14,6 +14,8 @@ The Rust SDK's typed write and direct-read surface.
   payload; uploaded video/model bytes are never uploaded again by that retry.
 - The retry window exceeds metadata lease expiry so ungraceful leader failover
   does not force callers to generate a second logical operation.
+- Retry expiry returns a `PendingAppend`; resuming it must preserve the UUIDv7
+  operation identity, encoded Arrow payload, and already-uploaded objects.
 - The primary public client receives only a query endpoint, discovers the
   credential-free managed-stage descriptor once, and uses process credentials;
   the production crate must not depend on, construct, or start `lake-metasrv`.

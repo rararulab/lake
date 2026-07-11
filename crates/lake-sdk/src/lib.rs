@@ -75,12 +75,21 @@ fn ambiguous_append_error(error: &SdkError) -> bool {
     }
 }
 
-async fn retry_ambiguous_append<F, Fut>(mut attempt: F) -> Result<PutResult>
+#[derive(Debug)]
+enum AppendRetryFailure {
+    Sdk(SdkError),
+    Expired,
+}
+
+async fn retry_ambiguous_append_with_window<F, Fut>(
+    mut attempt: F,
+    window: std::time::Duration,
+) -> std::result::Result<PutResult, AppendRetryFailure>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<PutResult>>,
 {
-    tokio::time::timeout(APPEND_RETRY_WINDOW, async {
+    tokio::time::timeout(window, async {
         let mut backoff = APPEND_RETRY_INITIAL_BACKOFF;
         loop {
             match attempt().await {
@@ -89,14 +98,12 @@ where
                     tokio::time::sleep(backoff).await;
                     backoff = backoff.saturating_mul(2).min(APPEND_RETRY_MAX_BACKOFF);
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(AppendRetryFailure::Sdk(error)),
             }
         }
     })
     .await
-    .map_err(|_| SdkError::AppendRetryExpired {
-        window: APPEND_RETRY_WINDOW,
-    })?
+    .map_err(|_| AppendRetryFailure::Expired)?
 }
 
 /// Errors raised by the typed Rust SDK.
@@ -106,8 +113,14 @@ pub enum SdkError {
     #[snafu(display("unsupported INSERT SQL: {message}"))]
     InvalidSql { message: String },
 
-    #[snafu(display("ambiguous FILE append did not converge within {window:?}"))]
-    AppendRetryExpired { window: std::time::Duration },
+    #[snafu(display(
+        "ambiguous FILE append did not converge within {window:?}; resume the returned pending \
+         append"
+    ))]
+    AppendRetryExpired {
+        window:  std::time::Duration,
+        pending: PendingAppend,
+    },
 
     #[snafu(display("INSERT binds {actual} values but SQL declares {expected} placeholders"))]
     ParameterCount { expected: usize, actual: usize },
@@ -187,6 +200,35 @@ pub enum SdkError {
 
 /// The result type for Rust SDK operations.
 pub type Result<T> = std::result::Result<T, SdkError>;
+
+/// A prepared append whose uploaded objects and operation identity are stable.
+///
+/// When an ambiguous append exhausts the automatic transport retry window,
+/// [`SdkError::AppendRetryExpired`] returns this value. Passing it to
+/// [`LakeClient::resume_append`] continues the same logical append without
+/// uploading objects again or allocating a new idempotency identity.
+#[derive(Clone, Debug)]
+pub struct PendingAppend {
+    operation_id: AppendOperationId,
+    messages:     Vec<FlightData>,
+}
+
+impl PendingAppend {
+    /// Return the durable identity reused by every retry of this append.
+    #[must_use]
+    pub fn operation_id(&self) -> &AppendOperationId { &self.operation_id }
+}
+
+impl SdkError {
+    /// Recover the pending append from an exhausted ambiguous retry window.
+    #[must_use]
+    pub fn into_pending_append(self) -> Option<PendingAppend> {
+        match self {
+            Self::AppendRetryExpired { pending, .. } => Some(pending),
+            _ => None,
+        }
+    }
+}
 
 /// An SDK upload source bound to a SQL `FILE` value.
 ///
@@ -372,12 +414,38 @@ impl LakeClient {
     /// Execute a parameterized, single-row INSERT with typed scalar/`FILE`
     /// values.
     pub async fn insert(&self, sql: &str, values: Vec<InsertValue>) -> Result<Version> {
-        let messages = self.prepare_insert(sql, values).await?;
-        let result = retry_ambiguous_append(|| self.put_append_once(messages.clone())).await?;
+        let pending = self.prepare_insert(sql, values).await?;
+        self.resume_append(pending).await
+    }
+
+    /// Resume a prepared or ambiguously timed-out append with the same
+    /// operation identity and already-uploaded object references.
+    pub async fn resume_append(&self, pending: PendingAppend) -> Result<Version> {
+        self.resume_append_with_window(pending, APPEND_RETRY_WINDOW)
+            .await
+    }
+
+    async fn resume_append_with_window(
+        &self,
+        pending: PendingAppend,
+        window: std::time::Duration,
+    ) -> Result<Version> {
+        let result = retry_ambiguous_append_with_window(
+            || self.put_append_once(pending.messages.clone()),
+            window,
+        )
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(AppendRetryFailure::Sdk(error)) => return Err(error),
+            Err(AppendRetryFailure::Expired) => {
+                return Err(SdkError::AppendRetryExpired { window, pending });
+            }
+        };
         serde_json::from_slice(&result.app_metadata).context(InvalidAppendResultSnafu)
     }
 
-    async fn prepare_insert(&self, sql: &str, values: Vec<InsertValue>) -> Result<Vec<FlightData>> {
+    async fn prepare_insert(&self, sql: &str, values: Vec<InsertValue>) -> Result<PendingAppend> {
         let insert = parse_insert(sql)?;
         if insert.columns.len() != values.len() {
             return Err(SdkError::ParameterCount {
@@ -409,9 +477,10 @@ impl LakeClient {
             .try_collect::<Vec<_>>()
             .await
             .context(FlightSnafu)?;
+        let operation_id = AppendOperationId::generate();
         let append = FileAppendRequest::new(
             insert.table,
-            AppendOperationId::generate(),
+            operation_id.clone(),
             append_flight_payload_digest(&messages),
         );
         let descriptor = FlightDescriptor::new_cmd(
@@ -425,7 +494,10 @@ impl LakeClient {
             .first_mut()
             .expect("Flight encoder emits a schema message")
             .flight_descriptor = Some(descriptor);
-        Ok(messages)
+        Ok(PendingAppend {
+            operation_id,
+            messages,
+        })
     }
 
     async fn put_append_once(&self, messages: Vec<FlightData>) -> Result<PutResult> {
@@ -796,7 +868,8 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
     use crate::{
-        FileUpload, InsertValue, LakeClient, SdkError, data_location, retry_ambiguous_append,
+        APPEND_RETRY_WINDOW, FileUpload, InsertValue, LakeClient, SdkError, data_location,
+        retry_ambiguous_append_with_window,
     };
 
     #[tokio::test]
@@ -807,7 +880,7 @@ mod tests {
         tokio::fs::write(&source, b"one uploaded video")
             .await
             .unwrap();
-        let messages = client
+        let pending = client
             .prepare_insert(
                 "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
                 vec![
@@ -820,23 +893,26 @@ mod tests {
         assert_eq!(object_count(&root.path().join("objects")).await, 1);
         let attempts = Arc::new(AtomicUsize::new(0));
 
-        let result = retry_ambiguous_append(|| {
-            let attempts = attempts.clone();
-            let messages = messages.clone();
-            let attempt_client = client.clone();
-            async move {
-                let committed = attempt_client.put_append_once(messages).await?;
-                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                    Err(SdkError::Flight {
-                        source: arrow_flight::error::FlightError::Tonic(Box::new(
-                            tonic::Status::unavailable("response lost after commit"),
-                        )),
-                    })
-                } else {
-                    Ok(committed)
+        let result = retry_ambiguous_append_with_window(
+            || {
+                let attempts = attempts.clone();
+                let messages = pending.messages.clone();
+                let attempt_client = client.clone();
+                async move {
+                    let committed = attempt_client.put_append_once(messages).await?;
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(SdkError::Flight {
+                            source: arrow_flight::error::FlightError::Tonic(Box::new(
+                                tonic::Status::unavailable("response lost after commit"),
+                            )),
+                        })
+                    } else {
+                        Ok(committed)
+                    }
                 }
-            }
-        })
+            },
+            APPEND_RETRY_WINDOW,
+        )
         .await
         .unwrap();
 
@@ -866,6 +942,56 @@ mod tests {
             row_count += batch.num_rows();
         }
         assert_eq!(row_count, 1);
+        assert_eq!(object_count(&root.path().join("objects")).await, 1);
+    }
+
+    #[tokio::test]
+    async fn sdk_resumes_same_operation_after_retry_horizon() {
+        let root = tempdir().unwrap();
+        let (client, metasrv, table, _meta, _engine) = setup_client(root.path()).await;
+        let source = root.path().join("episode.mp4");
+        tokio::fs::write(&source, b"one recoverable video")
+            .await
+            .unwrap();
+        let pending = client
+            .prepare_insert(
+                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    InsertValue::Utf8("episode-recovered".to_owned()),
+                    InsertValue::File(FileUpload::from_path(&source, "video/mp4")),
+                ],
+            )
+            .await
+            .unwrap();
+        let operation_id = pending.operation_id().clone();
+        let broken = LakeClient {
+            query:                 tonic::transport::Endpoint::from_static("http://127.0.0.1:9")
+                .connect_lazy(),
+            objects:               client.objects.clone(),
+            security:              client.security.clone(),
+            upload_checkpoint_dir: client.upload_checkpoint_dir.clone(),
+        };
+
+        let error = broken
+            .resume_append_with_window(pending, Duration::from_millis(5))
+            .await
+            .unwrap_err();
+        let recovered = error
+            .into_pending_append()
+            .expect("retry expiry returns a recoverable append");
+        assert_eq!(recovered.operation_id(), &operation_id);
+        assert_eq!(object_count(&root.path().join("objects")).await, 1);
+
+        assert_eq!(client.resume_append(recovered).await.unwrap(), Version(2));
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(2)
+        );
         assert_eq!(object_count(&root.path().join("objects")).await, 1);
     }
 

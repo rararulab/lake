@@ -147,7 +147,10 @@ digest of its ordered Flight control payload:
 1. The SDK uploads object bytes directly to managed storage, encodes only
    `DataLocation` rows, and generates the operation ID once. Ambiguous Flight
    failures reuse the same encoded messages, identity, and digest for a
-   30-second bounded window, longer than the 10-second metadata lease.
+   30-second bounded window, longer than the 10-second metadata lease. If that
+   window expires ambiguously, the error returns a `PendingAppend`; callers can
+   resume it throughout operation retention with the same identity and without
+   uploading the object again.
 2. Metasrv authenticates the tenant, verifies the digest, claims a durable
    per-table fence, and CAS-creates a compact `reserved` operation record.
 3. The engine writes the new immutable version. Lance disables automatic

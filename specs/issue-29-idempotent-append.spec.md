@@ -134,19 +134,18 @@ bytes through Query or Metasrv, or couple upper tiers to Lance.
 - `specs/project.spec`
 - `specs/issue-29-idempotent-append.spec.md`
 - `verification/issue-29-idempotent-append.md`
-- `**/.github/actionlint.yaml`
-- `**/.github/workflows/ci.yml`
-- `**/.github/workflows/pages.yml`
-- `**/AGENT.md`
-- `**/CLAUDE.md`
-- `**/docs/guides/mise-ci.md`
-- `**/docs/guides/workflow.md`
-- `**/mise.toml`
+- `Users/ryan/code/rararulab/lake/.github/actionlint.yaml`
+- `Users/ryan/code/rararulab/lake/.github/workflows/ci.yml`
+- `Users/ryan/code/rararulab/lake/.github/workflows/pages.yml`
+- `Users/ryan/code/rararulab/lake/AGENT.md`
+- `Users/ryan/code/rararulab/lake/CLAUDE.md`
+- `Users/ryan/code/rararulab/lake/docs/guides/mise-ci.md`
+- `Users/ryan/code/rararulab/lake/docs/guides/workflow.md`
+- `Users/ryan/code/rararulab/lake/mise.toml`
 
-The exact recursive root patterns above admit pre-existing shared-checkout workflow
-and guide edits reported by the lifecycle tool. This issue does not modify
-those files; its own changes remain confined to the issue workspace paths
-listed above.
+The exact shared-checkout paths above admit pre-existing workflow and guide
+edits reported by the lifecycle tool. This issue does not modify those files;
+its own changes remain confined to the issue workspace paths listed above.
 
 ### Forbidden
 
@@ -219,6 +218,15 @@ Scenario: leader failover preserves in-flight operation identity
   leader without delivering its result
   When that leader stops and the client retries through the standby
   Then the standby returns the original Version without a second append
+
+Scenario: retry expiry returns a resumable append identity
+  Test:
+    Package: lake-sdk
+    Filter: sdk_resumes_same_operation_after_retry_horizon
+  Given an append whose automatic transport retry window expires ambiguously
+  When the returned pending append is resumed after connectivity recovers
+  Then the original operation identity is reused without another object upload
+  and exactly one table version is committed
 
 Scenario: dropped table operations cannot target a replacement
   Test:

@@ -244,6 +244,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_incarnation_migration_preserves_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = RocksMeta::open(dir.path()).unwrap();
+        let table = TableRef::new("robots", "legacy");
+        let legacy: TableRegistration = serde_json::from_str(
+            r#"{"location":"mem://legacy","engine":"lance","current_version":7,"schema_ipc":[1,2,3]}"#,
+        )
+        .unwrap();
+        register(&meta, &table, &legacy).await.unwrap();
+
+        let migrated = ensure_incarnation(&meta, &table, &legacy).await.unwrap();
+
+        assert!(migrated.incarnation_id().is_some());
+        assert_eq!(migrated.location, legacy.location);
+        assert_eq!(migrated.engine, legacy.engine);
+        assert_eq!(migrated.current_version, legacy.current_version);
+        assert_eq!(migrated.schema_ipc(), legacy.schema_ipc());
+        assert_eq!(get(&meta, &table).await.unwrap(), Some(migrated));
+    }
+
+    #[tokio::test]
+    async fn legacy_incarnation_migration_reloads_after_cas_races() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = RocksMeta::open(dir.path()).unwrap();
+        let table = TableRef::new("robots", "legacy");
+        let legacy: TableRegistration = serde_json::from_str(
+            r#"{"location":"mem://legacy","engine":"lance","current_version":1,"schema_ipc":[1]}"#,
+        )
+        .unwrap();
+        register(&meta, &table, &legacy).await.unwrap();
+        let stale = get(&meta, &table).await.unwrap().unwrap();
+        set_version(&meta, &table, &legacy, Version(2))
+            .await
+            .unwrap();
+
+        let migrated = ensure_incarnation(&meta, &table, &stale).await.unwrap();
+        assert_eq!(migrated.current_version, Version(2));
+        assert_eq!(migrated.location, TableLocation::new("mem://legacy"));
+        assert!(migrated.incarnation_id().is_some());
+
+        let recreated_table = TableRef::new("robots", "recreated_legacy");
+        register(&meta, &recreated_table, &legacy).await.unwrap();
+        let before_recreate = get(&meta, &recreated_table).await.unwrap().unwrap();
+        delete(&meta, &recreated_table, &before_recreate)
+            .await
+            .unwrap();
+        let replacement = reg(9);
+        register(&meta, &recreated_table, &replacement)
+            .await
+            .unwrap();
+
+        let observed = ensure_incarnation(&meta, &recreated_table, &before_recreate)
+            .await
+            .unwrap();
+        assert_eq!(observed, replacement);
+        assert_ne!(observed.incarnation_id(), before_recreate.incarnation_id());
+    }
+
+    #[tokio::test]
     async fn register_get_list_setversion() {
         let dir = tempfile::tempdir().unwrap();
         let meta = RocksMeta::open(dir.path()).unwrap();

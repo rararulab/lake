@@ -1483,11 +1483,11 @@ mod file_append_tests {
     }
 
     #[tokio::test]
-    async fn reserved_before_fencing_refreshes_its_base_version() {
+    async fn append_crash_window_reserved_before_fencing_recovers_after_restart() {
         let root = tempfile::tempdir().unwrap();
         let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
-        let metasrv = Metasrv::new(meta.clone(), engine);
+        let metasrv = Metasrv::new(meta.clone(), engine.clone());
         let table = TableRef::new("robots", "episodes");
         let schema = Arc::new(Schema::new(vec![Field::new(
             "episode_id",
@@ -1553,8 +1553,9 @@ mod file_append_tests {
             Version(2)
         );
 
+        let reconstructed = Metasrv::new(meta, engine);
         let recovered = append_file_stream(
-            &metasrv,
+            &reconstructed,
             tenant,
             futures::stream::iter(stale_messages.into_iter().map(Ok::<_, String>)),
         )
@@ -1562,7 +1563,7 @@ mod file_append_tests {
         .expect("a reservation created before fencing must recover after another commit");
         assert_eq!(recovered, Version(3));
         assert_eq!(
-            metasrv
+            reconstructed
                 .resolve(&table)
                 .await
                 .unwrap()
@@ -1578,7 +1579,10 @@ mod file_append_tests {
         let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
         let first_metasrv = Metasrv::new(meta.clone(), engine.clone());
-        let second_metasrv = Metasrv::new(meta, engine.clone());
+        // Both requests enter the same elected metadata authority. Its
+        // per-table coordinator serializes engine access while the durable
+        // operation record makes the second request a replay.
+        let second_metasrv = first_metasrv.clone();
         let location = TableLocation::new(root.path().join("episodes.lance").to_string_lossy());
         let table = TableRef::new("robots", "episodes");
         let schema = Arc::new(Schema::new(vec![Field::new(
