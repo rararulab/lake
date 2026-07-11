@@ -1840,15 +1840,15 @@ mod tests {
         let maintenance = tokio::spawn({
             let resource = maintenance_resource.clone();
             async move {
-                let _resource = resource;
                 pending::<()>().await;
+                drop(resource);
             }
         });
         let campaign = tokio::spawn({
             let resource = campaign_resource.clone();
             async move {
-                let _resource = resource;
                 pending::<()>().await;
+                drop(resource);
             }
         });
         let grace = Duration::from_millis(20);
