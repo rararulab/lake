@@ -1,0 +1,30 @@
+# O(1) external manifest latest pointer
+
+Issue: #41
+
+## Outcome
+
+Opening a dataset reads one fixed latest key instead of scanning immutable
+manifest history. Existing deployments migrate lazily, and exact historical
+version reads remain available.
+
+## Protocol
+
+1. Latest is a fixed `{version, path}` record and the atomic claim for the
+   current version.
+2. To claim the next version, CAS-create an immutable archive of current latest
+   (or verify the existing identical archive), then CAS latest from exact old
+   bytes to the new staging pointer.
+3. Lance writes the staging manifest before calling this protocol, preserving
+   manifest-before-pointer. `put_if_exists` exact-CASes staging to final.
+4. Explicit reads first check immutable history, then exact-match fixed latest.
+5. A missing fixed pointer triggers one legacy max scan and CAS migration.
+6. Delete removes fixed latest and all immutable history, failing if either
+   layout changes concurrently.
+
+## Verification
+
+- `mise run spec-lifecycle specs/issue-41-manifest-latest-pointer.spec.md`
+- `cargo test -p lake-engine-lance manifest_store`
+- `cargo clippy -p lake-engine-lance --all-targets -- -D warnings`
+- `mise run gate`

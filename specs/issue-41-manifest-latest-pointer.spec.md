@@ -1,0 +1,100 @@
+spec: task
+name: "manifest-latest-pointer"
+inherits: project
+tags: [manifest, dynamodb, performance, migration]
+---
+
+## Intent
+
+Lake's bounded metadata authority must not pay for all historical commits when
+opening a table. Today `MetaManifestStore::get_latest_version` lists every
+per-version key and then reads the maximum. On Dynamo that is a strongly
+consistent table Scan with a filter. Reproducer: append thousands of versions,
+open the dataset, and observe one metadata scan whose evaluated items grow
+with both this dataset's history and unrelated keys.
+
+Lance's own Dynamo store uses a partition/sort-key query for latest, but Lake's
+generic single-key `MetaStore` has no backend-specific query API. This contract
+therefore makes one fixed latest record authoritative while retaining immutable
+per-version records for historical reads. The first read of a legacy dataset
+may scan once to install the pointer; steady-state reads may not scan.
+
+## Decisions
+
+- Store `lance-manifest-latest/<base_uri>` as `{version, path}` and use one
+  strongly consistent `MetaStore::get` for steady-state latest resolution.
+- The fixed latest record is also the atomic claim for the current version.
+  Before advancing it, archive the prior exact pointer into its immutable
+  per-version history key, then CAS latest from exact old bytes to new bytes.
+- Publishing latest in `put_if_not_exists` is safe because Lance has already
+  durably written the staging manifest; readers may finalize that staging path
+  using Lance's existing commit handler.
+- Historical backfill writes a version key without regressing latest.
+- If latest is absent but legacy history exists, scan once, CAS-install the
+  maximum record, and let racing migrators converge on the installed value.
+- Keep retention cleanup out of this issue; #42 couples it to authoritative
+  Lance cleanup outcomes and a durable bounded cursor.
+
+## Boundaries
+
+### Allowed Changes
+crates/lake-engine-lance/**
+docs/architecture.md
+docs/plans/2026-07-11-manifest-latest-pointer.md
+specs/issue-41-manifest-latest-pointer.spec.md
+verification/issue-41-manifest-latest-pointer.md
+
+### Forbidden
+crates/lake-meta/**
+crates/lake-metasrv/**
+crates/lake-query/**
+crates/lake-sdk/**
+
+## Completion Criteria
+
+Scenario: Published datasets resolve latest with one point read
+  Test:
+    Package: lake-engine-lance
+    Filter: latest_pointer_avoids_history_scan_after_publication
+  Given a dataset whose fixed latest pointer exists
+  When latest is resolved repeatedly
+  Then each resolution uses the fixed key and never lists version history
+
+Scenario: Concurrent claims cannot regress latest
+  Test:
+    Package: lake-engine-lance
+    Filter: concurrent_manifest_claims_never_regress_latest
+  Given two writers racing to claim the same next version
+  When both archive the same prior pointer and CAS latest
+  Then exactly one claim wins and latest remains at the winning next version
+
+Scenario: Legacy history migrates once
+  Test:
+    Package: lake-engine-lance
+    Filter: legacy_history_installs_latest_pointer_once
+  Given only legacy per-version records
+  When latest is first resolved and then resolved again
+  Then the first call installs the maximum as fixed latest and the second call performs no history scan
+
+Scenario: Current and historical reads preserve Lance semantics
+  Test:
+    Package: lake-engine-lance
+    Filter: current_and_historical_version_reads_survive_pointer_layout
+  Given latest has advanced and its prior version was archived
+  When Lance resolves both versions explicitly
+  Then both exact manifest paths are returned and historical backfill cannot regress latest
+
+Scenario: Dataset deletion clears both layouts
+  Test:
+    Package: lake-engine-lance
+    Filter: delete_clears_latest_and_history
+  Given fixed latest plus archived historical records
+  When the external manifest dataset is deleted
+  Then neither latest nor any historical version remains
+
+## Out of Scope
+
+- Physical DynamoDB partition/sort-key migration.
+- Deleting retained or obsolete external manifest history; tracked by #42.
+- Changing Lance's manifest file format, naming scheme, or commit handler.
+- Query-layer provider caching or catalog refresh behavior.
