@@ -17,6 +17,7 @@
 use std::{
     collections::BTreeMap,
     fmt,
+    ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -272,6 +273,18 @@ impl LakeClient {
     pub async fn open(&self, location: &DataLocation) -> Result<ObjectReader> {
         self.objects
             .open_reader(location)
+            .await
+            .context(ObjectSnafu)
+    }
+
+    /// Open exactly one non-empty half-open byte range directly from storage.
+    pub async fn open_range(
+        &self,
+        location: &DataLocation,
+        range: Range<u64>,
+    ) -> Result<ObjectReader> {
+        self.objects
+            .open_range(location, range)
             .await
             .context(ObjectSnafu)
     }
@@ -578,6 +591,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sdk_opens_range_from_queried_datalocation() {
+        let root = tempdir().unwrap();
+        let (client, _metasrv, _table, _meta, _engine) = setup_client(root.path()).await;
+        let expected = b"0123456789abcdef";
+        client
+            .insert(
+                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    InsertValue::Utf8("episode-range".to_owned()),
+                    InsertValue::File(FileUpload::from_reader(
+                        std::io::Cursor::new(expected),
+                        "video/mp4",
+                    )),
+                ],
+            )
+            .await
+            .unwrap();
+        let mut results = client
+            .query("SELECT video FROM lake.robots.episodes")
+            .await
+            .unwrap();
+        let batch = results.try_next().await.unwrap().unwrap();
+        let location = data_location(&batch, "video", 0).unwrap();
+
+        let mut reader = client.open_range(&location, 4..10).await.unwrap();
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).await.unwrap();
+
+        assert_eq!(actual, b"456789");
+    }
+
+    #[tokio::test]
     async fn client_accepts_managed_object_store_abstraction() {
         let root = tempdir().unwrap();
         let (client, _metasrv, _table, _meta, _engine) = setup_client(root.path()).await;
@@ -848,6 +893,14 @@ mod tests {
             location: &lake_common::DataLocation,
         ) -> ObjectResult<ObjectReader> {
             Ok(Box::pin(self.0.open_reader(location).await?))
+        }
+
+        async fn open_range(
+            &self,
+            location: &lake_common::DataLocation,
+            range: std::ops::Range<u64>,
+        ) -> ObjectResult<ObjectReader> {
+            Ok(Box::pin(self.0.open_range(location, range).await?))
         }
     }
 

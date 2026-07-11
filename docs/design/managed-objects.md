@@ -35,6 +35,14 @@ The administrative schema DSL exposes the same logical type as
 `lake_sdk::data_location(&batch, "video", row)` and pass the result to
 `LakeClient::open` for direct object I/O.
 
+For random-access consumers, `LakeClient::open_range(&location, start..end)`
+uses Rust half-open byte ranges. The managed stage rejects empty, reversed, or
+out-of-bounds intervals against `DataLocation.size_bytes` before opening the
+object. Local storage seeks once and limits the returned stream to
+`end - start`; S3 sends one `Range: bytes=start-(end-1)` request. The returned
+type is still a streaming `AsyncRead`, so callers can feed a decoder without
+allocating the interval or downloading the object prefix.
+
 The SDK validates the SQL subset, placeholders, column names, and Arrow types
 before opening any file upload. It then streams each `FileUpload` into the
 Lake-owned managed stage in bounded chunks while computing SHA-256. Only after
@@ -79,6 +87,10 @@ one SDK stage from becoming an arbitrary S3 reader. Endpoint, region,
 credentials, path-style behavior, and future presigning policy stay in the
 caller-configured AWS client. No raw object bytes travel over Flight SQL or
 the metasrv control plane.
+
+Range reads use the same containment check and caller-configured credentials
+as sequential reads. They do not introduce a query endpoint, signed URL, or
+arbitrary URI escape hatch.
 
 The current slice does not provide multipart resume across SDK restarts,
 tenant authorization, browser presigning, object deduplication, or garbage

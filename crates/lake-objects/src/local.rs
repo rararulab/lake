@@ -14,18 +14,22 @@
 
 //! Local-filesystem storage for managed objects in development.
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::SeekFrom,
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
 use async_trait::async_trait;
 use lake_common::DataLocation;
 use sha2::{Digest, Sha256};
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, Take},
 };
 use url::Url;
 
-use crate::{ManagedObjectStore, ObjectError, ObjectReader, Result};
+use crate::{ManagedObjectStore, ObjectError, ObjectReader, Result, validate_range};
 
 /// Bounded copy chunk, chosen to keep multi-gigabyte uploads off the heap.
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
@@ -216,6 +220,24 @@ impl LocalObjectStore {
             source,
         })
     }
+
+    /// Open exactly one non-empty half-open byte range from a managed object.
+    pub async fn open_range(
+        &self,
+        location: &DataLocation,
+        range: Range<u64>,
+    ) -> Result<Take<File>> {
+        let length = validate_range(location, &range)?;
+        let mut file = self.open_reader(location).await?;
+        file.seek(SeekFrom::Start(range.start))
+            .await
+            .map_err(|source| ObjectError::Io {
+                action: "seeking".to_owned(),
+                path: PathBuf::from(&location.uri),
+                source,
+            })?;
+        Ok(file.take(length))
+    }
 }
 
 #[async_trait]
@@ -227,6 +249,12 @@ impl ManagedObjectStore for LocalObjectStore {
     async fn open_reader(&self, location: &DataLocation) -> Result<ObjectReader> {
         Ok(Box::pin(
             LocalObjectStore::open_reader(self, location).await?,
+        ))
+    }
+
+    async fn open_range(&self, location: &DataLocation, range: Range<u64>) -> Result<ObjectReader> {
+        Ok(Box::pin(
+            LocalObjectStore::open_range(self, location, range).await?,
         ))
     }
 }

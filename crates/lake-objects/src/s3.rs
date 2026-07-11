@@ -14,6 +14,8 @@
 
 //! S3-backed managed object stage.
 
+use std::ops::Range;
+
 use async_trait::async_trait;
 use aws_sdk_s3::{
     Client,
@@ -25,7 +27,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use url::Url;
 
-use crate::{ManagedObjectStore, ObjectError, ObjectReader, Result};
+use crate::{ManagedObjectStore, ObjectError, ObjectReader, Result, validate_range};
 
 const MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024;
 
@@ -69,6 +71,30 @@ impl S3ObjectStore {
             .await
             .map_err(|error| ObjectError::S3 {
                 action:  "get_object",
+                message: error.to_string(),
+            })?;
+        Ok(Box::pin(output.body.into_async_read()))
+    }
+
+    /// Open exactly one non-empty half-open byte range with an S3 Range GET.
+    pub async fn open_range(
+        &self,
+        location: &DataLocation,
+        range: Range<u64>,
+    ) -> Result<ObjectReader> {
+        validate_range(location, &range)?;
+        let key = self.managed_key(&location.uri)?;
+        let inclusive_end = range.end - 1;
+        let output = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .range(format!("bytes={}-{inclusive_end}", range.start))
+            .send()
+            .await
+            .map_err(|error| ObjectError::S3 {
+                action:  "get_object_range",
                 message: error.to_string(),
             })?;
         Ok(Box::pin(output.body.into_async_read()))
@@ -260,6 +286,10 @@ impl ManagedObjectStore for S3ObjectStore {
 
     async fn open_reader(&self, location: &DataLocation) -> Result<ObjectReader> {
         S3ObjectStore::open_reader(self, location).await
+    }
+
+    async fn open_range(&self, location: &DataLocation, range: Range<u64>) -> Result<ObjectReader> {
+        S3ObjectStore::open_range(self, location, range).await
     }
 }
 
