@@ -448,6 +448,8 @@ impl FlightSqlService for FlightSqlServiceImpl {
         request: Request<Ticket>,
     ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let principal = self.principal(&request)?;
+        let permit = self.admission.acquire().await?;
+        let deadline = self.admission.execution_deadline();
         let mut builder = query.into_builder();
         let generation = self.engine.cached_catalog_generation();
         for namespace in generation.listings().keys() {
@@ -461,7 +463,11 @@ impl FlightSqlService for FlightSqlServiceImpl {
             .with_schema(schema)
             .build(futures::stream::once(async { batch }))
             .map_err(Status::from);
-        Ok(Response::new(Box::pin(stream)))
+        Ok(Response::new(Box::pin(AdmittedFlightStream::new(
+            Box::pin(stream),
+            deadline,
+            permit,
+        ))))
     }
 
     async fn do_get_tables(
@@ -470,6 +476,8 @@ impl FlightSqlService for FlightSqlServiceImpl {
         request: Request<Ticket>,
     ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let principal = self.principal(&request)?;
+        let permit = self.admission.acquire().await?;
+        let deadline = self.admission.execution_deadline();
         let generation = self.engine.cached_catalog_generation();
         let batch = build_table_discovery(query, &principal, &generation)?;
         let schema = batch.schema();
@@ -477,7 +485,11 @@ impl FlightSqlService for FlightSqlServiceImpl {
             .with_schema(schema)
             .build(futures::stream::once(async { Ok::<_, FlightError>(batch) }))
             .map_err(Status::from);
-        Ok(Response::new(Box::pin(stream)))
+        Ok(Response::new(Box::pin(AdmittedFlightStream::new(
+            Box::pin(stream),
+            deadline,
+            permit,
+        ))))
     }
 
     async fn do_put_fallback(
@@ -1316,6 +1328,49 @@ mod tests {
         let third = service.do_get_statement(ticket(), request()).await;
         assert!(third.is_ok(), "dropping the stream must release its permit");
         release.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn flight_discovery_admission_releases_on_stream_drop() {
+        let meta: MetaStoreRef = Arc::new(EmptyMeta);
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let limits =
+            QueryLimits::try_new(1, Duration::from_millis(20), Duration::from_secs(5), 1024)
+                .expect("limits");
+        let service = FlightSqlServiceImpl {
+            engine:            Arc::new(QueryEngine::new(meta, storage)),
+            metadata_addr:     None,
+            metadata_security: ClientSecurity::new(),
+            managed_stage:     None,
+            admission:         QueryAdmission::new(limits),
+            discovery_limits:  DiscoveryLimits::default(),
+        };
+        let query = || CommandGetDbSchemas {
+            catalog:                  None,
+            db_schema_filter_pattern: None,
+        };
+        let request = || {
+            let mut request = Request::new(Ticket::default());
+            request
+                .extensions_mut()
+                .insert(Principal::deployment_admin());
+            request
+        };
+
+        let first = service
+            .do_get_schemas(query(), request())
+            .await
+            .expect("first discovery admitted");
+        let Err(saturated) = service.do_get_schemas(query(), request()).await else {
+            panic!("second discovery must be rejected while first stream lives");
+        };
+        assert_eq!(saturated.code(), tonic::Code::ResourceExhausted);
+
+        drop(first);
+        assert!(
+            service.do_get_schemas(query(), request()).await.is_ok(),
+            "dropping the discovery stream must release its permit"
+        );
     }
 
     #[tokio::test]
