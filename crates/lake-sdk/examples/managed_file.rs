@@ -17,17 +17,18 @@
 use std::{error::Error, sync::Arc, time::Duration};
 
 use arrow::{
-    array::{Array, StringArray, StructArray},
+    array::{Array, StringArray},
     datatypes::{DataType, Field, Schema},
 };
+use futures::TryStreamExt;
 use lake_common::{TableLocation, TableRef};
 use lake_engine::TableEngineRef;
 use lake_engine_lance::LanceEngine;
 use lake_meta::{MetaStoreRef, RocksMeta};
 use lake_metasrv::Metasrv;
-use lake_objects::{LocalObjectStore, data_location_field, data_location_from_array};
+use lake_objects::{LocalObjectStore, data_location_field};
 use lake_query::QueryEngine;
-use lake_sdk::{FileUpload, InsertValue, LakeClient};
+use lake_sdk::{FileUpload, InsertValue, LakeClient, data_location};
 use tempfile::tempdir;
 use tokio::io::AsyncReadExt;
 
@@ -86,21 +87,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .await?;
 
-    let batches = QueryEngine::new(meta, engine)
-        .execute_sql("SELECT episode_id, video FROM lake.robots.episodes")
+    let mut results = client
+        .query("SELECT episode_id, video FROM lake.robots.episodes")
         .await?;
-    let episode_ids = batches[0]
+    let batch = results.try_next().await?.ok_or("query returned no rows")?;
+    let episode_ids = batch
         .column(0)
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or("episode_id is not UTF-8")?;
     assert_eq!(episode_ids.value(0), "episode-42");
-    let files = batches[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .ok_or("video is not a FILE/DataLocation struct")?;
-    let location = data_location_from_array(files, 0)?;
+    let location = data_location(&batch, "video", 0)?;
+    assert!(results.try_next().await?.is_none());
 
     let mut reader = client.open(&location).await?;
     let mut actual = Vec::new();

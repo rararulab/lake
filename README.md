@@ -41,8 +41,17 @@ embed, or connect directly to `lake-metasrv`:
 ```rust
 let client = LakeClient::connect(
     "http://127.0.0.1:50051",
-    LocalObjectStore::new("./managed-objects").await?,
+    LocalObjectStore::open("./managed-objects").await?,
 ).await?;
+```
+
+Create the table with a first-class `file` column through either the local or
+remote administrative CLI:
+
+```bash
+lake table create robots.episodes \
+  --column episode_id:utf8 \
+  --column video:file
 ```
 
 Its essential write path is:
@@ -57,8 +66,20 @@ client.insert(
 ).await?;
 ```
 
-The example queries the resulting `DataLocation` and passes it to
-`client.open(&location)` for direct streaming reads. The local slice uses a
+Query results stream back through the same SDK connection. Decode the logical
+`FILE` value into its stable `DataLocation`, then open the object directly:
+
+```rust
+let mut results = client
+    .query("SELECT video FROM lake.robots.episodes")
+    .await?;
+let batch = results.try_next().await?.expect("one result batch");
+let location = lake_sdk::data_location(&batch, "video", 0)?;
+let reader = client.open(&location).await?;
+```
+
+The example performs insert, query, `DataLocation` decoding, and direct open
+through `LakeClient`. The local slice uses a
 `file://` managed stage. The query service forwards only the Arrow row to the
 metadata leader; video/model bytes travel directly between the SDK and the
 managed stage. Cloud multipart uploads, authentication, and short-lived read

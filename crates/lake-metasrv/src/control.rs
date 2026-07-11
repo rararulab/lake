@@ -19,8 +19,9 @@
 //! query interface. [`MetasrvFlightService`] rides the Flight `DoAction`
 //! opcode: every request is an [`Action`] whose `type` names one of
 //! `create_table`, `resolve`, `list_tables`, `list_namespaces`, and whose
-//! `body` carries a small JSON payload. Every other Flight method is
-//! unimplemented — this service never serves `DoGet`/`DoPut` data.
+//! `body` carries a small JSON payload. Typed `FILE` appends use `DoPut` with
+//! Arrow `DataLocation` rows; the original object payload never enters this
+//! service. Query-data methods such as `DoGet` remain unimplemented.
 //!
 //! Writes are leader-aware: a write (`create_table`, `drop_table`) that lands
 //! on a follower is transparently forwarded over Flight to the current leader
@@ -55,7 +56,7 @@ use tonic::{Request, Response, Status, Streaming, transport::Channel};
 use crate::{Metasrv, leadership::Leadership};
 
 /// The [`Status`] message returned by every unsupported Flight method.
-const UNSUPPORTED: &str = "metasrv control plane only serves do_action";
+const UNSUPPORTED: &str = "metasrv control plane only serves actions and FILE append do_put";
 
 /// A boxed server stream of `T`, the shape every Flight response stream takes.
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;

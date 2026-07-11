@@ -30,13 +30,20 @@ client.insert(
 ).await?;
 ```
 
+The administrative schema DSL exposes the same logical type as
+`--column video:file`. Reads stream through `LakeClient::query`; callers use
+`lake_sdk::data_location(&batch, "video", row)` and pass the result to
+`LakeClient::open` for direct object I/O.
+
 The SDK validates the SQL subset, placeholders, column names, and Arrow types
 before opening any file upload. It then streams each `FileUpload` into the
 Lake-owned managed stage in bounded chunks while computing SHA-256. Only after
 the upload succeeds does it build a RecordBatch containing the immutable
 `DataLocation` physical representation. It sends that metadata-only batch to
 query, which forwards it unchanged to the metadata leader's existing append
-commit path.
+commit path. Once metadata acknowledges the commit, that query node evicts the
+table's cached registration so the same SDK connection observes its write;
+other query nodes retain the normal bounded-staleness contract.
 
 ```text
 Rust SDK INSERT (logical FILE)

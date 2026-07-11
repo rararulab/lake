@@ -558,6 +558,15 @@ mod tests {
         assert!(results.try_next().await.unwrap().is_none());
     }
 
+    #[test]
+    fn managed_file_example_queries_through_sdk() {
+        let example = include_str!("../examples/managed_file.rs");
+
+        assert!(example.contains(".query("));
+        assert!(example.contains("data_location("));
+        assert!(!example.contains(".execute_sql("));
+    }
+
     #[tokio::test]
     async fn failed_upload_does_not_publish_a_table_version() {
         let root = tempdir().unwrap();

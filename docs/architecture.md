@@ -149,6 +149,11 @@ the SDK sends `DataLocation` Arrow values to query, query proxies the stream
 without persisting it, and the metadata leader performs append + registry CAS.
 The original object bytes never enter query or metadata.
 
+After a query node receives the metadata leader's append acknowledgement, it
+evicts that table's local registration entry. The same SDK Flight connection
+therefore observes its own write immediately; independent query nodes retain
+the normal bounded-staleness window until their cache refreshes.
+
 Interactive results stream over `DoGet`. The planned large-result tier
 materializes Arrow/Parquet parts to a service-owned S3 prefix and publishes
 short-lived HTTPS locations through `PollFlightInfo`. The complete API and
@@ -168,7 +173,7 @@ security boundary are in
 | `lake-query` | stateless query-layer server (Flight SQL, DataFusion execution) | query |
 | `lake-metasrv` | stateful metadata-layer server (registry authority, write coordination, leader election) | metadata |
 | `lake-cli` | thin `clap` binary: subcommands to run each server + client | — |
-| `lake-sdk` | Rust parameterized `FILE` INSERT binding and direct `DataLocation` reader | client |
+| `lake-sdk` | Rust streaming SQL query, parameterized `FILE` INSERT, `DataLocation` decoding, and direct reader | client |
 
 Conventions: **thin libs** (`lib.rs` is module docs + re-exports; logic in
 sub-files), **async-first** (engine, metastore, catalog, servers are async;

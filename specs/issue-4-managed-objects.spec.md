@@ -49,7 +49,11 @@ metadata and RecordBatch streams.
   this slice's GC.
 - `DataLocation` has an Arrow struct representation so Lance stores it with
   the episode/model metadata and SQL can return it as a value. The Rust SDK
-  provides the direct reader for that value.
+  streams query results, decodes that value, and provides its direct reader.
+- The local and remote administrative schema DSLs expose `file`. A successful
+  append invalidates the handling query node's registration cache, providing
+  read-your-write on the same SDK connection while preserving bounded
+  staleness across other query nodes.
 
 ## Boundaries
 
@@ -60,6 +64,7 @@ metadata and RecordBatch streams.
 - `crates/lake-objects/**`
 - `crates/lake-sdk/**`
 - `crates/lake-cli/**`
+- `crates/lake-catalog/**`
 - `crates/lake-query/**`
 - `crates/lake-metasrv/**`
 - `README.md`
@@ -107,6 +112,22 @@ Scenario: unsupported INSERT syntax is rejected before any upload
   Given SQL outside the parameterized single-row INSERT subset
   When the Rust SDK receives an object parameter
   Then it returns a syntax error and the managed object prefix is unchanged
+
+Scenario: SDK query returns a DataLocation that opens directly
+  Test:
+    Package: lake-sdk
+    Filter: sdk_queries_datalocation_and_opens_file
+  Given a FILE row committed through the query endpoint
+  When the same SDK connection streams a SELECT result
+  Then it decodes the DataLocation and opens the original bytes directly
+
+Scenario: administrative DDL accepts the FILE logical type
+  Test:
+    Package: lake-cli
+    Filter: local_schema_dsl_accepts_file
+  Given a table schema containing video:file
+  When the administrative schema DSL parses the column
+  Then it produces the canonical non-null DataLocation Arrow field
 
 ## Out of Scope
 
