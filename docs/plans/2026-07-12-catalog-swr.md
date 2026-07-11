@@ -27,3 +27,6 @@ runs at a time; failure is observable but does not discard readable state.
 - At most one detached request-triggered refresh exists per replica.
 - Startup readiness still depends on a successful authority scan.
 - Health stores counters/timestamps, not unbounded error history.
+- Fallible server configuration runs before task creation, and a server
+  lifetime guard cancels scheduled and request-triggered refresh on future
+  drop as well as graceful shutdown.

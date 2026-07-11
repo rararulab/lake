@@ -30,6 +30,7 @@ startup validation or publishing partial snapshots.
 ## Boundaries
 
 ### Allowed Changes
+Cargo.lock
 crates/lake-catalog/**
 crates/lake-query/**
 docs/architecture.md
@@ -92,6 +93,22 @@ Scenario: Query shutdown owns detached revalidation
   Given a request-triggered revalidation is stuck in authority I/O
   When the query replica shuts down its catalog
   Then the in-flight task is aborted and joined without waiting for that I/O
+
+Scenario: Fallible startup precedes background task creation
+  Test:
+    Package: lake-query
+    Filter: startup_configuration_failure_does_not_leak_refresher
+  Given query server address or security setup is invalid
+  When startup returns that configuration error
+  Then no catalog refresher retains the query engine
+
+Scenario: Cancelling the serve future stops all refresh tasks
+  Test:
+    Package: lake-query
+    Filter: aborting_server_future_releases_refresh_tasks
+  Given scheduled refresh and request-triggered revalidation are owned by a query server
+  When its serve future is aborted instead of gracefully shut down
+  Then a drop guard cancels both task paths and releases their engine state
 
 ## Out of Scope
 

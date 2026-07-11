@@ -62,7 +62,9 @@ revalidation. A failed scan records bounded process-local health without
 replacing the snapshot; a later successful scan atomically publishes the
 replacement and clears failure state. Query shutdown aborts and joins the
 tracked request-triggered task, while the scheduled server refresher is owned
-directly by the server cancellation token.
+directly by the server cancellation token. All fallible address/security/TLS
+setup precedes task creation; a drop guard also cancels and aborts both refresh
+paths if the serve future itself is cancelled.
 
 ### Why the tiers scale differently
 

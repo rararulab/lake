@@ -473,18 +473,27 @@ pub async fn serve_with_config_and_shutdown<F>(
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    let socket = addr.parse().context(AddressSnafu { addr })?;
+    config
+        .server_security
+        .validate_exposure(socket, config.allow_insecure)
+        .context(SecuritySnafu)?;
+    let mut server = tonic::transport::Server::builder();
+    if let Some(tls) = config.server_security.tls_config() {
+        server = server.tls_config(tls).context(ServeSnafu)?;
+    }
+
     engine.refresh().await?;
     let cancellation = CancellationToken::new();
     let refresher = tokio::spawn(run_catalog_refresh_loop(
         engine.clone(),
         cancellation.clone(),
     ));
-
-    let socket = addr.parse().context(AddressSnafu { addr })?;
-    config
-        .server_security
-        .validate_exposure(socket, config.allow_insecure)
-        .context(SecuritySnafu)?;
+    let mut background = QueryBackgroundGuard {
+        cancellation: cancellation.clone(),
+        engine:       engine.clone(),
+        refresher:    Some(refresher),
+    };
     let service = FlightServiceServer::new(FlightSqlServiceImpl {
         engine:            engine.clone(),
         metadata_addr:     config.metadata_endpoint,
@@ -494,10 +503,6 @@ where
     });
 
     tracing::info!(%addr, "Flight SQL server ready");
-    let mut server = tonic::transport::Server::builder();
-    if let Some(tls) = config.server_security.tls_config() {
-        server = server.tls_config(tls).context(ServeSnafu)?;
-    }
     let server_shutdown = cancellation.clone();
     let server = server
         .layer(tonic::service::InterceptorLayer::new(
@@ -522,7 +527,10 @@ where
     };
     cancellation.cancel();
     engine.shutdown_catalog_revalidation().await;
-    let refresher_result = refresher
+    let refresher_result = background
+        .refresher
+        .take()
+        .expect("background refresher exists")
         .await
         .map_err(|source| QueryError::BackgroundTask {
             task: "catalog-refresh",
@@ -531,6 +539,22 @@ where
     server_result?;
     refresher_result?;
     Ok(())
+}
+
+struct QueryBackgroundGuard {
+    cancellation: CancellationToken,
+    engine:       Arc<QueryEngine>,
+    refresher:    Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for QueryBackgroundGuard {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.engine.catalog.abort_revalidation();
+        if let Some(refresher) = self.refresher.take() {
+            refresher.abort();
+        }
+    }
 }
 
 async fn run_catalog_refresh_loop(engine: Arc<QueryEngine>, shutdown: CancellationToken) {
@@ -950,6 +974,78 @@ mod tests {
             Arc::strong_count(&meta),
             1,
             "serve must join the refresher and drop its QueryEngine"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_configuration_failure_does_not_leak_refresher() {
+        let meta = Arc::new(CountingMeta::default());
+        let meta_ref: MetaStoreRef = meta.clone();
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let engine = Arc::new(QueryEngine::new(meta_ref, storage));
+
+        let error = serve_with_config_and_shutdown(
+            engine.clone(),
+            "not-a-socket-address",
+            QueryServerConfig::new(),
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, QueryError::Address { .. }));
+        drop(engine);
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            Arc::strong_count(&meta),
+            1,
+            "fallible startup must finish before spawning the refresher"
+        );
+    }
+
+    #[tokio::test]
+    async fn aborting_server_future_releases_refresh_tasks() {
+        let meta = Arc::new(PausingRefreshMeta {
+            scans:   AtomicUsize::new(0),
+            pause:   AtomicBool::new(false),
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let meta_ref: MetaStoreRef = meta.clone();
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let engine = Arc::new(QueryEngine::new(meta_ref, storage));
+        let addr = free_addr();
+        let server_engine = engine.clone();
+        let server = tokio::spawn(async move {
+            serve_with_config_and_shutdown(
+                server_engine,
+                &addr.to_string(),
+                QueryServerConfig::new(),
+                std::future::pending(),
+            )
+            .await
+        });
+        let _client = connect_sql(addr).await;
+        meta.pause.store(true, Ordering::SeqCst);
+        let entered = meta.entered.notified();
+        engine
+            .catalog
+            .refresh_if_stale(Duration::ZERO)
+            .await
+            .unwrap();
+        entered.await;
+
+        server.abort();
+        let _ = server.await;
+        drop(engine);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            Arc::strong_count(&meta),
+            1,
+            "aborting serve must cancel scheduled and request-triggered refresh tasks"
         );
     }
 

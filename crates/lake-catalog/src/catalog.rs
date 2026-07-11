@@ -383,18 +383,30 @@ impl LakeCatalog {
 
     /// Abort and join request-triggered revalidation during replica shutdown.
     pub async fn shutdown_revalidation(&self) {
-        self.state.refresh_shutdown.store(true, Ordering::Release);
-        let task = self
-            .state
-            .refresh_task
-            .lock()
-            .expect("refresh task lock poisoned")
-            .take();
+        let task = self.take_revalidation_for_shutdown();
         if let Some(task) = task {
             task.abort();
             let _ = task.await;
         }
         self.state.refresh_in_flight.store(false, Ordering::Release);
+    }
+
+    /// Synchronously fence and abort revalidation when an owning server future
+    /// is dropped and cannot await graceful task joining.
+    pub fn abort_revalidation(&self) {
+        if let Some(task) = self.take_revalidation_for_shutdown() {
+            task.abort();
+        }
+        self.state.refresh_in_flight.store(false, Ordering::Release);
+    }
+
+    fn take_revalidation_for_shutdown(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.state.refresh_shutdown.store(true, Ordering::Release);
+        self.state
+            .refresh_task
+            .lock()
+            .expect("refresh task lock poisoned")
+            .take()
     }
 
     async fn refresh_inner(&self, max_age: Option<Duration>) -> lake_meta::Result<()> {
