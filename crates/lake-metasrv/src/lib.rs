@@ -362,15 +362,16 @@ impl Default for MetasrvServerConfig {
 /// The registry authority. Holds the durable metastore and the storage
 /// engine used to materialize new tables.
 struct MetasrvInner {
-    meta:                   MetaStoreRef,
-    engine:                 TableEngineRef,
+    meta:                     MetaStoreRef,
+    engine:                   TableEngineRef,
     /// One coordinator per table. Metadata writes are rare and the catalog's
     /// design ceiling is ~10^4 tables, so retaining these locks is bounded.
-    table_locks:            Mutex<HashMap<TableRef, Arc<Mutex<()>>>>,
-    operation_retention:    Duration,
-    operation_gc_page_size: usize,
-    operation_gc_cursor:    Mutex<Option<String>>,
-    drop_gc_cursor:         Mutex<Option<String>>,
+    table_locks:              Mutex<HashMap<TableRef, Arc<Mutex<()>>>>,
+    operation_retention:      Duration,
+    operation_gc_page_size:   usize,
+    operation_gc_cursor:      Mutex<Option<String>>,
+    drop_gc_cursor:           Mutex<Option<String>>,
+    table_maintenance_cursor: Mutex<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -421,6 +422,7 @@ impl Metasrv {
                 operation_gc_page_size: operation_gc_page_size.max(1),
                 operation_gc_cursor: Mutex::new(None),
                 drop_gc_cursor: Mutex::new(None),
+                table_maintenance_cursor: Mutex::new(None),
             }),
         }
     }
