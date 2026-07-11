@@ -43,6 +43,15 @@ the batch size cannot exceed the row maximum. Schema/table `DoGet` requests
 share `LAKE_QUERY_MAX_CONCURRENT` admission; queue saturation or a response
 that exceeds the matching-row maximum returns gRPC `ResourceExhausted`.
 
+Metasrv FILE append admission uses `LAKE_APPEND_MAX_CONCURRENT` (default `8`),
+`LAKE_APPEND_QUEUE_TIMEOUT_MS` (default `100`),
+`LAKE_APPEND_MAX_STREAM_BYTES` (default `67108864`), and
+`LAKE_APPEND_MAX_BUFFERED_BYTES` (default `268435456`). All must be positive;
+the process buffer must hold at least one maximum-sized stream and both byte
+values must fit weighted semaphore permits. Each request reserves its complete
+per-stream maximum until forwarding or local commit finishes, so saturation
+returns gRPC `ResourceExhausted` before payload polling.
+
 ## Async Runtime
 
 - The CLI is async-first. Use `#[tokio::main]` at the binary boundary and keep

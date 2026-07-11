@@ -285,6 +285,16 @@ protocol above. Query forwards tenant scope derived from its authenticated
 principal; a caller-supplied tenant string is never trusted.
 The original object bytes never enter query or metadata.
 
+Each Metasrv process admits FILE appends before polling their first Flight
+message. A request reserves one concurrency slot plus its configured
+worst-case control-stream bytes, then holds both through follower forwarding
+or local digest validation, decode, engine commit, and response construction.
+Defaults are 8 concurrent appends, 100 ms queue wait, 64 MiB per stream, and
+256 MiB process-wide buffered control metadata. Reserving the whole per-stream
+maximum avoids incremental weighted-permit deadlocks; saturation fails with
+`ResourceExhausted`. These budgets cover only small `DataLocation`/scalar
+control rows—multi-GB objects continue directly between the SDK and storage.
+
 After a query node receives the metadata leader's append acknowledgement, it
 advances that table's local registration epoch and evicts the prior entry.
 An older in-flight cache fill is confined to its old epoch and cannot repopulate
@@ -408,6 +418,10 @@ design-level ones:
   deadline, and pre-planning SQL/ticket size checks. This protects one replica
   without adding metadata traffic. Tenant quotas, fair queuing, and distributed
   admission remain production policy work.
+- Each Metasrv replica separately bounds concurrent FILE appends and reserves
+  worst-case buffered control bytes before reading a request. A follower and
+  leader each enforce their own local ceiling while one forwarded upload is in
+  flight; per-tenant and distributed write quotas remain policy work.
 - Query's DataFusion runtime is also process-bounded: all concurrent operators
   share one fair execution-memory pool and one aggregate size-limited spill
   manager under an operator-owned local directory. Spill is ephemeral replica
