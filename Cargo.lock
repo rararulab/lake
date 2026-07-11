@@ -4241,6 +4241,9 @@ dependencies = [
 name = "lake-objects"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
  "datafusion",
  "lake-common",
  "sha2 0.10.9",
@@ -4280,6 +4283,9 @@ version = "0.0.1"
 dependencies = [
  "arrow",
  "arrow-flight",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
  "futures",
  "lake-common",
  "lake-engine",

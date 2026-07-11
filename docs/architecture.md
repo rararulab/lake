@@ -221,10 +221,12 @@ design-level ones:
   Add SDK-side catalog caching when fleet-node QPS demands another tier.
 - Managed large objects have a query-connected Rust SDK vertical slice:
   `INSERT ... VALUES (?, ?)` binds `InsertValue::File(FileUpload)`, streams it
-  into a Lake-owned managed stage, and stores an immutable `DataLocation`
-  physical representation in Lance. The SDK receives only query endpoint +
-  stage; query forwards metadata to the leader-aware metasrv. S3 multipart
-  presigning, authenticated expiring locations, and object GC are deferred.
+  into either a local or S3 Lake-owned managed stage, and stores an immutable
+  `DataLocation` physical representation in Lance. S3 uses bounded multipart
+  upload with abort-on-error and exact bucket/prefix validation for direct
+  reads. The SDK receives only query endpoint + stage; query forwards metadata
+  to the leader-aware metasrv. Resumable uploads, browser presigning,
+  authenticated expiring locations, and object GC are deferred.
 
 ## Phasing
 

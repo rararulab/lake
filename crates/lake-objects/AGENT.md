@@ -15,3 +15,6 @@ Managed large-object values and direct storage access for the Rust SDK.
 
 - `lib.rs` — public object value, Arrow conversion, and storage interfaces.
 - `local.rs` — local-development managed-object implementation.
+- `s3.rs` — production managed-prefix validation, multipart upload/abort, and
+  direct S3 reads.
+- `tests/s3_localstack.rs` — ignored real-protocol multipart and failure tests.

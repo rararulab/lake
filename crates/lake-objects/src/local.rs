@@ -16,6 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
 use lake_common::DataLocation;
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -24,7 +25,7 @@ use tokio::{
 };
 use url::Url;
 
-use crate::{ObjectError, Result};
+use crate::{ManagedObjectStore, ObjectError, ObjectReader, Result};
 
 /// Bounded copy chunk, chosen to keep multi-gigabyte uploads off the heap.
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
@@ -214,5 +215,18 @@ impl LocalObjectStore {
             path,
             source,
         })
+    }
+}
+
+#[async_trait]
+impl ManagedObjectStore for LocalObjectStore {
+    async fn put_reader(&self, input: ObjectReader, content_type: String) -> Result<DataLocation> {
+        LocalObjectStore::put_reader(self, input, content_type).await
+    }
+
+    async fn open_reader(&self, location: &DataLocation) -> Result<ObjectReader> {
+        Ok(Box::pin(
+            LocalObjectStore::open_reader(self, location).await?,
+        ))
     }
 }

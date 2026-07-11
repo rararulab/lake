@@ -45,6 +45,20 @@ let client = LakeClient::connect(
 ).await?;
 ```
 
+For production S3, pass the same client an S3 managed stage. Lake stores the
+stable `s3://` identity; the AWS client configuration and credentials remain
+in the SDK process and never enter SQL or table rows:
+
+```rust
+let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+let stage = S3ObjectStore::new(
+    aws_sdk_s3::Client::new(&aws),
+    "embodied-data",
+    "lake/managed-files",
+)?;
+let client = LakeClient::connect("https://query.example.com", stage).await?;
+```
+
 Create the table with a first-class `file` column through either the local or
 remote administrative CLI:
 
@@ -79,11 +93,13 @@ let reader = client.open(&location).await?;
 ```
 
 The example performs insert, query, `DataLocation` decoding, and direct open
-through `LakeClient`. The local slice uses a
-`file://` managed stage. The query service forwards only the Arrow row to the
-metadata leader; video/model bytes travel directly between the SDK and the
-managed stage. Cloud multipart uploads, authentication, and short-lived read
-capabilities are intentionally not part of this first Rust API.
+through `LakeClient`. Local development uses a `file://` stage; production can
+use a caller-configured `s3://` stage. Non-empty S3 objects stream through
+bounded 5 MiB multipart parts, with incremental SHA-256 and abort-on-error.
+The query service forwards only the Arrow row to the metadata leader;
+video/model bytes travel directly between the SDK and the managed stage.
+Presigned browser access, resumable uploads, tenant authorization, and object
+garbage collection remain outside this first Rust API.
 
 For a local deployment, start metadata and query separately. The query process
 is told where metadata lives; clients are not:
