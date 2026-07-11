@@ -22,14 +22,17 @@ use datafusion::arrow::{
 };
 use futures::TryStreamExt;
 use lake_common::{
-    AppendOperationId, FILE_APPEND_TYPE_URL, FileAppendRequest, TableLocation, TableRef,
+    AppendOperationId, FILE_APPEND_TYPE_URL, FileAppendRequest, Principal, PrincipalId,
+    PrincipalRole, TableLocation, TableRef, TenantId, Version,
 };
 use lake_engine::TableEngineRef;
 use lake_engine_lance::LanceEngine;
-use lake_flight::append_flight_payload_digest;
+use lake_flight::{
+    BearerPrincipalBinding, ClientSecurity, ServerSecurity, append_flight_payload_digest,
+};
 use lake_meta::{MetaStoreRef, RocksMeta};
-use lake_metasrv::Metasrv;
-use lake_query::{QueryEngine, serve_with_metadata};
+use lake_metasrv::{Metasrv, MetasrvServerConfig};
+use lake_query::{QueryEngine, QueryServerConfig};
 use prost::Message;
 use prost_types::Any;
 use tonic::transport::Channel;
@@ -40,7 +43,7 @@ fn free_addr() -> String {
 }
 
 #[tokio::test]
-async fn file_append_is_forwarded_without_payload_proxying() {
+async fn query_forwards_authenticated_append_operation_scope() {
     let root = tempfile::tempdir().unwrap();
     let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
     let engine: TableEngineRef = Arc::new(LanceEngine::new());
@@ -61,16 +64,55 @@ async fn file_append_is_forwarded_without_payload_proxying() {
         .unwrap();
     let meta_addr = free_addr();
     let query_addr = free_addr();
+    let query_service = Principal::try_new(
+        PrincipalId::try_new("query-service").unwrap(),
+        TenantId::try_new("service").unwrap(),
+        PrincipalRole::QueryService,
+        std::iter::empty::<&str>(),
+    )
+    .unwrap();
+    let meta_security = ServerSecurity::with_bearer_principals([BearerPrincipalBinding::new(
+        "query-token",
+        query_service,
+    )
+    .unwrap()])
+    .unwrap();
+    let metadata_client = ClientSecurity::new()
+        .with_bearer_token("query-token")
+        .unwrap();
     tokio::spawn({
         let metasrv = metasrv.clone();
         let addr = meta_addr.clone();
-        async move { lake_metasrv::serve(metasrv, &addr).await }
+        let config = MetasrvServerConfig::new().with_server_security(meta_security);
+        async move { lake_metasrv::serve_with_config(metasrv, &addr, config).await }
     });
+    let alpha = Principal::try_new(
+        PrincipalId::try_new("alpha-user").unwrap(),
+        TenantId::try_new("tenant-a").unwrap(),
+        PrincipalRole::User,
+        ["robots"],
+    )
+    .unwrap();
+    let beta = Principal::try_new(
+        PrincipalId::try_new("beta-user").unwrap(),
+        TenantId::try_new("tenant-b").unwrap(),
+        PrincipalRole::User,
+        ["robots"],
+    )
+    .unwrap();
+    let query_security = ServerSecurity::with_bearer_principals([
+        BearerPrincipalBinding::new("alpha-token", alpha).unwrap(),
+        BearerPrincipalBinding::new("beta-token", beta).unwrap(),
+    ])
+    .unwrap();
     tokio::spawn({
         let query = Arc::new(QueryEngine::new(meta.clone(), engine));
         let addr = query_addr.clone();
         let metadata = format!("http://{meta_addr}");
-        async move { serve_with_metadata(query, &addr, &metadata).await }
+        let config = QueryServerConfig::new()
+            .with_metadata(metadata, metadata_client)
+            .with_server_security(query_security);
+        async move { lake_query::serve_with_config(query, &addr, config).await }
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -97,29 +139,42 @@ async fn file_append_is_forwarded_without_payload_proxying() {
         }
         .encode_to_vec(),
     ));
-    let stream = futures::stream::iter(messages.into_iter().map(Ok));
     let channel = Channel::from_shared(format!("http://{query_addr}"))
         .unwrap()
         .connect()
         .await
         .unwrap();
-    let mut client = FlightClient::new(channel);
-    client
-        .do_put(stream)
-        .await
-        .unwrap()
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap();
+    let send = |token: &'static str, messages: Vec<arrow_flight::FlightData>| {
+        let channel = channel.clone();
+        async move {
+            let security = ClientSecurity::new().with_bearer_token(token).unwrap();
+            let mut client = FlightClient::new(channel);
+            security.apply_to_flight_client(&mut client).unwrap();
+            let results = client
+                .do_put(futures::stream::iter(messages.into_iter().map(Ok)))
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            serde_json::from_slice::<Version>(&results[0].app_metadata).unwrap()
+        }
+    };
 
-    assert!(
+    let alpha_version = send("alpha-token", messages.clone()).await;
+    let beta_version = send("beta-token", messages.clone()).await;
+    let alpha_replay = send("alpha-token", messages).await;
+
+    assert_eq!(alpha_version, Version(2));
+    assert_eq!(beta_version, Version(3));
+    assert_eq!(alpha_replay, alpha_version);
+    assert_eq!(
         metasrv
             .resolve(&table)
             .await
             .unwrap()
             .unwrap()
-            .current_version
-            .0
-            > 1
+            .current_version,
+        beta_version
     );
 }

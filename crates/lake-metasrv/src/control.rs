@@ -247,6 +247,9 @@ where
             crate::MetasrvError::OperationFromFuture { .. } => {
                 Status::invalid_argument(error.to_string())
             }
+            crate::MetasrvError::OperationTableRecreated { .. } => {
+                Status::failed_precondition(error.to_string())
+            }
             crate::MetasrvError::OperationInProgress { .. } => {
                 Status::unavailable(error.to_string())
             }
@@ -260,14 +263,16 @@ where
 /// [`Leadership`] flag it gates writes on.
 pub(crate) struct MetasrvFlightService {
     /// The registry authority every action dispatches to.
-    pub(crate) metasrv:       Arc<Metasrv>,
+    pub(crate) metasrv:            Arc<Metasrv>,
     /// The shared leadership state consulted before serving a write.
-    pub(crate) leadership:    Arc<Leadership>,
+    pub(crate) leadership:         Arc<Leadership>,
     /// This node's own Flight address, used to tell "the leader is me" apart
     /// from "forward to another node" when the leader flag is briefly stale.
-    pub(crate) own_addr:      String,
+    pub(crate) own_addr:           String,
     /// TLS and service identity for forwarding writes to the elected leader.
-    pub(crate) peer_security: ClientSecurity,
+    pub(crate) peer_security:      ClientSecurity,
+    #[cfg(feature = "test")]
+    pub(crate) append_result_gate: Option<Arc<crate::AppendResultGate>>,
 }
 
 /// `create_table` action body: the table to materialize and register.
@@ -600,6 +605,14 @@ impl FlightService for MetasrvFlightService {
             }
         }
         let version = append_file_stream(&self.metasrv, tenant, input).await?;
+        #[cfg(feature = "test")]
+        if let Some(gate) = &self.append_result_gate
+            && gate.block_first().await
+        {
+            return Err(Status::unavailable(
+                "injected post-commit append response loss",
+            ));
+        }
         let result = PutResult {
             app_metadata: serde_json::to_vec(&version)
                 .map_err(|error| Status::internal(error.to_string()))?
@@ -1021,7 +1034,7 @@ mod file_append_tests {
     }
 
     #[tokio::test]
-    async fn terminal_replay_clears_stale_active_fence() {
+    async fn append_crash_window_terminal_replay_clears_stale_active_fence() {
         let root = tempfile::tempdir().unwrap();
         let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
@@ -1069,6 +1082,81 @@ mod file_append_tests {
         .expect("terminal replay repairs crash-left active fence");
 
         assert_eq!(meta.get(&active).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn replay_after_drop_recreate_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::new(meta, engine);
+        let table = TableRef::new("robots", "episodes");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        metasrv
+            .create_table(
+                &table,
+                TableLocation::new(root.path().join("first.lance").to_string_lossy()),
+                schema.clone(),
+            )
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["episode-42"]))],
+        )
+        .unwrap();
+        let (_append, messages) = encoded_append(
+            table.clone(),
+            schema.clone(),
+            batch,
+            AppendOperationId::generate(),
+        )
+        .await;
+        let tenant = TenantId::try_new("tenant-a").unwrap();
+        assert_eq!(
+            append_file_stream(
+                &metasrv,
+                tenant.clone(),
+                futures::stream::iter(messages.clone().into_iter().map(Ok::<_, String>)),
+            )
+            .await
+            .unwrap(),
+            Version(2)
+        );
+
+        metasrv.drop_table(&table).await.unwrap();
+        metasrv
+            .create_table(
+                &table,
+                TableLocation::new(root.path().join("replacement.lance").to_string_lossy()),
+                schema,
+            )
+            .await
+            .unwrap();
+        let error = append_file_stream(
+            &metasrv,
+            tenant,
+            futures::stream::iter(messages.into_iter().map(Ok::<_, String>)),
+        )
+        .await
+        .expect_err(
+            "an operation from a dropped table incarnation must not target its replacement",
+        );
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(1)
+        );
     }
 
     #[tokio::test]
@@ -1329,7 +1417,7 @@ mod file_append_tests {
     }
 
     #[tokio::test]
-    async fn reservation_failure_does_not_leave_orphan_active_fence() {
+    async fn append_crash_window_reservation_failure_recovers_without_orphan_fence() {
         let root = tempfile::tempdir().unwrap();
         let underlying: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
         let meta: MetaStoreRef = Arc::new(FailOperationReservationMeta {
@@ -1337,7 +1425,7 @@ mod file_append_tests {
             fail_once: AtomicBool::new(true),
         });
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
-        let metasrv = Metasrv::new(meta, engine);
+        let metasrv = Metasrv::new(meta, engine.clone());
         let table = TableRef::new("robots", "episodes");
         let schema = Arc::new(Schema::new(vec![Field::new(
             "episode_id",
@@ -1365,7 +1453,7 @@ mod file_append_tests {
         let result = append_file_stream(
             &metasrv,
             tenant,
-            futures::stream::iter(messages.into_iter().map(Ok::<_, String>)),
+            futures::stream::iter(messages.clone().into_iter().map(Ok::<_, String>)),
         )
         .await;
 
@@ -1380,6 +1468,17 @@ mod file_append_tests {
                 .unwrap(),
             None,
             "failed reservation must not permanently fence the table"
+        );
+        let recovered = Metasrv::new(underlying, engine);
+        assert_eq!(
+            append_file_stream(
+                &recovered,
+                TenantId::try_new("tenant-a").unwrap(),
+                futures::stream::iter(messages.into_iter().map(Ok::<_, String>)),
+            )
+            .await
+            .unwrap(),
+            Version(2)
         );
     }
 
@@ -1420,7 +1519,16 @@ mod file_append_tests {
         .await;
         let stale_operation = operation(&stale_append, &tenant);
         let stale_key = operation_key(&stale_operation, &table);
-        let stale_record = AppendRecord::reserved(&stale_operation, &table, Version(1), 1);
+        let incarnation = metasrv
+            .resolve(&table)
+            .await
+            .unwrap()
+            .unwrap()
+            .incarnation_id()
+            .unwrap()
+            .to_owned();
+        let stale_record =
+            AppendRecord::reserved(&stale_operation, &table, &incarnation, Version(1), 1);
         assert!(
             meta.cas(&stale_key, None, &stale_record.encode().unwrap())
                 .await
@@ -1470,7 +1578,8 @@ mod file_append_tests {
         let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
         let first_metasrv = Metasrv::new(meta.clone(), engine.clone());
-        let second_metasrv = Metasrv::new(meta, engine);
+        let second_metasrv = Metasrv::new(meta, engine.clone());
+        let location = TableLocation::new(root.path().join("episodes.lance").to_string_lossy());
         let table = TableRef::new("robots", "episodes");
         let schema = Arc::new(Schema::new(vec![Field::new(
             "episode_id",
@@ -1478,11 +1587,7 @@ mod file_append_tests {
             false,
         )]));
         first_metasrv
-            .create_table(
-                &table,
-                TableLocation::new(root.path().join("episodes.lance").to_string_lossy()),
-                schema.clone(),
-            )
+            .create_table(&table, location.clone(), schema.clone())
             .await
             .unwrap();
         let batch = RecordBatch::try_new(
@@ -1526,6 +1631,15 @@ mod file_append_tests {
                 .unwrap()
                 .unwrap()
                 .current_version,
+            Version(2)
+        );
+        assert_eq!(
+            engine
+                .open(&location)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version(),
             Version(2)
         );
     }

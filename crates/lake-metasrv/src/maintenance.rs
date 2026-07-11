@@ -204,6 +204,12 @@ async fn reconcile_and_delete_expired(
         let Some(registration) = metasrv.resolve(&table).await? else {
             return delete_operation_record(metasrv, key, encoded, &table, &operation).await;
         };
+        if registration.incarnation_id() != Some(record.table_incarnation.as_str()) {
+            // The expired operation cannot legally target this replacement,
+            // and the server rejects its UUID before record creation. Removing
+            // its exact record/fence is therefore both safe and leak-free.
+            return delete_operation_record(metasrv, key, encoded, &table, &operation).await;
+        }
         let handle = metasrv
             .engine()
             .open(&registration.location)
@@ -386,12 +392,27 @@ mod tests {
         let metasrv =
             Metasrv::with_operation_policy(meta.clone(), engine, Duration::from_secs(1), 2);
         let table = TableRef::new("robots", "episodes");
+        let location = TableLocation::new(meta_dir.path().join("episodes.lance").to_string_lossy());
+        metasrv
+            .create_table(&table, location, batch().schema())
+            .await
+            .unwrap();
+        let incarnation = metasrv
+            .resolve(&table)
+            .await
+            .unwrap()
+            .unwrap()
+            .incarnation_id()
+            .unwrap()
+            .to_owned();
         let tenant = TenantId::try_new("tenant-a").unwrap();
         let mut operations = Vec::new();
-        for (suffix, state) in [
-            ("000000000011", AppendState::Committed),
-            ("000000000012", AppendState::Committed),
-            ("000000000013", AppendState::Reserved),
+        let sweep_now = u64::MAX / 2;
+        for (suffix, state, updated_at) in [
+            ("000000000011", AppendState::Committed, 1),
+            ("000000000012", AppendState::Committed, 1),
+            ("000000000013", AppendState::Reserved, 1),
+            ("000000000014", AppendState::Committed, sweep_now),
         ] {
             let operation = AppendOperation::builder()
                 .tenant(tenant.clone())
@@ -405,9 +426,15 @@ mod tests {
                     .unwrap(),
                 )
                 .build();
-            let mut record = AppendRecord::reserved(&operation, &table, lake_common::Version(1), 1);
+            let mut record = AppendRecord::reserved(
+                &operation,
+                &table,
+                &incarnation,
+                lake_common::Version(1),
+                1,
+            );
             record.state = state;
-            record.updated_at = 1;
+            record.updated_at = updated_at;
             if state == AppendState::Committed {
                 record.result_version = Some(lake_common::Version(2));
             }
@@ -427,17 +454,16 @@ mod tests {
             operations.push(operation);
         }
 
-        let first = sweep_operations_at(&metasrv, u64::MAX / 2).await;
+        let first = sweep_operations_at(&metasrv, sweep_now).await;
         assert!(
             first.scanned <= 2,
             "one sweep is limited to one metadata page"
         );
-        let second = sweep_operations_at(&metasrv, u64::MAX / 2).await;
+        let second = sweep_operations_at(&metasrv, sweep_now).await;
         assert!(second.scanned <= 2, "the continuation remains page bounded");
-        assert!(
-            meta.scan_prefix(OPERATION_PREFIX).await.unwrap().is_empty(),
-            "terminal and reconciled non-committed expired records are collected"
-        );
+        let remaining = meta.scan_prefix(OPERATION_PREFIX).await.unwrap();
+        assert_eq!(remaining.len(), 1, "recent operation records remain");
+        assert!(remaining[0].0.ends_with("000000000014"));
 
         let expired = &operations[0];
         let batch = batch();

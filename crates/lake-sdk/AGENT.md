@@ -12,6 +12,8 @@ The Rust SDK's typed write and direct-read surface.
   succeeds; per-table visibility remains owned by `Metasrv::append`.
 - Ambiguous append retries reuse one UUIDv7 identity, digest, and encoded Arrow
   payload; uploaded video/model bytes are never uploaded again by that retry.
+- The retry window exceeds metadata lease expiry so ungraceful leader failover
+  does not force callers to generate a second logical operation.
 - The primary public client receives only a query endpoint, discovers the
   credential-free managed-stage descriptor once, and uses process credentials;
   the production crate must not depend on, construct, or start `lake-metasrv`.

@@ -34,23 +34,25 @@ pub(crate) enum AppendState {
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub(crate) struct AppendRecord {
-    pub(crate) format_version: u8,
-    pub(crate) tenant:         String,
-    pub(crate) namespace:      String,
-    pub(crate) table:          String,
-    pub(crate) operation_id:   String,
-    pub(crate) payload_sha256: String,
-    pub(crate) base_version:   Version,
-    pub(crate) result_version: Option<Version>,
-    pub(crate) state:          AppendState,
-    pub(crate) created_at:     u64,
-    pub(crate) updated_at:     u64,
+    pub(crate) format_version:    u8,
+    pub(crate) tenant:            String,
+    pub(crate) namespace:         String,
+    pub(crate) table:             String,
+    pub(crate) table_incarnation: String,
+    pub(crate) operation_id:      String,
+    pub(crate) payload_sha256:    String,
+    pub(crate) base_version:      Version,
+    pub(crate) result_version:    Option<Version>,
+    pub(crate) state:             AppendState,
+    pub(crate) created_at:        u64,
+    pub(crate) updated_at:        u64,
 }
 
 impl AppendRecord {
     pub(crate) fn reserved(
         operation: &AppendOperation,
         table: &TableRef,
+        table_incarnation: &str,
         base_version: Version,
         now: u64,
     ) -> Self {
@@ -59,6 +61,7 @@ impl AppendRecord {
             tenant: operation.tenant().as_str().to_owned(),
             namespace: table.namespace.0.clone(),
             table: table.name.0.clone(),
+            table_incarnation: table_incarnation.to_owned(),
             operation_id: operation.operation_id().as_str().to_owned(),
             payload_sha256: operation.payload_digest().as_str().to_owned(),
             base_version,
@@ -69,7 +72,12 @@ impl AppendRecord {
         }
     }
 
-    pub(crate) fn validate(&self, operation: &AppendOperation, table: &TableRef) -> Result<()> {
+    pub(crate) fn validate(
+        &self,
+        operation: &AppendOperation,
+        table: &TableRef,
+        table_incarnation: &str,
+    ) -> Result<()> {
         if self.format_version != 1
             || self.tenant != operation.tenant().as_str()
             || self.namespace != table.namespace.0
@@ -77,6 +85,11 @@ impl AppendRecord {
             || self.operation_id != operation.operation_id().as_str()
         {
             return Err(MetasrvError::CorruptOperationState {
+                operation_id: operation.operation_id().to_string(),
+            });
+        }
+        if self.table_incarnation != table_incarnation {
+            return Err(MetasrvError::OperationTableRecreated {
                 operation_id: operation.operation_id().to_string(),
             });
         }

@@ -166,6 +166,20 @@ pub trait TableHandle: Send + Sync {
         batches: SendableRecordBatchStream,
     ) -> Result<Version>;
 
+    /// Commit an operation whose coordinator reservation proves it is new,
+    /// or whose coordinator already performed recovery lookup.
+    ///
+    /// Engines may skip an eager history scan on this path. Implementations
+    /// without that optimization retain the conservative [`Self::append`]
+    /// behavior through this default.
+    async fn append_reserved(
+        &self,
+        operation: &AppendOperation,
+        batches: SendableRecordBatchStream,
+    ) -> Result<Version> {
+        self.append(operation, batches).await
+    }
+
     /// Discover and finish an append already present in engine history.
     /// Implementations return `None` only when the operation never committed.
     async fn reconcile_append(&self, operation: &AppendOperation) -> Result<Option<Version>>;

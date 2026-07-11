@@ -22,7 +22,7 @@
 
 use lake_common::{Namespace, TableLocation, TableName, TableRef, Version};
 use serde::{Deserialize, Serialize};
-use snafu::{ResultExt, ensure};
+use snafu::{OptionExt, ResultExt, ensure};
 
 use crate::{
     error::{AlreadyRegisteredSnafu, ConflictSnafu, CorruptEntrySnafu, Result},
@@ -37,6 +37,9 @@ pub struct TableRegistration {
     /// routes to the right engine.
     pub engine:          String,
     pub current_version: Version,
+    /// Stable identity of this create/drop lifecycle, independent of its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    incarnation_id:      Option<String>,
     /// Arrow IPC schema bytes owned and interpreted by the catalog layer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     schema_ipc:          Option<Vec<u8>>,
@@ -54,12 +57,17 @@ impl TableRegistration {
             location,
             engine: engine.into(),
             current_version,
+            incarnation_id: Some(uuid::Uuid::now_v7().to_string()),
             schema_ipc: Some(schema_ipc),
         }
     }
 
     #[must_use]
     pub fn schema_ipc(&self) -> Option<&[u8]> { self.schema_ipc.as_deref() }
+
+    /// Return the immutable identity of this table lifecycle, when migrated.
+    #[must_use]
+    pub fn incarnation_id(&self) -> Option<&str> { self.incarnation_id.as_deref() }
 }
 
 fn key(table: &TableRef) -> String { format!("tbl/{}/{}", table.namespace.0, table.name.0) }
@@ -113,6 +121,39 @@ pub async fn get(meta: &dyn MetaStore, table: &TableRef) -> Result<Option<TableR
             Ok(Some(reg))
         }
         None => Ok(None),
+    }
+}
+
+/// Atomically add an incarnation identity to a legacy registration.
+///
+/// New registrations already contain one. The migration is CAS-guarded so a
+/// concurrent version advance or drop/recreate cannot be overwritten.
+pub async fn ensure_incarnation(
+    meta: &dyn MetaStore,
+    table: &TableRef,
+    expected: &TableRegistration,
+) -> Result<TableRegistration> {
+    if expected.incarnation_id.is_some() {
+        return Ok(expected.clone());
+    }
+    let k = key(table);
+    let identity = uuid::Uuid::now_v7().to_string();
+    let mut current = expected.clone();
+    loop {
+        if current.incarnation_id.is_some() {
+            return Ok(current);
+        }
+        let expected_bytes = serde_json::to_vec(&current).context(CorruptEntrySnafu { key: &k })?;
+        let mut migrated = current.clone();
+        migrated.incarnation_id = Some(identity.clone());
+        let migrated_bytes =
+            serde_json::to_vec(&migrated).context(CorruptEntrySnafu { key: &k })?;
+        if meta.cas(&k, Some(&expected_bytes), &migrated_bytes).await? {
+            return Ok(migrated);
+        }
+        current = get(meta, table).await?.context(ConflictSnafu {
+            table: table.to_string(),
+        })?;
     }
 }
 
@@ -207,8 +248,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let meta = RocksMeta::open(dir.path()).unwrap();
         let t = TableRef::new("robots", "arm_left");
+        let original = reg(1);
 
-        register(&meta, &t, &reg(1)).await.unwrap();
+        register(&meta, &t, &original).await.unwrap();
         assert!(
             register(&meta, &t, &reg(1)).await.is_err(),
             "double register must fail"
@@ -223,13 +265,13 @@ mod tests {
             vec![TableName("arm_left".into())]
         );
 
-        set_version(&meta, &t, &reg(1), Version(2)).await.unwrap();
+        set_version(&meta, &t, &original, Version(2)).await.unwrap();
         assert_eq!(
             get(&meta, &t).await.unwrap().unwrap().current_version,
             Version(2)
         );
         assert!(
-            set_version(&meta, &t, &reg(1), Version(3)).await.is_err(),
+            set_version(&meta, &t, &original, Version(3)).await.is_err(),
             "stale expected must conflict"
         );
     }

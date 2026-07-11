@@ -34,9 +34,14 @@ bytes through Query or Metasrv, or couple upper tiers to Lance.
 - The idempotency identity is `(tenant, table, operation_id)`. `operation_id`
   is a validated, time-bearing, high-entropy value generated once by the SDK
   after all object uploads complete.
+- Durable records also bind the registry's immutable table-incarnation ID, so
+  an operation from a dropped table fails closed instead of targeting a
+  same-name replacement.
 - The SDK retains the encoded Arrow metadata batch, operation ID, and digest
   for all transparent retries of an ambiguous `DoPut`. Retrying the append
   must not upload the video/model bytes again.
+- The bounded retry horizon exceeds the metadata lease TTL, preserving that
+  identity through an ungraceful leader failure and standby takeover.
 - The payload digest is a versioned SHA-256 digest over the actual ordered
   Arrow Flight metadata messages. It covers `DataLocation` values but never
   the referenced object bytes.
@@ -66,6 +71,9 @@ bytes through Query or Metasrv, or couple upper tiers to Lance.
   operation and digest converges on its committed version; a matching operation
   with a different digest conflicts; no match may be retried by the caller
   without changing the logical operation identity.
+- A newly reserved operation uses the engine's reserved-append path and avoids
+  eager transaction-history scans. History is consulted only for explicit
+  recovery/replay or a commit conflict.
 - Object-reference data is staged durably before the Lance manifest becomes
   visible. Lance transaction properties retain enough sidecar identity to
   finish publishing the canonical per-version reference chunks after a crash.
@@ -126,13 +134,16 @@ bytes through Query or Metasrv, or couple upper tiers to Lance.
 - `specs/project.spec`
 - `specs/issue-29-idempotent-append.spec.md`
 - `verification/issue-29-idempotent-append.md`
-- `**/.github/**`
+- `**/.github/actionlint.yaml`
+- `**/.github/workflows/ci.yml`
+- `**/.github/workflows/pages.yml`
 - `**/AGENT.md`
 - `**/CLAUDE.md`
-- `**/docs/guides/**`
+- `**/docs/guides/mise-ci.md`
+- `**/docs/guides/workflow.md`
 - `**/mise.toml`
 
-The recursive root patterns above admit pre-existing shared-checkout workflow
+The exact recursive root patterns above admit pre-existing shared-checkout workflow
 and guide edits reported by the lifecycle tool. This issue does not modify
 those files; its own changes remain confined to the issue workspace paths
 listed above.
@@ -193,7 +204,7 @@ Scenario: concurrent replays execute one engine append
 Scenario: every append crash window converges
   Test:
     Package: lake-metasrv
-    Filter: append_crash_windows_reconcile_without_duplicates
+    Filter: append_crash_window
   Given deterministic failures after reservation, engine commit, registry CAS,
   and terminal-state publication
   When Metasrv is reconstructed over the same MetaStore and the operation is
@@ -202,12 +213,22 @@ Scenario: every append crash window converges
 
 Scenario: leader failover preserves in-flight operation identity
   Test:
-    Package: lake-metasrv
-    Filter: leader_failover_reconciles_inflight_append
+    Package: lake-sdk
+    Filter: sdk_retries_same_insert_through_ungraceful_leader_failover
   Given a two-node metadata deployment and an append committed by the first
   leader without delivering its result
   When that leader stops and the client retries through the standby
   Then the standby returns the original Version without a second append
+
+Scenario: dropped table operations cannot target a replacement
+  Test:
+    Package: lake-metasrv
+    Filter: replay_after_drop_recreate_fails_closed
+  Given a committed append operation for one table incarnation
+  When the table is dropped, recreated at a new location, and that operation
+  is replayed within retention
+  Then replay fails with FailedPrecondition and the replacement remains at its
+  initial version
 
 Scenario: Lance transaction history converges without automatic rebase
   Test:
@@ -217,6 +238,14 @@ Scenario: Lance transaction history converges without automatic rebase
   When its result is lost or its commit races a newer parent version
   Then history identifies the existing operation and replay returns its exact
   committed Version without automatic rebase
+
+Scenario: a new reserved append avoids transaction-history scans
+  Test:
+    Package: lake-engine-lance
+    Filter: new_append_does_not_scan_transaction_history
+  Given a freshly reserved operation with no recovery evidence
+  When Lance commits its first attempt
+  Then the normal path performs no full transaction-history scan
 
 Scenario: recovered append preserves object-reference lineage
   Test:

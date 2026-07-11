@@ -83,6 +83,8 @@ struct WriteConfig {
     // Empty -> local filesystem. Non-empty -> object_store config keys
     // (`aws_endpoint`, `aws_access_key_id`, …) threaded into every read/write.
     storage_options: HashMap<String, String>,
+    #[cfg(test)]
+    history_scans:   Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl WriteConfig {
@@ -141,8 +143,9 @@ impl LanceEngine {
     pub fn with_manifest_store(meta: MetaStoreRef) -> Self {
         Self {
             config: WriteConfig {
-                commit_handler:  Some(external_handler(meta)),
+                commit_handler: Some(external_handler(meta)),
                 storage_options: HashMap::new(),
+                ..WriteConfig::default()
             },
         }
     }
@@ -157,6 +160,7 @@ impl LanceEngine {
             config: WriteConfig {
                 commit_handler: Some(external_handler(meta)),
                 storage_options,
+                ..WriteConfig::default()
             },
         }
     }
@@ -824,6 +828,10 @@ impl LanceTable {
     }
 
     async fn find_append(&self, operation: &AppendOperation) -> Result<Option<(Version, String)>> {
+        #[cfg(test)]
+        self.config
+            .history_scans
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let dataset = self
             .config
             .open_dataset(self.location.as_str())
@@ -901,6 +909,14 @@ impl TableHandle for LanceTable {
         if let Some(version) = self.reconcile_append(operation).await? {
             return Ok(version);
         }
+        self.append_reserved(operation, batches).await
+    }
+
+    async fn append_reserved(
+        &self,
+        operation: &AppendOperation,
+        batches: SendableRecordBatchStream,
+    ) -> Result<Version> {
         let parent_version = Version(
             self.config
                 .open_dataset(self.location.as_str())
@@ -1085,25 +1101,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_append_does_not_scan_transaction_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let loc = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
+        let engine = LanceEngine::new();
+        let handle = engine.create(&loc, batch().schema()).await.unwrap();
+        let input = batch();
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            input.schema(),
+            futures::stream::iter(vec![Ok::<_, DataFusionError>(input)]),
+        ));
+
+        handle.append_reserved(&operation(), stream).await.unwrap();
+
+        assert_eq!(
+            engine
+                .config
+                .history_scans
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn lance_transaction_history_converges_idempotent_append() {
         let dir = tempfile::tempdir().unwrap();
         let location = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
         let engine = LanceEngine::new();
         let handle = engine.create(&location, batch().schema()).await.unwrap();
+        let competing = engine.open(&location).await.unwrap().unwrap();
         let operation = operation();
         let first_batch = batch();
         let first_stream = Box::pin(RecordBatchStreamAdapter::new(
             first_batch.schema(),
             futures::stream::iter(vec![Ok::<_, DataFusionError>(first_batch)]),
         ));
-        let first = handle.append(&operation, first_stream).await.unwrap();
         let replay_batch = batch();
         let replay_stream = Box::pin(RecordBatchStreamAdapter::new(
             replay_batch.schema(),
             futures::stream::iter(vec![Ok::<_, DataFusionError>(replay_batch)]),
         ));
 
-        let replay = handle.append(&operation, replay_stream).await.unwrap();
+        let (first, replay) = tokio::join!(
+            handle.append(&operation, first_stream),
+            competing.append(&operation, replay_stream)
+        );
+        let first = first.unwrap();
+        let replay = replay.unwrap();
 
         assert_eq!(replay, first);
         assert_eq!(

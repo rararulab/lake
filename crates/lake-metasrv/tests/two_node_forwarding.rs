@@ -304,7 +304,7 @@ async fn follower_forwards_write_to_leader() {
 }
 
 #[tokio::test]
-async fn leader_failover_reconciles_inflight_append() {
+async fn committed_replay_survives_graceful_leader_handoff() {
     let meta_dir = tempfile::tempdir().expect("meta tempdir");
     let table_dir = tempfile::tempdir().expect("table tempdir");
     let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).expect("open RocksMeta"));

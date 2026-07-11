@@ -118,7 +118,9 @@ the same trait over its own format, using `lake-meta`'s CAS directly.
 There are three distinct pieces of metadata, owned by different layers:
 
 1. **Registry** (lake's, in `lake-meta`): which tables exist and where —
-   `tbl/<namespace>/<name> → { location, current_version, engine, schema_ipc? }`.
+   `tbl/<namespace>/<name> → { incarnation_id, location, current_version,
+   engine, schema_ipc? }`. The incarnation changes on every successful create,
+   so retained operation records cannot cross a drop/recreate boundary.
    The optional opaque Arrow IPC schema keeps old JSON readable while allowing
    Query to answer schema-inclusive Flight SQL discovery locally. Tiny (~10⁴
    entries), fully cacheable, the metadata layer is its authority.
@@ -144,13 +146,17 @@ digest of its ordered Flight control payload:
 
 1. The SDK uploads object bytes directly to managed storage, encodes only
    `DataLocation` rows, and generates the operation ID once. Ambiguous Flight
-   failures reuse the same encoded messages, identity, and digest.
+   failures reuse the same encoded messages, identity, and digest for a
+   30-second bounded window, longer than the 10-second metadata lease.
 2. Metasrv authenticates the tenant, verifies the digest, claims a durable
    per-table fence, and CAS-creates a compact `reserved` operation record.
 3. The engine writes the new immutable version. Lance disables automatic
    append rebase and stores tenant, operation ID, digest, and reference-stage
    identity in transaction properties. Object-reference chunks are staged
    before the manifest is visible.
+   A freshly reserved operation takes a no-eager-scan engine path; full
+   transaction history is consulted only for replay/recovery or commit
+   collision, not for every healthy append.
 4. Metasrv records `engine_committed`, CAS-advances the registry pointer only
    after reference lineage is complete, and records the terminal version.
 5. A replay or replacement leader loads the durable record and reconciles

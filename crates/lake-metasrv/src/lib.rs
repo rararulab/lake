@@ -86,6 +86,9 @@ pub enum MetasrvError {
     #[snafu(display("append operation '{operation_id}' timestamp is too far in the future"))]
     OperationFromFuture { operation_id: String },
 
+    #[snafu(display("append operation '{operation_id}' belongs to a dropped table incarnation"))]
+    OperationTableRecreated { operation_id: String },
+
     #[snafu(display("append operation '{operation_id}' has corrupt durable state"))]
     CorruptOperationState { operation_id: String },
 
@@ -124,13 +127,63 @@ pub enum MetasrvError {
 
 pub type Result<T> = std::result::Result<T, MetasrvError>;
 
+/// Deterministic post-commit response gate for cross-crate crash tests.
+#[cfg(feature = "test")]
+#[derive(Debug, Default)]
+pub struct AppendResultGate {
+    armed:   std::sync::atomic::AtomicBool,
+    fail:    std::sync::atomic::AtomicBool,
+    blocked: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test")]
+impl AppendResultGate {
+    /// Create a gate that blocks the first committed append response.
+    #[must_use]
+    pub fn armed() -> Self {
+        Self {
+            armed:   std::sync::atomic::AtomicBool::new(true),
+            fail:    std::sync::atomic::AtomicBool::new(false),
+            blocked: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Wait until a response is blocked after its append committed.
+    pub async fn wait_until_blocked(&self) { self.blocked.notified().await; }
+
+    /// Disable the fault and release a currently blocked response.
+    pub fn disable(&self) {
+        self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.release.notify_one();
+    }
+
+    /// Release the blocked post-commit request as a lost-response failure.
+    pub fn fail_blocked(&self) {
+        self.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release.notify_one();
+    }
+
+    pub(crate) async fn block_first(&self) -> bool {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.blocked.notify_one();
+            self.release.notified().await;
+            return self.fail.load(std::sync::atomic::Ordering::SeqCst);
+        }
+        false
+    }
+}
+
 /// Network security for one Metasrv node and its follower-to-leader hop.
 #[derive(Clone, Debug)]
 pub struct MetasrvServerConfig {
-    server_security: ServerSecurity,
-    peer_security:   ClientSecurity,
-    allow_insecure:  bool,
-    shutdown_grace:  Duration,
+    server_security:    ServerSecurity,
+    peer_security:      ClientSecurity,
+    allow_insecure:     bool,
+    shutdown_grace:     Duration,
+    #[cfg(feature = "test")]
+    append_result_gate: Option<Arc<AppendResultGate>>,
 }
 
 impl MetasrvServerConfig {
@@ -139,9 +192,11 @@ impl MetasrvServerConfig {
     pub fn new() -> Self {
         Self {
             server_security: ServerSecurity::insecure(),
-            peer_security:   ClientSecurity::new(),
-            allow_insecure:  false,
-            shutdown_grace:  Duration::from_secs(30),
+            peer_security: ClientSecurity::new(),
+            allow_insecure: false,
+            shutdown_grace: Duration::from_secs(30),
+            #[cfg(feature = "test")]
+            append_result_gate: None,
         }
     }
 
@@ -171,6 +226,14 @@ impl MetasrvServerConfig {
     #[must_use]
     pub const fn with_shutdown_grace(mut self, grace: Duration) -> Self {
         self.shutdown_grace = grace;
+        self
+    }
+
+    /// Block the first post-commit result for deterministic crash testing.
+    #[cfg(feature = "test")]
+    #[must_use]
+    pub fn with_append_result_gate(mut self, gate: Arc<AppendResultGate>) -> Self {
+        self.append_result_gate = Some(gate);
         self
     }
 }
@@ -297,17 +360,29 @@ impl Metasrv {
         let reg = self.resolve(table).await?.context(NotFoundSnafu {
             table: table.to_string(),
         })?;
+        let reg = registry::ensure_incarnation(self.meta().as_ref(), table, &reg)
+            .await
+            .context(RegistrySnafu)?;
+        let table_incarnation = reg
+            .incarnation_id()
+            .expect("ensured table registration has an incarnation");
         let key = operation_key(operation, table);
         let active = active_key(operation, table);
         let active_value = key.as_bytes();
-        let mut record = AppendRecord::reserved(operation, table, reg.current_version, now);
+        let mut record = AppendRecord::reserved(
+            operation,
+            table,
+            table_incarnation,
+            reg.current_version,
+            now,
+        );
         let mut encoded = record.encode()?;
         let mut created_record = false;
         loop {
             match self.meta().get(&key).await.context(RegistrySnafu)? {
                 Some(existing) => {
                     record = AppendRecord::decode(operation.operation_id().as_str(), &existing)?;
-                    record.validate(operation, table)?;
+                    record.validate(operation, table, table_incarnation)?;
                     encoded = existing;
                     if record.state == AppendState::Committed {
                         let version = record.result_version.ok_or_else(|| {
@@ -371,7 +446,7 @@ impl Metasrv {
         // while this request acquired the shared exact-value fence.
         if let Some(current_record) = self.meta().get(&key).await.context(RegistrySnafu)? {
             record = AppendRecord::decode(operation.operation_id().as_str(), &current_record)?;
-            record.validate(operation, table)?;
+            record.validate(operation, table, table_incarnation)?;
             encoded = current_record;
         }
 
@@ -387,7 +462,7 @@ impl Metasrv {
             .context(NotFoundSnafu {
                 table: table.to_string(),
             })?;
-        let reconciled = if record.result_version.is_none() {
+        let reconciled = if record.result_version.is_none() && !created_record {
             handle
                 .reconcile_append(operation)
                 .await
@@ -415,7 +490,7 @@ impl Metasrv {
                 self.meta().get(&key).await.context(RegistrySnafu)?
             {
                 record = AppendRecord::decode(operation.operation_id().as_str(), &current_record)?;
-                record.validate(operation, table)?;
+                record.validate(operation, table, table_incarnation)?;
                 encoded = current_record;
             }
         }
@@ -424,7 +499,7 @@ impl Metasrv {
             None => match reconciled {
                 Some(version) => version,
                 None => handle
-                    .append(operation, batches)
+                    .append_reserved(operation, batches)
                     .await
                     .context(EngineSnafu)?,
             },
@@ -453,7 +528,7 @@ impl Metasrv {
                         operation_id: operation.operation_id().to_string(),
                     })?;
                 let converged = AppendRecord::decode(operation.operation_id().as_str(), &current)?;
-                converged.validate(operation, table)?;
+                converged.validate(operation, table, table_incarnation)?;
                 if converged.result_version != Some(new_version)
                     || converged.state == AppendState::Reserved
                 {
@@ -498,7 +573,7 @@ impl Metasrv {
                     operation_id: operation.operation_id().to_string(),
                 })?;
             let converged = AppendRecord::decode(operation.operation_id().as_str(), &current)?;
-            converged.validate(operation, table)?;
+            converged.validate(operation, table, table_incarnation)?;
             if converged.state != AppendState::Committed
                 || converged.result_version != Some(new_version)
             {
@@ -600,6 +675,36 @@ pub async fn serve_with_config_and_shutdown<F>(
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    serve_with_config_and_termination(metasrv, addr, config, shutdown, false).await
+}
+
+/// Run until `crash` fires, then drop RPCs and campaigns without resigning.
+///
+/// This test-only entry point models process death: the durable lease remains
+/// until TTL expiry and accepted connections receive no graceful response.
+#[cfg(feature = "test")]
+pub async fn serve_with_config_and_crash<F>(
+    metasrv: Arc<Metasrv>,
+    addr: &str,
+    config: MetasrvServerConfig,
+    crash: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    serve_with_config_and_termination(metasrv, addr, config, crash, true).await
+}
+
+async fn serve_with_config_and_termination<F>(
+    metasrv: Arc<Metasrv>,
+    addr: &str,
+    config: MetasrvServerConfig,
+    shutdown: F,
+    crash: bool,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let socket = addr.parse().context(AddressSnafu { addr })?;
     config
         .server_security
@@ -630,6 +735,8 @@ where
         leadership,
         own_addr: addr.to_string(),
         peer_security: config.peer_security,
+        #[cfg(feature = "test")]
+        append_result_gate: config.append_result_gate,
     };
 
     tracing::info!(
@@ -655,9 +762,13 @@ where
         () = shutdown.as_mut() => {
             maintenance_shutdown.cancel();
             server_shutdown.cancel();
-            match tokio::time::timeout(config.shutdown_grace, server.as_mut()).await {
-                Ok(result) => result.context(ServeSnafu),
-                Err(_) => Err(MetasrvError::DrainTimeout { grace: config.shutdown_grace }),
+            if crash {
+                Ok(())
+            } else {
+                match tokio::time::timeout(config.shutdown_grace, server.as_mut()).await {
+                    Ok(result) => result.context(ServeSnafu),
+                    Err(_) => Err(MetasrvError::DrainTimeout { grace: config.shutdown_grace }),
+                }
             }
         }
     };
@@ -665,6 +776,13 @@ where
     // Dropping the server first guarantees no accepted write can outlive the
     // leadership lease. Only then may the campaign resign.
     drop(server);
+    if crash {
+        maintenance.abort();
+        campaign.abort();
+        let _ = maintenance.await;
+        let _ = campaign.await;
+        return server_result;
+    }
     maintenance_shutdown.cancel();
     campaign_shutdown.cancel();
     let maintenance_result = maintenance

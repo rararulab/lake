@@ -8,6 +8,9 @@ repository.workspace = true
 publish.workspace = true
 description = "Stateful metadata-layer server: registry authority and write coordination"
 
+[features]
+test = []
+
 [dependencies]
 arrow-flight = { workspace = true }
 async-trait = { workspace = true }

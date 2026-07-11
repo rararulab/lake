@@ -1235,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn query_forwards_authenticated_append_operation_scope() {
+    fn delegated_append_scope_headers_are_tenant_scoped() {
         let principal = |id: &str, tenant: &str| {
             Principal::try_new(
                 PrincipalId::try_new(id).unwrap(),

@@ -12,6 +12,8 @@ write path — create tables, resolve/list, and the append commit protocol.
   replays converge on one engine version; changed digests conflict.
 - Registry publication follows complete engine manifest/reference lineage;
   ambiguous results and leader failover reconcile from HA-KV plus history.
+- Operation records bind the table incarnation and fail closed after a
+  same-name drop/recreate.
 - Never bypass the engine trait — table creation/append delegate to
   `TableEngine`, so the storage engine stays swappable.
 - FILE `DoPut` contains Arrow `DataLocation` rows only. Followers forward the

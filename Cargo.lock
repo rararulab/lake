@@ -4232,6 +4232,7 @@ dependencies = [
  "snafu",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

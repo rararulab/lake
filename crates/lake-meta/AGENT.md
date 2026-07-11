@@ -12,6 +12,8 @@ backend `RocksMeta`, and `MetaError`.
   crate. Consumers see `MetaStore` / `MetaStoreRef` only.
 - `cas` is the only mutation primitive. No blind puts in the public API.
 - Production prefix scans and leader maintenance are cursor-paged and bounded.
+- Every new table registration has an immutable incarnation ID; legacy entries
+  are CAS-migrated before their first append.
 
 ## Layout
 

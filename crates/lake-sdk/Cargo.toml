@@ -29,7 +29,7 @@ async-trait.workspace = true
 lake-engine.workspace = true
 lake-engine-lance.workspace = true
 lake-meta.workspace = true
-lake-metasrv.workspace = true
+lake-metasrv = { workspace = true, features = ["test"] }
 lake-query.workspace = true
 rcgen = "^0.13"
 tempfile = "^3.0"
