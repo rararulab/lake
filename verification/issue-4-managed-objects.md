@@ -1,7 +1,7 @@
 # Verification report — issue #4
 
 - base_sha: d7c5a536037450aa77d4fc237f6315b49d928610
-- head_sha: 128e75d9bfb016a2440e6ed5720caff78a446457 (`issue-4-managed-objects`)
+- head_sha: b45cee4facf16b202ed309db0d8e4f29455d2110 (`issue-4-managed-objects`)
 - score_authority: verifier
 - implementer_evidence: self_check_only
 
@@ -237,6 +237,58 @@ $ mise run spec-lifecycle specs/issue-4-managed-objects.spec.md
 [PASS] SQL FILE insert uploads an object before publishing its DataLocation row
 [PASS] failed object upload does not publish a partial row
 [PASS] unsupported INSERT syntax is rejected before any upload
+spec-lifecycle-guard: OK
+
+$ mise run gate
+Finished successfully: workspace all-target tests, CLI selftest, and site checks
+```
+
+## Complete public SDK FILE round trip
+
+The follow-up closes the remaining public API gap: users can create a `file`
+column, stream a SELECT through `LakeClient`, decode its `DataLocation`, and
+open the bytes without importing `QueryEngine`, metasrv, or engine crates.
+
+RED evidence:
+
+```text
+$ cargo test -p lake-cli local_schema_dsl_accepts_file
+FAILED: unknown column type 'file' (use i64|f64|utf8|bool)
+
+$ cargo test -p lake-metasrv remote_schema_dsl_accepts_file
+FAILED: unknown column type 'file' (use i64|f64|utf8|bool)
+
+$ cargo test -p lake-sdk sdk_queries_datalocation_and_opens_file
+error[E0432]: unresolved import `crate::data_location`
+error[E0599]: no method named `query` found for struct `LakeClient`
+
+$ cargo test -p lake-sdk sdk_queries_datalocation_and_opens_file
+FAILED: insert followed by select returned no batch
+```
+
+The last failure exposed stale registration-cache state after a successful
+append. Query now invalidates that table's registration only after collecting
+the metasrv acknowledgement, so the same Flight connection has read-your-write
+while other query nodes retain the documented bounded-staleness window.
+
+GREEN and final evidence:
+
+```text
+$ cargo test -p lake-cli -p lake-catalog -p lake-metasrv -p lake-query -p lake-sdk
+all tests passed
+
+$ cargo clippy -p lake-cli -p lake-catalog -p lake-metasrv -p lake-query -p lake-sdk --all-targets -- -D warnings
+Finished successfully
+
+$ cargo run -p lake-sdk --example managed_file
+FILE upload and direct read succeeded: file:///.../objects/<immutable-id>
+
+$ mise run spec-lifecycle specs/issue-4-managed-objects.spec.md
+[PASS] SQL FILE insert uploads an object before publishing its DataLocation row
+[PASS] failed object upload does not publish a partial row
+[PASS] unsupported INSERT syntax is rejected before any upload
+[PASS] SDK query returns a DataLocation that opens directly
+[PASS] administrative DDL accepts the FILE logical type
 spec-lifecycle-guard: OK
 
 $ mise run gate
