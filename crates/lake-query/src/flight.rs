@@ -1364,11 +1364,16 @@ mod tests {
     #[tokio::test]
     async fn flight_discovery_stops_at_configured_row_limit() {
         let service = discovery_service(
-            &["alpha/events_0", "alpha/events_1", "alpha/events_2"],
-            DiscoveryLimits::try_new(2, 2).expect("limits"),
+            &[
+                "alpha/events_0",
+                "alpha/events_1",
+                "alpha/events_2",
+                "alpha/events_3",
+            ],
+            DiscoveryLimits::try_new(3, 2).expect("limits"),
         )
         .await;
-        let mut stream = service
+        let stream = service
             .do_get_tables(
                 CommandGetTables {
                     catalog:                   None,
@@ -1382,17 +1387,24 @@ mod tests {
             .await
             .expect("table discovery admitted")
             .into_inner();
-
-        let mut failure = None;
-        while let Some(item) = stream.next().await {
-            if let Err(status) = item {
-                failure = Some(status);
-                break;
+        let mut batches = FlightRecordBatchStream::new_from_flight_data(
+            stream.map_err(arrow_flight::error::FlightError::from),
+        );
+        let mut batch_rows = Vec::new();
+        let failure = loop {
+            match batches.next().await {
+                Some(Ok(batch)) => batch_rows.push(batch.num_rows()),
+                Some(Err(error)) => break error,
+                None => panic!("row limit must terminate the stream"),
             }
-        }
-        let failure = failure.expect("row limit must terminate the stream");
-        assert_eq!(failure.code(), tonic::Code::ResourceExhausted);
-        assert_eq!(failure.message(), "discovery row limit reached");
+        };
+
+        assert_eq!(batch_rows, vec![2, 1]);
+        let FlightError::Tonic(status) = failure else {
+            panic!("row limit must remain a tonic status: {failure}");
+        };
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(status.message(), "discovery row limit reached");
     }
 
     #[tokio::test]
