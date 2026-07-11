@@ -645,7 +645,10 @@ mod tests {
     #[tokio::test]
     async fn client_discovers_local_stage_from_query() {
         let root = tempdir().unwrap();
-        let client = setup_discovered_client(root.path()).await;
+        let descriptor = ManagedStageDescriptor::local(
+            root.path().join("objects").to_string_lossy().into_owned(),
+        );
+        let client = setup_client_with_descriptor(root.path(), descriptor).await;
         let expected = b"0123456789abcdef";
 
         client
@@ -843,6 +846,98 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[tokio::test]
+    #[ignore = "requires LocalStack S3; set LAKE_S3_ENDPOINT and run with --ignored"]
+    async fn sdk_discovers_s3_stage_and_streams_directly_localstack() {
+        let Ok(endpoint) = std::env::var("LAKE_S3_ENDPOINT") else {
+            return;
+        };
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .endpoint_url(&endpoint)
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "localstack"))
+            .force_path_style(true)
+            .build();
+        let s3 = aws_sdk_s3::Client::from_conf(config);
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let bucket = format!("lake-sdk-discovery-{suffix}");
+        s3.create_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .expect("create LocalStack bucket");
+        let descriptor = ManagedStageDescriptor::s3(
+            &bucket,
+            "managed/discovered",
+            Some("us-east-1".to_owned()),
+            Some(endpoint),
+            true,
+        );
+        let root = tempdir().expect("temporary SDK fixture");
+        let client = setup_client_with_descriptor(root.path(), descriptor).await;
+        let expected = (0..(5 * 1024 * 1024 + 17))
+            .map(|index| u8::try_from(index % 251).expect("bounded byte"))
+            .collect::<Vec<_>>();
+
+        client
+            .insert(
+                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    InsertValue::Utf8("episode-discovered-s3".to_owned()),
+                    InsertValue::File(FileUpload::from_reader(
+                        std::io::Cursor::new(expected.clone()),
+                        "video/mp4",
+                    )),
+                ],
+            )
+            .await
+            .expect("SQL FILE insert through discovered S3 stage");
+        let mut results = client
+            .query("SELECT video FROM lake.robots.episodes")
+            .await
+            .expect("query DataLocation");
+        let batch = results
+            .try_next()
+            .await
+            .expect("query stream")
+            .expect("one batch");
+        let location = data_location(&batch, "video", 0).expect("decode DataLocation");
+        assert!(
+            location
+                .uri
+                .starts_with(&format!("s3://{bucket}/managed/discovered/"))
+        );
+        let mut full_reader = client.open(&location).await.expect("direct S3 reader");
+        let mut full = Vec::new();
+        full_reader
+            .read_to_end(&mut full)
+            .await
+            .expect("read S3 object");
+        let mut range_reader = client
+            .open_range(&location, 1024..2048)
+            .await
+            .expect("direct S3 range reader");
+        let mut range = Vec::new();
+        range_reader
+            .read_to_end(&mut range)
+            .await
+            .expect("read S3 range");
+
+        assert_eq!(full, expected);
+        assert_eq!(range, expected[1024..2048]);
+    }
+
+    #[test]
+    fn sdk_s3_stage_discovery_localstack_is_wired() {
+        let integration = include_str!("../../../scripts/test-integration.ts");
+        assert!(integration.contains("lake-sdk"));
+        assert!(integration.contains("--run-ignored"));
+    }
+
     #[test]
     fn sdk_file_insert_uses_s3_stage_is_wired() {
         let integration = include_str!("../../../scripts/test-integration.ts");
@@ -854,6 +949,8 @@ mod tests {
     fn managed_file_example_queries_through_sdk() {
         let example = include_str!("../examples/managed_file.rs");
 
+        assert!(example.contains("LakeClient::connect("));
+        assert!(!example.contains("connect_with_store"));
         assert!(example.contains(".query("));
         assert!(example.contains("data_location("));
         assert!(!example.contains(".execute_sql("));
@@ -996,7 +1093,10 @@ mod tests {
         (client, metasrv, table, meta, engine)
     }
 
-    async fn setup_discovered_client(root: &std::path::Path) -> LakeClient {
+    async fn setup_client_with_descriptor(
+        root: &std::path::Path,
+        stage: ManagedStageDescriptor,
+    ) -> LakeClient {
         let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.join("meta")).unwrap());
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
         let metasrv = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
@@ -1022,8 +1122,6 @@ mod tests {
             let query = Arc::new(QueryEngine::new(meta, engine));
             let addr = query_addr.clone();
             let metadata = format!("http://{meta_addr}");
-            let stage =
-                ManagedStageDescriptor::local(root.join("objects").to_string_lossy().into_owned());
             async move {
                 lake_query::serve_with_metadata_and_stage(query, &addr, &metadata, stage).await
             }
