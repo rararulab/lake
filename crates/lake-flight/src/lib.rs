@@ -193,14 +193,20 @@ impl Interceptor for BearerAuthenticator {
 /// authenticated production requests.
 #[derive(Clone, Debug)]
 pub struct ServerInterceptor {
-    bearer: Option<BearerAuthenticator>,
+    bearer:                Option<BearerAuthenticator>,
+    development_principal: Option<Principal>,
 }
 
 impl Interceptor for ServerInterceptor {
-    fn call(&mut self, request: Request<()>) -> std::result::Result<Request<()>, Status> {
+    fn call(&mut self, mut request: Request<()>) -> std::result::Result<Request<()>, Status> {
         match &mut self.bearer {
             Some(authenticator) => authenticator.call(request),
-            None => Ok(request),
+            None => {
+                if let Some(principal) = &self.development_principal {
+                    request.extensions_mut().insert(principal.clone());
+                }
+                Ok(request)
+            }
         }
     }
 }
@@ -208,25 +214,32 @@ impl Interceptor for ServerInterceptor {
 /// Server-side TLS identity, authentication, and exposure policy.
 #[derive(Clone)]
 pub struct ServerSecurity {
-    bearer:       Option<BearerAuthenticator>,
-    tls_identity: Option<Identity>,
+    bearer:                Option<BearerAuthenticator>,
+    development_principal: Option<Principal>,
+    tls_identity:          Option<Identity>,
 }
 
 impl ServerSecurity {
     /// Explicit plaintext/anonymous configuration for loopback development.
     #[must_use]
-    pub const fn insecure() -> Self {
+    pub fn insecure() -> Self { Self::insecure_with_principal(Principal::development_admin()) }
+
+    /// Explicit plaintext development mode with a caller-selected identity.
+    #[must_use]
+    pub fn insecure_with_principal(principal: Principal) -> Self {
         Self {
-            bearer:       None,
-            tls_identity: None,
+            bearer:                None,
+            development_principal: Some(principal),
+            tls_identity:          None,
         }
     }
 
     /// Require one opaque deployment bearer credential on every RPC.
     pub fn with_bearer_token(value: impl Into<String>) -> Result<Self> {
         Ok(Self {
-            bearer:       Some(BearerAuthenticator::new(value)?),
-            tls_identity: None,
+            bearer:                Some(BearerAuthenticator::new(value)?),
+            development_principal: None,
+            tls_identity:          None,
         })
     }
 
@@ -252,7 +265,8 @@ impl ServerSecurity {
     #[must_use]
     pub fn interceptor(&self) -> ServerInterceptor {
         ServerInterceptor {
-            bearer: self.bearer.clone(),
+            bearer:                self.bearer.clone(),
+            development_principal: self.development_principal.clone(),
         }
     }
 
@@ -271,6 +285,7 @@ impl fmt::Debug for ServerSecurity {
         formatter
             .debug_struct("ServerSecurity")
             .field("authenticated", &self.bearer.is_some())
+            .field("development_principal", &self.development_principal)
             .field("tls", &self.tls_identity.is_some())
             .finish()
     }
@@ -550,5 +565,26 @@ mod tests {
 
         let secure = auth_only.with_tls_identity_pem(b"certificate", b"private-key");
         assert!(secure.validate_exposure(public, false).is_ok());
+    }
+
+    #[test]
+    fn insecure_loopback_uses_explicit_development_principal() {
+        let development = Principal::try_new(
+            PrincipalId::try_new("local-developer").unwrap(),
+            TenantId::try_new("development").unwrap(),
+            PrincipalRole::User,
+            ["local"],
+        )
+        .unwrap();
+        let security = ServerSecurity::insecure_with_principal(development.clone());
+
+        let accepted = security
+            .interceptor()
+            .call(Request::new(()))
+            .expect("loopback development request");
+
+        assert_eq!(accepted.extensions().get::<Principal>(), Some(&development));
+        let public: SocketAddr = "0.0.0.0:50051".parse().unwrap();
+        assert!(security.validate_exposure(public, false).is_err());
     }
 }

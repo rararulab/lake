@@ -134,6 +134,17 @@ impl Principal {
         }
     }
 
+    /// Explicit unrestricted identity for anonymous loopback development.
+    #[must_use]
+    pub fn development_admin() -> Self {
+        Self {
+            id:         PrincipalId(Arc::from("lake-development")),
+            tenant:     TenantId(Arc::from("development")),
+            role:       PrincipalRole::Admin,
+            namespaces: BTreeSet::new(),
+        }
+    }
+
     #[must_use]
     pub fn id(&self) -> &PrincipalId { &self.id }
 
