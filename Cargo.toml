@@ -63,6 +63,7 @@ tokio-util = "^0.7"
 # so the Flight service types share one tonic with our transport Server.
 tonic = { version = "^0.14", features = ["tls-ring", "tls-webpki-roots"] }
 tracing = "^0.1"
+tracing-subscriber = { version = "^0.3", features = ["env-filter", "fmt", "json"] }
 subtle = "^2.6"
 url = "^2.5"
 uuid = { version = "^1.23", features = ["v7"] }

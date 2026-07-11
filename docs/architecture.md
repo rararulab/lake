@@ -470,6 +470,12 @@ design-level ones:
   stale/corrupt plans, prefix escapes, and future removal deltas all fail
   closed. The operational safety horizon must exceed upload-to-commit retries;
   apply runs in a write-quiescent window.
+- The CLI application boundary installs a process-wide tracing subscriber
+  before parsing commands or opening resources. Existing Query and Metasrv
+  operational events therefore reach newline-delimited JSON stderr by default;
+  deployments may select pretty output and standard `RUST_LOG` filtering.
+  Startup events exclude argv, SQL, paths, and credentials. Metrics, readiness
+  probes, and distributed tracing remain production observability work.
 
 ## Phasing
 
@@ -481,9 +487,10 @@ design-level ones:
   Flight SQL server, and the `lake-metasrv` Flight `do_action` control plane.
 - **v2 (metadata HA + ops)** — lease-election, follower forwarding,
   leadership-gated writes, per-table serialization, and leader-only
-  maintenance are wired. Remaining: durable operation state, production
-  observability, and client-side SDK caching. A self-built engine slots in
-  behind `TableEngine` if/when Lance's ceiling is hit.
+  maintenance are wired. Structured process logging is wired. Remaining:
+  durable operation state, metrics/readiness/distributed tracing, and
+  client-side SDK caching. A self-built engine slots in behind `TableEngine`
+  if/when Lance's ceiling is hit.
 
 Invariant across all phases: fleet reads go through the stateless query
 layer, never directly at the metadata authority.

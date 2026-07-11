@@ -20,6 +20,7 @@
 #![allow(clippy::print_stdout)]
 
 mod commands;
+mod observability;
 
 use clap::{Parser, Subcommand};
 
@@ -81,6 +82,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    observability::init_from_env()?;
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "lake process starting");
     let Cli { data_dir, command } = Cli::parse();
     match command {
         // A pure network client: it holds no local storage, so it must not
