@@ -140,19 +140,15 @@ It does not publish the internal crates, which remain `publish = false`.
 - When a new crate is added, add its exact `Cargo.lock` extra-file JSONPath
   using `.name.value` to `release-please-config.json`.
 
-The workflow needs a dedicated `RELEASE_PLEASE_TOKEN` repository secret.
-Using the default `GITHUB_TOKEN` would prevent the generated release PR from
-triggering normal pull-request CI. Use a fine-grained token scoped to this
-repository with Contents, Issues, and Pull requests read/write permissions:
-
-```bash
-gh secret set RELEASE_PLEASE_TOKEN --repo rararulab/lake
-```
+The workflow uses GitHub's short-lived built-in `GITHUB_TOKEN`; no long-lived
+release credential is stored. This matches the repository's local-first model:
+generated release PRs do not trigger a separate pull-request workflow.
+Maintainers review the version/changelog diff and run `mise run gate` before
+merge, while the existing main-only CI remains the post-merge backstop.
 
 Release Please continuously updates one release PR from Conventional Commits.
-Merging that PR updates the changelog and versions, creates an unprefixed
-`vX.Y.Z` tag, and publishes the matching GitHub Release. Release PRs remain
-subject to the normal review, CI, and merge gates.
+Merging that PR updates the changelog and versions, creates `vX.Y.Z` without a
+component prefix, and publishes the matching GitHub Release.
 
 ## Review Checklist
 
