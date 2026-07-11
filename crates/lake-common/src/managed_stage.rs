@@ -14,8 +14,12 @@
 
 //! Credential-free managed-stage discovery contract.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
+
+use crate::TenantId;
 
 /// Flight action used by an SDK to discover the query endpoint's managed stage.
 pub const MANAGED_STAGE_DISCOVERY_ACTION: &str = "lake.managed_stage.v1";
@@ -110,6 +114,45 @@ impl ManagedStageDescriptor {
     /// Return the backend configuration carried by this descriptor.
     #[must_use]
     pub fn backend(&self) -> &ManagedStageBackend { &self.backend }
+
+    /// Derive the exact credential-free child stage owned by `tenant`.
+    #[must_use]
+    pub fn scope_to_tenant(&self, tenant: &TenantId) -> Self {
+        let backend = match &self.backend {
+            ManagedStageBackend::Local { root } => ManagedStageBackend::Local {
+                root: Path::new(root)
+                    .join("tenants")
+                    .join(tenant.as_str())
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+            ManagedStageBackend::S3 {
+                bucket,
+                prefix,
+                region,
+                endpoint,
+                force_path_style,
+            } => {
+                let prefix = prefix.trim_end_matches('/');
+                let prefix = if prefix.is_empty() {
+                    format!("tenants/{}", tenant.as_str())
+                } else {
+                    format!("{prefix}/tenants/{}", tenant.as_str())
+                };
+                ManagedStageBackend::S3 {
+                    bucket: bucket.clone(),
+                    prefix,
+                    region: region.clone(),
+                    endpoint: endpoint.clone(),
+                    force_path_style: *force_path_style,
+                }
+            }
+        };
+        Self {
+            version: self.version,
+            backend,
+        }
+    }
 
     /// Encode a descriptor for a Flight result body.
     pub fn to_wire(&self) -> Result<Vec<u8>, ManagedStageError> {

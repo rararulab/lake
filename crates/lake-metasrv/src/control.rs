@@ -45,9 +45,10 @@ use datafusion::{
 };
 use futures::{Stream, StreamExt};
 use lake_common::{
-    FILE_APPEND_TYPE_URL, FileAppendRequest, Namespace, TableLocation, TableRef, Version,
+    FILE_APPEND_TYPE_URL, FileAppendRequest, Namespace, Principal, PrincipalRole, TableLocation,
+    TableRef, Version,
 };
-use lake_flight::ClientSecurity;
+use lake_flight::{ClientSecurity, DELEGATED_NAMESPACE_HEADER};
 use lake_objects::data_location_field;
 use prost::Message;
 use prost_types::Any;
@@ -59,12 +60,66 @@ use crate::{Metasrv, leadership::Leadership};
 /// The [`Status`] message returned by every unsupported Flight method.
 const UNSUPPORTED: &str = "metasrv control plane only serves actions and FILE append do_put";
 
+const RESOURCE_UNAVAILABLE: &str = "resource is not available";
+
 /// A boxed server stream of `T`, the shape every Flight response stream takes.
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
 /// The `DoAction` response stream: a (usually one-shot) stream of Flight
 /// results carrying JSON bodies.
 type ActionStream = BoxStream<FlightResult>;
+
+fn principal<T>(request: &Request<T>) -> Result<Principal, Status> {
+    request
+        .extensions()
+        .get::<Principal>()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("authenticated principal is missing"))
+}
+
+fn delegated_namespace<T>(request: &Request<T>) -> Result<Option<String>, Status> {
+    request
+        .metadata()
+        .get(DELEGATED_NAMESPACE_HEADER)
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| Status::permission_denied(RESOURCE_UNAVAILABLE))
+        })
+        .transpose()
+}
+
+fn authorize_namespace(
+    principal: &Principal,
+    delegated: Option<&str>,
+    target: &str,
+) -> Result<(), Status> {
+    let authorized = match principal.role() {
+        PrincipalRole::Admin => true,
+        PrincipalRole::User => delegated.is_none() && principal.can_access_namespace(target),
+        PrincipalRole::QueryService | PrincipalRole::MetadataPeer => delegated == Some(target),
+    };
+    if authorized {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(RESOURCE_UNAVAILABLE))
+    }
+}
+
+fn append_request(first: &FlightData) -> Result<FileAppendRequest, Status> {
+    let descriptor = first
+        .flight_descriptor
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("FILE append requires a command descriptor"))?;
+    let command = Any::decode(descriptor.cmd.as_ref())
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    if command.type_url != FILE_APPEND_TYPE_URL {
+        return Err(Status::invalid_argument("invalid FILE append command type"));
+    }
+    FileAppendRequest::from_command_payload(&command.value)
+        .ok_or_else(|| Status::invalid_argument("invalid FILE append descriptor"))
+}
 
 async fn append_file_stream<S, E>(metasrv: &Metasrv, mut input: S) -> Result<Version, Status>
 where
@@ -76,17 +131,7 @@ where
         .await
         .ok_or_else(|| Status::invalid_argument("FILE append stream is empty"))?
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let descriptor = first
-        .flight_descriptor
-        .as_ref()
-        .ok_or_else(|| Status::invalid_argument("FILE append requires a command descriptor"))?;
-    let command = Any::decode(descriptor.cmd.as_ref())
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    if command.type_url != FILE_APPEND_TYPE_URL {
-        return Err(Status::invalid_argument("invalid FILE append command type"));
-    }
-    let append = FileAppendRequest::from_command_payload(&command.value)
-        .ok_or_else(|| Status::invalid_argument("invalid FILE append descriptor"))?;
+    let append = append_request(&first)?;
     let flight_data = futures::stream::once(async move { Ok(first) }).chain(input.map(|item| {
         item.map_err(|error| arrow_flight::error::FlightError::protocol(error.to_string()))
     }));
@@ -199,6 +244,7 @@ impl MetasrvFlightService {
     async fn maybe_forward(
         &self,
         action: &Action,
+        namespace: &str,
     ) -> Result<Option<Response<ActionStream>>, Status> {
         if self.leadership.is_leader() {
             return Ok(None);
@@ -206,14 +252,19 @@ impl MetasrvFlightService {
         match self.leadership.leader() {
             // We are the elected leader; the flag is just briefly stale.
             Some(addr) if addr == self.own_addr => Ok(None),
-            Some(addr) => self.forward(&addr, action).await.map(Some),
+            Some(addr) => self.forward(&addr, action, namespace).await.map(Some),
             None => Err(Status::unavailable("no leader elected")),
         }
     }
 
     /// Forward `action` to the leader at `addr` over Flight `DoAction`,
     /// relaying its streamed result as this call's response.
-    async fn forward(&self, addr: &str, action: &Action) -> Result<Response<ActionStream>, Status> {
+    async fn forward(
+        &self,
+        addr: &str,
+        action: &Action,
+        namespace: &str,
+    ) -> Result<Response<ActionStream>, Status> {
         let endpoint = self.peer_security.endpoint_for_authority(addr);
         let channel = self
             .peer_security
@@ -221,19 +272,30 @@ impl MetasrvFlightService {
             .await
             .map_err(|e| Status::unavailable(format!("cannot reach leader '{addr}': {e}")))?;
         let mut client = FlightServiceClient::new(channel);
-        let request = self
+        let mut request = self
             .peer_security
             .authorize_request(Request::new(action.clone()));
+        request.metadata_mut().insert(
+            DELEGATED_NAMESPACE_HEADER,
+            namespace
+                .parse()
+                .map_err(|_| Status::internal("authorized namespace is not valid metadata"))?,
+        );
         let response = client.do_action(request).await?;
         let stream: ActionStream = Box::pin(response.into_inner());
         Ok(Response::new(stream))
     }
 
-    async fn forward_put(
+    async fn forward_put<S, E>(
         &self,
         addr: &str,
-        input: Streaming<FlightData>,
-    ) -> Result<Response<BoxStream<PutResult>>, Status> {
+        namespace: &str,
+        input: S,
+    ) -> Result<Response<BoxStream<PutResult>>, Status>
+    where
+        S: Stream<Item = std::result::Result<FlightData, E>> + Send + 'static,
+        E: std::fmt::Display + Send + 'static,
+    {
         let endpoint = self.peer_security.endpoint_for_authority(addr);
         let channel = self
             .peer_security
@@ -244,6 +306,12 @@ impl MetasrvFlightService {
         self.peer_security
             .apply_to_flight_client(&mut client)
             .map_err(|error| Status::internal(error.to_string()))?;
+        client.metadata_mut().insert(
+            DELEGATED_NAMESPACE_HEADER,
+            namespace
+                .parse()
+                .map_err(|_| Status::internal("authorized namespace is not valid metadata"))?,
+        );
         let results = client
             .do_put(input.map(|item| {
                 item.map_err(|error| arrow_flight::error::FlightError::protocol(error.to_string()))
@@ -257,10 +325,10 @@ impl MetasrvFlightService {
     /// `create_table`: serve locally if leader, else forward to the leader,
     /// then materialize and register the table described by the JSON body.
     async fn action_create_table(&self, action: Action) -> Result<Response<ActionStream>, Status> {
-        if let Some(forwarded) = self.maybe_forward(&action).await? {
+        let req: CreateTableReq = parse_body(&action.body)?;
+        if let Some(forwarded) = self.maybe_forward(&action, &req.namespace).await? {
             return Ok(forwarded);
         }
-        let req: CreateTableReq = parse_body(&action.body)?;
         let location = req
             .location
             .ok_or_else(|| Status::invalid_argument("create_table requires a 'location' field"))?;
@@ -277,10 +345,10 @@ impl MetasrvFlightService {
     /// `drop_table`: serve locally if leader, else forward to the leader, then
     /// delete the table's data and deregister it. Idempotent.
     async fn action_drop_table(&self, action: Action) -> Result<Response<ActionStream>, Status> {
-        if let Some(forwarded) = self.maybe_forward(&action).await? {
+        let req: TableIdent = parse_body(&action.body)?;
+        if let Some(forwarded) = self.maybe_forward(&action, &req.namespace).await? {
             return Ok(forwarded);
         }
-        let req: TableIdent = parse_body(&action.body)?;
         let table = TableRef::new(req.namespace, req.name);
         self.metasrv
             .drop_table(&table)
@@ -317,13 +385,29 @@ impl MetasrvFlightService {
     }
 
     /// `list_namespaces`: return every namespace as a JSON array.
-    async fn action_list_namespaces(&self) -> Result<Response<ActionStream>, Status> {
+    async fn action_list_namespaces(
+        &self,
+        principal: &Principal,
+        delegated: Option<&str>,
+    ) -> Result<Response<ActionStream>, Status> {
+        if delegated.is_some() && principal.role() == PrincipalRole::User {
+            return Err(Status::permission_denied(RESOURCE_UNAVAILABLE));
+        }
         let namespaces = self
             .metasrv
             .list_namespaces()
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        let namespaces: Vec<String> = namespaces.into_iter().map(|n| n.0).collect();
+        let namespaces: Vec<String> = namespaces
+            .into_iter()
+            .filter(|namespace| match principal.role() {
+                PrincipalRole::Admin
+                | PrincipalRole::QueryService
+                | PrincipalRole::MetadataPeer => true,
+                PrincipalRole::User => principal.can_access_namespace(&namespace.0),
+            })
+            .map(|n| n.0)
+            .collect();
         respond_json(&namespaces)
     }
 }
@@ -384,16 +468,27 @@ impl FlightService for MetasrvFlightService {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
+        let principal = principal(&request)?;
+        let delegated = delegated_namespace(&request)?;
+        let mut input = request.into_inner();
+        let first = input
+            .next()
+            .await
+            .ok_or_else(|| Status::invalid_argument("FILE append stream is empty"))??;
+        let append = append_request(&first)?;
+        let namespace = &append.table().namespace.0;
+        authorize_namespace(&principal, delegated.as_deref(), namespace)?;
+        let input = Box::pin(futures::stream::once(async move { Ok(first) }).chain(input));
         if !self.leadership.is_leader() {
             match self.leadership.leader() {
                 Some(addr) if addr != self.own_addr => {
-                    return self.forward_put(&addr, request.into_inner()).await;
+                    return self.forward_put(&addr, namespace, input).await;
                 }
                 Some(_) => {}
                 None => return Err(Status::unavailable("no leader elected")),
             }
         }
-        let version = append_file_stream(&self.metasrv, request.into_inner()).await?;
+        let version = append_file_stream(&self.metasrv, input).await?;
         let result = PutResult {
             app_metadata: serde_json::to_vec(&version)
                 .map_err(|error| Status::internal(error.to_string()))?
@@ -417,13 +512,34 @@ impl FlightService for MetasrvFlightService {
         &self,
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
+        let principal = principal(&request)?;
+        let delegated = delegated_namespace(&request)?;
         let action = request.into_inner();
         match action.r#type.as_str() {
-            "create_table" => self.action_create_table(action).await,
-            "drop_table" => self.action_drop_table(action).await,
-            "resolve" => self.action_resolve(&action.body).await,
-            "list_tables" => self.action_list_tables(&action.body).await,
-            "list_namespaces" => self.action_list_namespaces().await,
+            "create_table" => {
+                let req: CreateTableReq = parse_body(&action.body)?;
+                authorize_namespace(&principal, delegated.as_deref(), &req.namespace)?;
+                self.action_create_table(action).await
+            }
+            "drop_table" => {
+                let req: TableIdent = parse_body(&action.body)?;
+                authorize_namespace(&principal, delegated.as_deref(), &req.namespace)?;
+                self.action_drop_table(action).await
+            }
+            "resolve" => {
+                let req: TableIdent = parse_body(&action.body)?;
+                authorize_namespace(&principal, delegated.as_deref(), &req.namespace)?;
+                self.action_resolve(&action.body).await
+            }
+            "list_tables" => {
+                let req: NamespaceIdent = parse_body(&action.body)?;
+                authorize_namespace(&principal, delegated.as_deref(), &req.namespace)?;
+                self.action_list_tables(&action.body).await
+            }
+            "list_namespaces" => {
+                self.action_list_namespaces(&principal, delegated.as_deref())
+                    .await
+            }
             other => Err(Status::unimplemented(format!(
                 "unknown action type '{other}'"
             ))),
@@ -552,5 +668,54 @@ mod schema_tests {
         let schema = build_schema(&["video:file".to_owned()]).unwrap();
 
         assert_eq!(schema.field(0), &data_location_field("video", false));
+    }
+}
+
+#[cfg(test)]
+mod authorization_tests {
+    use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
+    use tonic::Code;
+
+    use super::authorize_namespace;
+
+    fn principal(role: PrincipalRole, namespaces: &[&str]) -> Principal {
+        Principal::try_new(
+            PrincipalId::try_new("caller").unwrap(),
+            TenantId::try_new("tenant-a").unwrap(),
+            role,
+            namespaces,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn metasrv_rejects_cross_tenant_mutations() {
+        let user = principal(PrincipalRole::User, &["alpha"]);
+        assert!(authorize_namespace(&user, None, "alpha").is_ok());
+        assert_eq!(
+            authorize_namespace(&user, None, "beta").unwrap_err().code(),
+            Code::PermissionDenied
+        );
+        assert_eq!(
+            authorize_namespace(&user, Some("alpha"), "alpha")
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+
+        let query = principal(PrincipalRole::QueryService, &[]);
+        assert!(authorize_namespace(&query, Some("alpha"), "alpha").is_ok());
+        assert_eq!(
+            authorize_namespace(&query, None, "alpha")
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+        assert_eq!(
+            authorize_namespace(&query, Some("beta"), "alpha")
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
     }
 }

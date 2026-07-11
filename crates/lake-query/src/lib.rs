@@ -269,6 +269,12 @@ impl QueryEngine {
         self.catalog.invalidate_registration(table).await;
     }
 
+    pub(crate) fn cached_catalog_snapshot(
+        &self,
+    ) -> std::collections::BTreeMap<lake_common::Namespace, Vec<lake_common::TableName>> {
+        self.catalog.cached_snapshot()
+    }
+
     /// Execute a SQL statement and collect the results.
     pub async fn execute_sql(&self, sql: &str) -> Result<Vec<RecordBatch>> {
         let df = self.plan_sql(sql).await?;
@@ -443,7 +449,7 @@ mod tests {
         },
     };
     use futures::{StreamExt, TryStreamExt};
-    use lake_common::{MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor};
+    use lake_common::{MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor, TenantId};
     use lake_engine_lance::LanceEngine;
     use lake_flight::{ClientSecurity, ServerSecurity};
     use lake_meta::{MetaStore, MetaStoreRef};
@@ -686,7 +692,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(
             ManagedStageDescriptor::from_wire(&results[0].body).expect("descriptor"),
-            descriptor
+            descriptor.scope_to_tenant(&TenantId::try_new("deployment").unwrap())
         );
 
         server.abort();

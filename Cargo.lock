@@ -4149,6 +4149,7 @@ dependencies = [
  "lake-metasrv",
  "lake-objects",
  "lake-query",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -4205,6 +4206,7 @@ name = "lake-flight"
 version = "0.0.1"
 dependencies = [
  "arrow-flight",
+ "lake-common",
  "rustls 0.23.41",
  "snafu",
  "subtle",

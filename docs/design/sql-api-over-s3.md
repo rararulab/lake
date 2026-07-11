@@ -132,9 +132,9 @@ schema encoding, streaming, error mapping, and result-location semantics.
 
 ## Delivery sequence
 
-1. Productionize Tier 1: TLS and per-RPC deployment authentication are wired;
-   next add tenant authorization, limits, signed opaque tickets, cancellation,
-   credential rotation, and load tests.
+1. Productionize Tier 1: TLS, immutable tenant principal maps, pre-planning
+   authorization, and per-replica limits are wired; next add signed opaque
+   tickets, cancellation, online credential rotation, and load tests.
 2. Add an async query state store and `PollFlightInfo`.
 3. Add bounded result materialization, manifest publication, presigned HTTPS
    endpoints, and result garbage collection.

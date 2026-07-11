@@ -95,6 +95,16 @@ impl LakeCatalog {
 
     pub fn state(&self) -> Arc<CatalogState> { self.state.clone() }
 
+    /// Clone the warmed listing snapshot without performing metadata I/O.
+    #[must_use]
+    pub fn cached_snapshot(&self) -> BTreeMap<Namespace, Vec<TableName>> {
+        self.state
+            .snapshot
+            .read()
+            .expect("snapshot lock poisoned")
+            .clone()
+    }
+
     /// Evict one resolved registration after this query node proxies a
     /// successful write, so the same client connection observes its commit.
     pub async fn invalidate_registration(&self, table: &TableRef) {

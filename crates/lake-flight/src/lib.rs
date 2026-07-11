@@ -17,6 +17,7 @@
 use std::{fmt, net::SocketAddr, sync::Arc};
 
 use arrow_flight::{FlightClient, sql::client::FlightSqlServiceClient};
+pub use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
 use snafu::Snafu;
 use subtle::ConstantTimeEq;
 use tonic::{
@@ -26,6 +27,10 @@ use tonic::{
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig},
 };
 
+/// Metadata key used by trusted Query and metadata peers to preserve an
+/// already-authorized namespace across an internal Flight hop.
+pub const DELEGATED_NAMESPACE_HEADER: &str = "x-lake-delegated-namespace";
+
 /// Errors raised while constructing Flight transport security.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -33,6 +38,9 @@ pub enum FlightSecurityError {
     /// Bearer credentials must be non-empty and legal ASCII metadata.
     #[snafu(display("bearer credential is empty or invalid"))]
     InvalidBearerCredential,
+
+    #[snafu(display("bearer principal map is empty or contains a duplicate credential"))]
+    InvalidBearerPrincipalMap,
 
     /// The tonic endpoint URI is invalid.
     #[snafu(display("invalid Flight endpoint"))]
@@ -89,29 +97,62 @@ impl fmt::Debug for BearerToken {
     }
 }
 
-/// Identity installed into authenticated tonic request extensions.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Principal {
-    subject: &'static str,
+#[derive(Clone)]
+pub struct BearerPrincipalBinding {
+    token:     BearerToken,
+    principal: Principal,
 }
 
-impl Principal {
-    /// Stable subject for the initial deployment-level bearer authenticator.
-    #[must_use]
-    pub const fn subject(&self) -> &'static str { self.subject }
+impl BearerPrincipalBinding {
+    pub fn new(value: impl Into<String>, principal: Principal) -> Result<Self> {
+        Ok(Self {
+            token: BearerToken::new(value)?,
+            principal,
+        })
+    }
+}
+
+impl fmt::Debug for BearerPrincipalBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BearerPrincipalBinding")
+            .field("token", &self.token)
+            .field("principal", &self.principal)
+            .finish()
+    }
 }
 
 /// Constant-time opaque bearer authenticator for a tonic interceptor.
 #[derive(Clone)]
 pub struct BearerAuthenticator {
-    expected: BearerToken,
+    bindings: Arc<[BearerPrincipalBinding]>,
 }
 
 impl BearerAuthenticator {
     /// Construct an authenticator without exposing the credential in errors.
     pub fn new(value: impl Into<String>) -> Result<Self> {
+        Self::from_bindings([BearerPrincipalBinding::new(
+            value,
+            Principal::deployment_admin(),
+        )?])
+    }
+
+    pub fn from_bindings<I>(bindings: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = BearerPrincipalBinding>,
+    {
+        let bindings = bindings.into_iter().collect::<Vec<_>>();
+        if bindings.is_empty()
+            || bindings.iter().enumerate().any(|(index, binding)| {
+                bindings[index + 1..]
+                    .iter()
+                    .any(|other| binding.token.value == other.token.value)
+            })
+        {
+            return Err(FlightSecurityError::InvalidBearerPrincipalMap);
+        }
         Ok(Self {
-            expected: BearerToken::new(value)?,
+            bindings: Arc::from(bindings),
         })
     }
 }
@@ -120,7 +161,7 @@ impl fmt::Debug for BearerAuthenticator {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("BearerAuthenticator")
-            .field("expected", &self.expected)
+            .field("bindings", &self.bindings)
             .finish()
     }
 }
@@ -128,19 +169,22 @@ impl fmt::Debug for BearerAuthenticator {
 impl Interceptor for BearerAuthenticator {
     fn call(&mut self, mut request: Request<()>) -> std::result::Result<Request<()>, Status> {
         let supplied = request.metadata().get("authorization");
-        let accepted = supplied.is_some_and(|value| {
+        let principal = supplied.and_then(|value| {
             let actual = value.as_encoded_bytes();
-            let expected = self.expected.authorization.as_encoded_bytes();
-            bool::from(actual.ct_eq(expected))
+            let mut matched = None;
+            for binding in self.bindings.iter() {
+                if bool::from(actual.ct_eq(binding.token.authorization.as_encoded_bytes())) {
+                    matched = Some(binding.principal.clone());
+                }
+            }
+            matched
         });
-        if !accepted {
+        let Some(principal) = principal else {
             return Err(Status::unauthenticated(
                 "missing or invalid bearer credential",
             ));
-        }
-        request.extensions_mut().insert(Principal {
-            subject: "deployment-bearer",
-        });
+        };
+        request.extensions_mut().insert(principal);
         Ok(request)
     }
 }
@@ -149,14 +193,20 @@ impl Interceptor for BearerAuthenticator {
 /// authenticated production requests.
 #[derive(Clone, Debug)]
 pub struct ServerInterceptor {
-    bearer: Option<BearerAuthenticator>,
+    bearer:                Option<BearerAuthenticator>,
+    development_principal: Option<Principal>,
 }
 
 impl Interceptor for ServerInterceptor {
-    fn call(&mut self, request: Request<()>) -> std::result::Result<Request<()>, Status> {
+    fn call(&mut self, mut request: Request<()>) -> std::result::Result<Request<()>, Status> {
         match &mut self.bearer {
             Some(authenticator) => authenticator.call(request),
-            None => Ok(request),
+            None => {
+                if let Some(principal) = &self.development_principal {
+                    request.extensions_mut().insert(principal.clone());
+                }
+                Ok(request)
+            }
         }
     }
 }
@@ -164,25 +214,44 @@ impl Interceptor for ServerInterceptor {
 /// Server-side TLS identity, authentication, and exposure policy.
 #[derive(Clone)]
 pub struct ServerSecurity {
-    bearer:       Option<BearerAuthenticator>,
-    tls_identity: Option<Identity>,
+    bearer:                Option<BearerAuthenticator>,
+    development_principal: Option<Principal>,
+    tls_identity:          Option<Identity>,
 }
 
 impl ServerSecurity {
     /// Explicit plaintext/anonymous configuration for loopback development.
     #[must_use]
-    pub const fn insecure() -> Self {
+    pub fn insecure() -> Self { Self::insecure_with_principal(Principal::development_admin()) }
+
+    /// Explicit plaintext development mode with a caller-selected identity.
+    #[must_use]
+    pub fn insecure_with_principal(principal: Principal) -> Self {
         Self {
-            bearer:       None,
-            tls_identity: None,
+            bearer:                None,
+            development_principal: Some(principal),
+            tls_identity:          None,
         }
     }
 
     /// Require one opaque deployment bearer credential on every RPC.
     pub fn with_bearer_token(value: impl Into<String>) -> Result<Self> {
         Ok(Self {
-            bearer:       Some(BearerAuthenticator::new(value)?),
-            tls_identity: None,
+            bearer:                Some(BearerAuthenticator::new(value)?),
+            development_principal: None,
+            tls_identity:          None,
+        })
+    }
+
+    /// Require one of the supplied opaque credential-to-principal bindings.
+    pub fn with_bearer_principals<I>(bindings: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = BearerPrincipalBinding>,
+    {
+        Ok(Self {
+            bearer:                Some(BearerAuthenticator::from_bindings(bindings)?),
+            development_principal: None,
+            tls_identity:          None,
         })
     }
 
@@ -193,11 +262,11 @@ impl ServerSecurity {
         self
     }
 
-    /// Validate that a remotely reachable listener cannot downgrade silently.
+    /// Validate that a remotely reachable listener always authenticates; an
+    /// explicit override may delegate TLS, but never identity, to a proxy.
     pub fn validate_exposure(&self, addr: SocketAddr, allow_insecure: bool) -> Result<()> {
         if addr.ip().is_loopback()
-            || allow_insecure
-            || (self.bearer.is_some() && self.tls_identity.is_some())
+            || (self.bearer.is_some() && (allow_insecure || self.tls_identity.is_some()))
         {
             return Ok(());
         }
@@ -208,7 +277,8 @@ impl ServerSecurity {
     #[must_use]
     pub fn interceptor(&self) -> ServerInterceptor {
         ServerInterceptor {
-            bearer: self.bearer.clone(),
+            bearer:                self.bearer.clone(),
+            development_principal: self.development_principal.clone(),
         }
     }
 
@@ -227,6 +297,7 @@ impl fmt::Debug for ServerSecurity {
         formatter
             .debug_struct("ServerSecurity")
             .field("authenticated", &self.bearer.is_some())
+            .field("development_principal", &self.development_principal)
             .field("tls", &self.tls_identity.is_some())
             .finish()
     }
@@ -376,9 +447,10 @@ mod tests {
     use std::net::SocketAddr;
 
     use arrow_flight::{FlightClient, sql::client::FlightSqlServiceClient};
+    use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
     use tonic::{Request, service::Interceptor};
 
-    use super::{BearerAuthenticator, ClientSecurity, ServerSecurity};
+    use super::{BearerAuthenticator, BearerPrincipalBinding, ClientSecurity, ServerSecurity};
 
     fn request_with_authorization(value: &str) -> Request<()> {
         let mut request = Request::new(());
@@ -410,6 +482,52 @@ mod tests {
             .expect("valid credential");
         assert!(accepted.extensions().get::<super::Principal>().is_some());
         assert!(!format!("{authenticator:?}").contains(secret));
+    }
+
+    #[test]
+    fn bearer_principals_are_tenant_scoped_and_redacted() {
+        let alpha_secret = "alpha-secret-value";
+        let beta_secret = "beta-secret-value";
+        let alpha = Principal::try_new(
+            PrincipalId::try_new("alice@example.com").unwrap(),
+            TenantId::try_new("tenant-alpha").unwrap(),
+            PrincipalRole::User,
+            ["alpha_episodes"],
+        )
+        .unwrap();
+        let beta = Principal::try_new(
+            PrincipalId::try_new("bob@example.com").unwrap(),
+            TenantId::try_new("tenant-beta").unwrap(),
+            PrincipalRole::User,
+            ["beta_episodes"],
+        )
+        .unwrap();
+        let mut authenticator = BearerAuthenticator::from_bindings([
+            BearerPrincipalBinding::new(alpha_secret, alpha.clone()).unwrap(),
+            BearerPrincipalBinding::new(beta_secret, beta.clone()).unwrap(),
+        ])
+        .unwrap();
+
+        let accepted = authenticator
+            .call(request_with_authorization(&format!(
+                "Bearer {alpha_secret}"
+            )))
+            .unwrap();
+        assert_eq!(accepted.extensions().get::<Principal>(), Some(&alpha));
+        assert!(alpha.can_access_namespace("alpha_episodes"));
+        assert!(!alpha.can_access_namespace("beta_episodes"));
+        let debug = format!("{authenticator:?}");
+        assert!(!debug.contains(alpha_secret));
+        assert!(!debug.contains(beta_secret));
+
+        assert!(TenantId::try_new("../escape").is_err());
+        assert!(PrincipalId::try_new("").is_err());
+        let duplicate = BearerAuthenticator::from_bindings([
+            BearerPrincipalBinding::new(alpha_secret, alpha.clone()).unwrap(),
+            BearerPrincipalBinding::new(alpha_secret, beta).unwrap(),
+        ])
+        .unwrap_err();
+        assert!(!duplicate.to_string().contains(alpha_secret));
     }
 
     #[tokio::test]
@@ -452,12 +570,34 @@ mod tests {
         let insecure = ServerSecurity::insecure();
         assert!(insecure.validate_exposure(loopback, false).is_ok());
         assert!(insecure.validate_exposure(public, false).is_err());
-        assert!(insecure.validate_exposure(public, true).is_ok());
+        assert!(insecure.validate_exposure(public, true).is_err());
 
         let auth_only = ServerSecurity::with_bearer_token("secret").expect("auth");
         assert!(auth_only.validate_exposure(public, false).is_err());
+        assert!(auth_only.validate_exposure(public, true).is_ok());
 
         let secure = auth_only.with_tls_identity_pem(b"certificate", b"private-key");
         assert!(secure.validate_exposure(public, false).is_ok());
+    }
+
+    #[test]
+    fn insecure_loopback_uses_explicit_development_principal() {
+        let development = Principal::try_new(
+            PrincipalId::try_new("local-developer").unwrap(),
+            TenantId::try_new("development").unwrap(),
+            PrincipalRole::User,
+            ["local"],
+        )
+        .unwrap();
+        let security = ServerSecurity::insecure_with_principal(development.clone());
+
+        let accepted = security
+            .interceptor()
+            .call(Request::new(()))
+            .expect("loopback development request");
+
+        assert_eq!(accepted.extensions().get::<Principal>(), Some(&development));
+        let public: SocketAddr = "0.0.0.0:50051".parse().unwrap();
+        assert!(security.validate_exposure(public, false).is_err());
     }
 }

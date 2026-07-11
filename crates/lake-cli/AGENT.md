@@ -28,7 +28,8 @@ tables. clap derive, thin `main.rs`, one handler module per command.
 
 ## Flight security
 
-- Inbound: `LAKE_AUTH_TOKEN_FILE`, `LAKE_TLS_CERT_FILE`,
+- Inbound: `LAKE_AUTH_PRINCIPALS_FILE` (protected multi-tenant map) or the
+  backward-compatible `LAKE_AUTH_TOKEN_FILE`, plus `LAKE_TLS_CERT_FILE` and
   `LAKE_TLS_KEY_FILE`.
 - Query/admin→Metasrv: `LAKE_METADATA_AUTH_TOKEN_FILE`,
   `LAKE_METADATA_CA_FILE`, `LAKE_METADATA_SERVER_NAME`.

@@ -106,7 +106,7 @@ pub struct MetasrvServerConfig {
 impl MetasrvServerConfig {
     /// Explicit loopback development configuration.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             server_security: ServerSecurity::insecure(),
             peer_security:   ClientSecurity::new(),

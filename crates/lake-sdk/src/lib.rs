@@ -699,10 +699,13 @@ mod tests {
     use aws_config::BehaviorVersion;
     use aws_sdk_s3::config::{Credentials, Region};
     use futures::TryStreamExt;
-    use lake_common::{ManagedStageDescriptor, TableLocation, TableRef};
+    use lake_common::{
+        ManagedStageDescriptor, Principal, PrincipalId, PrincipalRole, TableLocation, TableRef,
+        TenantId,
+    };
     use lake_engine::TableEngineRef;
     use lake_engine_lance::LanceEngine;
-    use lake_flight::{ClientSecurity, ServerSecurity};
+    use lake_flight::{BearerPrincipalBinding, ClientSecurity, ServerSecurity};
     use lake_meta::{MetaStoreRef, RocksMeta};
     use lake_metasrv::{Metasrv, MetasrvServerConfig};
     use lake_objects::{
@@ -855,6 +858,79 @@ mod tests {
 
         assert_eq!(full, expected);
         assert_eq!(range, b"456789");
+    }
+
+    #[tokio::test]
+    async fn managed_stage_discovery_is_tenant_scoped() {
+        let root = tempdir().unwrap();
+        let base = ManagedStageDescriptor::local(
+            root.path().join("objects").to_string_lossy().into_owned(),
+        );
+        let alpha_principal = Principal::try_new(
+            PrincipalId::try_new("alpha-user").unwrap(),
+            TenantId::try_new("alpha").unwrap(),
+            PrincipalRole::User,
+            ["alpha"],
+        )
+        .unwrap();
+        let beta_principal = Principal::try_new(
+            PrincipalId::try_new("beta-user").unwrap(),
+            TenantId::try_new("beta").unwrap(),
+            PrincipalRole::User,
+            ["beta"],
+        )
+        .unwrap();
+        let security = ServerSecurity::with_bearer_principals([
+            BearerPrincipalBinding::new("alpha-token", alpha_principal).unwrap(),
+            BearerPrincipalBinding::new("beta-token", beta_principal).unwrap(),
+        ])
+        .unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let query_addr = free_addr();
+        let server = tokio::spawn({
+            let addr = query_addr.clone();
+            let query = Arc::new(QueryEngine::new(meta, engine));
+            let config = QueryServerConfig::new()
+                .with_managed_stage(base.clone())
+                .with_server_security(security);
+            async move { lake_query::serve_with_config(query, &addr, config).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let alpha = LakeClient::builder(format!("http://{query_addr}"))
+            .with_bearer_token("alpha-token")
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let beta = LakeClient::builder(format!("http://{query_addr}"))
+            .with_bearer_token("beta-token")
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        assert_ne!(
+            alpha.objects.stage_identity(),
+            beta.objects.stage_identity()
+        );
+        let location = alpha
+            .objects
+            .put_reader(
+                Box::pin(std::io::Cursor::new(b"tenant-owned-video".to_vec())),
+                "video/mp4".to_owned(),
+            )
+            .await
+            .unwrap();
+        assert!(alpha.open(&location).await.is_ok());
+        assert!(beta.open(&location).await.is_err());
+
+        let alpha_wire = base
+            .scope_to_tenant(&TenantId::try_new("alpha").unwrap())
+            .to_wire()
+            .unwrap();
+        assert!(!String::from_utf8(alpha_wire).unwrap().contains("token"));
+        server.abort();
     }
 
     #[tokio::test]

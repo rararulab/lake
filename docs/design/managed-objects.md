@@ -149,7 +149,8 @@ Range reads use the same containment check and process credentials
 as sequential reads. They do not introduce a query endpoint, signed URL, or
 arbitrary URI escape hatch.
 
-The current slice does not provide tenant authorization, browser presigning,
-object deduplication, cross-host upload-checkpoint sharing, or row-level DELETE.
-Those additions must keep the same visibility rule: a SQL-visible
+Tenant authorization derives one exact managed-stage child prefix per validated
+tenant and the SDK refuses locations outside it. The current slice does not
+provide browser presigning, object deduplication, cross-host upload-checkpoint
+sharing, or row-level DELETE. Those additions must keep the same visibility rule: a SQL-visible
 `DataLocation` always identifies a complete, immutable object.

@@ -214,9 +214,19 @@ design-level ones:
 - Every production Flight hop shares `lake-flight`: a server interceptor
   authenticates every RPC, TLS configuration is verified by the client, and
   non-loopback plaintext/anonymous listeners fail closed. This covers
-  SDK→Query, Query→Metasrv, and follower→leader. The current opaque deployment
-  bearer establishes service identity; tenant authorization and token rotation
-  remain later policy/operations layers.
+  SDK→Query, Query→Metasrv, and follower→leader. A protected immutable
+  principal map binds opaque credentials to validated tenant, role, and finite
+  namespace grants. Query rejects unauthorized SQL before planning and filters
+  discovery from its local catalog snapshot. Metasrv independently checks every
+  table action and FILE append; only authenticated Query/metadata-peer roles may
+  preserve an exact authorized namespace across internal hops. Loopback
+  development installs an explicit development principal rather than treating a
+  missing identity as authority.
+- Managed-stage discovery derives `tenants/<tenant-id>` below the configured
+  local root or S3 prefix. The SDK opens that child stage directly and rejects a
+  `DataLocation` outside it. Production workload IAM must independently restrict
+  each SDK identity to the same S3 child prefix; Lake never sends AWS credentials
+  or large-object bytes through Query or Metasrv.
 - The full prod path (Lance on S3 + DynamoDB commit pointer via
   `ExternalManifestStore`) is wired end to end: `LanceEngine::for_object_store`
   threads S3 storage options + the commit handler through create/open/append,

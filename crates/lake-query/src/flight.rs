@@ -35,16 +35,21 @@ use arrow_flight::{
     error::FlightError,
     flight_service_server::FlightService,
     sql::{
-        Any, CommandStatementQuery, ProstMessageExt, SqlInfo, TicketStatementQuery,
+        Any, CommandGetDbSchemas, CommandGetTables, CommandStatementQuery, ProstMessageExt,
+        SqlInfo, TicketStatementQuery,
         server::{FlightSqlService, PeekableFlightDataStream},
     },
 };
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion::{
+    arrow::datatypes::{Schema, SchemaRef},
+    common::{TableReference, config::Dialect},
+};
 use futures::{Stream, StreamExt, TryStreamExt};
 use lake_common::{
-    FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor,
+    FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION,
+    ManagedStageDescriptor, Principal, PrincipalRole,
 };
-use lake_flight::ClientSecurity;
+use lake_flight::{ClientSecurity, DELEGATED_NAMESPACE_HEADER};
 use prost::Message;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
@@ -162,6 +167,52 @@ impl FlightSqlServiceImpl {
         let df = self.engine.plan_sql(sql).await.map_err(to_status)?;
         Ok(df.schema().as_arrow().clone())
     }
+
+    fn principal<T>(&self, request: &Request<T>) -> std::result::Result<Principal, Status> {
+        request
+            .extensions()
+            .get::<Principal>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("authenticated principal is missing"))
+    }
+
+    fn authorize_namespace(
+        &self,
+        principal: &Principal,
+        namespace: &str,
+    ) -> std::result::Result<(), Status> {
+        if principal.can_access_namespace(namespace) {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("resource is not available"))
+        }
+    }
+
+    fn authorize_sql(&self, principal: &Principal, sql: &str) -> std::result::Result<(), Status> {
+        let state = self.engine.context().state();
+        let statement = state
+            .sql_to_statement(sql, &Dialect::Generic)
+            .map_err(|_| Status::invalid_argument("invalid SQL statement"))?;
+        let references = state
+            .resolve_table_references(&statement)
+            .map_err(|_| Status::invalid_argument("invalid SQL statement"))?;
+        for reference in references {
+            let namespace = match reference {
+                TableReference::Full {
+                    catalog, schema, ..
+                } if catalog.as_ref() == "lake" => schema,
+                TableReference::Partial { schema, .. } => schema,
+                TableReference::Bare { .. } if principal.role() == PrincipalRole::Admin => {
+                    continue;
+                }
+                TableReference::Full { .. } | TableReference::Bare { .. } => {
+                    return Err(Status::permission_denied("resource is not available"));
+                }
+            };
+            self.authorize_namespace(principal, &namespace)?;
+        }
+        Ok(())
+    }
 }
 
 /// Collapse any displayable error into an internal [`Status`].
@@ -192,6 +243,8 @@ impl FlightSqlService for FlightSqlServiceImpl {
     ) -> std::result::Result<Response<FlightInfo>, Status> {
         let CommandStatementQuery { query: sql, .. } = query;
         self.admission.validate_sql_size(sql.as_bytes())?;
+        let principal = self.principal(&request)?;
+        self.authorize_sql(&principal, &sql)?;
         let _permit = self.admission.acquire().await?;
         let schema =
             tokio::time::timeout_at(self.admission.execution_deadline(), self.plan_schema(&sql))
@@ -213,16 +266,48 @@ impl FlightSqlService for FlightSqlServiceImpl {
         Ok(Response::new(info))
     }
 
+    async fn get_flight_info_schemas(
+        &self,
+        query: CommandGetDbSchemas,
+        request: Request<FlightDescriptor>,
+    ) -> std::result::Result<Response<FlightInfo>, Status> {
+        let endpoint =
+            FlightEndpoint::new().with_ticket(Ticket::new(query.as_any().encode_to_vec()));
+        let info = FlightInfo::new()
+            .try_with_schema(&query.clone().into_builder().schema())
+            .map_err(|error| Status::internal(format!("encode schema discovery: {error}")))?
+            .with_endpoint(endpoint)
+            .with_descriptor(request.into_inner());
+        Ok(Response::new(info))
+    }
+
+    async fn get_flight_info_tables(
+        &self,
+        query: CommandGetTables,
+        request: Request<FlightDescriptor>,
+    ) -> std::result::Result<Response<FlightInfo>, Status> {
+        let endpoint =
+            FlightEndpoint::new().with_ticket(Ticket::new(query.as_any().encode_to_vec()));
+        let info = FlightInfo::new()
+            .try_with_schema(&query.clone().into_builder().schema())
+            .map_err(|error| Status::internal(format!("encode table discovery: {error}")))?
+            .with_endpoint(endpoint)
+            .with_descriptor(request.into_inner());
+        Ok(Response::new(info))
+    }
+
     async fn do_get_statement(
         &self,
         ticket: TicketStatementQuery,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         self.admission.validate_sql_size(&ticket.statement_handle)?;
-        let permit = self.admission.acquire().await?;
-        let deadline = self.admission.execution_deadline();
         let sql = String::from_utf8(ticket.statement_handle.to_vec())
             .map_err(|e| Status::invalid_argument(format!("ticket is not utf-8: {e}")))?;
+        let principal = self.principal(&request)?;
+        self.authorize_sql(&principal, &sql)?;
+        let permit = self.admission.acquire().await?;
+        let deadline = self.admission.execution_deadline();
 
         let batches = tokio::time::timeout_at(deadline, async {
             let df = self.engine.plan_sql(&sql).await.map_err(to_status)?;
@@ -244,6 +329,54 @@ impl FlightSqlService for FlightSqlServiceImpl {
         ))))
     }
 
+    async fn do_get_schemas(
+        &self,
+        query: CommandGetDbSchemas,
+        request: Request<Ticket>,
+    ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let principal = self.principal(&request)?;
+        let mut builder = query.into_builder();
+        for (namespace, _) in self.engine.cached_catalog_snapshot() {
+            if principal.can_access_namespace(&namespace.0) {
+                builder.append("lake", namespace.0);
+            }
+        }
+        let schema = builder.schema();
+        let batch = builder.build();
+        let stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(futures::stream::once(async { batch }))
+            .map_err(Status::from);
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn do_get_tables(
+        &self,
+        query: CommandGetTables,
+        request: Request<Ticket>,
+    ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let principal = self.principal(&request)?;
+        let mut builder = query.into_builder();
+        let empty_schema = Schema::empty();
+        for (namespace, tables) in self.engine.cached_catalog_snapshot() {
+            if !principal.can_access_namespace(&namespace.0) {
+                continue;
+            }
+            for table in tables {
+                builder
+                    .append("lake", &namespace.0, table.0, "TABLE", &empty_schema)
+                    .map_err(Status::from)?;
+            }
+        }
+        let schema = builder.schema();
+        let batch = builder.build();
+        let stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(futures::stream::once(async { batch }))
+            .map_err(Status::from);
+        Ok(Response::new(Box::pin(stream)))
+    }
+
     async fn do_put_fallback(
         &self,
         request: Request<PeekableFlightDataStream>,
@@ -254,6 +387,8 @@ impl FlightSqlService for FlightSqlServiceImpl {
         }
         let append = FileAppendRequest::from_command_payload(&message.value)
             .ok_or_else(|| Status::invalid_argument("invalid FILE append command"))?;
+        let principal = self.principal(&request)?;
+        self.authorize_namespace(&principal, &append.table().namespace.0)?;
         let addr = self
             .metadata_addr
             .as_ref()
@@ -267,6 +402,15 @@ impl FlightSqlService for FlightSqlServiceImpl {
         self.metadata_security
             .apply_to_flight_client(&mut client)
             .map_err(|error| Status::internal(error.to_string()))?;
+        client.metadata_mut().insert(
+            DELEGATED_NAMESPACE_HEADER,
+            append
+                .table()
+                .namespace
+                .0
+                .parse()
+                .map_err(|_| Status::internal("authorized namespace is not valid metadata"))?,
+        );
         let results = client
             .do_put(request.into_inner().map(|item| {
                 item.map_err(|error| arrow_flight::error::FlightError::protocol(error.to_string()))
@@ -286,6 +430,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         &self,
         request: Request<Action>,
     ) -> std::result::Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        let principal = self.principal(&request)?;
         let action = request.into_inner();
         if action.r#type != MANAGED_STAGE_DISCOVERY_ACTION {
             return Err(Status::invalid_argument(format!(
@@ -303,6 +448,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("managed FILE stage is not configured"))?;
         let body = descriptor
+            .scope_to_tenant(principal.tenant())
             .to_wire()
             .map_err(|error| Status::internal(error.to_string()))?;
         let stream = futures::stream::once(async move { Ok(FlightResult { body: body.into() }) });
@@ -326,10 +472,14 @@ mod tests {
         time::Duration,
     };
 
+    use arrow_flight::{
+        decode::FlightRecordBatchStream,
+        sql::{CommandGetDbSchemas, CommandGetTables},
+    };
     use async_trait::async_trait;
     use datafusion::{
         arrow::{
-            array::Int64Array,
+            array::{Int64Array, StringArray},
             datatypes::{DataType, Field},
             record_batch::RecordBatch,
         },
@@ -341,7 +491,10 @@ mod tests {
         },
     };
     use futures::{StreamExt, TryStreamExt};
-    use lake_common::{MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor};
+    use lake_common::{
+        MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor, Principal, PrincipalId,
+        PrincipalRole, TenantId,
+    };
     use lake_engine::TableEngineRef;
     use lake_engine_lance::LanceEngine;
     use lake_meta::{MetaStore, MetaStoreRef};
@@ -374,6 +527,36 @@ mod tests {
     #[derive(Default)]
     struct PlanningMeta {
         scans: AtomicUsize,
+    }
+
+    struct DiscoveryMeta;
+
+    #[async_trait]
+    impl MetaStore for DiscoveryMeta {
+        async fn get(&self, _key: &str) -> lake_meta::Result<Option<Vec<u8>>> { Ok(None) }
+
+        async fn cas(
+            &self,
+            _key: &str,
+            _expected: Option<&[u8]>,
+            _new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            Ok(true)
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            Ok(match prefix {
+                "tbl/" => vec![
+                    "alpha_episodes/events".to_owned(),
+                    "beta_episodes/secrets".to_owned(),
+                ],
+                "tbl/alpha_episodes/" => vec!["events".to_owned()],
+                "tbl/beta_episodes/" => vec!["secrets".to_owned()],
+                _ => Vec::new(),
+            })
+        }
+
+        async fn delete(&self, _key: &str, _expected: &[u8]) -> lake_meta::Result<bool> { Ok(true) }
     }
 
     #[async_trait]
@@ -446,10 +629,20 @@ mod tests {
             managed_stage:     Some(descriptor.clone()),
             admission:         QueryAdmission::new(QueryLimits::default()),
         };
-        let request = Request::new(arrow_flight::Action {
+        let action = arrow_flight::Action {
             r#type: MANAGED_STAGE_DISCOVERY_ACTION.to_owned(),
             body:   Vec::new().into(),
-        });
+        };
+        let error = service
+            .do_action_fallback(Request::new(action.clone()))
+            .await
+            .err()
+            .expect("missing principal must fail closed");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        let mut request = Request::new(action);
+        request
+            .extensions_mut()
+            .insert(Principal::deployment_admin());
 
         let results = service
             .do_action_fallback(request)
@@ -463,8 +656,131 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(
             ManagedStageDescriptor::from_wire(&results[0].body).expect("decode result"),
-            descriptor
+            descriptor.scope_to_tenant(&TenantId::try_new("deployment").unwrap())
         );
+    }
+
+    #[test]
+    fn query_tenant_policy_denies_cross_namespace_before_execution() {
+        let meta = Arc::new(PlanningMeta::default());
+        let meta_ref: MetaStoreRef = meta.clone();
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let service = FlightSqlServiceImpl {
+            engine:            Arc::new(QueryEngine::new(meta_ref, storage)),
+            metadata_addr:     None,
+            metadata_security: ClientSecurity::new(),
+            managed_stage:     None,
+            admission:         QueryAdmission::new(QueryLimits::default()),
+        };
+        let principal = Principal::try_new(
+            PrincipalId::try_new("alpha-reader").unwrap(),
+            TenantId::try_new("tenant-alpha").unwrap(),
+            PrincipalRole::User,
+            ["alpha_episodes"],
+        )
+        .unwrap();
+
+        service
+            .authorize_sql(
+                &principal,
+                "WITH recent AS (SELECT * FROM lake.alpha_episodes.events) SELECT * FROM recent",
+            )
+            .expect("same-tenant CTE is authorized");
+        let denied = service
+            .authorize_sql(
+                &principal,
+                "SELECT * FROM lake.alpha_episodes.events a JOIN lake.beta_episodes.secrets b ON \
+                 a.id = b.id",
+            )
+            .expect_err("cross-tenant join is denied");
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert_eq!(denied.message(), "resource is not available");
+        assert_eq!(
+            meta.scans.load(Ordering::Relaxed),
+            0,
+            "authorization must not consult the metastore"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_discovery_filters_unauthorized_namespaces() {
+        let meta: MetaStoreRef = Arc::new(DiscoveryMeta);
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let engine = Arc::new(QueryEngine::new(meta, storage));
+        engine.refresh().await.unwrap();
+        let service = FlightSqlServiceImpl {
+            engine,
+            metadata_addr: None,
+            metadata_security: ClientSecurity::new(),
+            managed_stage: None,
+            admission: QueryAdmission::new(QueryLimits::default()),
+        };
+        let principal = Principal::try_new(
+            PrincipalId::try_new("alpha-reader").unwrap(),
+            TenantId::try_new("tenant-alpha").unwrap(),
+            PrincipalRole::User,
+            ["alpha_episodes"],
+        )
+        .unwrap();
+        let request = || {
+            let mut request = Request::new(Ticket::default());
+            request.extensions_mut().insert(principal.clone());
+            request
+        };
+
+        let schema_stream = service
+            .do_get_schemas(
+                CommandGetDbSchemas {
+                    catalog:                  None,
+                    db_schema_filter_pattern: None,
+                },
+                request(),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        let schema_batches = FlightRecordBatchStream::new_from_flight_data(
+            schema_stream.map_err(arrow_flight::error::FlightError::from),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        let namespaces = schema_batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            namespaces.iter().collect::<Vec<_>>(),
+            vec![Some("alpha_episodes")]
+        );
+
+        let table_stream = service
+            .do_get_tables(
+                CommandGetTables {
+                    catalog:                   None,
+                    db_schema_filter_pattern:  None,
+                    table_name_filter_pattern: None,
+                    table_types:               Vec::new(),
+                    include_schema:            false,
+                },
+                request(),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        let table_batches = FlightRecordBatchStream::new_from_flight_data(
+            table_stream.map_err(arrow_flight::error::FlightError::from),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        let table_names = table_batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(table_names.iter().collect::<Vec<_>>(), vec![Some("events")]);
     }
 
     #[tokio::test]
@@ -557,23 +873,25 @@ mod tests {
         let ticket = || TicketStatementQuery {
             statement_handle: b"SELECT * FROM admitted".to_vec().into(),
         };
+        let request = || {
+            let mut request = Request::new(Ticket::default());
+            request
+                .extensions_mut()
+                .insert(Principal::deployment_admin());
+            request
+        };
 
         let first = service
-            .do_get_statement(ticket(), Request::new(Ticket::default()))
+            .do_get_statement(ticket(), request())
             .await
             .expect("first query admitted");
-        let Err(saturated) = service
-            .do_get_statement(ticket(), Request::new(Ticket::default()))
-            .await
-        else {
+        let Err(saturated) = service.do_get_statement(ticket(), request()).await else {
             panic!("second query must be rejected while first stream lives");
         };
         assert_eq!(saturated.code(), tonic::Code::ResourceExhausted);
 
         drop(first);
-        let third = service
-            .do_get_statement(ticket(), Request::new(Ticket::default()))
-            .await;
+        let third = service.do_get_statement(ticket(), request()).await;
         assert!(third.is_ok(), "dropping the stream must release its permit");
         release.notify_waiters();
     }
@@ -618,8 +936,12 @@ mod tests {
         let ticket = || TicketStatementQuery {
             statement_handle: b"SELECT * FROM deadline".to_vec().into(),
         };
+        let mut request = Request::new(Ticket::default());
+        request
+            .extensions_mut()
+            .insert(Principal::deployment_admin());
         let response = service
-            .do_get_statement(ticket(), Request::new(Ticket::default()))
+            .do_get_statement(ticket(), request)
             .await
             .expect("query admitted");
         let mut stream = response.into_inner();
