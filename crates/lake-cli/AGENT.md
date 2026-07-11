@@ -45,6 +45,8 @@ tables. clap derive, thin `main.rs`, one handler module per command.
 - `LAKE_QUERY_QUEUE_TIMEOUT_MS` (default 100)
 - `LAKE_QUERY_EXECUTION_TIMEOUT_MS` (default 1800000)
 - `LAKE_QUERY_MAX_SQL_BYTES` (default 1048576)
+- `LAKE_QUERY_MAX_DISCOVERY_ROWS` (default 10000)
+- `LAKE_QUERY_DISCOVERY_BATCH_ROWS` (default 256; at most the row maximum)
 
 All values are positive integers parsed once before serving.
 

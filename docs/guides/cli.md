@@ -36,6 +36,13 @@ not just the e2e self-check binary.
   `--catalog-url`, or `--endpoint`; avoid ambiguous positional arguments for
   operational commands.
 
+Query Flight SQL discovery is bounded by
+`LAKE_QUERY_MAX_DISCOVERY_ROWS` (default `10000`) and
+`LAKE_QUERY_DISCOVERY_BATCH_ROWS` (default `256`). Both must be positive and
+the batch size cannot exceed the row maximum. Schema/table `DoGet` requests
+share `LAKE_QUERY_MAX_CONCURRENT` admission; queue saturation or a response
+that exceeds the matching-row maximum returns gRPC `ResourceExhausted`.
+
 ## Async Runtime
 
 - The CLI is async-first. Use `#[tokio::main]` at the binary boundary and keep

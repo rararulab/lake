@@ -18,7 +18,7 @@ use std::{path::PathBuf, str::FromStr, time::Duration};
 
 use anyhow::Context as _;
 use lake_metasrv::DEFAULT_APPEND_OPERATION_RETENTION;
-use lake_query::{QueryLimits, QueryResources};
+use lake_query::{DiscoveryLimits, QueryLimits, QueryResources};
 
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 const DEFAULT_OPERATION_GC_PAGE_SIZE: usize = 128;
@@ -83,6 +83,12 @@ pub(crate) fn query_limits_from_env() -> anyhow::Result<QueryLimits> {
         execution_ms.as_deref(),
         max_sql_bytes.as_deref(),
     )
+}
+
+pub(crate) fn discovery_limits_from_env() -> anyhow::Result<DiscoveryLimits> {
+    let max_rows = env_value("LAKE_QUERY_MAX_DISCOVERY_ROWS")?;
+    let batch_rows = env_value("LAKE_QUERY_DISCOVERY_BATCH_ROWS")?;
+    discovery_limits_from_values(max_rows.as_deref(), batch_rows.as_deref())
 }
 
 pub(crate) fn query_resources_from_env() -> anyhow::Result<QueryResources> {
@@ -156,6 +162,24 @@ fn query_limits_from_values(
     .context("invalid Query admission limits")
 }
 
+fn discovery_limits_from_values(
+    max_rows: Option<&str>,
+    batch_rows: Option<&str>,
+) -> anyhow::Result<DiscoveryLimits> {
+    let defaults = DiscoveryLimits::default();
+    let max_rows = parse_or(
+        "LAKE_QUERY_MAX_DISCOVERY_ROWS",
+        max_rows,
+        defaults.max_rows(),
+    )?;
+    let batch_rows = parse_or(
+        "LAKE_QUERY_DISCOVERY_BATCH_ROWS",
+        batch_rows,
+        defaults.batch_rows(),
+    )?;
+    DiscoveryLimits::try_new(max_rows, batch_rows).context("invalid Query discovery limits")
+}
+
 fn parse_or<T>(name: &str, value: Option<&str>, default: T) -> anyhow::Result<T>
 where
     T: FromStr,
@@ -182,8 +206,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        operation_policy_from_values, query_limits_from_values, query_resources_from_values,
-        shutdown_grace_from_value,
+        discovery_limits_from_values, operation_policy_from_values, query_limits_from_values,
+        query_resources_from_values, shutdown_grace_from_value,
     };
 
     #[test]
@@ -209,6 +233,19 @@ mod tests {
         assert_eq!(limits.queue_wait(), Duration::from_millis(250));
         assert_eq!(limits.execution_time(), Duration::from_secs(5));
         assert_eq!(limits.max_sql_bytes(), 4096);
+    }
+
+    #[test]
+    fn discovery_limit_values_are_validated_before_serving() {
+        assert!(discovery_limits_from_values(Some("0"), None).is_err());
+        assert!(discovery_limits_from_values(Some("many"), None).is_err());
+        assert!(discovery_limits_from_values(None, Some("0")).is_err());
+        assert!(discovery_limits_from_values(Some("2"), Some("3")).is_err());
+
+        let limits = discovery_limits_from_values(Some("4096"), Some("128"))
+            .expect("valid discovery limits");
+        assert_eq!(limits.max_rows(), 4096);
+        assert_eq!(limits.batch_rows(), 128);
     }
 
     #[test]

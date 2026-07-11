@@ -21,7 +21,10 @@ use lake_query::{QueryEngine, QueryServerConfig};
 
 use super::{
     Context,
-    limits::{query_limits_from_env, query_resources_from_env, shutdown_grace_from_env},
+    limits::{
+        discovery_limits_from_env, query_limits_from_env, query_resources_from_env,
+        shutdown_grace_from_env,
+    },
     security::{
         allow_insecure_from_env, metadata_client_security_from_env, peer_client_security_from_env,
         server_security_from_env,
@@ -51,6 +54,7 @@ where
         .with_managed_stage(ctx.managed_stage().clone())
         .with_server_security(server_security_from_env()?)
         .with_limits(query_limits_from_env()?)
+        .with_discovery_limits(discovery_limits_from_env()?)
         .with_shutdown_grace(shutdown_grace_from_env()?)
         .allow_insecure(allow_insecure_from_env()?);
     lake_query::serve_with_config_and_shutdown(engine, addr, config, shutdown).await?;
