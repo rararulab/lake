@@ -28,6 +28,10 @@ previously deferred boundary rather than reversing an earlier decision.
 - Use an explicit operator-owned spill root and DataFusion's disk manager with
   a hard aggregate byte limit; DataFusion owns randomized child directories
   and removes them when the runtime is dropped.
+- Carry a minimal vendored patch for DataFusion 53.1's spill-quota accounting:
+  reserve growth atomically before accepting it so an over-budget write cannot
+  poison the shared runtime's disk counter. Remove the patch when the pinned
+  Lance/DataFusion line contains the upstream fix.
 - Keep `QueryEngine::new` as a bounded-default convenience constructor and add
   a fallible constructor for deployment configuration/startup validation.
 - Configure Rust and `lake query` first through environment variables; do not
@@ -38,6 +42,9 @@ previously deferred boundary rather than reversing an earlier decision.
 ### Allowed Changes
 crates/lake-query/**
 crates/lake-cli/**
+third_party/datafusion-execution/**
+Cargo.toml
+Cargo.lock
 docs/architecture.md
 docs/guides/local-deploy.md
 docs/design/sql-api-over-s3.md
@@ -78,6 +85,14 @@ Scenario: A memory-intensive query spills and cleans up
   When DataFusion executes it through the Query runtime
   Then execution spills under the configured root, returns correct sorted rows, and releases memory and spill files
 
+Scenario: Exceeding spill quota does not poison the shared runtime
+  Test:
+    Package: lake-query
+    Filter: spill_budget_error_does_not_poison_runtime
+  Given a query whose external sort exceeds the aggregate spill budget
+  When DataFusion returns a resource error and drops the failed query
+  Then disk accounting and files return to zero and a later query on the same runtime succeeds
+
 Scenario: Deployment values are parsed before Query startup
   Test:
     Package: lake-cli
@@ -92,3 +107,4 @@ Scenario: Deployment values are parsed before Query startup
 - A custom Lake spill format, distributed spill, or durable query results.
 - Automatically deriving budgets from cgroups or machine RAM.
 - Changing Lance write/compaction memory behavior.
+- A broad DataFusion upgrade or modifications outside the execution crate.

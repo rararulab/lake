@@ -1100,4 +1100,89 @@ mod tests {
                 .is_none()
         );
     }
+
+    #[tokio::test]
+    async fn spill_budget_error_does_not_poison_runtime() {
+        use std::io::Write;
+
+        use datafusion::{arrow::array::StringArray, datasource::MemTable, physical_plan::collect};
+
+        let spill_root = tempfile::tempdir().expect("spill root");
+        let resources =
+            QueryResources::try_new(16 * 1024 * 1024, 16 * 1024 * 1024, spill_root.path())
+                .expect("valid resources");
+        let engine = QueryEngine::try_with_resources(
+            Arc::new(CountingMeta::default()),
+            Arc::new(LanceEngine::new()),
+            resources,
+        )
+        .expect("bounded Query runtime");
+        let runtime = engine.context().runtime_env();
+        let context = SessionContext::new_with_config_rt(
+            SessionConfig::new()
+                .with_target_partitions(1)
+                .with_sort_spill_reservation_bytes(512 * 1024),
+            runtime.clone(),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )]));
+        let batches = (0..256)
+            .map(|batch| {
+                let values = (0..1024)
+                    .rev()
+                    .map(|row| format!("{:08}-{}", batch * 1024 + row, "x".repeat(64)))
+                    .collect::<Vec<_>>();
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))])
+                    .expect("input batch")
+            })
+            .collect::<Vec<_>>();
+        context
+            .register_table(
+                "over_budget",
+                Arc::new(MemTable::try_new(schema, vec![batches]).expect("memory table")),
+            )
+            .expect("register input");
+        let frame = context
+            .sql("SELECT value FROM over_budget ORDER BY value")
+            .await
+            .expect("plan sort");
+        let plan = frame.create_physical_plan().await.expect("physical sort");
+        let error = collect(plan.clone(), context.task_ctx())
+            .await
+            .expect_err("spill must exceed disk budget");
+        assert!(error.to_string().contains("allowable limit"));
+        assert_eq!(runtime.disk_manager.spilling_progress().current_bytes, 0);
+        assert!(runtime.disk_manager.temp_dir_paths().iter().all(|path| {
+            std::fs::read_dir(path)
+                .expect("read DataFusion spill directory")
+                .next()
+                .is_none()
+        }));
+
+        let mut quota_probe = runtime
+            .disk_manager
+            .create_tmp_file("quota recovery probe")
+            .expect("disk quota remains usable");
+        quota_probe
+            .inner()
+            .as_file()
+            .write_all(b"recovered")
+            .expect("write quota probe");
+        quota_probe
+            .update_disk_usage()
+            .expect("reserve quota after rejection");
+        drop(quota_probe);
+        assert_eq!(runtime.disk_manager.spilling_progress().current_bytes, 0);
+        let result = context
+            .sql("SELECT 42 AS answer")
+            .await
+            .expect("plan recovery query")
+            .collect()
+            .await
+            .expect("same runtime remains usable");
+        assert_eq!(result.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    }
 }
