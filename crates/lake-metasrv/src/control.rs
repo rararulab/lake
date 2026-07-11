@@ -56,12 +56,61 @@ use lake_objects::data_location_field;
 use prost::Message;
 use prost_types::Any;
 use serde::{Serialize, de::DeserializeOwned};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::{Metasrv, TablePlacement, leadership::Leadership};
+use crate::{AppendLimits, Metasrv, TablePlacement, leadership::Leadership};
 
 /// The [`Status`] message returned by every unsupported Flight method.
 const UNSUPPORTED: &str = "metasrv control plane only serves actions and FILE append do_put";
+
+#[derive(Clone, Debug)]
+pub(crate) struct AppendAdmission {
+    concurrent: Arc<Semaphore>,
+    buffered:   Arc<Semaphore>,
+    limits:     AppendLimits,
+}
+
+#[derive(Debug)]
+struct AppendPermit {
+    _concurrent: OwnedSemaphorePermit,
+    _buffered:   OwnedSemaphorePermit,
+}
+
+impl AppendAdmission {
+    pub(crate) fn new(limits: AppendLimits) -> Self {
+        Self {
+            concurrent: Arc::new(Semaphore::new(limits.max_concurrent())),
+            buffered: Arc::new(Semaphore::new(limits.max_buffered_bytes())),
+            limits,
+        }
+    }
+
+    async fn acquire(&self) -> Result<AppendPermit, Status> {
+        let stream_bytes = u32::try_from(self.limits.max_stream_bytes())
+            .expect("validated append stream bytes fit u32");
+        tokio::time::timeout(self.limits.queue_wait(), async {
+            let concurrent = self
+                .concurrent
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| Status::unavailable("append admission is shutting down"))?;
+            let buffered = self
+                .buffered
+                .clone()
+                .acquire_many_owned(stream_bytes)
+                .await
+                .map_err(|_| Status::unavailable("append admission is shutting down"))?;
+            Ok(AppendPermit {
+                _concurrent: concurrent,
+                _buffered:   buffered,
+            })
+        })
+        .await
+        .map_err(|_| Status::resource_exhausted("append admission limit reached"))?
+    }
+}
 
 const RESOURCE_UNAVAILABLE: &str = "resource is not available";
 
@@ -740,9 +789,9 @@ mod file_append_tests {
     use prost::Message;
     use prost_types::Any;
 
-    use super::{append_file_stream, append_file_stream_with_limit};
+    use super::{AppendAdmission, append_file_stream, append_file_stream_with_limit};
     use crate::{
-        Metasrv,
+        AppendLimits, Metasrv,
         election::{LeaseElection, LeaseStatus},
         leadership::Leadership,
         operation::{AppendRecord, active_key, operation_key},
@@ -911,6 +960,40 @@ mod file_append_tests {
             .operation_id(append.operation_id().clone())
             .payload_digest(append.payload_digest().clone())
             .build()
+    }
+
+    #[tokio::test]
+    async fn append_admission_rejects_concurrency_saturation_and_releases() {
+        let limits =
+            AppendLimits::try_new(1, Duration::from_millis(20), 64, 128).expect("valid limits");
+        let admission = AppendAdmission::new(limits);
+
+        let first = admission.acquire().await.expect("first append admitted");
+        let saturated = admission
+            .acquire()
+            .await
+            .expect_err("second append must exceed concurrency");
+        assert_eq!(saturated.code(), tonic::Code::ResourceExhausted);
+
+        drop(first);
+        assert!(admission.acquire().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn append_admission_reserves_worst_case_buffer_budget() {
+        let limits =
+            AppendLimits::try_new(2, Duration::from_millis(20), 64, 64).expect("valid limits");
+        let admission = AppendAdmission::new(limits);
+
+        let first = admission.acquire().await.expect("first append admitted");
+        let saturated = admission
+            .acquire()
+            .await
+            .expect_err("second append must exceed buffered-byte budget");
+        assert_eq!(saturated.code(), tonic::Code::ResourceExhausted);
+
+        drop(first);
+        assert!(admission.acquire().await.is_ok());
     }
 
     #[tokio::test]
