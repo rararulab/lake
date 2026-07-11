@@ -841,7 +841,16 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::{
+        arrow::{
+            array::Int64Array,
+            datatypes::{DataType, Field, Schema, SchemaRef},
+            record_batch::RecordBatch,
+        },
+        error::DataFusionError,
+        physical_plan::stream::RecordBatchStreamAdapter,
+    };
+    use lake_common::{AppendOperationId, AppendPayloadDigest, TenantId};
     use lake_engine::{
         ObjectReferencePage, ObjectReferenceRequest, Result as EngineResult, TableEngine,
         TableEngineRef, TableHandleRef,
@@ -992,6 +1001,7 @@ mod tests {
     #[tokio::test]
     async fn production_metadata_mutations_use_guarded_store() {
         let meta_dir = tempfile::tempdir().unwrap();
+        let table_dir = tempfile::tempdir().unwrap();
         let rocks: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
         let recording = Arc::new(RecordingMeta {
             inner:           rocks,
@@ -1008,23 +1018,73 @@ mod tests {
         let leadership = Arc::new(Leadership::new());
         leadership.assume_guarded_leader("node-a", guard, Duration::from_mins(1));
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
-        let authority = Metasrv::new(raw.clone(), engine).fenced_for_server(leadership);
+        let authority = Metasrv::with_operation_policy(
+            raw.clone(),
+            engine,
+            Duration::ZERO,
+            DEFAULT_OPERATION_GC_PAGE_SIZE,
+        )
+        .fenced_for_server(leadership);
 
         recording.ordinary_cas.store(0, Ordering::SeqCst);
         recording.ordinary_delete.store(0, Ordering::SeqCst);
         recording.guarded.store(0, Ordering::SeqCst);
+        let table = TableRef::new("robots", "episodes");
+        let schema = Arc::new(Schema::new(vec![Field::new("ep", DataType::Int64, false)]));
+        let location =
+            TableLocation::new(table_dir.path().join("episodes.lance").to_string_lossy());
+        authority
+            .create_table(&table, location, schema.clone())
+            .await
+            .unwrap();
+        let after_create = recording.guarded.load(Ordering::SeqCst);
+        assert!(after_create > 0, "registry creation must be guarded");
+
+        for _ in 0..3 {
+            let operation = AppendOperation::builder()
+                .tenant(TenantId::try_new("tenant-a").unwrap())
+                .operation_id(AppendOperationId::generate())
+                .payload_digest(
+                    AppendPayloadDigest::parse(
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    )
+                    .unwrap(),
+                )
+                .build();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap();
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
+            ));
+            authority.append(&table, &operation, stream).await.unwrap();
+        }
+        let after_append = recording.guarded.load(Ordering::SeqCst);
         assert!(
-            authority
-                .meta()
-                .cas("target", None, b"value")
-                .await
-                .unwrap()
+            after_append > after_create,
+            "append records, fences, registry publication, and cleanup must be guarded"
         );
-        assert!(authority.meta().delete("target", b"value").await.unwrap());
+
+        maintenance::sweep(&authority).await;
+        let after_maintenance = recording.guarded.load(Ordering::SeqCst);
+        assert!(
+            after_maintenance > after_append,
+            "maintenance version publication must be guarded"
+        );
+        let gc = maintenance::sweep_operations_at(&authority, u64::MAX).await;
+        assert!(gc.deleted > 0, "operation GC must exercise guarded deletes");
+        let after_gc = recording.guarded.load(Ordering::SeqCst);
+        assert!(after_gc > after_maintenance, "operation GC must be guarded");
+        authority.drop_table(&table).await.unwrap();
+        let after_drop = recording.guarded.load(Ordering::SeqCst);
+        assert!(after_drop > after_gc, "registry deletion must be guarded");
+
         assert_eq!(recording.ordinary_cas.load(Ordering::SeqCst), 0);
         assert_eq!(recording.ordinary_delete.load(Ordering::SeqCst), 0);
-        assert_eq!(recording.guarded.load(Ordering::SeqCst), 2);
-        assert_eq!(raw.get("target").await.unwrap(), None);
+        assert!(authority.resolve(&table).await.unwrap().is_none());
     }
 
     #[tokio::test]

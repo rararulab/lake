@@ -44,6 +44,7 @@ impl MetaStore for FencedMetaStore {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> { self.inner.get(key).await }
 
     async fn cas(&self, key: &str, expected: Option<&[u8]>, new: &[u8]) -> Result<bool> {
+        let _publication = self.leadership.begin_publication().await;
         let guard = self.guard()?;
         let mutation = match expected {
             None => GuardedMutation::create(crate::election::LEASE_KEY, guard.bytes(), key, new),
@@ -74,6 +75,7 @@ impl MetaStore for FencedMetaStore {
     }
 
     async fn delete(&self, key: &str, expected: &[u8]) -> Result<bool> {
+        let _publication = self.leadership.begin_publication().await;
         let guard = self.guard()?;
         self.inner
             .guarded_mutate(GuardedMutation::delete(

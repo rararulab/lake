@@ -681,8 +681,8 @@ impl FlightService for MetasrvFlightService {
             },
             ActionType {
                 r#type:      "drop_table".to_string(),
-                description: "Delete a table's data and deregister it (leader only). Body JSON: \
-                              {namespace, name}"
+                description: "Unavailable until durable tombstones are implemented; returns \
+                              FailedPrecondition. Body JSON: {namespace, name}"
                     .to_string(),
             },
             ActionType {
@@ -1854,6 +1854,13 @@ mod table_placement_tests {
             })))
             .await
             .expect("create table");
+        let table = TableRef::new("robots", "episodes");
+        let registration = service
+            .metasrv
+            .resolve(&table)
+            .await
+            .unwrap()
+            .expect("created registration");
 
         let error = match service
             .action_drop_table(drop_action("robots", "episodes"))
@@ -1864,13 +1871,18 @@ mod table_placement_tests {
         };
         assert_eq!(error.code(), Code::FailedPrecondition);
         assert!(
+            service.metasrv.resolve(&table).await.unwrap().is_some(),
+            "drop rejection must happen before registry or engine mutation"
+        );
+        assert!(
             service
                 .metasrv
-                .resolve(&TableRef::new("robots", "episodes"))
+                .engine()
+                .open(&registration.location)
                 .await
                 .unwrap()
                 .is_some(),
-            "drop rejection must happen before registry or engine mutation"
+            "drop rejection must leave the underlying dataset intact"
         );
     }
 

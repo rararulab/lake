@@ -264,10 +264,14 @@ Production Metasrv wraps its raw metastore in a lease-fenced view after
 election starts. Each registry, append-operation, and maintenance CAS/delete
 loads the latest exact lease bytes immediately before publication and executes
 through `guarded_mutate`; election renew/resign continues on the raw store.
-This fresh-per-publication rule lets long engine operations span same-holder
-renewals, while a takeover changes the guard and rejects a paused former
-leader. If the old leader already committed an engine version, the successor
-reconciles that immutable commit before publishing it.
+Within one process, the metastore transaction takes a shared publication
+barrier while renewal/resign holds its exclusive side from durable lease CAS
+through local guard publication. This closes the exact-bytes rotation window
+without holding the barrier across long engine work. Long engine operations
+can therefore span same-holder renewals, while a takeover changes the guard
+and rejects a paused former leader. If the old leader already committed an
+engine version, the successor reconciles that immutable commit before
+publishing it.
 
 Destructive table drop remains a different protocol because object deletion
 cannot share the KV transaction. Remote drop therefore fails closed before

@@ -68,10 +68,10 @@ Scenario: paused former leader cannot publish after takeover
 Scenario: renewal does not invalidate a long operation
   Test:
     Package: lake-metasrv
-    Filter: publication_uses_fresh_guard_after_renewal
-  Given one holder renews while an engine operation remains in progress
-  When the operation publishes after the renewal
-  Then it uses the newly published exact lease bytes and succeeds at the same epoch
+    Filter: renewal_does_not_reject_a_concurrent_publication
+  Given one holder has durably rotated its exact lease bytes during renewal
+  When a concurrent operation publishes before the new local guard is visible
+  Then publication waits for the guard switch and succeeds at the same epoch
 
 Scenario: append recovery converges after stale publication rejection
   Test:
@@ -96,8 +96,8 @@ Scenario: all production metadata CAS and delete operations are fenced
     Level: integration
     Test Double: recording raw metastore
   Given a production Metasrv server view backed by a recording raw metastore
-  When its target CAS and delete interface is exercised
-  Then no ordinary target CAS or delete reaches the raw metastore
+  When registry create/drop, append, maintenance, and operation GC run
+  Then every publication is guarded and no ordinary target CAS/delete reaches the raw store
 
 ## Out of Scope
 

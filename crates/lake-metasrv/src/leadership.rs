@@ -26,7 +26,10 @@ use std::{
     time::Duration,
 };
 
-use tokio::time::Instant;
+use tokio::{
+    sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::election::{LeaseElection, LeaseGuard, LeaseStatus};
@@ -42,7 +45,8 @@ const RENEW_INTERVAL: Duration = Duration::from_secs(5);
 /// follower can forward writes to the current leader. [`run_campaign_loop`]
 /// writes both; the Flight service reads them.
 pub(crate) struct Leadership {
-    state: Mutex<LeadershipState>,
+    state:             Mutex<LeadershipState>,
+    authority_barrier: RwLock<()>,
 }
 
 struct LeadershipState {
@@ -61,11 +65,24 @@ impl Leadership {
     /// A fresh leadership state: not leading, no known leader yet.
     pub(crate) fn new() -> Self {
         Self {
-            state: Mutex::new(LeadershipState {
+            state:             Mutex::new(LeadershipState {
                 leader:          None,
                 local_authority: None,
             }),
+            authority_barrier: RwLock::new(()),
         }
+    }
+
+    /// Prevent an exact-guard publication from crossing a local lease
+    /// transition. Readers hold this only for the metastore transaction;
+    /// campaign and resignation hold the writer side until the new local
+    /// authority has been published.
+    pub(crate) async fn begin_publication(&self) -> RwLockReadGuard<'_, ()> {
+        self.authority_barrier.read().await
+    }
+
+    async fn begin_authority_transition(&self) -> RwLockWriteGuard<'_, ()> {
+        self.authority_barrier.write().await
     }
 
     /// Whether this node currently holds an unexpired local lease.
@@ -161,6 +178,7 @@ pub(crate) async fn run_campaign_loop_until(
         }
     }
 
+    let _transition = leadership.begin_authority_transition().await;
     if let Err(err) = election.resign().await {
         tracing::warn!(
             node_id = election.node_id(),
@@ -172,6 +190,7 @@ pub(crate) async fn run_campaign_loop_until(
 }
 
 async fn campaign_once(election: &LeaseElection, leadership: &Leadership) {
+    let _transition = leadership.begin_authority_transition().await;
     // Bound local authority from the start of the store round-trip. This
     // is conservative when the store is slow and immune to wall-clock
     // jumps after the lease is written.
@@ -232,10 +251,55 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use async_trait::async_trait;
-    use lake_meta::{MetaStore, MetaStoreRef, RocksMeta};
+    use lake_meta::{GuardedMutation, MetaStore, MetaStoreRef, RocksMeta};
+    use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::fenced_meta::FencedMetaStore;
+
+    struct PausedLeaseCasMeta {
+        inner:                MetaStoreRef,
+        pause_next_lease_cas: AtomicBool,
+        lease_written:        Notify,
+        release_renewal:      Notify,
+    }
+
+    #[async_trait]
+    impl MetaStore for PausedLeaseCasMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            let changed = self.inner.cas(key, expected, new).await?;
+            if changed
+                && key == crate::election::LEASE_KEY
+                && self.pause_next_lease_cas.swap(false, Ordering::SeqCst)
+            {
+                self.lease_written.notify_one();
+                self.release_renewal.notified().await;
+            }
+            Ok(changed)
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
+        }
+
+        async fn guarded_mutate(&self, mutation: GuardedMutation<'_>) -> lake_meta::Result<bool> {
+            self.inner.guarded_mutate(mutation).await
+        }
+    }
 
     #[tokio::test]
     async fn write_gate_expires_without_a_completed_renewal() {
@@ -289,6 +353,47 @@ mod tests {
         assert!(
             leadership.current_guard().is_none(),
             "expired local authority must not yield a durable guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn renewal_does_not_reject_a_concurrent_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let rocks: MetaStoreRef = Arc::new(RocksMeta::open(dir.path()).unwrap());
+        let raw = Arc::new(PausedLeaseCasMeta {
+            inner:                rocks,
+            pause_next_lease_cas: AtomicBool::new(false),
+            lease_written:        Notify::new(),
+            release_renewal:      Notify::new(),
+        });
+        let meta: MetaStoreRef = raw.clone();
+        let election = LeaseElection::new(meta.clone(), "node-a", Duration::from_secs(10));
+        let leadership = Arc::new(Leadership::new());
+        campaign_once(&election, &leadership).await;
+        raw.pause_next_lease_cas.store(true, Ordering::SeqCst);
+
+        let renewal = tokio::spawn({
+            let leadership = leadership.clone();
+            async move { campaign_once(&election, &leadership).await }
+        });
+        raw.lease_written.notified().await;
+
+        let publication = tokio::spawn({
+            let fenced = FencedMetaStore::new(meta, leadership);
+            async move { fenced.cas("target", None, b"published").await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !publication.is_finished(),
+            "publication must wait while renewal rotates the exact guard bytes"
+        );
+
+        raw.release_renewal.notify_one();
+        renewal.await.unwrap();
+        assert!(publication.await.unwrap().unwrap());
+        assert_eq!(
+            raw.get("target").await.unwrap().as_deref(),
+            Some(&b"published"[..])
         );
     }
 

@@ -71,7 +71,7 @@ pub(crate) async fn run_maintenance_loop_until(
 ///
 /// Each step degrades gracefully: a failed listing logs and moves on, and a
 /// per-table `maintain` error is logged and skipped so the sweep continues.
-async fn sweep(metasrv: &Metasrv) {
+pub(crate) async fn sweep(metasrv: &Metasrv) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock is after Unix epoch")
@@ -141,12 +141,12 @@ async fn sweep(metasrv: &Metasrv) {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct OperationGcStats {
-    scanned: usize,
-    deleted: usize,
+pub(crate) struct OperationGcStats {
+    pub(crate) scanned: usize,
+    pub(crate) deleted: usize,
 }
 
-async fn sweep_operations_at(metasrv: &Metasrv, now: u64) -> OperationGcStats {
+pub(crate) async fn sweep_operations_at(metasrv: &Metasrv, now: u64) -> OperationGcStats {
     let cursor = metasrv.inner.operation_gc_cursor.lock().await.clone();
     let page = match metasrv
         .meta()
