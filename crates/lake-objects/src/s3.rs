@@ -365,8 +365,8 @@ impl S3ObjectStore {
             checkpoint
         };
 
-        self.reconcile_parts(&checkpoint).await?;
         let mut hasher = Sha256::new();
+        let mut completed_size = 0_u64;
         for completed in checkpoint.parts() {
             let part = read_part(&mut input).await?;
             if part.len() != completed.size_bytes
@@ -377,6 +377,31 @@ impl S3ObjectStore {
                 });
             }
             hasher.update(&part);
+            completed_size = completed_size.saturating_add(part.len() as u64);
+        }
+        if let Err(reconcile_error) = self.reconcile_parts(&checkpoint).await {
+            if completed_size == metadata.len() {
+                let expected_sha256 = format!("{:x}", hasher.clone().finalize());
+                if let Some(location) = self
+                    .recover_completed_object(
+                        &checkpoint,
+                        &content_type,
+                        metadata.len(),
+                        &expected_sha256,
+                    )
+                    .await?
+                {
+                    tokio::fs::remove_file(checkpoint_path)
+                        .await
+                        .map_err(|source| ObjectError::CheckpointIo {
+                            action: "removing recovered",
+                            path: checkpoint_path.to_path_buf(),
+                            source,
+                        })?;
+                    return Ok(location);
+                }
+            }
+            return Err(reconcile_error);
         }
 
         loop {
@@ -514,6 +539,55 @@ impl S3ObjectStore {
             });
         }
         Ok(())
+    }
+
+    async fn recover_completed_object(
+        &self,
+        checkpoint: &UploadCheckpointV1,
+        content_type: &str,
+        expected_size: u64,
+        expected_sha256: &str,
+    ) -> Result<Option<DataLocation>> {
+        let output = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(checkpoint.object_key())
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(_) => return Ok(None),
+        };
+        let mut reader = output.body.into_async_read();
+        let mut hasher = Sha256::new();
+        let mut size = 0_u64;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .await
+                .map_err(|source| ObjectError::Read { source })?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            size = size.saturating_add(read as u64);
+        }
+        let actual_sha256 = format!("{:x}", hasher.finalize());
+        if size != expected_size || actual_sha256 != expected_sha256 {
+            return Err(ObjectError::CheckpointMismatch {
+                field: "completed destination object",
+            });
+        }
+        Ok(Some(
+            DataLocation::builder()
+                .uri(format!("s3://{}/{}", self.bucket, checkpoint.object_key()))
+                .content_type(content_type)
+                .size_bytes(size)
+                .sha256(actual_sha256)
+                .build(),
+        ))
     }
 }
 

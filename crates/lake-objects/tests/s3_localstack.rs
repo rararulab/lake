@@ -22,7 +22,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::{
     config::{Credentials, Region},
     primitives::ByteStream,
-    types::ChecksumAlgorithm,
+    types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart},
 };
 use lake_objects::{ManagedObjectStore, ObjectError, S3ObjectStore};
 use sha2::{Digest, Sha256};
@@ -372,4 +372,53 @@ async fn cancel_resumable_s3_upload_aborts_and_removes_checkpoint_localstack() {
 fn cancel_resumable_s3_upload_aborts_and_removes_checkpoint_localstack_is_wired() {
     let integration = include_str!("../../../scripts/test-integration.ts");
     assert!(integration.contains("--run-ignored"));
+}
+
+#[tokio::test]
+#[ignore = "requires LocalStack S3; set LAKE_S3_ENDPOINT and run with --ignored"]
+async fn resumable_s3_upload_recovers_ambiguous_completion_localstack() {
+    let Some((client, store, bucket)) = stage().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("temporary source directory");
+    let source = dir.path().join("episode.mp4");
+    let checkpoint = dir.path().join("episode.upload.json");
+    let bytes = vec![9; PART_BYTES];
+    tokio::fs::write(&source, &bytes)
+        .await
+        .expect("write source");
+    seed_resumable_checkpoint(&client, &bucket, &source, &checkpoint).await;
+    let document: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(&checkpoint).await.expect("read checkpoint"))
+            .expect("decode checkpoint");
+    let key = document["object_key"].as_str().expect("object key");
+    let upload_id = document["upload_id"].as_str().expect("upload id");
+    let part = &document["parts"][0];
+    let completed = CompletedMultipartUpload::builder()
+        .parts(
+            CompletedPart::builder()
+                .part_number(1)
+                .e_tag(part["e_tag"].as_str().expect("part ETag"))
+                .set_checksum_crc32(part["checksum_crc32"].as_str().map(ToOwned::to_owned))
+                .build(),
+        )
+        .build();
+    client
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(completed)
+        .send()
+        .await
+        .expect("complete while retaining local checkpoint");
+
+    let location = store
+        .put_path(source, "video/mp4".to_owned(), Some(checkpoint.clone()))
+        .await
+        .expect("recover completed destination");
+
+    assert!(!checkpoint.exists());
+    assert_eq!(location.size_bytes, bytes.len() as u64);
+    assert_eq!(location.sha256, format!("{:x}", Sha256::digest(bytes)));
 }

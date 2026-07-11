@@ -1235,7 +1235,8 @@ mod tests {
     fn managed_file_example_queries_through_sdk() {
         let example = include_str!("../examples/managed_file.rs");
 
-        assert!(example.contains("LakeClient::connect("));
+        assert!(example.contains("LakeClient::builder("));
+        assert!(example.contains(".with_upload_checkpoint_dir("));
         assert!(!example.contains("connect_with_store"));
         assert!(example.contains(".query("));
         assert!(example.contains("data_location("));

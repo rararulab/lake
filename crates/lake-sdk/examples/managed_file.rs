@@ -80,7 +80,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let client = LakeClient::connect(format!("http://{query_addr}")).await?;
+    let client = LakeClient::builder(format!("http://{query_addr}"))
+        .with_upload_checkpoint_dir(root.path().join("upload-checkpoints"))
+        .connect()
+        .await?;
     client
         .insert(
             "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
