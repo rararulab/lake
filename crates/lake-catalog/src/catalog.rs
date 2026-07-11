@@ -95,6 +95,12 @@ impl LakeCatalog {
 
     pub fn state(&self) -> Arc<CatalogState> { self.state.clone() }
 
+    /// Evict one resolved registration after this query node proxies a
+    /// successful write, so the same client connection observes its commit.
+    pub async fn invalidate_registration(&self, table: &TableRef) {
+        self.state.regs.invalidate(table).await;
+    }
+
     /// Reload the listing snapshot from the registry. Call on startup and on
     /// a timer; DataFusion's sync `schema_names`/`table_names` read what this
     /// leaves behind, so they never block on the metastore.

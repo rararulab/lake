@@ -99,6 +99,10 @@ impl QueryEngine {
             .context(RefreshSnafu)
     }
 
+    pub(crate) async fn invalidate_registration(&self, table: &lake_common::TableRef) {
+        self.catalog.invalidate_registration(table).await;
+    }
+
     /// Execute a SQL statement and collect the results.
     pub async fn execute_sql(&self, sql: &str) -> Result<Vec<RecordBatch>> {
         let df = self.plan_sql(sql).await?;

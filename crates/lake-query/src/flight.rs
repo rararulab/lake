@@ -131,11 +131,11 @@ impl FlightSqlService for FlightSqlServiceImpl {
         request: Request<PeekableFlightDataStream>,
         message: Any,
     ) -> std::result::Result<Response<<Self as FlightService>::DoPutStream>, Status> {
-        if message.type_url != FILE_APPEND_TYPE_URL
-            || FileAppendRequest::from_command_payload(&message.value).is_none()
-        {
+        if message.type_url != FILE_APPEND_TYPE_URL {
             return Err(Status::invalid_argument("invalid FILE append command"));
         }
+        let append = FileAppendRequest::from_command_payload(&message.value)
+            .ok_or_else(|| Status::invalid_argument("invalid FILE append command"))?;
         let addr = self
             .metadata_addr
             .as_ref()
@@ -151,9 +151,14 @@ impl FlightSqlService for FlightSqlServiceImpl {
                 item.map_err(|error| arrow_flight::error::FlightError::protocol(error.to_string()))
             }))
             .await
-            .map_err(|error| Status::unavailable(error.to_string()))?;
-        let results = results.map(|item| item.map_err(|error| Status::internal(error.to_string())));
-        Ok(Response::new(Box::pin(results)))
+            .map_err(|error| Status::unavailable(error.to_string()))?
+            .map_err(|error| Status::internal(error.to_string()))
+            .try_collect::<Vec<_>>()
+            .await?;
+        self.engine.invalidate_registration(append.table()).await;
+        Ok(Response::new(Box::pin(futures::stream::iter(
+            results.into_iter().map(Ok),
+        ))))
     }
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}

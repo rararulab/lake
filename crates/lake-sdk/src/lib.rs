@@ -22,18 +22,20 @@ use std::{
 };
 
 use arrow::{
-    array::{ArrayRef, StringArray},
+    array::{ArrayRef, StringArray, StructArray},
     datatypes::{DataType, Schema, SchemaRef},
     error::ArrowError,
     record_batch::RecordBatch,
 };
 use arrow_flight::{
-    FlightClient, FlightDescriptor, encode::FlightDataEncoderBuilder,
-    sql::client::FlightSqlServiceClient,
+    FlightClient, FlightDescriptor, decode::FlightRecordBatchStream,
+    encode::FlightDataEncoderBuilder, sql::client::FlightSqlServiceClient,
 };
 use futures::TryStreamExt;
 use lake_common::{DataLocation, FILE_APPEND_TYPE_URL, FileAppendRequest, TableRef, Version};
-use lake_objects::{LocalObjectStore, data_location_array, data_location_field};
+use lake_objects::{
+    LocalObjectStore, data_location_array, data_location_field, data_location_from_array,
+};
 use prost::Message;
 use prost_types::Any;
 use snafu::{OptionExt, ResultExt, Snafu};
@@ -75,6 +77,21 @@ pub enum SdkError {
 
     #[snafu(display("query returned no FILE append result"))]
     MissingAppendResult,
+
+    #[snafu(display("query returned no Flight endpoint"))]
+    MissingQueryEndpoint,
+
+    #[snafu(display("query returned a Flight endpoint without a ticket"))]
+    MissingQueryTicket,
+
+    #[snafu(display("query result column '{column}' is missing"))]
+    MissingResultColumn { column: String },
+
+    #[snafu(display("query result column '{column}' is not a FILE value"))]
+    InvalidFileColumn { column: String },
+
+    #[snafu(display("query result row {row} is outside the batch of {rows} rows"))]
+    RowOutOfBounds { row: usize, rows: usize },
 
     #[snafu(display("query returned an invalid FILE append version"))]
     InvalidAppendResult { source: serde_json::Error },
@@ -224,6 +241,23 @@ impl LakeClient {
         serde_json::from_slice(&result.app_metadata).context(InvalidAppendResultSnafu)
     }
 
+    /// Execute read-only SQL through the query endpoint and stream Arrow
+    /// record batches as they arrive.
+    pub async fn query(&self, sql: &str) -> Result<FlightRecordBatchStream> {
+        let mut client = FlightSqlServiceClient::new(self.query.clone());
+        let info = client
+            .execute(sql.to_owned(), None)
+            .await
+            .context(FlightSnafu)?;
+        let endpoint = info
+            .endpoint
+            .into_iter()
+            .next()
+            .context(MissingQueryEndpointSnafu)?;
+        let ticket = endpoint.ticket.context(MissingQueryTicketSnafu)?;
+        client.do_get(ticket).await.context(FlightSnafu)
+    }
+
     /// Open a direct local reader for an immutable `DataLocation`.
     pub async fn open(&self, location: &DataLocation) -> Result<File> {
         self.objects
@@ -270,6 +304,27 @@ impl LakeClient {
             }),
         }
     }
+}
+
+/// Decode one logical SQL `FILE` value from a named query-result column.
+pub fn data_location(batch: &RecordBatch, column: &str, row: usize) -> Result<DataLocation> {
+    if row >= batch.num_rows() {
+        return Err(SdkError::RowOutOfBounds {
+            row,
+            rows: batch.num_rows(),
+        });
+    }
+    let values = batch
+        .column_by_name(column)
+        .ok_or_else(|| SdkError::MissingResultColumn {
+            column: column.to_owned(),
+        })?
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| SdkError::InvalidFileColumn {
+            column: column.to_owned(),
+        })?;
+    data_location_from_array(values, row).context(ObjectSnafu)
 }
 
 #[derive(Debug)]
@@ -397,6 +452,7 @@ mod tests {
         array::{Array, StringArray, StructArray},
         datatypes::{DataType, Field, Schema},
     };
+    use futures::TryStreamExt;
     use lake_common::{TableLocation, TableRef};
     use lake_engine::TableEngineRef;
     use lake_engine_lance::LanceEngine;
@@ -408,7 +464,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
-    use crate::{FileUpload, InsertValue, LakeClient};
+    use crate::{FileUpload, InsertValue, LakeClient, data_location};
 
     #[tokio::test]
     async fn unreachable_query_endpoint_fails_connect() {
@@ -468,6 +524,38 @@ mod tests {
         let mut actual = Vec::new();
         reader.read_to_end(&mut actual).await.unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn sdk_queries_datalocation_and_opens_file() {
+        let root = tempdir().unwrap();
+        let (client, _metasrv, _table, _meta, _engine) = setup_client(root.path()).await;
+        let source = root.path().join("episode.mp4");
+        let expected = b"queried and opened through the public sdk";
+        tokio::fs::write(&source, expected).await.unwrap();
+        client
+            .insert(
+                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    InsertValue::Utf8("episode-42".to_owned()),
+                    InsertValue::File(FileUpload::from_path(&source, "video/mp4")),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let mut results = client
+            .query("SELECT video FROM lake.robots.episodes")
+            .await
+            .unwrap();
+        let batch = results.try_next().await.unwrap().unwrap();
+        let location = data_location(&batch, "video", 0).unwrap();
+        let mut reader = client.open(&location).await.unwrap();
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).await.unwrap();
+
+        assert_eq!(actual, expected);
+        assert!(results.try_next().await.unwrap().is_none());
     }
 
     #[tokio::test]
