@@ -23,8 +23,8 @@ Fleet nodes / users            millions of reads, DDoS-like fan-out
 Query layer   (lake-query)     STATELESS — fan out freely
     - accept SQL, plan + execute via DataFusion
     - read data files directly from object storage (disaggregated storage)
-    - cache the catalog (db→table→location+version) with TTL;
-      serve list/resolve from cache, rarely touching the metadata tier
+    - cache registrations (db→table→location+version) with TTL;
+      cache immutable providers by exact generation with bounded capacity
     │  cache miss / refresh / writes
     ▼
 Metadata layer (lake-metasrv)  STATEFUL — bounded, leader-elected
@@ -45,6 +45,14 @@ the registry is small (~10⁴ tables) it fits in memory on every query node,
 so catalog reads are served locally and the metadata authority sees only
 cache-miss and write traffic. That is why the metadata tier being hard to
 fan out is acceptable — it is not on the hot read path.
+
+Each query replica also keeps a capacity-bounded DataFusion provider cache.
+The key includes table name, engine, physical location, incarnation, and
+registry version. Concurrent SQL planning for one generation coalesces into
+one engine open/provider build. An append changes the version; drop/recreate
+changes the incarnation, so neither can reuse a stale provider. Old immutable
+providers remain safe for in-flight readers and disappear through normal
+eviction. Missing or failed loads are never cached.
 
 ### Why the tiers scale differently
 

@@ -11,6 +11,9 @@ authority.
   panics inside the async runtime). Refresh the snapshot with
   `LakeCatalog::refresh`.
 - Per-table lookups hit the moka cache before the registry.
+- DataFusion providers are cached per exact table generation (name, engine,
+  location, incarnation, version); concurrent misses coalesce and the cache is
+  capacity-bounded.
 - Listing and registration caches have bounded staleness; refreshes coalesce
   so concurrent queries cannot stampede the metastore.
 - Read-only over the engine; table creation is an explicit `ops::create_table`
@@ -19,7 +22,7 @@ authority.
 ## Layout
 
 - `catalog.rs` — `CatalogState` + `LakeCatalog` (`CatalogProvider`, snapshot,
-  registration cache, `refresh`)
+  registration/provider caches, `refresh`)
 - `schema.rs` — `LakeSchema` (`SchemaProvider`: snapshot listing + live
   `table()` resolution)
 - `ops.rs` — `create_table` (engine create + registry register)
