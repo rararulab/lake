@@ -29,6 +29,7 @@
 pub mod election;
 
 mod control;
+mod fenced_meta;
 mod leadership;
 mod maintenance;
 mod operation;
@@ -57,6 +58,7 @@ use tonic::transport::Server;
 use crate::{
     control::MetasrvFlightService,
     election::LeaseElection,
+    fenced_meta::FencedMetaStore,
     leadership::{Leadership, run_campaign_loop_until},
     maintenance::run_maintenance_loop_until,
     operation::{AppendRecord, AppendState, active_key, operation_key},
@@ -315,6 +317,18 @@ impl Metasrv {
                 operation_gc_cursor: Mutex::new(None),
             }),
         }
+    }
+
+    /// Build the production server view: reads share the raw authority, while
+    /// every metadata CAS/delete is translated into a lease-guarded mutation.
+    fn fenced_for_server(&self, leadership: Arc<Leadership>) -> Arc<Self> {
+        let meta: MetaStoreRef = Arc::new(FencedMetaStore::new(self.meta().clone(), leadership));
+        Arc::new(Self::with_operation_policy(
+            meta,
+            self.engine().clone(),
+            self.inner.operation_retention,
+            self.inner.operation_gc_page_size,
+        ))
     }
 
     pub(crate) async fn lock_table(&self, table: &TableRef) -> OwnedMutexGuard<()> {
@@ -728,6 +742,7 @@ where
 
     let election = LeaseElection::new(metasrv.meta().clone(), addr, Duration::from_secs(10));
     let leadership = Arc::new(Leadership::new());
+    let metasrv = metasrv.fenced_for_server(leadership.clone());
     let maintenance_shutdown = CancellationToken::new();
     let campaign_shutdown = CancellationToken::new();
     let maintenance = tokio::spawn(run_maintenance_loop_until(
@@ -817,7 +832,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use async_trait::async_trait;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -826,10 +847,53 @@ mod tests {
         TableEngineRef, TableHandleRef,
     };
     use lake_engine_lance::LanceEngine;
-    use lake_meta::RocksMeta;
+    use lake_meta::{GuardedMutation, MetaStore, RocksMeta};
     use tokio::sync::{Notify, oneshot};
 
     use super::*;
+    use crate::election::LeaseStatus;
+
+    struct RecordingMeta {
+        inner:           MetaStoreRef,
+        ordinary_cas:    AtomicUsize,
+        ordinary_delete: AtomicUsize,
+        guarded:         AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MetaStore for RecordingMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            self.ordinary_cas.fetch_add(1, Ordering::SeqCst);
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn guarded_mutate(&self, mutation: GuardedMutation<'_>) -> lake_meta::Result<bool> {
+            self.guarded.fetch_add(1, Ordering::SeqCst);
+            self.inner.guarded_mutate(mutation).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn scan_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<(String, Vec<u8>)>> {
+            self.inner.scan_prefix(prefix).await
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.ordinary_delete.fetch_add(1, Ordering::SeqCst);
+            self.inner.delete(key, expected).await
+        }
+    }
 
     struct PausedRemoveEngine {
         inner:          LanceEngine,
@@ -923,6 +987,44 @@ mod tests {
         drop_task.await.unwrap().unwrap();
         create_task.await.unwrap().unwrap();
         assert!(metasrv.resolve(&table).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn production_metadata_mutations_use_guarded_store() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let rocks: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let recording = Arc::new(RecordingMeta {
+            inner:           rocks,
+            ordinary_cas:    AtomicUsize::new(0),
+            ordinary_delete: AtomicUsize::new(0),
+            guarded:         AtomicUsize::new(0),
+        });
+        let raw: MetaStoreRef = recording.clone();
+        let election = LeaseElection::new(raw.clone(), "node-a", Duration::from_secs(10));
+        let status = election.campaign_at(0).await.unwrap();
+        let LeaseStatus::Leader { guard, .. } = status else {
+            panic!("node-a must acquire the lease");
+        };
+        let leadership = Arc::new(Leadership::new());
+        leadership.assume_guarded_leader("node-a", guard, Duration::from_mins(1));
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let authority = Metasrv::new(raw.clone(), engine).fenced_for_server(leadership);
+
+        recording.ordinary_cas.store(0, Ordering::SeqCst);
+        recording.ordinary_delete.store(0, Ordering::SeqCst);
+        recording.guarded.store(0, Ordering::SeqCst);
+        assert!(
+            authority
+                .meta()
+                .cas("target", None, b"value")
+                .await
+                .unwrap()
+        );
+        assert!(authority.meta().delete("target", b"value").await.unwrap());
+        assert_eq!(recording.ordinary_cas.load(Ordering::SeqCst), 0);
+        assert_eq!(recording.ordinary_delete.load(Ordering::SeqCst), 0);
+        assert_eq!(recording.guarded.load(Ordering::SeqCst), 2);
+        assert_eq!(raw.get("target").await.unwrap(), None);
     }
 
     #[tokio::test]

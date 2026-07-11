@@ -21,7 +21,8 @@
 //! *follower's* Flight address and assert it succeeds — which can only happen
 //! if the follower forwarded the write to the leader (a write served locally on
 //! a follower would fail `unavailable`). We then confirm the table is really
-//! registered, and that a follower-issued `drop_table` forwards too.
+//! registered, and that remote destructive drop fails closed on either node
+//! until durable tombstones are available.
 //!
 //! Hermetic: no external services, only two loopback ports and two tempdirs.
 
@@ -288,19 +289,20 @@ async fn follower_forwards_write_to_leader() {
         .expect("table remains registered");
     assert!(after_append.current_version > before_append);
 
-    // A follower-issued drop forwards too: after it, the table is gone.
+    // Remote destructive drop is intentionally unavailable until a durable
+    // tombstone can recover storage deletion across leader failure.
     let drop_body = json!({ "namespace": "robots", "name": "arm" });
     let dropped = forward_with_retry(&follower, "drop_table", drop_body).await;
-    assert!(
-        dropped.is_ok(),
-        "follower {follower} did not forward drop_table to the leader: {dropped:?}"
+    assert_eq!(
+        dropped.expect_err("remote drop must fail closed").code(),
+        Code::FailedPrecondition
     );
     let reg_after = registry::get(meta.as_ref(), &table)
         .await
         .expect("registry get after drop");
     assert!(
-        reg_after.is_none(),
-        "robots.arm still registered after a forwarded drop_table"
+        reg_after.is_some(),
+        "drop rejection must preserve robots.arm"
     );
 }
 

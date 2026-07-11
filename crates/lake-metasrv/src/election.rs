@@ -82,6 +82,27 @@ pub struct LeaseValue {
     pub epoch:         u64,
 }
 
+/// Exact durable lease value authorizing one metadata publication.
+///
+/// The bytes are the value successfully installed at [`LEASE_KEY`]. Keeping
+/// them opaque prevents callers from re-encoding legacy JSON and weakening an
+/// exact DynamoDB/RocksDB guard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaseGuard {
+    epoch: u64,
+    bytes: Vec<u8>,
+}
+
+impl LeaseGuard {
+    pub(crate) fn new(epoch: u64, bytes: Vec<u8>) -> Self { Self { epoch, bytes } }
+
+    #[must_use]
+    pub const fn epoch(&self) -> u64 { self.epoch }
+
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] { &self.bytes }
+}
+
 /// The outcome of a single campaign round.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaseStatus {
@@ -89,8 +110,8 @@ pub enum LeaseStatus {
     Leader {
         /// Absolute expiry of the lease this node now holds.
         expires_at_ms: u64,
-        /// Durable fencing epoch held by this node.
-        epoch:         u64,
+        /// Exact durable lease value held by this node.
+        guard:         LeaseGuard,
     },
     /// Another node holds the lease.
     Follower {
@@ -178,7 +199,7 @@ impl LeaseElection {
                 {
                     Ok(LeaseStatus::Leader {
                         expires_at_ms: new_lease.expires_at_ms,
-                        epoch:         new_lease.epoch,
+                        guard:         LeaseGuard::new(new_lease.epoch, new_bytes),
                     })
                 } else {
                     // Lost the install race: someone else got in first.
@@ -212,7 +233,7 @@ impl LeaseElection {
                     {
                         Ok(LeaseStatus::Leader {
                             expires_at_ms: new_lease.expires_at_ms,
-                            epoch:         new_lease.epoch,
+                            guard:         LeaseGuard::new(new_lease.epoch, new_bytes),
                         })
                     } else {
                         self.follower_after_lost_race().await
@@ -317,6 +338,18 @@ mod tests {
         LeaseElection::new(Arc::clone(meta), node_id, Duration::from_millis(TTL_MS))
     }
 
+    fn assert_leader(status: LeaseStatus, expires_at_ms: u64, epoch: u64) {
+        let LeaseStatus::Leader {
+            expires_at_ms: actual_expiry,
+            guard,
+        } = status
+        else {
+            panic!("expected leader status");
+        };
+        assert_eq!(actual_expiry, expires_at_ms);
+        assert_eq!(guard.epoch(), epoch);
+    }
+
     #[tokio::test]
     async fn lease_lifecycle_over_injected_clock() {
         let (_dir, meta) = shared_store();
@@ -324,13 +357,7 @@ mod tests {
         let b = election(&meta, "b");
 
         // At now=0, a wins the empty install and b sees a valid holder.
-        assert_eq!(
-            a.campaign_at(0).await.expect("a campaigns"),
-            LeaseStatus::Leader {
-                expires_at_ms: TTL_MS,
-                epoch:         1,
-            }
-        );
+        assert_leader(a.campaign_at(0).await.expect("a campaigns"), TTL_MS, 1);
         assert!(a.campaign_at(0).await.expect("a status").is_leader());
         assert_eq!(
             b.campaign_at(0).await.expect("b campaigns"),
@@ -340,12 +367,10 @@ mod tests {
         );
 
         // a renews in place; expiry advances with the clock.
-        assert_eq!(
+        assert_leader(
             a.campaign_at(1000).await.expect("a renews"),
-            LeaseStatus::Leader {
-                expires_at_ms: 1000 + TTL_MS,
-                epoch:         1,
-            }
+            1000 + TTL_MS,
+            1,
         );
 
         // Before expiry (a's lease runs to 11_000), b stays a follower.
@@ -357,12 +382,10 @@ mod tests {
         );
 
         // After expiry, b steals the lease; a then becomes a follower of b.
-        assert_eq!(
+        assert_leader(
             b.campaign_at(20_000).await.expect("b steals"),
-            LeaseStatus::Leader {
-                expires_at_ms: 20_000 + TTL_MS,
-                epoch:         2,
-            }
+            20_000 + TTL_MS,
+            2,
         );
         assert_eq!(
             a.campaign_at(20_001).await.expect("a demoted"),
@@ -384,26 +407,20 @@ mod tests {
                 .await
                 .expect("seed legacy")
         );
-        assert_eq!(
+        assert_leader(
             a.campaign_at(100).await.expect("upgrade legacy renewal"),
-            LeaseStatus::Leader {
-                expires_at_ms: 100 + TTL_MS,
-                epoch:         1,
-            }
+            100 + TTL_MS,
+            1,
         );
-        assert_eq!(
+        assert_leader(
             a.campaign_at(200).await.expect("renew epoch 1"),
-            LeaseStatus::Leader {
-                expires_at_ms: 200 + TTL_MS,
-                epoch:         1,
-            }
+            200 + TTL_MS,
+            1,
         );
-        assert_eq!(
+        assert_leader(
             b.campaign_at(20_000).await.expect("take over"),
-            LeaseStatus::Leader {
-                expires_at_ms: 20_000 + TTL_MS,
-                epoch:         2,
-            }
+            20_000 + TTL_MS,
+            2,
         );
 
         let current_bytes = meta.get(LEASE_KEY).await.expect("read lease").unwrap();
@@ -429,6 +446,22 @@ mod tests {
                 .expect("read unchanged")
                 .as_deref(),
             Some(exhausted_bytes.as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn campaign_returns_exact_installed_lease_guard() {
+        let (_dir, meta) = shared_store();
+        let a = election(&meta, "a");
+
+        let status = a.campaign_at(123).await.expect("acquire lease");
+        let LeaseStatus::Leader { guard, .. } = status else {
+            panic!("first campaign must lead");
+        };
+        assert_eq!(guard.epoch(), 1);
+        assert_eq!(
+            meta.get(LEASE_KEY).await.expect("read lease").as_deref(),
+            Some(guard.bytes())
         );
     }
 
@@ -467,12 +500,10 @@ mod tests {
         // The holder resigns, releasing the lease well before its TTL.
         assert!(a.resign_at(200).await.expect("a resigns"));
         // b now steals it immediately, without waiting out the TTL.
-        assert_eq!(
+        assert_leader(
             b.campaign_at(300).await.expect("b takes over"),
-            LeaseStatus::Leader {
-                expires_at_ms: 300 + TTL_MS,
-                epoch:         2,
-            }
+            300 + TTL_MS,
+            2,
         );
     }
 }

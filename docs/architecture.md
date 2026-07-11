@@ -260,12 +260,20 @@ surfaced through `lake-catalog`.
 No self-built consensus: read HA comes from stateless replicas, write HA
 from lease-election over an already-HA KV.
 
-The guarded mutation is the durable fencing primitive, not yet the complete
-write-path integration. Registry create/version/delete, append-operation
-records, and maintenance must pass their observed lease bytes into it before
-the epoch fences every metadata publication. Destructive table drop also
-requires a durable tombstone because object deletion cannot share the KV
-transaction; that recovery protocol is separate follow-up work.
+Production Metasrv wraps its raw metastore in a lease-fenced view after
+election starts. Each registry, append-operation, and maintenance CAS/delete
+loads the latest exact lease bytes immediately before publication and executes
+through `guarded_mutate`; election renew/resign continues on the raw store.
+This fresh-per-publication rule lets long engine operations span same-holder
+renewals, while a takeover changes the guard and rejects a paused former
+leader. If the old leader already committed an engine version, the successor
+reconciles that immutable commit before publishing it.
+
+Destructive table drop remains a different protocol because object deletion
+cannot share the KV transaction. Remote drop therefore fails closed before
+engine mutation until a durable tombstone makes cleanup restartable; local
+single-process administrative drop remains available. Tombstoned drop and
+cleanup recovery are the next metadata-safety increment.
 
 ## Deliberate simplifications (ponytail markers)
 

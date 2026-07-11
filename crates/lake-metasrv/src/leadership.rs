@@ -29,7 +29,7 @@ use std::{
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::election::{LeaseElection, LeaseStatus};
+use crate::election::{LeaseElection, LeaseGuard, LeaseStatus};
 
 /// How often the campaign loop renews the lease. Half the 10s TTL used by
 /// [`serve`](crate::serve), so a renew is attempted well before expiry.
@@ -47,9 +47,14 @@ pub(crate) struct Leadership {
 
 struct LeadershipState {
     /// Address of the observed lease holder, or `None` when no leader is known.
-    leader:         Option<String>,
-    /// Local monotonic deadline for a lease held by this node.
-    local_deadline: Option<Instant>,
+    leader:          Option<String>,
+    /// Exact durable guard paired with its conservative local deadline.
+    local_authority: Option<LocalAuthority>,
+}
+
+struct LocalAuthority {
+    deadline: Instant,
+    guard:    LeaseGuard,
 }
 
 impl Leadership {
@@ -57,8 +62,8 @@ impl Leadership {
     pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(LeadershipState {
-                leader:         None,
-                local_deadline: None,
+                leader:          None,
+                local_authority: None,
             }),
         }
     }
@@ -68,8 +73,9 @@ impl Leadership {
         self.state
             .lock()
             .expect("leadership mutex poisoned")
-            .local_deadline
-            .is_some_and(|deadline| Instant::now() < deadline)
+            .local_authority
+            .as_ref()
+            .is_some_and(|authority| Instant::now() < authority.deadline)
     }
 
     /// The address of the currently observed leader, if any.
@@ -81,14 +87,24 @@ impl Leadership {
             .clone()
     }
 
+    /// Clone the exact current lease guard only while local authority remains
+    /// inside its conservative monotonic deadline.
+    pub(crate) fn current_guard(&self) -> Option<LeaseGuard> {
+        let state = self.state.lock().expect("leadership mutex poisoned");
+        state.local_authority.as_ref().and_then(|authority| {
+            (Instant::now() < authority.deadline).then(|| authority.guard.clone())
+        })
+    }
+
     /// Atomically publish the observed leader and our local lease deadline.
-    fn publish(&self, leader: Option<String>, local_deadline: Option<Instant>) -> bool {
+    fn publish(&self, leader: Option<String>, local_authority: Option<LocalAuthority>) -> bool {
         let mut state = self.state.lock().expect("leadership mutex poisoned");
         let was_leader = state
-            .local_deadline
-            .is_some_and(|deadline| Instant::now() < deadline);
+            .local_authority
+            .as_ref()
+            .is_some_and(|authority| Instant::now() < authority.deadline);
         state.leader = leader;
-        state.local_deadline = local_deadline;
+        state.local_authority = local_authority;
         was_leader
     }
 
@@ -96,7 +112,21 @@ impl Leadership {
     pub(crate) fn assume_leader(&self, addr: &str) {
         self.publish(
             Some(addr.to_owned()),
-            Some(Instant::now() + Duration::from_mins(1)),
+            Some(LocalAuthority {
+                deadline: Instant::now() + Duration::from_mins(1),
+                guard:    LeaseGuard::new(1, Vec::new()),
+            }),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assume_guarded_leader(&self, addr: &str, guard: LeaseGuard, lifetime: Duration) {
+        self.publish(
+            Some(addr.to_owned()),
+            Some(LocalAuthority {
+                deadline: Instant::now() + lifetime,
+                guard,
+            }),
         );
     }
 }
@@ -150,11 +180,14 @@ async fn campaign_once(election: &LeaseElection, leadership: &Leadership) {
     // most another 40% of the lease on store I/O leaves a 10% demotion
     // margin before the previously published deadline.
     let campaign_timeout = election.ttl() * 2 / 5;
-    let (leader, local_deadline) =
+    let (leader, local_authority) =
         match tokio::time::timeout(campaign_timeout, election.campaign()).await {
-            Ok(Ok(LeaseStatus::Leader { .. })) => (
+            Ok(Ok(LeaseStatus::Leader { guard, .. })) => (
                 Some(election.node_id().to_string()),
-                Some(campaign_started + election.ttl()),
+                Some(LocalAuthority {
+                    deadline: campaign_started + election.ttl(),
+                    guard,
+                }),
             ),
             Ok(Ok(LeaseStatus::Follower { current_holder })) => {
                 // An empty holder means the lease vanished under a lost race;
@@ -181,8 +214,10 @@ async fn campaign_once(election: &LeaseElection, leadership: &Leadership) {
             }
         };
 
-    let now_leader = local_deadline.is_some_and(|deadline| Instant::now() < deadline);
-    let was_leader = leadership.publish(leader, local_deadline);
+    let now_leader = local_authority
+        .as_ref()
+        .is_some_and(|authority| Instant::now() < authority.deadline);
+    let was_leader = leadership.publish(leader, local_authority);
     if now_leader != was_leader {
         if now_leader {
             tracing::info!(node_id = election.node_id(), "acquired metasrv leadership");
@@ -224,6 +259,37 @@ mod tests {
             "a completed campaign must not authorize writes past its lease deadline"
         );
         campaign.abort();
+    }
+
+    #[tokio::test]
+    async fn leadership_publishes_latest_exact_lease_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(dir.path()).unwrap());
+        let election = LeaseElection::new(meta.clone(), "node-a", Duration::from_millis(100));
+        let leadership = Leadership::new();
+
+        campaign_once(&election, &leadership).await;
+        let first = leadership.current_guard().expect("first live guard");
+        assert_eq!(first.epoch(), 1);
+        assert_eq!(
+            meta.get(crate::election::LEASE_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(first.bytes())
+        );
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        campaign_once(&election, &leadership).await;
+        let renewed = leadership.current_guard().expect("renewed live guard");
+        assert_eq!(renewed.epoch(), first.epoch());
+        assert_ne!(renewed.bytes(), first.bytes());
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            leadership.current_guard().is_none(),
+            "expired local authority must not yield a durable guard"
+        );
     }
 
     struct HangingMeta {

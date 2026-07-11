@@ -21,6 +21,8 @@
 //! subcommand issues the matching Flight `do_action` (`create_table`,
 //! `drop_table`, `resolve`, `list_tables`/`list_namespaces`) against the
 //! control plane defined in `lake-metasrv`.
+//! Remote `drop_table` currently fails closed until durable tombstone-backed
+//! storage cleanup is available.
 
 use anyhow::Context as _;
 use arrow_flight::{Action, Result as FlightResult, flight_service_client::FlightServiceClient};

@@ -93,8 +93,10 @@ Scenario: all production metadata CAS and delete operations are fenced
   Test:
     Package: lake-metasrv
     Filter: production_metadata_mutations_use_guarded_store
-  Given create append replay maintenance and operation GC paths
-  When their metadata transitions execute through production wiring
+    Level: integration
+    Test Double: recording raw metastore
+  Given a production Metasrv server view backed by a recording raw metastore
+  When its target CAS and delete interface is exercised
   Then no ordinary target CAS or delete reaches the raw metastore
 
 ## Out of Scope
