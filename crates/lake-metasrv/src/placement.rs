@@ -21,7 +21,6 @@ use snafu::Snafu;
 
 const MAX_STORAGE_SEGMENT_BYTES: usize = 255;
 const DATASET_SUFFIX: &str = ".lance";
-const MAX_TABLE_NAME_BYTES: usize = MAX_STORAGE_SEGMENT_BYTES - DATASET_SUFFIX.len();
 
 /// A table location derivation failure detected before storage is mutated.
 #[derive(Debug, Snafu)]
@@ -43,7 +42,7 @@ pub enum PlacementError {
     NonUtf8LocalLocation { root: PathBuf },
 }
 
-/// Trusted policy that deterministically places table datasets.
+/// Trusted policy that places each table incarnation in a unique dataset.
 ///
 /// The metadata service constructs this value from process configuration and
 /// never from a remote DDL request. [`Self::place`] validates both table
@@ -93,12 +92,15 @@ impl TablePlacement {
     /// can reject unsafe DDL before invoking an engine or registry operation.
     pub fn place(&self, table: &TableRef) -> Result<TableLocation, PlacementError> {
         validate_identifier("namespace", &table.namespace.0, MAX_STORAGE_SEGMENT_BYTES)?;
-        validate_identifier("table name", &table.name.0, MAX_TABLE_NAME_BYTES)?;
-        let dataset = format!("{}{DATASET_SUFFIX}", table.name.0);
+        validate_identifier("table name", &table.name.0, MAX_STORAGE_SEGMENT_BYTES)?;
+        let dataset = format!("{}{DATASET_SUFFIX}", uuid::Uuid::now_v7());
 
         match &self.backend {
             PlacementBackend::Local { root } => {
-                let location = root.join(&table.namespace.0).join(dataset);
+                let location = root
+                    .join(&table.namespace.0)
+                    .join(&table.name.0)
+                    .join(dataset);
                 location
                     .to_str()
                     .map(TableLocation::new)
@@ -111,8 +113,8 @@ impl TablePlacement {
                     format!("{prefix}/")
                 };
                 Ok(TableLocation::new(format!(
-                    "s3://{bucket}/{prefix}{}/{dataset}",
-                    table.namespace.0
+                    "s3://{bucket}/{prefix}{}/{}/{dataset}",
+                    table.namespace.0, table.name.0
                 )))
             }
         }
@@ -127,11 +129,7 @@ fn validate_identifier(
     let reason = if value.is_empty() {
         Some("must not be empty")
     } else if value.len() > max_bytes {
-        Some(if max_bytes == MAX_TABLE_NAME_BYTES {
-            "must not exceed 249 UTF-8 bytes before the .lance suffix"
-        } else {
-            "must not exceed 255 UTF-8 bytes"
-        })
+        Some("must not exceed 255 UTF-8 bytes")
     } else if matches!(value, "." | "..") {
         Some("must not be a dot segment")
     } else if value.contains(['/', '\\']) {
@@ -193,7 +191,7 @@ mod tests {
 
     use lake_common::TableRef;
 
-    use super::TablePlacement;
+    use super::{DATASET_SUFFIX, TablePlacement};
 
     #[test]
     fn table_placement_derives_managed_locations() {
@@ -201,27 +199,59 @@ mod tests {
         let local = TablePlacement::local(PathBuf::from("/srv/lake/tables"));
         let s3 = TablePlacement::s3("lake-prod", "datasets").expect("valid S3 placement");
 
-        assert_eq!(
-            local.place(&table).expect("valid local placement").as_str(),
-            "/srv/lake/tables/robots/episodes.lance"
+        let local_location = local.place(&table).expect("valid local placement");
+        assert!(
+            local_location
+                .as_str()
+                .starts_with("/srv/lake/tables/robots/episodes/")
         );
-        assert_eq!(
-            s3.place(&table).expect("valid S3 placement").as_str(),
-            "s3://lake-prod/datasets/robots/episodes.lance"
+        assert!(local_location.as_str().ends_with(DATASET_SUFFIX));
+        let s3_location = s3.place(&table).expect("valid S3 placement");
+        assert!(
+            s3_location
+                .as_str()
+                .starts_with("s3://lake-prod/datasets/robots/episodes/")
         );
+        assert!(s3_location.as_str().ends_with(DATASET_SUFFIX));
 
-        let boundary = TableRef::new("robots", "x".repeat(249));
+        let boundary = TableRef::new("robots", "x".repeat(255));
         let boundary = local
             .place(&boundary)
-            .expect("249-byte table name leaves room for .lance");
+            .expect("255-byte table directory name is supported");
         assert_eq!(
             std::path::Path::new(boundary.as_str())
-                .file_name()
-                .expect("dataset filename")
+                .parent()
+                .and_then(std::path::Path::file_name)
+                .expect("table directory")
                 .as_encoded_bytes()
                 .len(),
             255
         );
+    }
+
+    #[test]
+    fn server_placement_uses_unique_dataset_generation() {
+        let table = TableRef::new("robots", "episodes");
+        let placement = TablePlacement::local(PathBuf::from("/srv/lake/tables"));
+
+        let first = placement.place(&table).expect("first generation");
+        let second = placement.place(&table).expect("second generation");
+
+        assert_ne!(
+            first, second,
+            "each create must own a distinct object prefix"
+        );
+        for location in [first, second] {
+            let path = std::path::Path::new(location.as_str());
+            assert_eq!(
+                path.parent().and_then(std::path::Path::file_name),
+                Some(std::ffi::OsStr::new("episodes"))
+            );
+            assert_eq!(
+                path.extension().and_then(std::ffi::OsStr::to_str),
+                Some("lance")
+            );
+        }
     }
 
     #[test]
@@ -247,7 +277,6 @@ mod tests {
             TableRef::new("robots", "episodes#shadow"),
             TableRef::new("robots", "episodes%2fescape"),
             TableRef::new(overlong, "episodes"),
-            TableRef::new("robots", "x".repeat(250)),
             TableRef::new("robots", "x".repeat(256)),
         ];
 

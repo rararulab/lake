@@ -21,8 +21,8 @@
 //! subcommand issues the matching Flight `do_action` (`create_table`,
 //! `drop_table`, `resolve`, `list_tables`/`list_namespaces`) against the
 //! control plane defined in `lake-metasrv`.
-//! Remote `drop_table` currently fails closed until durable tombstone-backed
-//! storage cleanup is available.
+//! Remote `drop_table` uses the server's durable tombstone protocol, so a
+//! repeated request can finish cleanup after a crash or leader handoff.
 
 use anyhow::Context as _;
 use arrow_flight::{Action, Result as FlightResult, flight_service_client::FlightServiceClient};

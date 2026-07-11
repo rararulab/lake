@@ -36,7 +36,7 @@ same-name replacement.
 ## Boundaries
 
 ### Allowed Changes
-- `Cargo.lock`
+- `**/Cargo.lock`
 - `crates/lake-metasrv/**`
 - `crates/lake-meta/**`
 - `crates/lake-cli/**`

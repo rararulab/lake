@@ -128,7 +128,11 @@ There are three distinct pieces of metadata, owned by different layers:
    keyed by tenant, table, and UUIDv7 operation identity. They contain only a
    payload digest, base/result versions, state, and timestamps. Arrow rows,
    object bytes, credentials, and signed URLs are forbidden.
-3. **Per-table manifest** (the engine's): the file list, schema, and
+3. **Drop coordination** (lake's, in `lake-meta`): immutable tombstones keyed
+   `drop/<namespace>/<name>/<incarnation>`. A tombstone retains the exact old
+   registration needed to conditionally detach the registry and resume
+   idempotent engine cleanup after a crash.
+4. **Per-table manifest** (the engine's): the file list, schema, and
    version history of one table. For Lance this is the Lance dataset
    manifest; lake does not reimplement it.
 
@@ -273,11 +277,16 @@ and rejects a paused former leader. If the old leader already committed an
 engine version, the successor reconciles that immutable commit before
 publishing it.
 
-Destructive table drop remains a different protocol because object deletion
-cannot share the KV transaction. Remote drop therefore fails closed before
-engine mutation until a durable tombstone makes cleanup restartable; local
-single-process administrative drop remains available. Tombstoned drop and
-cleanup recovery are the next metadata-safety increment.
+Destructive table drop is a persisted idempotent procedure because object
+deletion cannot share the KV transaction. Metasrv first guarded-CAS creates an
+immutable incarnation tombstone, guarded-deletes the exact registry pointer,
+idempotently removes the old engine location, and finally guarded-deletes the
+exact tombstone. Leader maintenance resumes a cursor-paged bounded set of
+unfinished tombstones. Remote creates use
+`<root>/<namespace>/<table>/<uuid>.lance` (or the equivalent S3 prefix), so an
+old leader that continues object deletion after takeover can touch only the old
+physical generation. A replacement incarnation therefore remains safe even
+though object-store deletion itself is not lease-transactional.
 
 ## Deliberate simplifications (ponytail markers)
 

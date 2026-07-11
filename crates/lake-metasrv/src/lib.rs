@@ -29,6 +29,7 @@
 pub mod election;
 
 mod control;
+mod drop_tombstone;
 mod fenced_meta;
 mod leadership;
 mod maintenance;
@@ -80,6 +81,9 @@ pub enum MetasrvError {
 
     #[snafu(display("engine error"))]
     Engine { source: lake_engine::EngineError },
+
+    #[snafu(display("durable drop protocol failed: {message}"))]
+    DropProtocol { message: String },
 
     #[snafu(display("append operation '{operation_id}' conflicts with its durable payload"))]
     OperationConflict { operation_id: String },
@@ -266,6 +270,7 @@ struct MetasrvInner {
     operation_retention:    Duration,
     operation_gc_page_size: usize,
     operation_gc_cursor:    Mutex<Option<String>>,
+    drop_gc_cursor:         Mutex<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -315,6 +320,7 @@ impl Metasrv {
                 operation_retention,
                 operation_gc_page_size: operation_gc_page_size.max(1),
                 operation_gc_cursor: Mutex::new(None),
+                drop_gc_cursor: Mutex::new(None),
             }),
         }
     }
@@ -351,6 +357,7 @@ impl Metasrv {
         schema: SchemaRef,
     ) -> Result<()> {
         let _guard = self.lock_table(table).await;
+        self.resume_drop_locked(table).await?;
         create_table(self.meta(), self.engine(), table, location, schema)
             .await
             .context(CreateSnafu)
@@ -367,6 +374,7 @@ impl Metasrv {
         batches: SendableRecordBatchStream,
     ) -> Result<Version> {
         let _guard = self.lock_table(table).await;
+        self.resume_drop_locked(table).await?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after Unix epoch")
@@ -615,28 +623,67 @@ impl Metasrv {
         Ok(new_version)
     }
 
-    /// Drop a table: delete its data via the engine, then remove the registry
-    /// entry. Idempotent — dropping an absent table is a no-op. Data-first so a
-    /// crash leaves at worst orphaned data (reclaimable by GC), never a
-    /// registry entry pointing at deleted data.
-    ///
-    /// ponytail: query-layer caches self-heal (a dropped table's dataset is
-    /// gone, so `open` returns `None`) and refresh drops it from listings; a
-    /// push-based cache invalidation across instances is a v2 concern.
+    /// Durably detach and remove one table incarnation. The immutable
+    /// tombstone is published before either the registry or objects change, so
+    /// any successor can restart the exact same cleanup sequence.
     pub async fn drop_table(&self, table: &TableRef) -> Result<()> {
         let _guard = self.lock_table(table).await;
-        let Some(reg) = self.resolve(table).await? else {
+        self.resume_drop_locked(table).await?;
+        let Some(registration) = self.resolve(table).await? else {
             return Ok(());
         };
-        self.inner
-            .engine
-            .remove(&reg.location)
-            .await
-            .context(EngineSnafu)?;
-        registry::delete(self.meta().as_ref(), table, &reg)
+        let registration = registry::ensure_incarnation(self.meta().as_ref(), table, &registration)
             .await
             .context(RegistrySnafu)?;
+        let tombstone = drop_tombstone::DropTombstone::new(table.clone(), registration)
+            .map_err(Self::drop_protocol_error)?;
+        drop_tombstone::prepare(self.meta().as_ref(), &tombstone)
+            .await
+            .map_err(Self::drop_protocol_error)?;
+        self.cleanup_drop_locked(&tombstone).await
+    }
+
+    async fn resume_drop_locked(&self, table: &TableRef) -> Result<()> {
+        let tombstones = drop_tombstone::list_for_table(self.meta().as_ref(), table)
+            .await
+            .map_err(Self::drop_protocol_error)?;
+        for tombstone in tombstones {
+            self.cleanup_drop_locked(&tombstone).await?;
+        }
         Ok(())
+    }
+
+    pub(crate) async fn cleanup_drop_locked(
+        &self,
+        tombstone: &drop_tombstone::DropTombstone,
+    ) -> Result<()> {
+        if let Some(current) = self.resolve(&tombstone.table).await? {
+            if current == tombstone.registration {
+                registry::delete(self.meta().as_ref(), &tombstone.table, &current)
+                    .await
+                    .context(RegistrySnafu)?;
+            } else if current.incarnation_id() == tombstone.registration.incarnation_id() {
+                return Err(MetasrvError::DropProtocol {
+                    message: format!(
+                        "registration changed within incarnation for {}",
+                        tombstone.table
+                    ),
+                });
+            }
+        }
+        self.engine()
+            .remove(&tombstone.registration.location)
+            .await
+            .context(EngineSnafu)?;
+        drop_tombstone::finish(self.meta().as_ref(), tombstone)
+            .await
+            .map_err(Self::drop_protocol_error)
+    }
+
+    fn drop_protocol_error(error: drop_tombstone::DropTombstoneError) -> MetasrvError {
+        MetasrvError::DropProtocol {
+            message: error.to_string(),
+        }
     }
 
     /// Resolve a table to its current registration.
@@ -910,6 +957,178 @@ mod tests {
         resume_remove:  Arc<Notify>,
     }
 
+    struct PartialRemoveEngine {
+        inner:     LanceEngine,
+        fail_once: std::sync::atomic::AtomicBool,
+    }
+
+    struct PauseFirstRemoveEngine {
+        inner:          LanceEngine,
+        calls:          AtomicUsize,
+        remove_started: Arc<Notify>,
+        resume_first:   Arc<Notify>,
+    }
+
+    struct PauseAfterRemoveEngine {
+        inner:           LanceEngine,
+        calls:           AtomicUsize,
+        remove_finished: Arc<Notify>,
+        resume_first:    Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl TableEngine for PauseAfterRemoveEngine {
+        fn kind(&self) -> &'static str { self.inner.kind() }
+
+        async fn create(
+            &self,
+            location: &TableLocation,
+            schema: SchemaRef,
+        ) -> EngineResult<TableHandleRef> {
+            self.inner.create(location, schema).await
+        }
+
+        async fn open(&self, location: &TableLocation) -> EngineResult<Option<TableHandleRef>> {
+            self.inner.open(location).await
+        }
+
+        async fn remove(&self, location: &TableLocation) -> EngineResult<()> {
+            self.inner.remove(location).await?;
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.remove_finished.notify_one();
+                self.resume_first.notified().await;
+            }
+            Ok(())
+        }
+
+        async fn maintain(
+            &self,
+            location: &TableLocation,
+            version: Version,
+        ) -> EngineResult<Option<Version>> {
+            self.inner.maintain(location, version).await
+        }
+
+        async fn retained_object_references(
+            &self,
+            location: &TableLocation,
+            request: ObjectReferenceRequest,
+        ) -> EngineResult<ObjectReferencePage> {
+            self.inner
+                .retained_object_references(location, request)
+                .await
+        }
+    }
+
+    #[async_trait]
+    impl TableEngine for PauseFirstRemoveEngine {
+        fn kind(&self) -> &'static str { self.inner.kind() }
+
+        async fn create(
+            &self,
+            location: &TableLocation,
+            schema: SchemaRef,
+        ) -> EngineResult<TableHandleRef> {
+            self.inner.create(location, schema).await
+        }
+
+        async fn open(&self, location: &TableLocation) -> EngineResult<Option<TableHandleRef>> {
+            self.inner.open(location).await
+        }
+
+        async fn remove(&self, location: &TableLocation) -> EngineResult<()> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.remove_started.notify_one();
+                self.resume_first.notified().await;
+            }
+            self.inner.remove(location).await
+        }
+
+        async fn maintain(
+            &self,
+            location: &TableLocation,
+            version: Version,
+        ) -> EngineResult<Option<Version>> {
+            self.inner.maintain(location, version).await
+        }
+
+        async fn retained_object_references(
+            &self,
+            location: &TableLocation,
+            request: ObjectReferenceRequest,
+        ) -> EngineResult<ObjectReferencePage> {
+            self.inner
+                .retained_object_references(location, request)
+                .await
+        }
+    }
+
+    fn remove_one_file(path: &std::path::Path) -> std::io::Result<bool> {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                if remove_one_file(&entry.path())? {
+                    return Ok(true);
+                }
+            } else if file_type.is_file() {
+                std::fs::remove_file(entry.path())?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[async_trait]
+    impl TableEngine for PartialRemoveEngine {
+        fn kind(&self) -> &'static str { self.inner.kind() }
+
+        async fn create(
+            &self,
+            location: &TableLocation,
+            schema: SchemaRef,
+        ) -> EngineResult<TableHandleRef> {
+            self.inner.create(location, schema).await
+        }
+
+        async fn open(&self, location: &TableLocation) -> EngineResult<Option<TableHandleRef>> {
+            self.inner.open(location).await
+        }
+
+        async fn remove(&self, location: &TableLocation) -> EngineResult<()> {
+            if self.fail_once.swap(false, Ordering::SeqCst) {
+                let removed = remove_one_file(std::path::Path::new(location.as_str()))
+                    .map_err(lake_engine::EngineError::backend)?;
+                assert!(
+                    removed,
+                    "partial cleanup must remove one real dataset object"
+                );
+                return Err(lake_engine::EngineError::backend(std::io::Error::other(
+                    "injected failure after partial object deletion",
+                )));
+            }
+            self.inner.remove(location).await
+        }
+
+        async fn maintain(
+            &self,
+            location: &TableLocation,
+            version: Version,
+        ) -> EngineResult<Option<Version>> {
+            self.inner.maintain(location, version).await
+        }
+
+        async fn retained_object_references(
+            &self,
+            location: &TableLocation,
+            request: ObjectReferenceRequest,
+        ) -> EngineResult<ObjectReferencePage> {
+            self.inner
+                .retained_object_references(location, request)
+                .await
+        }
+    }
+
     #[async_trait]
     impl TableEngine for PausedRemoveEngine {
         fn kind(&self) -> &'static str { self.inner.kind() }
@@ -996,6 +1215,197 @@ mod tests {
         drop_task.await.unwrap().unwrap();
         create_task.await.unwrap().unwrap();
         assert!(metasrv.resolve(&table).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn drop_resumes_after_tombstone_publication_crash() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let table_dir = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let first = Metasrv::new(meta.clone(), engine.clone());
+        let table = TableRef::new("robots", "episodes");
+        let location = TableLocation::new(table_dir.path().join("old.lance").to_string_lossy());
+        let schema = Arc::new(Schema::new(vec![Field::new("ep", DataType::Int64, false)]));
+        first
+            .create_table(&table, location.clone(), schema)
+            .await
+            .unwrap();
+        let registration = first.resolve(&table).await.unwrap().unwrap();
+        let tombstone = drop_tombstone::DropTombstone::new(table.clone(), registration).unwrap();
+        drop_tombstone::prepare(meta.as_ref(), &tombstone)
+            .await
+            .unwrap();
+
+        let successor = Metasrv::new(meta.clone(), engine.clone());
+        successor.drop_table(&table).await.unwrap();
+
+        assert!(successor.resolve(&table).await.unwrap().is_none());
+        assert!(engine.open(&location).await.unwrap().is_none());
+        assert!(
+            drop_tombstone::list_for_table(meta.as_ref(), &table)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_resumes_after_partial_object_deletion() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let table_dir = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let engine = Arc::new(PartialRemoveEngine {
+            inner:     LanceEngine::new(),
+            fail_once: std::sync::atomic::AtomicBool::new(true),
+        });
+        let engine_ref: TableEngineRef = engine.clone();
+        let metasrv = Metasrv::new(meta.clone(), engine_ref);
+        let table = TableRef::new("robots", "episodes");
+        let location = TableLocation::new(table_dir.path().join("old.lance").to_string_lossy());
+        let schema = Arc::new(Schema::new(vec![Field::new("ep", DataType::Int64, false)]));
+        metasrv
+            .create_table(&table, location.clone(), schema)
+            .await
+            .unwrap();
+
+        metasrv
+            .drop_table(&table)
+            .await
+            .expect_err("first cleanup fails after deleting one object");
+        assert!(metasrv.resolve(&table).await.unwrap().is_none());
+        assert_eq!(
+            drop_tombstone::list_for_table(meta.as_ref(), &table)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        metasrv.drop_table(&table).await.unwrap();
+        assert!(engine.open(&location).await.unwrap().is_none());
+        assert!(
+            drop_tombstone::list_for_table(meta.as_ref(), &table)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_drop_cannot_delete_recreated_table() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let table_dir = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let engine = Arc::new(PauseFirstRemoveEngine {
+            inner:          LanceEngine::new(),
+            calls:          AtomicUsize::new(0),
+            remove_started: Arc::new(Notify::new()),
+            resume_first:   Arc::new(Notify::new()),
+        });
+        let engine_ref: TableEngineRef = engine.clone();
+        let old_authority = Arc::new(Metasrv::new(meta.clone(), engine_ref.clone()));
+        let successor = Metasrv::new(meta.clone(), engine_ref);
+        let placement = TablePlacement::local(table_dir.path().to_path_buf());
+        let table = TableRef::new("robots", "episodes");
+        let old_location = placement.place(&table).unwrap();
+        let new_location = placement.place(&table).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("ep", DataType::Int64, false)]));
+        old_authority
+            .create_table(&table, old_location.clone(), schema.clone())
+            .await
+            .unwrap();
+
+        let stale_drop = tokio::spawn({
+            let authority = old_authority.clone();
+            let table = table.clone();
+            async move { authority.drop_table(&table).await }
+        });
+        engine.remove_started.notified().await;
+
+        successor
+            .create_table(&table, new_location.clone(), schema)
+            .await
+            .unwrap();
+        engine.resume_first.notify_one();
+        stale_drop.await.unwrap().unwrap();
+
+        let replacement = successor.resolve(&table).await.unwrap().unwrap();
+        assert_eq!(replacement.location, new_location);
+        assert!(engine.open(&replacement.location).await.unwrap().is_some());
+        assert!(engine.open(&old_location).await.unwrap().is_none());
+        assert!(
+            drop_tombstone::list_for_table(meta.as_ref(), &table)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_leader_cannot_finalize_drop_after_takeover() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let table_dir = tempfile::tempdir().unwrap();
+        let raw: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let election_a = LeaseElection::new(raw.clone(), "a", Duration::from_millis(10));
+        let LeaseStatus::Leader { guard: guard_a, .. } = election_a.campaign_at(0).await.unwrap()
+        else {
+            panic!("a acquires lease");
+        };
+        let leadership_a = Arc::new(Leadership::new());
+        leadership_a.assume_guarded_leader("a", guard_a, Duration::from_mins(1));
+        let engine = Arc::new(PauseAfterRemoveEngine {
+            inner:           LanceEngine::new(),
+            calls:           AtomicUsize::new(0),
+            remove_finished: Arc::new(Notify::new()),
+            resume_first:    Arc::new(Notify::new()),
+        });
+        let engine_ref: TableEngineRef = engine.clone();
+        let authority_a =
+            Metasrv::new(raw.clone(), engine_ref.clone()).fenced_for_server(leadership_a);
+        let table = TableRef::new("robots", "episodes");
+        let location = TableLocation::new(table_dir.path().join("old.lance").to_string_lossy());
+        let schema = Arc::new(Schema::new(vec![Field::new("ep", DataType::Int64, false)]));
+        authority_a
+            .create_table(&table, location, schema)
+            .await
+            .unwrap();
+
+        let stale_drop = tokio::spawn({
+            let authority = authority_a.clone();
+            let table = table.clone();
+            async move { authority.drop_table(&table).await }
+        });
+        engine.remove_finished.notified().await;
+
+        let election_b = LeaseElection::new(raw.clone(), "b", Duration::from_millis(10));
+        let LeaseStatus::Leader { guard: guard_b, .. } = election_b.campaign_at(20).await.unwrap()
+        else {
+            panic!("b takes over");
+        };
+        engine.resume_first.notify_one();
+        stale_drop
+            .await
+            .unwrap()
+            .expect_err("stale tombstone finalization must be fenced");
+        assert_eq!(
+            drop_tombstone::list_for_table(raw.as_ref(), &table)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let leadership_b = Arc::new(Leadership::new());
+        leadership_b.assume_guarded_leader("b", guard_b, Duration::from_mins(1));
+        let authority_b = Metasrv::new(raw.clone(), engine_ref).fenced_for_server(leadership_b);
+        authority_b.drop_table(&table).await.unwrap();
+        assert!(
+            drop_tombstone::list_for_table(raw.as_ref(), &table)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

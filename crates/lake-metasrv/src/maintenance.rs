@@ -76,6 +76,12 @@ pub(crate) async fn sweep(metasrv: &Metasrv) {
         .duration_since(UNIX_EPOCH)
         .expect("system clock is after Unix epoch")
         .as_secs();
+    let drop_gc = sweep_drop_tombstones(metasrv).await;
+    tracing::debug!(
+        scanned = drop_gc.scanned,
+        completed = drop_gc.completed,
+        "drop tombstone maintenance page complete"
+    );
     let operation_gc = sweep_operations_at(metasrv, now).await;
     tracing::debug!(
         scanned = operation_gc.scanned,
@@ -107,29 +113,56 @@ pub(crate) async fn sweep(metasrv: &Metasrv) {
             let table = TableRef::new(namespace.0.clone(), name.0);
             let _guard = metasrv.lock_table(&table).await;
             match metasrv.resolve(&table).await {
-                Ok(Some(reg)) => match metasrv
-                    .engine()
-                    .maintain(&reg.location, reg.current_version)
-                    .await
-                {
-                    Ok(Some(version)) => {
-                        match registry::set_version(metasrv.meta().as_ref(), &table, &reg, version)
-                            .await
+                Ok(Some(reg)) => {
+                    let tombstoned =
+                        match crate::drop_tombstone::DropTombstone::new(table.clone(), reg.clone())
                         {
-                            Ok(()) => tracing::debug!(%table, %version, "maintained table"),
-                            Err(MetaError::Conflict { .. }) => {
-                                tracing::debug!(%table, %version, "maintenance result lost registry CAS")
+                            Ok(tombstone) => {
+                                crate::drop_tombstone::exists(metasrv.meta().as_ref(), &tombstone)
+                                    .await
                             }
-                            Err(err) => {
-                                tracing::warn!(%table, error = %err, "publishing maintenance failed")
-                            }
+                            Err(_) => Ok(false),
+                        };
+                    match tombstoned {
+                        Ok(true) => {
+                            tracing::debug!(%table, "maintenance skipped tombstoned table");
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(%table, %error, "maintenance could not inspect drop tombstone");
+                            continue;
                         }
                     }
-                    Ok(None) => tracing::debug!(%table, "table needs no maintenance"),
-                    Err(err) => {
-                        tracing::warn!(%table, error = %err, "maintenance failed for table");
+                    match metasrv
+                        .engine()
+                        .maintain(&reg.location, reg.current_version)
+                        .await
+                    {
+                        Ok(Some(version)) => {
+                            match registry::set_version(
+                                metasrv.meta().as_ref(),
+                                &table,
+                                &reg,
+                                version,
+                            )
+                            .await
+                            {
+                                Ok(()) => tracing::debug!(%table, %version, "maintained table"),
+                                Err(MetaError::Conflict { .. }) => {
+                                    tracing::debug!(%table, %version, "maintenance result lost registry CAS")
+                                }
+                                Err(err) => {
+                                    tracing::warn!(%table, error = %err, "publishing maintenance failed")
+                                }
+                            }
+                        }
+                        Ok(None) => tracing::debug!(%table, "table needs no maintenance"),
+                        Err(err) => {
+                            tracing::warn!(%table, error = %err, "maintenance failed for table");
+                        }
                     }
-                },
+                }
                 // Dropped between listing and resolve — nothing to maintain.
                 Ok(None) => {}
                 Err(err) => {
@@ -138,6 +171,46 @@ pub(crate) async fn sweep(metasrv: &Metasrv) {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DropGcStats {
+    scanned:   usize,
+    completed: usize,
+}
+
+async fn sweep_drop_tombstones(metasrv: &Metasrv) -> DropGcStats {
+    let cursor = metasrv.inner.drop_gc_cursor.lock().await.clone();
+    let (tombstones, continuation) = match crate::drop_tombstone::scan_page(
+        metasrv.meta().as_ref(),
+        cursor.as_deref(),
+        metasrv.inner.operation_gc_page_size,
+    )
+    .await
+    {
+        Ok(page) => page,
+        Err(error) => {
+            tracing::warn!(%error, "drop tombstone maintenance scan failed");
+            return DropGcStats::default();
+        }
+    };
+    *metasrv.inner.drop_gc_cursor.lock().await = continuation;
+    let mut stats = DropGcStats {
+        scanned:   tombstones.len(),
+        completed: 0,
+    };
+    for tombstone in tombstones {
+        let _guard = metasrv.lock_table(&tombstone.table).await;
+        match metasrv.cleanup_drop_locked(&tombstone).await {
+            Ok(()) => stats.completed += 1,
+            Err(error) => tracing::warn!(
+                table = %tombstone.table,
+                error = %error,
+                "drop tombstone maintenance failed"
+            ),
+        }
+    }
+    stats
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -304,10 +377,11 @@ mod tests {
     };
     use lake_common::{
         AppendOperation, AppendOperationId, AppendPayloadDigest, TableLocation, TableRef, TenantId,
+        Version,
     };
     use lake_engine::TableEngineRef;
     use lake_engine_lance::LanceEngine;
-    use lake_meta::{MetaStoreRef, RocksMeta};
+    use lake_meta::{MetaStoreRef, RocksMeta, registry::TableRegistration};
 
     use super::*;
     use crate::operation::operation_key;
@@ -328,6 +402,61 @@ mod tests {
                 .unwrap(),
             )
             .build()
+    }
+
+    #[tokio::test]
+    async fn drop_tombstone_maintenance_is_bounded() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let table_dir = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::with_operation_policy(
+            meta.clone(),
+            engine,
+            crate::DEFAULT_APPEND_OPERATION_RETENTION,
+            2,
+        );
+        for index in 0..3 {
+            let table = TableRef::new("robots", format!("episodes-{index}"));
+            let registration = TableRegistration::new(
+                TableLocation::new(
+                    table_dir
+                        .path()
+                        .join(format!("absent-{index}.lance"))
+                        .to_string_lossy(),
+                ),
+                "lance",
+                Version(1),
+                vec![1, 2, 3],
+            );
+            let tombstone = crate::drop_tombstone::DropTombstone::new(table, registration).unwrap();
+            crate::drop_tombstone::prepare(meta.as_ref(), &tombstone)
+                .await
+                .unwrap();
+        }
+
+        let first = sweep_drop_tombstones(&metasrv).await;
+        assert_eq!(first.scanned, 2);
+        assert_eq!(first.completed, 2);
+        assert!(metasrv.inner.drop_gc_cursor.lock().await.is_some());
+        assert_eq!(
+            meta.list_prefix(crate::drop_tombstone::DROP_PREFIX)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let second = sweep_drop_tombstones(&metasrv).await;
+        assert_eq!(second.scanned, 1);
+        assert_eq!(second.completed, 1);
+        assert!(metasrv.inner.drop_gc_cursor.lock().await.is_none());
+        assert!(
+            meta.list_prefix(crate::drop_tombstone::DROP_PREFIX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
