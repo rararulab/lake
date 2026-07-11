@@ -490,7 +490,7 @@ impl Stream for AdmittedFlightStream {
             .expect("checked above")
             .as_mut()
             .poll_next(context);
-        if matches!(poll, Poll::Ready(None)) {
+        if matches!(poll, Poll::Ready(None | Some(Err(_)))) {
             self.inner.take();
             self.permit.take();
         }
@@ -1359,6 +1359,23 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2, 2, 1]
         );
+        let namespaces = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("schema names")
+                    .iter()
+                    .flatten()
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            namespaces,
+            vec!["alpha", "bravo", "charlie", "delta", "echo"]
+        );
     }
 
     #[tokio::test]
@@ -1405,6 +1422,59 @@ mod tests {
         };
         assert_eq!(status.code(), tonic::Code::ResourceExhausted);
         assert_eq!(status.message(), "discovery row limit reached");
+    }
+
+    #[tokio::test]
+    async fn flight_discovery_error_releases_admission_permit() {
+        let mut service = discovery_service(
+            &["alpha/events_0", "alpha/events_1"],
+            DiscoveryLimits::try_new(1, 1).expect("discovery limits"),
+        )
+        .await;
+        let query_limits =
+            QueryLimits::try_new(1, Duration::from_millis(20), Duration::from_secs(5), 1024)
+                .expect("query limits");
+        service.admission = QueryAdmission::new(query_limits);
+        let mut failed_stream = service
+            .do_get_tables(
+                CommandGetTables {
+                    catalog:                   None,
+                    db_schema_filter_pattern:  None,
+                    table_name_filter_pattern: None,
+                    table_types:               Vec::new(),
+                    include_schema:            false,
+                },
+                admin_ticket_request(),
+            )
+            .await
+            .expect("first discovery admitted")
+            .into_inner();
+
+        loop {
+            match failed_stream.next().await {
+                Some(Ok(_)) => {}
+                Some(Err(status)) => {
+                    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+                    break;
+                }
+                None => panic!("row limit must fail the stream"),
+            }
+        }
+
+        assert!(
+            service
+                .do_get_schemas(
+                    CommandGetDbSchemas {
+                        catalog:                  None,
+                        db_schema_filter_pattern: None,
+                    },
+                    admin_ticket_request(),
+                )
+                .await
+                .is_ok(),
+            "reading a terminal stream error must release admission immediately"
+        );
+        drop(failed_stream);
     }
 
     #[tokio::test]
