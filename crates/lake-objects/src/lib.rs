@@ -25,6 +25,7 @@ use lake_common::DataLocation;
 use snafu::{OptionExt, Snafu};
 use tokio::io::AsyncRead;
 
+mod checkpoint;
 mod local;
 pub use local::LocalObjectStore;
 mod s3;
@@ -79,6 +80,25 @@ pub enum ObjectError {
 
     #[snafu(display("reading the object source failed"))]
     Read { source: std::io::Error },
+
+    #[snafu(display("upload checkpoint I/O failed while {action} {path:?}"))]
+    CheckpointIo {
+        action: &'static str,
+        path:   PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("upload checkpoint {path:?} is invalid"))]
+    InvalidCheckpoint {
+        path:   PathBuf,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display("upload checkpoint does not match {field}"))]
+    CheckpointMismatch { field: &'static str },
+
+    #[snafu(display("upload checkpoint {path:?} is already in use"))]
+    CheckpointInUse { path: PathBuf },
 
     #[snafu(display(
         "byte range {start}..{end} is invalid for DataLocation '{uri}' with size {size_bytes}"
