@@ -36,6 +36,7 @@ use datafusion::{
     prelude::{SQLOptions, SessionContext},
 };
 use lake_catalog::LakeCatalog;
+use lake_common::ManagedStageDescriptor;
 use lake_engine::TableEngineRef;
 use lake_meta::MetaStoreRef;
 use snafu::{ResultExt, Snafu};
@@ -126,7 +127,7 @@ impl QueryEngine {
 /// Warms the catalog, then binds a tonic server exposing the Flight SQL
 /// statement path. Runs until the server stops or the process is killed.
 pub async fn serve(engine: Arc<QueryEngine>, addr: &str) -> Result<()> {
-    serve_inner(engine, addr, None).await
+    serve_inner(engine, addr, None, None).await
 }
 
 /// Run the Flight SQL server with stateless FILE-write forwarding.
@@ -138,13 +139,31 @@ pub async fn serve_with_metadata(
     addr: &str,
     metadata_addr: &str,
 ) -> Result<()> {
-    serve_inner(engine, addr, Some(metadata_addr.to_owned())).await
+    serve_inner(engine, addr, Some(metadata_addr.to_owned()), None).await
+}
+
+/// Run the Flight SQL server with FILE-write forwarding and managed-stage
+/// discovery.
+pub async fn serve_with_metadata_and_stage(
+    engine: Arc<QueryEngine>,
+    addr: &str,
+    metadata_addr: &str,
+    managed_stage: ManagedStageDescriptor,
+) -> Result<()> {
+    serve_inner(
+        engine,
+        addr,
+        Some(metadata_addr.to_owned()),
+        Some(managed_stage),
+    )
+    .await
 }
 
 async fn serve_inner(
     engine: Arc<QueryEngine>,
     addr: &str,
     metadata_addr: Option<String>,
+    managed_stage: Option<ManagedStageDescriptor>,
 ) -> Result<()> {
     engine.refresh().await?;
     let refresher = engine.clone();
@@ -165,6 +184,7 @@ async fn serve_inner(
     let service = FlightServiceServer::new(FlightSqlServiceImpl {
         engine,
         metadata_addr,
+        managed_stage,
     });
 
     tracing::info!(%addr, "Flight SQL server ready");
