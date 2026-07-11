@@ -18,6 +18,11 @@
     {
       "type": "toml",
       "path": "Cargo.lock",
+      "jsonpath": "$.package[?(@.name.value == \"lake-flight\")].version"
+    },
+    {
+      "type": "toml",
+      "path": "Cargo.lock",
       "jsonpath": "$.package[?(@.name.value == \"lake-meta\")].version"
     },
     {
@@ -44,6 +49,16 @@
       "type": "toml",
       "path": "Cargo.lock",
       "jsonpath": "$.package[?(@.name.value == \"lake-metasrv\")].version"
+    },
+    {
+      "type": "toml",
+      "path": "Cargo.lock",
+      "jsonpath": "$.package[?(@.name.value == \"lake-objects\")].version"
+    },
+    {
+      "type": "toml",
+      "path": "Cargo.lock",
+      "jsonpath": "$.package[?(@.name.value == \"lake-sdk\")].version"
     },
     {
       "type": "toml",
