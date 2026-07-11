@@ -56,12 +56,61 @@ use lake_objects::data_location_field;
 use prost::Message;
 use prost_types::Any;
 use serde::{Serialize, de::DeserializeOwned};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::{Metasrv, TablePlacement, leadership::Leadership};
+use crate::{AppendLimits, Metasrv, TablePlacement, leadership::Leadership};
 
 /// The [`Status`] message returned by every unsupported Flight method.
 const UNSUPPORTED: &str = "metasrv control plane only serves actions and FILE append do_put";
+
+#[derive(Clone, Debug)]
+pub(crate) struct AppendAdmission {
+    concurrent: Arc<Semaphore>,
+    buffered:   Arc<Semaphore>,
+    limits:     AppendLimits,
+}
+
+#[derive(Debug)]
+struct AppendPermit {
+    _concurrent: OwnedSemaphorePermit,
+    _buffered:   OwnedSemaphorePermit,
+}
+
+impl AppendAdmission {
+    pub(crate) fn new(limits: AppendLimits) -> Self {
+        Self {
+            concurrent: Arc::new(Semaphore::new(limits.max_concurrent())),
+            buffered: Arc::new(Semaphore::new(limits.max_buffered_bytes())),
+            limits,
+        }
+    }
+
+    async fn acquire(&self) -> Result<AppendPermit, Status> {
+        let stream_bytes = u32::try_from(self.limits.max_stream_bytes())
+            .expect("validated append stream bytes fit u32");
+        tokio::time::timeout(self.limits.queue_wait(), async {
+            let concurrent = self
+                .concurrent
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| Status::unavailable("append admission is shutting down"))?;
+            let buffered = self
+                .buffered
+                .clone()
+                .acquire_many_owned(stream_bytes)
+                .await
+                .map_err(|_| Status::unavailable("append admission is shutting down"))?;
+            Ok(AppendPermit {
+                _concurrent: concurrent,
+                _buffered:   buffered,
+            })
+        })
+        .await
+        .map_err(|_| Status::resource_exhausted("append admission limit reached"))?
+    }
+}
 
 const RESOURCE_UNAVAILABLE: &str = "resource is not available";
 
@@ -156,12 +205,6 @@ fn append_request(first: &FlightData) -> Result<FileAppendRequest, Status> {
         .ok_or_else(|| Status::invalid_argument("invalid FILE append descriptor"))
 }
 
-// FILE rows carry object references and scalar metadata, never the multi-GB
-// object itself. Bounding this buffered control payload prevents one append
-// from exhausting the metadata service while still leaving ample headroom for
-// large Arrow batches of references.
-const MAX_APPEND_FLIGHT_STREAM_BYTES: usize = 64 * 1024 * 1024;
-
 async fn append_file_stream<S, E>(
     metasrv: &Metasrv,
     tenant: TenantId,
@@ -171,7 +214,20 @@ where
     S: Stream<Item = std::result::Result<FlightData, E>> + Send + Unpin + 'static,
     E: std::fmt::Display + Send + 'static,
 {
-    append_file_stream_with_limit(metasrv, tenant, input, MAX_APPEND_FLIGHT_STREAM_BYTES).await
+    append_file_stream_with_limits(metasrv, tenant, input, AppendLimits::default()).await
+}
+
+async fn append_file_stream_with_limits<S, E>(
+    metasrv: &Metasrv,
+    tenant: TenantId,
+    input: S,
+    limits: AppendLimits,
+) -> Result<Version, Status>
+where
+    S: Stream<Item = std::result::Result<FlightData, E>> + Send + Unpin + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    append_file_stream_with_limit(metasrv, tenant, input, limits.max_stream_bytes()).await
 }
 
 async fn append_file_stream_with_limit<S, E>(
@@ -273,6 +329,8 @@ pub(crate) struct MetasrvFlightService {
     pub(crate) peer_security:      ClientSecurity,
     /// Trusted policy used to derive every remotely-created table location.
     pub(crate) table_placement:    Option<TablePlacement>,
+    /// Process-local admission shared by direct and forwarded FILE appends.
+    pub(crate) append_admission:   AppendAdmission,
     #[cfg(feature = "test")]
     pub(crate) append_result_gate: Option<Arc<crate::AppendResultGate>>,
 }
@@ -589,6 +647,7 @@ impl FlightService for MetasrvFlightService {
         let principal = principal(&request)?;
         let delegated = delegated_namespace(&request)?;
         let tenant = operation_tenant(&principal, delegated_tenant(&request)?)?;
+        let permit = self.append_admission.acquire().await?;
         let mut input = request.into_inner();
         let first = input
             .next()
@@ -601,13 +660,21 @@ impl FlightService for MetasrvFlightService {
         if !self.leadership.is_leader() {
             match self.leadership.leader() {
                 Some(addr) if addr != self.own_addr => {
-                    return self.forward_put(&addr, namespace, &tenant, input).await;
+                    let response = self.forward_put(&addr, namespace, &tenant, input).await;
+                    drop(permit);
+                    return response;
                 }
                 Some(_) => {}
                 None => return Err(Status::unavailable("no leader elected")),
             }
         }
-        let version = append_file_stream(&self.metasrv, tenant, input).await?;
+        let version = append_file_stream_with_limits(
+            &self.metasrv,
+            tenant,
+            input,
+            self.append_admission.limits,
+        )
+        .await?;
         #[cfg(feature = "test")]
         if let Some(gate) = &self.append_result_gate
             && gate.block_first().await
@@ -621,9 +688,10 @@ impl FlightService for MetasrvFlightService {
                 .map_err(|error| Status::internal(error.to_string()))?
                 .into(),
         };
-        Ok(Response::new(Box::pin(futures::stream::once(async move {
-            Ok(result)
-        }))))
+        let stream: Self::DoPutStream = Box::pin(futures::stream::once(async move { Ok(result) }));
+        let response = Response::new(stream);
+        drop(permit);
+        Ok(response)
     }
 
     async fn do_exchange(
@@ -740,9 +808,9 @@ mod file_append_tests {
     use prost::Message;
     use prost_types::Any;
 
-    use super::{append_file_stream, append_file_stream_with_limit};
+    use super::{AppendAdmission, append_file_stream, append_file_stream_with_limits};
     use crate::{
-        Metasrv,
+        AppendLimits, Metasrv,
         election::{LeaseElection, LeaseStatus},
         leadership::Leadership,
         operation::{AppendRecord, active_key, operation_key},
@@ -914,39 +982,88 @@ mod file_append_tests {
     }
 
     #[tokio::test]
-    async fn oversized_append_metadata_is_rejected_before_commit() {
+    async fn append_admission_rejects_concurrency_saturation_and_releases() {
+        let limits =
+            AppendLimits::try_new(1, Duration::from_millis(20), 64, 128).expect("valid limits");
+        let admission = AppendAdmission::new(limits);
+
+        let first = admission.acquire().await.expect("first append admitted");
+        let saturated = admission
+            .acquire()
+            .await
+            .expect_err("second append must exceed concurrency");
+        assert_eq!(saturated.code(), tonic::Code::ResourceExhausted);
+
+        drop(first);
+        assert!(admission.acquire().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn append_admission_reserves_worst_case_buffer_budget() {
+        let limits =
+            AppendLimits::try_new(2, Duration::from_millis(20), 64, 64).expect("valid limits");
+        let admission = AppendAdmission::new(limits);
+
+        let first = admission.acquire().await.expect("first append admitted");
+        let saturated = admission
+            .acquire()
+            .await
+            .expect_err("second append must exceed buffered-byte budget");
+        assert_eq!(saturated.code(), tonic::Code::ResourceExhausted);
+
+        drop(first);
+        assert!(admission.acquire().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn configured_append_stream_limit_rejects_before_commit() {
         let root = tempfile::tempdir().unwrap();
         let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
         let metasrv = Metasrv::new(meta, engine);
+        let table = TableRef::new("robots", "episodes");
         let schema = Arc::new(Schema::new(vec![Field::new(
             "episode_id",
             DataType::Utf8,
             false,
         )]));
+        metasrv
+            .create_table(
+                &table,
+                TableLocation::new(root.path().join("episodes.lance").to_string_lossy()),
+                schema.clone(),
+            )
+            .await
+            .unwrap();
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(StringArray::from(vec!["episode-42"]))],
         )
         .unwrap();
-        let (_append, messages) = encoded_append(
-            TableRef::new("robots", "episodes"),
-            schema,
-            batch,
-            AppendOperationId::generate(),
-        )
-        .await;
+        let (_append, messages) =
+            encoded_append(table.clone(), schema, batch, AppendOperationId::generate()).await;
 
-        let error = append_file_stream_with_limit(
+        let limits =
+            AppendLimits::try_new(1, Duration::from_millis(20), 1, 1).expect("valid limits");
+        let error = append_file_stream_with_limits(
             &metasrv,
             TenantId::try_new("tenant-a").unwrap(),
             futures::stream::iter(messages.into_iter().map(Ok::<_, String>)),
-            1,
+            limits,
         )
         .await
         .expect_err("metadata larger than the configured limit must fail");
 
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(1)
+        );
     }
 
     #[tokio::test]
@@ -1809,8 +1926,8 @@ mod table_placement_tests {
     use serde_json::json;
     use tonic::Code;
 
-    use super::MetasrvFlightService;
-    use crate::{Metasrv, TablePlacement, leadership::Leadership};
+    use super::{AppendAdmission, MetasrvFlightService};
+    use crate::{AppendLimits, Metasrv, TablePlacement, leadership::Leadership};
 
     fn service(root: &tempfile::TempDir) -> MetasrvFlightService {
         let meta: MetaStoreRef =
@@ -1824,6 +1941,7 @@ mod table_placement_tests {
             own_addr: "127.0.0.1:50052".to_owned(),
             peer_security: ClientSecurity::new(),
             table_placement: Some(TablePlacement::local(root.path().join("tables"))),
+            append_admission: AppendAdmission::new(AppendLimits::default()),
             #[cfg(feature = "test")]
             append_result_gate: None,
         }

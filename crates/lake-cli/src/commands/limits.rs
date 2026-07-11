@@ -17,7 +17,7 @@
 use std::{path::PathBuf, str::FromStr, time::Duration};
 
 use anyhow::Context as _;
-use lake_metasrv::DEFAULT_APPEND_OPERATION_RETENTION;
+use lake_metasrv::{AppendLimits, DEFAULT_APPEND_OPERATION_RETENTION};
 use lake_query::{DiscoveryLimits, QueryLimits, QueryResources};
 
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
@@ -28,6 +28,56 @@ pub(crate) fn operation_policy_from_env() -> anyhow::Result<(Duration, usize)> {
     let retention = env_value("LAKE_APPEND_OPERATION_RETENTION_SECS")?;
     let page_size = env_value("LAKE_APPEND_OPERATION_GC_PAGE_SIZE")?;
     operation_policy_from_values(retention.as_deref(), page_size.as_deref())
+}
+
+pub(crate) fn append_limits_from_env() -> anyhow::Result<AppendLimits> {
+    let max_concurrent = env_value("LAKE_APPEND_MAX_CONCURRENT")?;
+    let queue_ms = env_value("LAKE_APPEND_QUEUE_TIMEOUT_MS")?;
+    let max_stream_bytes = env_value("LAKE_APPEND_MAX_STREAM_BYTES")?;
+    let max_buffered_bytes = env_value("LAKE_APPEND_MAX_BUFFERED_BYTES")?;
+    append_limits_from_values(
+        max_concurrent.as_deref(),
+        queue_ms.as_deref(),
+        max_stream_bytes.as_deref(),
+        max_buffered_bytes.as_deref(),
+    )
+}
+
+fn append_limits_from_values(
+    max_concurrent: Option<&str>,
+    queue_ms: Option<&str>,
+    max_stream_bytes: Option<&str>,
+    max_buffered_bytes: Option<&str>,
+) -> anyhow::Result<AppendLimits> {
+    let defaults = AppendLimits::default();
+    let max_concurrent = parse_or(
+        "LAKE_APPEND_MAX_CONCURRENT",
+        max_concurrent,
+        defaults.max_concurrent(),
+    )?;
+    let queue_ms = parse_or(
+        "LAKE_APPEND_QUEUE_TIMEOUT_MS",
+        queue_ms,
+        u64::try_from(defaults.queue_wait().as_millis())
+            .expect("default append queue duration fits u64"),
+    )?;
+    let max_stream_bytes = parse_or(
+        "LAKE_APPEND_MAX_STREAM_BYTES",
+        max_stream_bytes,
+        defaults.max_stream_bytes(),
+    )?;
+    let max_buffered_bytes = parse_or(
+        "LAKE_APPEND_MAX_BUFFERED_BYTES",
+        max_buffered_bytes,
+        defaults.max_buffered_bytes(),
+    )?;
+    AppendLimits::try_new(
+        max_concurrent,
+        Duration::from_millis(queue_ms),
+        max_stream_bytes,
+        max_buffered_bytes,
+    )
+    .context("invalid Metasrv append admission limits")
 }
 
 fn operation_policy_from_values(
@@ -206,8 +256,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        discovery_limits_from_values, operation_policy_from_values, query_limits_from_values,
-        query_resources_from_values, shutdown_grace_from_value,
+        append_limits_from_values, discovery_limits_from_values, operation_policy_from_values,
+        query_limits_from_values, query_resources_from_values, shutdown_grace_from_value,
     };
 
     #[test]
@@ -219,6 +269,25 @@ mod tests {
         assert!(operation_policy_from_values(Some("0"), None).is_err());
         assert!(operation_policy_from_values(None, Some("0")).is_err());
         assert!(operation_policy_from_values(Some("forever"), None).is_err());
+    }
+
+    #[test]
+    fn append_limit_values_are_validated_before_serving() {
+        assert!(append_limits_from_values(Some("0"), None, None, None).is_err());
+        assert!(append_limits_from_values(Some("many"), None, None, None).is_err());
+        assert!(append_limits_from_values(None, Some("0"), None, None).is_err());
+        assert!(append_limits_from_values(None, None, Some("0"), None).is_err());
+        assert!(append_limits_from_values(None, None, Some("65"), Some("64")).is_err());
+        let semaphore_overflow = (u64::from(u32::MAX) + 1).to_string();
+        assert!(append_limits_from_values(None, None, Some(&semaphore_overflow), None).is_err());
+
+        let limits =
+            append_limits_from_values(Some("3"), Some("250"), Some("1048576"), Some("4194304"))
+                .expect("valid append limits");
+        assert_eq!(limits.max_concurrent(), 3);
+        assert_eq!(limits.queue_wait(), Duration::from_millis(250));
+        assert_eq!(limits.max_stream_bytes(), 1024 * 1024);
+        assert_eq!(limits.max_buffered_bytes(), 4 * 1024 * 1024);
     }
 
     #[test]

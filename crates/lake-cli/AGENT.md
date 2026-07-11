@@ -54,6 +54,10 @@ All values are positive integers parsed once before serving.
 
 - `LAKE_APPEND_OPERATION_RETENTION_SECS` (default 604800)
 - `LAKE_APPEND_OPERATION_GC_PAGE_SIZE` (default 128, maximum 10000)
+- `LAKE_APPEND_MAX_CONCURRENT` (default 8)
+- `LAKE_APPEND_QUEUE_TIMEOUT_MS` (default 100)
+- `LAKE_APPEND_MAX_STREAM_BYTES` (default 67108864)
+- `LAKE_APPEND_MAX_BUFFERED_BYTES` (default 268435456)
 
 ## Layout
 

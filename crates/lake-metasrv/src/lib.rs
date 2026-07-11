@@ -57,7 +57,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 
 use crate::{
-    control::MetasrvFlightService,
+    control::{AppendAdmission, MetasrvFlightService},
     election::LeaseElection,
     fenced_meta::FencedMetaStore,
     leadership::{Leadership, run_campaign_loop_until},
@@ -123,6 +123,9 @@ pub enum MetasrvError {
         source: lake_flight::FlightSecurityError,
     },
 
+    #[snafu(display("invalid append admission limits: {message}"))]
+    InvalidAppendLimits { message: String },
+
     #[snafu(display("Metasrv Flight connections did not drain within {grace:?}"))]
     DrainTimeout { grace: Duration },
 
@@ -134,6 +137,91 @@ pub enum MetasrvError {
 }
 
 pub type Result<T> = std::result::Result<T, MetasrvError>;
+
+/// Per-process admission and control-payload bounds for FILE appends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AppendLimits {
+    max_concurrent:     usize,
+    queue_wait:         Duration,
+    max_stream_bytes:   usize,
+    max_buffered_bytes: usize,
+}
+
+impl AppendLimits {
+    /// Validate finite append concurrency and memory bounds.
+    pub fn try_new(
+        max_concurrent: usize,
+        queue_wait: Duration,
+        max_stream_bytes: usize,
+        max_buffered_bytes: usize,
+    ) -> Result<Self> {
+        for (valid, message) in [
+            (
+                (1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&max_concurrent),
+                "max_concurrent must fit the Tokio semaphore and be greater than zero",
+            ),
+            (
+                !queue_wait.is_zero(),
+                "queue_wait must be greater than zero",
+            ),
+            (
+                max_stream_bytes > 0,
+                "max_stream_bytes must be greater than zero",
+            ),
+            (
+                max_buffered_bytes >= max_stream_bytes,
+                "max_buffered_bytes must be at least max_stream_bytes",
+            ),
+            (
+                u32::try_from(max_stream_bytes).is_ok(),
+                "max_stream_bytes must fit a weighted semaphore permit",
+            ),
+            (
+                u32::try_from(max_buffered_bytes).is_ok(),
+                "max_buffered_bytes must fit a weighted semaphore permit",
+            ),
+        ] {
+            if !valid {
+                return Err(MetasrvError::InvalidAppendLimits {
+                    message: message.to_owned(),
+                });
+            }
+        }
+        Ok(Self {
+            max_concurrent,
+            queue_wait,
+            max_stream_bytes,
+            max_buffered_bytes,
+        })
+    }
+
+    /// Maximum append requests occupying one Metasrv process.
+    #[must_use]
+    pub const fn max_concurrent(&self) -> usize { self.max_concurrent }
+
+    /// Maximum time an append waits for process-local admission.
+    #[must_use]
+    pub const fn queue_wait(&self) -> Duration { self.queue_wait }
+
+    /// Maximum encoded Flight control bytes accepted from one append.
+    #[must_use]
+    pub const fn max_stream_bytes(&self) -> usize { self.max_stream_bytes }
+
+    /// Maximum worst-case Flight control bytes reserved across appends.
+    #[must_use]
+    pub const fn max_buffered_bytes(&self) -> usize { self.max_buffered_bytes }
+}
+
+impl Default for AppendLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent:     8,
+            queue_wait:         Duration::from_millis(100),
+            max_stream_bytes:   64 * 1024 * 1024,
+            max_buffered_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
 
 /// Deterministic post-commit response gate for cross-crate crash tests.
 #[cfg(feature = "test")]
@@ -190,6 +278,7 @@ pub struct MetasrvServerConfig {
     peer_security:      ClientSecurity,
     table_placement:    Option<TablePlacement>,
     allow_insecure:     bool,
+    append_limits:      AppendLimits,
     shutdown_grace:     Duration,
     #[cfg(feature = "test")]
     append_result_gate: Option<Arc<AppendResultGate>>,
@@ -204,6 +293,7 @@ impl MetasrvServerConfig {
             peer_security: ClientSecurity::new(),
             table_placement: None,
             allow_insecure: false,
+            append_limits: AppendLimits::default(),
             shutdown_grace: Duration::from_secs(30),
             #[cfg(feature = "test")]
             append_result_gate: None,
@@ -236,6 +326,13 @@ impl MetasrvServerConfig {
     #[must_use]
     pub const fn allow_insecure(mut self, allow: bool) -> Self {
         self.allow_insecure = allow;
+        self
+    }
+
+    /// Apply process-local append admission and control-payload bounds.
+    #[must_use]
+    pub const fn with_append_limits(mut self, limits: AppendLimits) -> Self {
+        self.append_limits = limits;
         self
     }
 
@@ -809,6 +906,7 @@ where
         own_addr: addr.to_string(),
         peer_security: config.peer_security,
         table_placement: config.table_placement,
+        append_admission: AppendAdmission::new(config.append_limits),
         #[cfg(feature = "test")]
         append_result_gate: config.append_result_gate,
     };

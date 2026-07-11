@@ -21,7 +21,9 @@ write path — create tables, resolve/list, and the append commit protocol.
   `TableEngine`, so the storage engine stays swappable.
 - FILE `DoPut` contains Arrow `DataLocation` rows only. Followers forward the
   authenticated tenant scope and stream to the observed leader; metasrv never
-  accepts the object payload. Buffered control streams are bounded.
+  accepts the object payload. Every process reserves one concurrency slot and
+  one worst-case control-buffer budget before polling a stream; the permit
+  covers forwarding or local commit through response construction.
 - Remote DDL never accepts a dataset URI. `TablePlacement` derives a unique
   generation-qualified location from trusted server configuration after
   validating both identifier path segments.
