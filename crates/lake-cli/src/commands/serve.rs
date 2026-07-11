@@ -30,6 +30,7 @@ use super::{
         server_security_from_env,
     },
 };
+use crate::metrics;
 
 pub async fn query(ctx: &Context, addr: &str, metadata_addr: &str) -> anyhow::Result<()> {
     query_with_shutdown(ctx, addr, metadata_addr, shutdown_signal()).await
@@ -57,8 +58,17 @@ where
         .with_discovery_limits(discovery_limits_from_env()?)
         .with_shutdown_grace(shutdown_grace_from_env()?)
         .allow_insecure(allow_insecure_from_env()?);
-    lake_query::serve_with_config_and_shutdown(engine, addr, config, shutdown).await?;
-    Ok(())
+    metrics::run_with_metrics("query", shutdown, |cancellation| async move {
+        lake_query::serve_with_config_and_shutdown(
+            engine,
+            addr,
+            config,
+            cancellation.cancelled_owned(),
+        )
+        .await?;
+        Ok(())
+    })
+    .await
 }
 
 pub async fn meta(ctx: &Context, addr: &str) -> anyhow::Result<()> {
@@ -77,9 +87,17 @@ where
         .with_maintenance_limits(maintenance_limits_from_env()?)
         .with_shutdown_grace(shutdown_grace_from_env()?)
         .allow_insecure(allow_insecure_from_env()?);
-    lake_metasrv::serve_with_config_and_shutdown(ctx.metasrv.clone(), addr, config, shutdown)
+    metrics::run_with_metrics("metasrv", shutdown, |cancellation| async move {
+        lake_metasrv::serve_with_config_and_shutdown(
+            ctx.metasrv.clone(),
+            addr,
+            config,
+            cancellation.cancelled_owned(),
+        )
         .await?;
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 async fn shutdown_signal() {

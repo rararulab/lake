@@ -59,7 +59,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::{AppendLimits, Metasrv, TablePlacement, leadership::Leadership};
+use crate::{AppendLimits, Metasrv, TablePlacement, leadership::Leadership, telemetry};
 
 /// The [`Status`] message returned by every unsupported Flight method.
 const UNSUPPORTED: &str = "metasrv control plane only serves actions and FILE append do_put";
@@ -72,9 +72,14 @@ pub(crate) struct AppendAdmission {
 }
 
 #[derive(Debug)]
-struct AppendPermit {
+pub(crate) struct AppendPermit {
     _concurrent: OwnedSemaphorePermit,
     _buffered:   OwnedSemaphorePermit,
+    bytes:       usize,
+}
+
+impl Drop for AppendPermit {
+    fn drop(&mut self) { telemetry::append_released(self.bytes); }
 }
 
 impl AppendAdmission {
@@ -86,10 +91,10 @@ impl AppendAdmission {
         }
     }
 
-    async fn acquire(&self) -> Result<AppendPermit, Status> {
+    pub(crate) async fn acquire(&self) -> Result<AppendPermit, Status> {
         let stream_bytes = u32::try_from(self.limits.max_stream_bytes())
             .expect("validated append stream bytes fit u32");
-        tokio::time::timeout(self.limits.queue_wait(), async {
+        let permit = tokio::time::timeout(self.limits.queue_wait(), async {
             let concurrent = self
                 .concurrent
                 .clone()
@@ -105,10 +110,25 @@ impl AppendAdmission {
             Ok(AppendPermit {
                 _concurrent: concurrent,
                 _buffered:   buffered,
+                bytes:       self.limits.max_stream_bytes(),
             })
         })
         .await
-        .map_err(|_| Status::resource_exhausted("append admission limit reached"))?
+        .map_err(|_| {
+            telemetry::append_admission("saturated");
+            Status::resource_exhausted("append admission limit reached")
+        })?;
+        match permit {
+            Ok(permit) => {
+                telemetry::append_admission("admitted");
+                telemetry::append_acquired(self.limits.max_stream_bytes());
+                Ok(permit)
+            }
+            Err(status) => {
+                telemetry::append_admission("shutting_down");
+                Err(status)
+            }
+        }
     }
 }
 

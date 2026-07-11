@@ -479,8 +479,12 @@ design-level ones:
   authenticated standard gRPC Health on their existing TLS port: the empty
   service is process liveness, while Flight readiness follows Query catalog
   warmup or Metasrv's usable local-lease/remote-leader route. Graceful shutdown
-  withdraws both before connection drain. Metrics, scheduler manifests, and
-  distributed tracing remain production observability work.
+  withdraws both before connection drain. An opt-in, loopback-only Prometheus
+  endpoint exposes bounded Query saturation/catalog signals and Metasrv
+  append/leadership/maintenance signals. Its listener and upkeep work are
+  owned by the server lifecycle, and labels never contain workload or object
+  identities. Scheduler manifests and distributed tracing remain production
+  work.
 
 ## Phasing
 
@@ -493,8 +497,8 @@ design-level ones:
 - **v2 (metadata HA + ops)** — lease-election, follower forwarding,
   leadership-gated writes, per-table serialization, and leader-only
   maintenance are wired. Structured process logging and authenticated gRPC
-  health readiness are wired. Remaining:
-  durable operation state, metrics/distributed tracing, and
+  health readiness and bounded Prometheus metrics are wired. Remaining:
+  durable operation state, distributed tracing, and
   client-side SDK caching. A self-built engine slots in behind `TableEngine`
   if/when Lance's ceiling is hit.
 

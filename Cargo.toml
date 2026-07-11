@@ -39,6 +39,7 @@ anyhow = "^1.0"
 arrow = "^58.0"
 arrow-flight = { version = "^58.0", features = ["flight-sql-experimental"] }
 async-trait = "^0.1"
+axum = { version = "^0.8", default-features = false, features = ["http1", "tokio"] }
 aws-config = "^1.5"
 aws-sdk-dynamodb = "^1.60"
 bon = "^3.9"
@@ -48,6 +49,8 @@ futures = "^0.3"
 lance = "^8.0"
 lance-table = "^8.0"
 moka = { version = "^0.12", features = ["future"] }
+metrics = "^0.24"
+metrics-exporter-prometheus = { version = "^0.18", default-features = false }
 object_store = "^0.13"
 prost = "^0.14"
 prost-types = "^0.14"

@@ -81,6 +81,40 @@ streaming transitions. During graceful shutdown both service names publish
 `NOT_SERVING` before Tonic begins connection drain, so a watcher can remove the
 node before the process exits.
 
+## Prometheus metrics
+
+Set `LAKE_METRICS_ADDR` on `lake query` or `lake meta` to enable the
+Prometheus text endpoint at `GET /metrics`:
+
+```bash
+LAKE_METRICS_ADDR=127.0.0.1:9090 lake query \
+  --addr 127.0.0.1:50051 \
+  --metadata-addr http://127.0.0.1:50052
+```
+
+The value must be an IP loopback socket. Hostnames, wildcard addresses, and
+non-loopback IPs fail startup before the Flight listener binds. In a production
+pod, use a localhost Prometheus sidecar or node agent to scrape and forward the
+endpoint; Lake does not create an anonymous network-wide telemetry surface.
+Only `GET /metrics` succeeds; HEAD, other methods, and other paths are rejected.
+
+Core series are:
+
+- `lake_process_info` with fixed `service` and build `version` labels.
+- `lake_query_admission_total`, `lake_query_inflight_requests`,
+  `lake_query_rejections_total`, `lake_query_catalog_refresh_total`, and
+  `lake_query_ready`.
+- `lake_metasrv_append_admission_total`, `lake_metasrv_inflight_appends`,
+  `lake_metasrv_reserved_append_bytes`, `lake_metasrv_campaign_total`,
+  `lake_metasrv_write_ready`, `lake_metasrv_maintenance_pages_total`, and
+  `lake_metasrv_maintenance_items_total`.
+
+Labels are finite state-machine values such as `success`, `error`, `leader`,
+or `saturated`. SQL, tenant, namespace, table, operation ID, URI, and credential
+values are never metric labels. The listener and exporter upkeep future share
+the server future directly: normal shutdown joins it, while dropping the outer
+server future drops the listener without leaving detached work.
+
 ## Process logging
 
 The binary installs its tracing subscriber before command parsing, storage
