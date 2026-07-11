@@ -14,14 +14,16 @@
 
 //! Managed large-object values and their Arrow representation.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, pin::Pin, sync::Arc};
 
+use async_trait::async_trait;
 use datafusion::arrow::{
     array::{Array, ArrayRef, StringArray, StructArray, UInt64Array},
     datatypes::{DataType, Field, Fields},
 };
 use lake_common::DataLocation;
 use snafu::{OptionExt, Snafu};
+use tokio::io::AsyncRead;
 
 mod local;
 pub use local::LocalObjectStore;
@@ -58,6 +60,20 @@ pub enum ObjectError {
 
 /// The result type for managed-object operations.
 pub type Result<T> = std::result::Result<T, ObjectError>;
+
+/// A bounded-memory direct object stream returned by a managed stage.
+pub type ObjectReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
+
+/// Storage boundary used by the SDK for direct managed-object I/O.
+#[async_trait]
+pub trait ManagedObjectStore: Send + Sync {
+    /// Upload one stream and return its stable immutable identity.
+    async fn put_reader(&self, input: ObjectReader, content_type: String) -> Result<DataLocation>;
+
+    /// Open a direct reader after validating the location belongs to this
+    /// managed stage.
+    async fn open_reader(&self, location: &DataLocation) -> Result<ObjectReader>;
+}
 
 /// Arrow field encoding a logical SQL `FILE` table column as `DataLocation`.
 #[must_use]

@@ -34,7 +34,8 @@ use arrow_flight::{
 use futures::TryStreamExt;
 use lake_common::{DataLocation, FILE_APPEND_TYPE_URL, FileAppendRequest, TableRef, Version};
 use lake_objects::{
-    LocalObjectStore, data_location_array, data_location_field, data_location_from_array,
+    ManagedObjectStore, ObjectReader, data_location_array, data_location_field,
+    data_location_from_array,
 };
 use prost::Message;
 use prost_types::Any;
@@ -98,6 +99,12 @@ pub enum SdkError {
 
     #[snafu(display("managed object operation failed"))]
     Object { source: lake_objects::ObjectError },
+
+    #[snafu(display("could not open FILE upload source {path:?}"))]
+    SourceFile {
+        path:   PathBuf,
+        source: std::io::Error,
+    },
 
     #[snafu(display("could not build INSERT record batch"))]
     Arrow { source: ArrowError },
@@ -170,15 +177,15 @@ pub enum InsertValue {
 #[derive(Clone)]
 pub struct LakeClient {
     query:   Channel,
-    objects: LocalObjectStore,
+    objects: Arc<dyn ManagedObjectStore>,
 }
 
 impl LakeClient {
     /// Connect to Lake through its query endpoint.
-    pub async fn connect(
-        query_endpoint: impl AsRef<str>,
-        objects: LocalObjectStore,
-    ) -> Result<Self> {
+    pub async fn connect<S>(query_endpoint: impl AsRef<str>, objects: S) -> Result<Self>
+    where
+        S: ManagedObjectStore + 'static,
+    {
         let query = Channel::from_shared(query_endpoint.as_ref().to_owned())
             .map_err(|error| SdkError::InvalidEndpoint {
                 message: error.to_string(),
@@ -186,7 +193,10 @@ impl LakeClient {
             .connect()
             .await
             .context(ConnectSnafu)?;
-        Ok(Self { query, objects })
+        Ok(Self {
+            query,
+            objects: Arc::new(objects),
+        })
     }
 
     /// Execute a parameterized, single-row INSERT with typed scalar/`FILE`
@@ -259,7 +269,7 @@ impl LakeClient {
     }
 
     /// Open a direct local reader for an immutable `DataLocation`.
-    pub async fn open(&self, location: &DataLocation) -> Result<File> {
+    pub async fn open(&self, location: &DataLocation) -> Result<ObjectReader> {
         self.objects
             .open_reader(location)
             .await
@@ -288,15 +298,19 @@ impl LakeClient {
             (data_type, InsertValue::File(file))
                 if data_type == data_location_field("ignored", false).data_type() =>
             {
-                let location = match file.source {
-                    ObjectSource::Path(path) => {
-                        self.objects.put_file(path, file.content_type).await
-                    }
-                    ObjectSource::Reader(reader) => {
-                        self.objects.put_reader(reader, file.content_type).await
-                    }
-                }
-                .context(ObjectSnafu)?;
+                let reader = match file.source {
+                    ObjectSource::Path(path) => Box::pin(
+                        File::open(&path)
+                            .await
+                            .map_err(|source| SdkError::SourceFile { path, source })?,
+                    ) as ObjectReader,
+                    ObjectSource::Reader(reader) => Box::into_pin(reader),
+                };
+                let location = self
+                    .objects
+                    .put_reader(reader, file.content_type)
+                    .await
+                    .context(ObjectSnafu)?;
                 Ok(Arc::new(data_location_array(&[location])))
             }
             (..) => Err(SdkError::TypeMismatch {
@@ -458,7 +472,10 @@ mod tests {
     use lake_engine_lance::LanceEngine;
     use lake_meta::{MetaStoreRef, RocksMeta};
     use lake_metasrv::Metasrv;
-    use lake_objects::{LocalObjectStore, data_location_field, data_location_from_array};
+    use lake_objects::{
+        LocalObjectStore, ManagedObjectStore, ObjectReader, Result as ObjectResult,
+        data_location_field, data_location_from_array,
+    };
     use lake_query::QueryEngine;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
@@ -556,6 +573,37 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert!(results.try_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn client_accepts_managed_object_store_abstraction() {
+        let root = tempdir().unwrap();
+        let (client, _metasrv, _table, _meta, _engine) = setup_client(root.path()).await;
+        let source = root.path().join("model.bin");
+        let expected = b"managed store abstraction";
+        tokio::fs::write(&source, expected).await.unwrap();
+
+        client
+            .insert(
+                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    InsertValue::Utf8("episode-store".to_owned()),
+                    InsertValue::File(FileUpload::from_path(&source, "application/octet-stream")),
+                ],
+            )
+            .await
+            .unwrap();
+        let mut results = client
+            .query("SELECT video FROM lake.robots.episodes")
+            .await
+            .unwrap();
+        let batch = results.try_next().await.unwrap().unwrap();
+        let location = crate::data_location(&batch, "video", 0).unwrap();
+        let mut reader = client.open(&location).await.unwrap();
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).await.unwrap();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -683,11 +731,31 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let client = LakeClient::connect(
             format!("http://{query_addr}"),
-            LocalObjectStore::open(root.join("objects")).await.unwrap(),
+            DelegatingStore(LocalObjectStore::open(root.join("objects")).await.unwrap()),
         )
         .await
         .unwrap();
         (client, metasrv, table, meta, engine)
+    }
+
+    struct DelegatingStore(LocalObjectStore);
+
+    #[async_trait::async_trait]
+    impl ManagedObjectStore for DelegatingStore {
+        async fn put_reader(
+            &self,
+            input: ObjectReader,
+            content_type: String,
+        ) -> ObjectResult<lake_common::DataLocation> {
+            self.0.put_reader(input, content_type).await
+        }
+
+        async fn open_reader(
+            &self,
+            location: &lake_common::DataLocation,
+        ) -> ObjectResult<ObjectReader> {
+            Ok(Box::pin(self.0.open_reader(location).await?))
+        }
     }
 
     struct FailingReader {

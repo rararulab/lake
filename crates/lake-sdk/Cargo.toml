@@ -21,6 +21,7 @@ tokio.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 lake-engine.workspace = true
 lake-engine-lance.workspace = true
 lake-meta.workspace = true
