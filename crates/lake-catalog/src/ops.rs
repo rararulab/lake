@@ -15,7 +15,8 @@
 //! Catalog write operations (create table). Read paths live on the
 //! DataFusion providers; writes are explicit calls the metadata layer makes.
 
-use datafusion::arrow::datatypes::SchemaRef;
+use arrow_flight::{IpcMessage, IpcWriteOptions, SchemaAsIpc};
+use datafusion::arrow::{datatypes::SchemaRef, error::ArrowError};
 use lake_common::{TableLocation, TableRef};
 use lake_engine::TableEngineRef;
 use lake_meta::{MetaStoreRef, registry, registry::TableRegistration};
@@ -30,6 +31,9 @@ pub enum CatalogError {
 
     #[snafu(display("engine error"))]
     Engine { source: lake_engine::EngineError },
+
+    #[snafu(display("table schema IPC encoding failed"))]
+    Schema { source: ArrowError },
 }
 
 /// Create a table: create the empty dataset via the engine, then register it
@@ -45,15 +49,19 @@ pub async fn create_table(
 ) -> Result<(), CatalogError> {
     use snafu::ResultExt;
 
+    let IpcMessage(schema_ipc) = SchemaAsIpc::new(&schema, &IpcWriteOptions::default())
+        .try_into()
+        .context(SchemaSnafu)?;
     let handle = engine
         .create(&location, schema)
         .await
         .context(EngineSnafu)?;
-    let reg = TableRegistration {
+    let reg = TableRegistration::new(
         location,
-        engine: engine.kind().to_string(),
-        current_version: handle.current_version(),
-    };
+        engine.kind(),
+        handle.current_version(),
+        schema_ipc.to_vec(),
+    );
     registry::register(meta.as_ref(), table, &reg)
         .await
         .context(MetaSnafu)?;

@@ -9,6 +9,7 @@ publish.workspace = true
 description = "db→table registry and DataFusion catalog over the storage engine"
 
 [dependencies]
+arrow-flight.workspace = true
 async-trait = { workspace = true }
 datafusion = { workspace = true }
 lake-common = { workspace = true }

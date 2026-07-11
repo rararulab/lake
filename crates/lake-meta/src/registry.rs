@@ -37,6 +37,29 @@ pub struct TableRegistration {
     /// routes to the right engine.
     pub engine:          String,
     pub current_version: Version,
+    /// Arrow IPC schema bytes owned and interpreted by the catalog layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    schema_ipc:          Option<Vec<u8>>,
+}
+
+impl TableRegistration {
+    #[must_use]
+    pub fn new(
+        location: TableLocation,
+        engine: impl Into<String>,
+        current_version: Version,
+        schema_ipc: Vec<u8>,
+    ) -> Self {
+        Self {
+            location,
+            engine: engine.into(),
+            current_version,
+            schema_ipc: Some(schema_ipc),
+        }
+    }
+
+    #[must_use]
+    pub fn schema_ipc(&self) -> Option<&[u8]> { self.schema_ipc.as_deref() }
 }
 
 fn key(table: &TableRef) -> String { format!("tbl/{}/{}", table.namespace.0, table.name.0) }
@@ -122,10 +145,8 @@ pub async fn set_version(
 ) -> Result<()> {
     let k = key(table);
     let expected_bytes = serde_json::to_vec(expected).context(CorruptEntrySnafu { key: &k })?;
-    let updated = TableRegistration {
-        current_version: new_version,
-        ..expected.clone()
-    };
+    let mut updated = expected.clone();
+    updated.current_version = new_version;
     let new_bytes = serde_json::to_vec(&updated).context(CorruptEntrySnafu { key: &k })?;
     let swapped = meta.cas(&k, Some(&expected_bytes), &new_bytes).await?;
     ensure!(
@@ -143,11 +164,26 @@ mod tests {
     use crate::rocks::RocksMeta;
 
     fn reg(v: u64) -> TableRegistration {
-        TableRegistration {
-            location:        TableLocation::new("mem://t"),
-            engine:          "lance".to_string(),
-            current_version: Version(v),
-        }
+        TableRegistration::new(
+            TableLocation::new("mem://t"),
+            "lance",
+            Version(v),
+            vec![1, 2, 3],
+        )
+    }
+
+    #[test]
+    fn registration_schema_payload_is_backward_compatible() {
+        let legacy: TableRegistration = serde_json::from_str(
+            r#"{"location":"mem://legacy","engine":"lance","current_version":1}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.schema_ipc(), None);
+
+        let current = reg(7);
+        let wire = serde_json::to_vec(&current).unwrap();
+        let decoded: TableRegistration = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(decoded.schema_ipc(), Some(&[1, 2, 3][..]));
     }
 
     #[tokio::test]

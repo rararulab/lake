@@ -4118,6 +4118,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 name = "lake-catalog"
 version = "0.0.1"
 dependencies = [
+ "arrow-flight",
  "async-trait",
  "datafusion",
  "lake-common",
