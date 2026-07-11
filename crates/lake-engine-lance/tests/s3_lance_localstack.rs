@@ -55,11 +55,15 @@ use datafusion::{
 };
 use lake_common::{
     AppendOperation, AppendOperationId, AppendPayloadDigest, ObjectReferenceDelta, TableLocation,
-    TenantId,
+    TenantId, Version,
 };
 use lake_engine::TableEngine;
-use lake_engine_lance::LanceEngine;
+use lake_engine_lance::{LanceEngine, MetaManifestStore};
 use lake_meta::{DynamoMeta, MetaStoreRef};
+use lance::dataset::builder::DatasetBuilder;
+use lance_table::io::commit::external_manifest::{
+    ExternalManifestCommitHandler, ExternalManifestStore,
+};
 
 /// A unique suffix so parallel/repeat runs never collide on bucket, table, or
 /// dataset paths.
@@ -351,4 +355,151 @@ async fn lance_engine_on_s3_with_dynamo_external_manifest() {
         1,
         "a recreated dataset starts a fresh version history"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires localstack S3 + DynamoDB; set LAKE_DYNAMODB_ENDPOINT and run with --ignored"]
+async fn external_manifest_cleanup_localstack() {
+    let Ok(endpoint) = std::env::var("LAKE_DYNAMODB_ENDPOINT") else {
+        return;
+    };
+    let suffix = unique_suffix();
+    let bucket = format!("lake-lance-cleanup-{suffix}");
+    let s3_conf = aws_sdk_s3::config::Builder::new()
+        .behavior_version(BehaviorVersion::latest())
+        .endpoint_url(&endpoint)
+        .region(Region::new("us-east-1"))
+        .credentials_provider(Credentials::new(
+            cred("AWS_ACCESS_KEY_ID"),
+            cred("AWS_SECRET_ACCESS_KEY"),
+            None,
+            None,
+            "localstack",
+        ))
+        .force_path_style(true)
+        .build();
+    let s3 = aws_sdk_s3::Client::from_conf(s3_conf);
+    s3.create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("create cleanup bucket");
+
+    let table = format!("lake_lance_cleanup_{suffix}");
+    let dynamo = DynamoMeta::connect(Some(&endpoint), &table)
+        .await
+        .expect("connect cleanup metastore");
+    dynamo.ensure_table().await.expect("create cleanup table");
+    let meta: MetaStoreRef = Arc::new(dynamo);
+    let engine = LanceEngine::for_object_store(meta.clone(), s3_storage_options(&endpoint));
+    let location = TableLocation::new(format!("s3://{bucket}/ns/cleanup"));
+    let schema = Arc::new(Schema::new(vec![Field::new("ep", DataType::Int64, false)]));
+    let handle = engine
+        .create(&location, schema.clone())
+        .await
+        .expect("create cleanup dataset");
+    let mut version = handle.current_version();
+    for value in 0_i64..12 {
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![value]))],
+        )
+        .expect("cleanup append batch");
+        version = handle
+            .append(&append_operation(), one_batch_stream(schema.clone(), batch))
+            .await
+            .expect("append cleanup version");
+    }
+    let before_keys = meta
+        .list_prefix("lance-manifest/")
+        .await
+        .expect("history before cleanup");
+    let mut before_paths = HashMap::new();
+    for key in &before_keys {
+        let bytes = meta
+            .get(&format!("lance-manifest/{key}"))
+            .await
+            .expect("read history record")
+            .expect("history record exists");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("history JSON");
+        before_paths.insert(
+            key.clone(),
+            value["path"].as_str().expect("manifest path").to_owned(),
+        );
+    }
+    let v1_key = before_keys
+        .iter()
+        .find(|key| key.ends_with("/1"))
+        .expect("v1 history key")
+        .clone();
+    let external_store: Arc<dyn ExternalManifestStore> =
+        Arc::new(MetaManifestStore::new(meta.clone()));
+    DatasetBuilder::from_uri(location.as_str())
+        .with_storage_options(s3_storage_options(&endpoint))
+        .with_commit_handler(Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: external_store,
+        }))
+        .load()
+        .await
+        .expect("open dataset for tag")
+        .tags()
+        .create("retain-v1", 1_u64)
+        .await
+        .expect("tag v1");
+
+    engine
+        .maintain(&location, version)
+        .await
+        .expect("cleanup maintenance");
+
+    let after_keys = meta
+        .list_prefix("lance-manifest/")
+        .await
+        .expect("history after cleanup");
+    assert!(
+        after_keys.len() < before_keys.len(),
+        "Dynamo history shrank"
+    );
+    assert!(after_keys.contains(&v1_key), "tagged v1 history remains");
+    s3.head_object()
+        .bucket(&bucket)
+        .key(&before_paths[&v1_key])
+        .send()
+        .await
+        .expect("tagged v1 manifest remains on S3");
+    engine
+        .open(&location)
+        .await
+        .expect("open after cleanup")
+        .expect("dataset remains")
+        .table_provider(Version(1))
+        .await
+        .expect("tagged v1 snapshot remains readable");
+    for removed in before_keys.iter().filter(|key| !after_keys.contains(key)) {
+        let path = &before_paths[removed];
+        assert!(
+            s3.head_object()
+                .bucket(&bucket)
+                .key(path)
+                .send()
+                .await
+                .is_err(),
+            "external history is deleted only after S3 manifest absence: {path}"
+        );
+    }
+    assert!(
+        !meta
+            .list_prefix("lance-manifest-latest/")
+            .await
+            .expect("latest after cleanup")
+            .is_empty(),
+        "fixed latest remains"
+    );
+}
+
+#[test]
+fn external_manifest_cleanup_localstack_is_wired() {
+    let integration = include_str!("../../../scripts/test-integration.ts");
+    assert!(integration.contains("lake-engine-lance"));
+    assert!(integration.contains("--run-ignored"));
 }

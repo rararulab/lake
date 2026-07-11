@@ -80,6 +80,7 @@ struct WriteConfig {
     // FS). `Some` -> commits route through our `MetaStore`-backed external
     // manifest store, giving put-if-not-exists semantics on S3.
     commit_handler:  Option<Arc<dyn CommitHandler>>,
+    manifest_store:  Option<MetaManifestStore>,
     // Empty -> local filesystem. Non-empty -> object_store config keys
     // (`aws_endpoint`, `aws_access_key_id`, …) threaded into every read/write.
     storage_options: HashMap<String, String>,
@@ -141,9 +142,11 @@ impl LanceEngine {
     /// compare-and-set instead of relying on object-store atomic renames.
     #[must_use]
     pub fn with_manifest_store(meta: MetaStoreRef) -> Self {
+        let manifest_store = MetaManifestStore::new(meta);
         Self {
             config: WriteConfig {
-                commit_handler: Some(external_handler(meta)),
+                commit_handler: Some(external_handler(manifest_store.clone())),
+                manifest_store: Some(manifest_store),
                 storage_options: HashMap::new(),
                 ..WriteConfig::default()
             },
@@ -156,9 +159,11 @@ impl LanceEngine {
     /// at the bucket. This is the production path.
     #[must_use]
     pub fn for_object_store(meta: MetaStoreRef, storage_options: HashMap<String, String>) -> Self {
+        let manifest_store = MetaManifestStore::new(meta);
         Self {
             config: WriteConfig {
-                commit_handler: Some(external_handler(meta)),
+                commit_handler: Some(external_handler(manifest_store.clone())),
+                manifest_store: Some(manifest_store),
                 storage_options,
                 ..WriteConfig::default()
             },
@@ -166,8 +171,8 @@ impl LanceEngine {
     }
 }
 
-fn external_handler(meta: MetaStoreRef) -> Arc<dyn CommitHandler> {
-    let store: Arc<dyn ExternalManifestStore> = Arc::new(MetaManifestStore::new(meta));
+fn external_handler(manifest_store: MetaManifestStore) -> Arc<dyn CommitHandler> {
+    let store: Arc<dyn ExternalManifestStore> = Arc::new(manifest_store);
     Arc::new(ExternalManifestCommitHandler {
         external_manifest_store: store,
     })
@@ -182,6 +187,7 @@ fn external_handler(meta: MetaStoreRef) -> Arc<dyn CommitHandler> {
 // retention needs `chrono` as a workspace dependency (Lance does not re-export
 // it), which is not wired up yet.
 const RETAIN_VERSIONS: usize = 10;
+const MANIFEST_HISTORY_CLEANUP_PAGE_SIZE: usize = 256;
 
 #[cfg(not(test))]
 const REFERENCE_CHUNK_SIZE: usize = 4_096;
@@ -300,6 +306,23 @@ impl TableEngine for LanceEngine {
             .cleanup_with_policy(policy)
             .await
             .map_err(EngineError::backend)?;
+        if let Some(manifest_store) = &self.config.manifest_store {
+            let url = dataset_url(location)?;
+            let (_, base) = object_store::parse_url_opts(&url, self.config.storage_options.clone())
+                .map_err(EngineError::backend)?;
+            let object_store = dataset
+                .object_store(None)
+                .await
+                .map_err(EngineError::backend)?;
+            manifest_store
+                .reclaim_removed_history(
+                    base.as_ref(),
+                    object_store.as_ref(),
+                    MANIFEST_HISTORY_CLEANUP_PAGE_SIZE,
+                )
+                .await
+                .map_err(EngineError::backend)?;
+        }
         Ok((maintained_version != version).then_some(maintained_version))
     }
 
@@ -1025,6 +1048,7 @@ mod tests {
         error::DataFusionError,
         physical_plan::stream::RecordBatchStreamAdapter,
     };
+    use lake_meta::{MetaStore, RocksMeta};
 
     use super::*;
 
@@ -1424,6 +1448,49 @@ mod tests {
         // The table is still openable and its rows survive compaction.
         let reopened = engine.open(&loc).await.unwrap().expect("table survives");
         assert!(reopened.current_version().0 >= 1);
+    }
+
+    #[tokio::test]
+    async fn maintenance_reclaims_external_manifest_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_dir = tempfile::tempdir().unwrap();
+        let meta = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let loc = TableLocation::new(dir.path().join("external.lance").to_str().unwrap());
+        let engine = LanceEngine::with_manifest_store(meta.clone());
+        let handle = engine.create(&loc, batch().schema()).await.unwrap();
+        let mut version = handle.current_version();
+        for _ in 0..12 {
+            let value = batch();
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                value.schema(),
+                futures::stream::iter(vec![Ok::<_, DataFusionError>(value)]),
+            ));
+            version = handle.append(&operation(), stream).await.unwrap();
+        }
+        let before = meta.list_prefix("lance-manifest/").await.unwrap().len();
+        assert!(before > RETAIN_VERSIONS, "fixture has reclaimable history");
+        engine
+            .config
+            .open_dataset(loc.as_str())
+            .await
+            .unwrap()
+            .tags()
+            .create("retain-v1", 1_u64)
+            .await
+            .unwrap();
+
+        engine.maintain(&loc, version).await.unwrap();
+
+        let after = meta.list_prefix("lance-manifest/").await.unwrap();
+        assert!(
+            after.len() < before,
+            "maintenance reclaimed external history"
+        );
+        assert!(
+            after.iter().any(|key| key.ends_with("/1")),
+            "tagged version keeps its external history"
+        );
+        assert!(engine.open(&loc).await.unwrap().is_some());
     }
 
     #[tokio::test]
