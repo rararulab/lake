@@ -21,12 +21,12 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
 };
 use futures::TryStreamExt;
-use lake_common::{TableLocation, TableRef};
+use lake_common::{ManagedStageDescriptor, TableLocation, TableRef};
 use lake_engine::TableEngineRef;
 use lake_engine_lance::LanceEngine;
 use lake_meta::{MetaStoreRef, RocksMeta};
 use lake_metasrv::Metasrv;
-use lake_objects::{LocalObjectStore, data_location_field};
+use lake_objects::data_location_field;
 use lake_query::QueryEngine;
 use lake_sdk::{FileUpload, InsertValue, LakeClient, data_location};
 use tempfile::tempdir;
@@ -60,6 +60,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tokio::fs::write(&source, expected).await?;
     let metadata_addr = free_addr()?;
     let query_addr = free_addr()?;
+    let managed_stage = ManagedStageDescriptor::local(
+        root.path()
+            .join("managed-objects")
+            .to_string_lossy()
+            .into_owned(),
+    );
     tokio::spawn({
         let metasrv = metasrv.clone();
         let addr = metadata_addr.clone();
@@ -69,14 +75,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let query = Arc::new(QueryEngine::new(meta.clone(), engine.clone()));
         let addr = query_addr.clone();
         let metadata = format!("http://{metadata_addr}");
-        async move { lake_query::serve_with_metadata(query, &addr, &metadata).await }
+        async move {
+            lake_query::serve_with_metadata_and_stage(query, &addr, &metadata, managed_stage).await
+        }
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let client = LakeClient::connect(
-        format!("http://{query_addr}"),
-        LocalObjectStore::open(root.path().join("objects")).await?,
-    )
-    .await?;
+    let client = LakeClient::connect(format!("http://{query_addr}")).await?;
     client
         .insert(
             "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",

@@ -32,7 +32,7 @@ pub mod table;
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-use lake_common::{TableLocation, TableRef};
+use lake_common::{ManagedStageDescriptor, TableLocation, TableRef};
 use lake_engine::TableEngineRef;
 use lake_engine_lance::LanceEngine;
 use lake_meta::{DynamoMeta, MetaStoreRef, RocksMeta};
@@ -47,10 +47,11 @@ enum Storage {
 /// Shared, process-wide handles. Built from `--data-dir` (local) or the
 /// `LAKE_S3_BUCKET`/`LAKE_DYNAMODB_*`/`AWS_*` environment (cloud).
 pub struct Context {
-    pub meta:    MetaStoreRef,
-    pub engine:  TableEngineRef,
-    pub metasrv: Arc<Metasrv>,
-    storage:     Storage,
+    pub meta:      MetaStoreRef,
+    pub engine:    TableEngineRef,
+    pub metasrv:   Arc<Metasrv>,
+    storage:       Storage,
+    managed_stage: ManagedStageDescriptor,
 }
 
 impl Context {
@@ -65,14 +66,17 @@ impl Context {
     fn open_local(data_dir: &str) -> anyhow::Result<Self> {
         let root = PathBuf::from(data_dir);
         std::fs::create_dir_all(&root)?;
+        let root = std::fs::canonicalize(root)?;
         let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.join("meta"))?);
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let managed_stage = local_managed_stage_descriptor(&root);
         Ok(Self::wire(
             meta,
             engine,
             Storage::Local {
                 table_root: root.join("tables"),
             },
+            managed_stage,
         ))
     }
 
@@ -87,18 +91,40 @@ impl Context {
             meta.clone(),
             s3_storage_options(),
         ));
-        Ok(Self::wire(meta, engine, Storage::S3 { bucket }))
+        let managed_prefix = std::env::var("LAKE_MANAGED_OBJECT_PREFIX")
+            .unwrap_or_else(|_| "managed-objects".to_owned());
+        let managed_stage = s3_managed_stage_descriptor(
+            &bucket,
+            &managed_prefix,
+            std::env::var("AWS_REGION").ok(),
+            std::env::var("LAKE_S3_ENDPOINT").ok(),
+        );
+        Ok(Self::wire(
+            meta,
+            engine,
+            Storage::S3 { bucket },
+            managed_stage,
+        ))
     }
 
-    fn wire(meta: MetaStoreRef, engine: TableEngineRef, storage: Storage) -> Self {
+    fn wire(
+        meta: MetaStoreRef,
+        engine: TableEngineRef,
+        storage: Storage,
+        managed_stage: ManagedStageDescriptor,
+    ) -> Self {
         let metasrv = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
         Self {
             meta,
             engine,
             metasrv,
             storage,
+            managed_stage,
         }
     }
+
+    /// Credential-free managed `FILE` stage advertised by query.
+    pub fn managed_stage(&self) -> &ManagedStageDescriptor { &self.managed_stage }
 
     /// The Lance dataset location for a table (local path or `s3://` URI).
     pub fn location(&self, table: &TableRef) -> TableLocation {
@@ -115,6 +141,20 @@ impl Context {
             )),
         }
     }
+}
+
+fn local_managed_stage_descriptor(root: &std::path::Path) -> ManagedStageDescriptor {
+    ManagedStageDescriptor::local(root.join("managed-objects").to_string_lossy().into_owned())
+}
+
+fn s3_managed_stage_descriptor(
+    bucket: &str,
+    prefix: &str,
+    region: Option<String>,
+    endpoint: Option<String>,
+) -> ManagedStageDescriptor {
+    let force_path_style = endpoint.is_some();
+    ManagedStageDescriptor::s3(bucket, prefix, region, endpoint, force_path_style)
 }
 
 /// object_store S3 config keys from the environment. `LAKE_S3_ENDPOINT` (e.g.
@@ -153,4 +193,52 @@ fn s3_storage_options() -> HashMap<String, String> {
         opts.insert("aws_allow_http".to_owned(), "true".to_owned());
     }
     opts
+}
+
+#[cfg(test)]
+mod managed_stage_tests {
+    use std::path::Path;
+
+    use lake_common::ManagedStageBackend;
+
+    use super::{local_managed_stage_descriptor, s3_managed_stage_descriptor};
+
+    #[test]
+    fn local_query_advertises_a_sibling_managed_object_directory() {
+        let descriptor = local_managed_stage_descriptor(Path::new("/var/lib/lake"));
+
+        assert!(matches!(
+            descriptor.backend(),
+            ManagedStageBackend::Local { root }
+                if root == "/var/lib/lake/managed-objects"
+        ));
+    }
+
+    #[test]
+    fn cloud_query_advertises_s3_without_credentials() {
+        let descriptor = s3_managed_stage_descriptor(
+            "embodied-data",
+            "episodes/files",
+            Some("us-east-1".to_owned()),
+            Some("http://s3.internal:4566".to_owned()),
+        );
+
+        assert!(matches!(
+            descriptor.backend(),
+            ManagedStageBackend::S3 {
+                bucket,
+                prefix,
+                region,
+                endpoint,
+                force_path_style: true,
+            } if bucket == "embodied-data"
+                && prefix == "episodes/files"
+                && region.as_deref() == Some("us-east-1")
+                && endpoint.as_deref() == Some("http://s3.internal:4566")
+        ));
+        let wire = descriptor.to_wire().expect("encode descriptor");
+        let json = std::str::from_utf8(&wire).expect("JSON wire");
+        assert!(!json.contains("access_key"));
+        assert!(!json.contains("secret"));
+    }
 }

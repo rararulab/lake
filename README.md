@@ -39,25 +39,29 @@ The SDK connects only to the public query endpoint; it does not construct,
 embed, or connect directly to `lake-metasrv`:
 
 ```rust
-let client = LakeClient::connect(
-    "http://127.0.0.1:50051",
-    LocalObjectStore::open("./managed-objects").await?,
-).await?;
+let client = LakeClient::connect("http://127.0.0.1:50051").await?;
 ```
 
-For production S3, pass the same client an S3 managed stage. Lake stores the
-stable `s3://` identity; the AWS client configuration and credentials remain
-in the SDK process and never enter SQL or table rows:
+At connection time the SDK asks query for a versioned, credential-free managed
+stage descriptor. Query returns either a local root or the S3 bucket, prefix,
+region, endpoint, and path-style policy configured by the deployment. The SDK
+then opens storage directly. This discovery happens once per client, not per
+query or object read.
 
-```rust
-let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-let stage = S3ObjectStore::new(
-    aws_sdk_s3::Client::new(&aws),
-    "embodied-data",
-    "lake/managed-files",
-)?;
-let client = LakeClient::connect("https://query.example.com", stage).await?;
+For production S3, configure the query process instead of constructing a stage
+in application code:
+
+```bash
+LAKE_S3_BUCKET=embodied-data \
+LAKE_MANAGED_OBJECT_PREFIX=lake/managed-files \
+AWS_REGION=us-east-1 \
+lake query --addr 0.0.0.0:50051 --metadata-addr http://lake-meta:50052
 ```
+
+Lake stores the stable `s3://` identity. AWS credentials come from the SDK
+process's default credential chain or workload identity; they never enter SQL,
+table rows, or the discovery descriptor. Embedders and tests that need a custom
+backend can use the explicit `LakeClient::connect_with_store` constructor.
 
 Create the table with a first-class `file` column through either the local or
 remote administrative CLI:
@@ -107,8 +111,8 @@ Empty, reversed, and out-of-bounds ranges return a typed SDK object error
 before storage I/O.
 
 The example performs insert, query, `DataLocation` decoding, and direct open
-through `LakeClient`. Local development uses a `file://` stage; production can
-use a caller-configured `s3://` stage. Non-empty S3 objects stream through
+through `LakeClient`. Local development discovers a `file://` stage; production
+discovers an `s3://` stage. Non-empty S3 objects stream through
 bounded 5 MiB multipart parts, with incremental SHA-256 and abort-on-error.
 The query service forwards only the Arrow row to the metadata leader;
 video/model bytes travel directly between the SDK and the managed stage.

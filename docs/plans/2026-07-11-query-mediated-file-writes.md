@@ -127,10 +127,11 @@ Expected: PASS.
 
 **Step 1: Write the failing test**
 
-Construct `LakeClient::connect(query_endpoint, managed_stage)` against running
-Flight services. Assert `INSERT` uploads bytes directly to the stage and the
-query endpoint commits only the `DataLocation` row; the SDK has no `Metasrv`,
-engine, or metastore dependency.
+Construct `LakeClient::connect_with_store(query_endpoint, managed_stage)`
+against running Flight services. Assert `INSERT` uploads bytes directly to the
+stage and the query endpoint commits only the `DataLocation` row; the SDK has
+no `Metasrv`, engine, or metastore dependency. Issue #11 later made
+`LakeClient::connect(query_endpoint)` the primary discovery-based API.
 
 **Step 2: Run the test to verify it fails**
 

@@ -226,8 +226,10 @@ design-level ones:
   upload with abort-on-error and exact bucket/prefix validation for direct
   reads. Sequential and half-open byte-range readers share the same SDK/storage
   boundary; local ranges seek + limit and S3 ranges issue one bounded GET. The
-  SDK receives only query endpoint + stage; query forwards metadata to the
-  leader-aware metasrv. Resumable uploads, browser presigning, authenticated
+  SDK receives only the query endpoint, discovers a credential-free managed
+  stage descriptor once, and constructs local/S3 access using process
+  credentials; query forwards metadata to the leader-aware metasrv. Resumable
+  uploads, browser presigning, authenticated
   expiring locations, codec indexes, and object GC are deferred.
 
 ## Phasing

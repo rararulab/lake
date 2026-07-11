@@ -24,8 +24,8 @@
 use std::{pin::Pin, sync::Arc};
 
 use arrow_flight::{
-    FlightClient, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest,
-    HandshakeResponse, Ticket,
+    Action, ActionType, FlightClient, FlightDescriptor, FlightEndpoint, FlightInfo,
+    HandshakeRequest, HandshakeResponse, Result as FlightResult, Ticket,
     encode::FlightDataEncoderBuilder,
     error::FlightError,
     flight_service_server::FlightService,
@@ -36,7 +36,9 @@ use arrow_flight::{
 };
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use futures::{Stream, StreamExt, TryStreamExt};
-use lake_common::{FILE_APPEND_TYPE_URL, FileAppendRequest};
+use lake_common::{
+    FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor,
+};
 use prost::Message;
 use tonic::{Request, Response, Status, Streaming, transport::Channel};
 
@@ -48,6 +50,8 @@ pub struct FlightSqlServiceImpl {
     pub engine:        Arc<QueryEngine>,
     /// Metadata Flight address used only for stateless FILE append forwarding.
     pub metadata_addr: Option<String>,
+    /// Immutable, credential-free stage metadata advertised to SDK clients.
+    pub managed_stage: Option<ManagedStageDescriptor>,
 }
 
 impl FlightSqlServiceImpl {
@@ -161,6 +165,40 @@ impl FlightSqlService for FlightSqlServiceImpl {
         ))))
     }
 
+    async fn do_action_fallback(
+        &self,
+        request: Request<Action>,
+    ) -> std::result::Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        let action = request.into_inner();
+        if action.r#type != MANAGED_STAGE_DISCOVERY_ACTION {
+            return Err(Status::invalid_argument(format!(
+                "unknown query action '{}'",
+                action.r#type
+            )));
+        }
+        if !action.body.is_empty() {
+            return Err(Status::invalid_argument(
+                "managed-stage discovery action body must be empty",
+            ));
+        }
+        let descriptor = self
+            .managed_stage
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("managed FILE stage is not configured"))?;
+        let body = descriptor
+            .to_wire()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let stream = futures::stream::once(async move { Ok(FlightResult { body: body.into() }) });
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn list_custom_actions(&self) -> Option<Vec<std::result::Result<ActionType, Status>>> {
+        Some(vec![Ok(ActionType {
+            r#type:      MANAGED_STAGE_DISCOVERY_ACTION.to_owned(),
+            description: "Return the versioned credential-free managed FILE stage".to_owned(),
+        })])
+    }
+
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
 }
 
@@ -182,7 +220,8 @@ mod tests {
             SendableRecordBatchStream, stream::RecordBatchStreamAdapter, streaming::PartitionStream,
         },
     };
-    use futures::StreamExt;
+    use futures::{StreamExt, TryStreamExt};
+    use lake_common::{MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor};
     use lake_engine::TableEngineRef;
     use lake_engine_lance::LanceEngine;
     use lake_meta::{MetaStore, MetaStoreRef};
@@ -244,6 +283,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_stage_action_returns_configured_descriptor() {
+        let meta: MetaStoreRef = Arc::new(EmptyMeta);
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let descriptor = ManagedStageDescriptor::s3(
+            "embodied-data",
+            "managed-objects",
+            Some("us-east-1".to_owned()),
+            None,
+            false,
+        );
+        let service = FlightSqlServiceImpl {
+            engine:        Arc::new(QueryEngine::new(meta, storage)),
+            metadata_addr: None,
+            managed_stage: Some(descriptor.clone()),
+        };
+        let request = Request::new(arrow_flight::Action {
+            r#type: MANAGED_STAGE_DISCOVERY_ACTION.to_owned(),
+            body:   Vec::new().into(),
+        });
+
+        let results = service
+            .do_action_fallback(request)
+            .await
+            .expect("discovery action")
+            .into_inner()
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("discovery results");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            ManagedStageDescriptor::from_wire(&results[0].body).expect("decode result"),
+            descriptor
+        );
+    }
+
+    #[tokio::test]
     async fn do_get_returns_before_the_input_stream_finishes() {
         let meta: MetaStoreRef = Arc::new(EmptyMeta);
         let storage: TableEngineRef = Arc::new(LanceEngine::new());
@@ -270,6 +346,7 @@ mod tests {
         let service = FlightSqlServiceImpl {
             engine,
             metadata_addr: None,
+            managed_stage: None,
         };
         let ticket = TicketStatementQuery {
             statement_handle: b"SELECT * FROM delayed".to_vec().into(),

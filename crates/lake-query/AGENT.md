@@ -12,6 +12,8 @@ The query layer: stateless SQL compute. `QueryEngine` wires a DataFusion
   layer never asks a datanode.
 - Typed SQL `FILE` writes are metadata-only Flight streams proxied to metasrv;
   query does not persist rows or receive the original object bytes.
+- Managed-stage discovery returns one versioned, credential-free descriptor;
+  it never proxies object bytes or exposes SDK process credentials.
 - Caches the catalog with a bounded-staleness refresh window; concurrent
   refreshes coalesce and the server refreshes in the background so metadata
   scans stay off the per-query hot path.
@@ -19,4 +21,5 @@ The query layer: stateless SQL compute. `QueryEngine` wires a DataFusion
 ## Layout
 
 - `lib.rs` — read-only `QueryEngine` plus server wiring with optional metadata forwarding
-- `flight.rs` — streaming Flight SQL reads and typed FILE `DoPut` proxy
+- `flight.rs` — streaming Flight SQL reads, typed FILE `DoPut` proxy, and
+  managed-stage discovery action

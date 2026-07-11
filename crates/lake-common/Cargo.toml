@@ -11,6 +11,8 @@ description = "Shared newtypes and identifiers used across the lake workspace"
 [dependencies]
 bon = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+snafu = { workspace = true }
 
 [lints]
 workspace = true

@@ -4156,6 +4156,8 @@ version = "0.0.1"
 dependencies = [
  "bon",
  "serde",
+ "serde_json",
+ "snafu",
 ]
 
 [[package]]
