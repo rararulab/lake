@@ -100,6 +100,9 @@ pub enum ObjectError {
     #[snafu(display("upload checkpoint {path:?} is already in use"))]
     CheckpointInUse { path: PathBuf },
 
+    #[snafu(display("this managed object store does not support resumable uploads"))]
+    ResumeUnsupported,
+
     #[snafu(display(
         "byte range {start}..{end} is invalid for DataLocation '{uri}' with size {size_bytes}"
     ))]
@@ -122,6 +125,30 @@ pub type ObjectReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
 pub trait ManagedObjectStore: Send + Sync {
     /// Upload one stream and return its stable immutable identity.
     async fn put_reader(&self, input: ObjectReader, content_type: String) -> Result<DataLocation>;
+
+    /// Upload a seekable local path. Stores that support restart checkpoints
+    /// override this method; the default keeps bounded streaming behavior.
+    async fn put_path(
+        &self,
+        path: PathBuf,
+        content_type: String,
+        checkpoint: Option<PathBuf>,
+    ) -> Result<DataLocation> {
+        let _ = checkpoint;
+        let input = tokio::fs::File::open(&path)
+            .await
+            .map_err(|source| ObjectError::Io {
+                action: "opening".to_owned(),
+                path,
+                source,
+            })?;
+        self.put_reader(Box::pin(input), content_type).await
+    }
+
+    /// Explicitly abandon one resumable upload checkpoint.
+    async fn cancel_upload(&self, _checkpoint: PathBuf) -> Result<()> {
+        Err(ObjectError::ResumeUnsupported)
+    }
 
     /// Open a direct reader after validating the location belongs to this
     /// managed stage.
@@ -218,6 +245,8 @@ fn u64_value(array: &StructArray, column: &'static str, row: usize) -> Result<u6
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use aws_config::BehaviorVersion;
     use aws_sdk_s3::config::{Credentials, Region};
     use lake_common::DataLocation;
@@ -226,7 +255,8 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     use crate::{
-        LocalObjectStore, ObjectError, S3ObjectStore, data_location_array, data_location_from_array,
+        LocalObjectStore, ManagedObjectStore, ObjectError, S3ObjectStore, data_location_array,
+        data_location_from_array,
     };
 
     #[test]
@@ -283,6 +313,34 @@ mod tests {
         reader.read_to_end(&mut actual).await.unwrap();
 
         assert_eq!(actual, b"23456");
+    }
+
+    #[tokio::test]
+    async fn path_aware_managed_store_preserves_local_atomic_upload() {
+        let source_dir = tempdir().unwrap();
+        let source = source_dir.path().join("episode.mp4");
+        tokio::fs::write(&source, b"path-backed upload")
+            .await
+            .unwrap();
+        let managed_dir = tempdir().unwrap();
+        let store: Arc<dyn ManagedObjectStore> =
+            Arc::new(LocalObjectStore::open(managed_dir.path()).await.unwrap());
+        let checkpoint = source_dir.path().join("episode.upload.json");
+
+        let location = store
+            .put_path(source, "video/mp4".to_owned(), Some(checkpoint.clone()))
+            .await
+            .unwrap();
+
+        let mut reader = store.open_reader(&location).await.unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"path-backed upload");
+        assert!(!checkpoint.exists());
+        assert!(matches!(
+            store.cancel_upload(checkpoint).await,
+            Err(ObjectError::ResumeUnsupported)
+        ));
     }
 
     #[tokio::test]
