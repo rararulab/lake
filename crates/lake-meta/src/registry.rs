@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, ensure};
 
 use crate::{
-    error::{AlreadyRegisteredSnafu, ConflictSnafu, CorruptEntrySnafu, Result},
+    error::{
+        AlreadyRegisteredSnafu, ConflictSnafu, CorruptEntrySnafu, InvalidScanLimitSnafu, Result,
+    },
     store::MetaStore,
 };
 
@@ -192,6 +194,55 @@ pub async fn scan_tables(meta: &dyn MetaStore) -> Result<Vec<(TableRef, TableReg
     Ok(tables)
 }
 
+/// One decoded, bounded page of table registrations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableRegistrationPage {
+    tables:       Vec<(TableRef, TableRegistration)>,
+    continuation: Option<String>,
+}
+
+impl TableRegistrationPage {
+    /// Borrow the registrations returned by this page.
+    #[must_use]
+    pub fn tables(&self) -> &[(TableRef, TableRegistration)] { &self.tables }
+
+    /// Borrow the backend-opaque token for the next page.
+    #[must_use]
+    pub fn continuation(&self) -> Option<&str> { self.continuation.as_deref() }
+
+    /// Consume the page into registrations and continuation state.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<(TableRef, TableRegistration)>, Option<String>) {
+        (self.tables, self.continuation)
+    }
+}
+
+/// Scan at most `limit` table registrations and return an opaque continuation.
+pub async fn scan_tables_page(
+    meta: &dyn MetaStore,
+    continuation: Option<&str>,
+    limit: usize,
+) -> Result<TableRegistrationPage> {
+    ensure!(limit > 0, InvalidScanLimitSnafu);
+    let page = meta.scan_prefix_page("tbl/", continuation, limit).await?;
+    let (entries, continuation) = page.into_parts();
+    let mut tables = Vec::with_capacity(entries.len());
+    for (rest, bytes) in entries {
+        let Some((namespace, name)) = rest.split_once('/') else {
+            continue;
+        };
+        let registration = serde_json::from_slice(&bytes).context(CorruptEntrySnafu {
+            key: format!("tbl/{rest}"),
+        })?;
+        tables.push((TableRef::new(namespace, name), registration));
+    }
+    tables.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(TableRegistrationPage {
+        tables,
+        continuation,
+    })
+}
+
 /// Advance a table's current-version pointer, CAS-guarded on the expected
 /// prior registration. Losers of the race get [`crate::MetaError::Conflict`].
 pub async fn set_version(
@@ -241,6 +292,40 @@ mod tests {
         let wire = serde_json::to_vec(&current).unwrap();
         let decoded: TableRegistration = serde_json::from_slice(&wire).unwrap();
         assert_eq!(decoded.schema_ipc(), Some(&[1, 2, 3][..]));
+    }
+
+    #[tokio::test]
+    async fn scan_table_pages_are_bounded_and_resumable() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = RocksMeta::open(dir.path()).unwrap();
+        let expected = (0..5)
+            .map(|index| TableRef::new("robots", format!("episodes-{index}")))
+            .collect::<std::collections::BTreeSet<_>>();
+        for table in &expected {
+            register(&meta, table, &reg(1)).await.unwrap();
+        }
+
+        let mut cursor = None;
+        let mut actual = std::collections::BTreeSet::new();
+        let mut page_count = 0;
+        loop {
+            let page = scan_tables_page(&meta, cursor.as_deref(), 2).await.unwrap();
+            assert!(page.tables().len() <= 2);
+            page_count += 1;
+            for (table, _) in page.tables() {
+                assert!(
+                    actual.insert(table.clone()),
+                    "table returned twice: {table}"
+                );
+            }
+            cursor = page.continuation().map(ToOwned::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        assert_eq!(page_count, 3);
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
