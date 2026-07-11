@@ -16,6 +16,9 @@ authority.
   capacity-bounded.
 - Listing and registration caches have bounded staleness; refreshes coalesce
   so concurrent queries cannot stampede the metastore.
+- Initial listing warm is synchronous and fail-closed. After warm, stale SQL
+  checks serve last-good immediately and trigger one tracked revalidation;
+  failed refreshes never replace the published snapshot.
 - Read-only over the engine; table creation is an explicit `ops::create_table`
   call the metadata layer makes.
 

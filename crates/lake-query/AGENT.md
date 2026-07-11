@@ -21,6 +21,9 @@ The query layer: stateless SQL compute. `QueryEngine` wires a DataFusion
 - Caches the catalog with a bounded-staleness refresh window; concurrent
   refreshes coalesce and the server refreshes in the background so metadata
   scans stay off the per-query hot path.
+- Startup waits for the first catalog generation. Runtime SQL planning uses
+  stale-while-revalidate and never awaits authority I/O; shutdown aborts and
+  joins any request-triggered catalog task.
 - Reuses a capacity-bounded `TableProvider` per exact immutable table
   generation; concurrent planning in one replica performs one storage open.
 - `QueryLimits` bounds concurrency, queue wait, execution duration, and SQL

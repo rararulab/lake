@@ -85,6 +85,14 @@ Scenario: SQL planning does not await runtime refresh
   When a SQL statement is planned after the refresh age expires
   Then planning completes from last-good before the authority scan is released
 
+Scenario: Query shutdown owns detached revalidation
+  Test:
+    Package: lake-catalog
+    Filter: shutdown_aborts_inflight_revalidation
+  Given a request-triggered revalidation is stuck in authority I/O
+  When the query replica shuts down its catalog
+  Then the in-flight task is aborted and joined without waiting for that I/O
+
 ## Out of Scope
 
 - Serving before the initial catalog warm succeeds.

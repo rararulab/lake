@@ -54,6 +54,16 @@ changes the incarnation, so neither can reuse a stale provider. Old immutable
 providers remain safe for in-flight readers and disappear through normal
 eviction. Missing or failed loads are never cached.
 
+Catalog listing refresh is startup-strict and runtime-available. A replica
+must synchronously publish its first complete registry generation before it is
+ready. After that, an expired request-path check serves the immutable
+last-good generation immediately and admits at most one tracked background
+revalidation. A failed scan records bounded process-local health without
+replacing the snapshot; a later successful scan atomically publishes the
+replacement and clears failure state. Query shutdown aborts and joins the
+tracked request-triggered task, while the scheduled server refresher is owned
+directly by the server cancellation token.
+
 ### Why the tiers scale differently
 
 - **Query layer is stateless** — no durable state, no coordination. HA and
