@@ -19,17 +19,20 @@
 //! [`registry`] module layers lake's db→table registry on top of it. The
 //! authoritative durable state of the whole metadata tier lives here.
 //!
-//! Backends: [`RocksMeta`] for dev. `DynamoMeta` (prod, multi-AZ HA via
-//! conditional puts) is v1 — see `docs/architecture.md`; the trait is the
-//! seam it will slot into.
+//! Backends: [`RocksMeta`] for dev and [`DynamoMeta`] for production multi-AZ
+//! HA. Dynamo uses native transactions for conditional dual writes and a
+//! strongly-consistent, sharded prefix-query layout.
 
 mod dynamo;
+mod dynamo_layout;
+mod dynamo_migration;
 mod error;
 pub mod registry;
 mod rocks;
 mod store;
 
 pub use dynamo::DynamoMeta;
+pub use dynamo_migration::{DynamoMigrationPage, DynamoMigrationVerification};
 pub use error::{MetaError, Result};
 pub use rocks::RocksMeta;
 pub use store::{GuardedMutation, MetaScanPage, MetaStore, MetaStoreRef};

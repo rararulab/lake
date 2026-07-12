@@ -338,6 +338,39 @@ start Query or Metasrv. On a versioned S3 bucket, `DeleteObject` creates a
 delete marker rather than reclaiming old versions, so configure an S3
 noncurrent-version lifecycle policy when physical byte reclamation is required.
 
+### DynamoDB prefix-layout migration
+
+Cloud deployments use a companion table named
+`$LAKE_DYNAMODB_TABLE_prefix_v2`. Its `(family#shard, full-key)` primary key
+lets catalog and maintenance prefix reads use strongly consistent `Query`
+requests instead of evaluating unrelated append-operation and manifest keys.
+Every current binary dual-writes the legacy and prefix tables atomically.
+
+After upgrading every commit-capable metadata node, run bounded backfill pages
+until `complete` is true, then finalize with an explicit rollout acknowledgement:
+
+```bash
+lake dynamo-migrate --page-size 500 --json
+lake dynamo-migrate --page-size 500 \
+  --finalize --acknowledge-dual-rollout \
+  --acknowledge-write-quiescence --json
+```
+
+The cursor is durable, so rerunning after a crash resumes safely. Before the
+second command, pause metadata write admission. Finalization installs a durable
+write barrier, checks exact key/value parity in both directions, and publishes
+the authority marker while the barrier is still held. Restart Query and
+Metasrv pods immediately afterward: refreshed nodes read v2, while the retained
+barrier rejects stale pre-finalization writers. Reads may keep serving their
+last-good cache during this short write-quiescent window. Retain the legacy
+table for at least `LAKE_APPEND_OPERATION_RETENTION_SECS`; rollback after
+finalization requires a dual-capable binary.
+
+If exact verification reports an incomplete or divergent copy, the barrier is
+left in place deliberately. Keep write admission paused, run bounded backfill
+again, and retry finalization; do not manually remove the barrier while a
+verifier or stale dual node may still be running.
+
 For a local deployment, start metadata and query separately. The query process
 is told where metadata lives; clients are not:
 

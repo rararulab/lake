@@ -40,6 +40,15 @@ LAKE_DYNAMODB_ENDPOINT=http://127.0.0.1:<dynamic-port>
 (the same endpoint serves S3, since LocalStack multiplexes all services on one
 port). `mise run test-env-down` removes that checkout's container.
 
+The ignored `lake-meta` LocalStack test creates both Dynamo layouts, exercises
+dual CAS and lease-guarded transactions, backfills in bounded pages, finalizes,
+then reads through the prefix-query path:
+
+```bash
+set -a; source .lake/test-env.env; set +a
+cargo test -p lake-meta --test dynamo_localstack -- --ignored --nocapture
+```
+
 The community image `localstack/localstack:3` is pinned deliberately —
 `:latest` now requires a `LOCALSTACK_AUTH_TOKEN` and exits without one.
 
