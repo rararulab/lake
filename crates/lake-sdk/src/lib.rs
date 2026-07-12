@@ -20,7 +20,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use arrow::{
@@ -884,10 +884,21 @@ impl LakeClient {
         expires_in: Duration,
     ) -> Result<PresignedRead> {
         validate_presign_expiration(expires_in).context(ObjectSnafu)?;
-        self.objects
+        let capability = self
+            .objects
             .presign_read(location, expires_in)
             .await
-            .context(ObjectSnafu)
+            .context(ObjectSnafu)?;
+        let now = SystemTime::now();
+        let maximum = now
+            .checked_add(expires_in)
+            .expect("validated one-hour expiration fits SystemTime");
+        if capability.expires_at() <= now || capability.expires_at() > maximum {
+            return Err(SdkError::Object {
+                source: lake_objects::ObjectError::InvalidPresignedCapabilityLifetime,
+            });
+        }
+        Ok(capability)
     }
 
     async fn table_schema(&self, table: &TableRef) -> Result<SchemaRef> {
@@ -1234,7 +1245,7 @@ mod tests {
         pin::Pin,
         sync::{
             Arc, Mutex as StdMutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         task::{Context, Poll},
         time::{Duration, SystemTime, UNIX_EPOCH},
@@ -2625,10 +2636,14 @@ mod tests {
     #[tokio::test]
     async fn sdk_presigned_read_delegates_to_managed_store() {
         let seen = Arc::new(StdMutex::new(None));
+        let overlong = Arc::new(AtomicBool::new(false));
         let client = LakeClient {
             query:                 tonic::transport::Endpoint::from_static("http://127.0.0.1:9")
                 .connect_lazy(),
-            objects:               Arc::new(SigningStore { seen: seen.clone() }),
+            objects:               Arc::new(SigningStore {
+                seen:     seen.clone(),
+                overlong: overlong.clone(),
+            }),
             security:              ClientSecurity::new(),
             schema_cache:          SchemaCache::new(SchemaCacheConfig::default()),
             upload_checkpoint_dir: None,
@@ -2659,8 +2674,18 @@ mod tests {
         );
         assert_eq!(
             *seen.lock().unwrap(),
-            Some((location.uri, Duration::from_secs(90)))
+            Some((location.uri.clone(), Duration::from_secs(90)))
         );
+
+        overlong.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            client
+                .presign_read(&location, Duration::from_secs(90))
+                .await,
+            Err(SdkError::Object {
+                source: lake_objects::ObjectError::InvalidPresignedCapabilityLifetime,
+            })
+        ));
     }
 
     #[test]
@@ -2863,7 +2888,8 @@ mod tests {
     struct DelegatingStore(LocalObjectStore);
 
     struct SigningStore {
-        seen: Arc<StdMutex<Option<(String, Duration)>>>,
+        seen:     Arc<StdMutex<Option<(String, Duration)>>>,
+        overlong: Arc<AtomicBool>,
     }
 
     #[async_trait::async_trait]
@@ -2897,10 +2923,15 @@ mod tests {
             expires_in: Duration,
         ) -> ObjectResult<PresignedRead> {
             *self.seen.lock().unwrap() = Some((location.uri.clone(), expires_in));
+            let extra = if self.overlong.load(Ordering::SeqCst) {
+                Duration::from_mins(1)
+            } else {
+                Duration::ZERO
+            };
             Ok(PresignedRead::new(
                 "https://example.invalid/redacted-capability",
                 Vec::new(),
-                SystemTime::now() + expires_in,
+                SystemTime::now() + expires_in + extra,
             ))
         }
     }

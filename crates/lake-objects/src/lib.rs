@@ -126,6 +126,9 @@ pub enum ObjectError {
     #[snafu(display("presigned read expiration {expires_in:?} is outside 1s..=1h"))]
     InvalidPresignExpiration { expires_in: Duration },
 
+    #[snafu(display("managed object store returned an invalid presigned capability lifetime"))]
+    InvalidPresignedCapabilityLifetime,
+
     #[snafu(display("object GC cannot plan while retained reference lineage is incomplete"))]
     GcLineageIncomplete,
 
@@ -220,6 +223,9 @@ pub struct PresignedRead {
 
 impl PresignedRead {
     /// Construct a capability returned by a custom managed object store.
+    ///
+    /// The store must not make `expires_at` later than the requested lifetime;
+    /// SDK callers revalidate this boundary for embedding stores.
     #[must_use]
     pub fn new(
         url: impl Into<String>,
@@ -307,6 +313,8 @@ pub trait ManagedObjectStore: Send + Sync {
     async fn open_range(&self, location: &DataLocation, range: Range<u64>) -> Result<ObjectReader>;
 
     /// Mint one short-lived HTTP GET capability after validating stage scope.
+    /// Implementations must honor `expires_in`; callers may reject an expired
+    /// result or one whose remaining lifetime exceeds the request.
     async fn presign_read(
         &self,
         _location: &DataLocation,
@@ -692,6 +700,18 @@ mod tests {
                 name.eq_ignore_ascii_case("X-Amz-Expires") && value == "60"
             })
         );
+        let signed_headers = url
+            .query_pairs()
+            .find(|(name, _)| name.eq_ignore_ascii_case("X-Amz-SignedHeaders"))
+            .map(|(_, value)| value.into_owned())
+            .expect("SigV4 signed headers");
+        assert!(!signed_headers.to_ascii_lowercase().contains("range"));
+        assert!(
+            capability
+                .headers()
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("range"))
+        );
         assert!(capability.expires_at() >= before + Duration::from_mins(1));
         assert!(capability.expires_at() <= SystemTime::now() + Duration::from_mins(1));
         let debug = format!("{capability:?}");
@@ -726,6 +746,25 @@ mod tests {
                 Err(ObjectError::OutsideManagedS3Prefix { .. })
                     | Err(ObjectError::InvalidS3Uri { .. })
             ));
+        }
+
+        let credential_uri = concat!(
+            "s3://user:userinfo-secret@lake-managed/tenants/tenant-a/objects/object?",
+            "X-Amz-Signature=signature-secret&X-Amz-Security-Token=token-secret#fragment-secret",
+        );
+        let error = store
+            .presign_read(&s3_location(credential_uri), Duration::from_mins(1))
+            .await
+            .unwrap_err();
+        for formatted in [format!("{error}"), format!("{error:?}")] {
+            for secret in [
+                "userinfo-secret",
+                "signature-secret",
+                "token-secret",
+                "fragment-secret",
+            ] {
+                assert!(!formatted.contains(secret));
+            }
         }
 
         let local = LocalObjectStore::open(tempdir().unwrap().path())

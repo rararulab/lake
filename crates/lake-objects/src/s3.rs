@@ -136,9 +136,9 @@ impl S3ObjectStore {
             .key(key)
             .presigned(config)
             .await
-            .map_err(|error| ObjectError::S3 {
+            .map_err(|_error| ObjectError::S3 {
                 action:  "presign_get_object",
-                message: error.to_string(),
+                message: "could not construct signed GET capability".to_owned(),
             })?;
         debug_assert_eq!(request.method(), "GET");
         let headers = request
@@ -154,7 +154,7 @@ impl S3ObjectStore {
 
     fn managed_key(&self, uri: &str) -> Result<String> {
         let parsed = Url::parse(uri).map_err(|_| ObjectError::InvalidS3Uri {
-            uri: uri.to_owned(),
+            uri: redacted_s3_identity(uri),
         })?;
         if parsed.scheme() != "s3"
             || !parsed.username().is_empty()
@@ -164,11 +164,11 @@ impl S3ObjectStore {
             || parsed.fragment().is_some()
         {
             return Err(ObjectError::InvalidS3Uri {
-                uri: uri.to_owned(),
+                uri: redacted_s3_identity(uri),
             });
         }
         let bucket = parsed.host_str().ok_or_else(|| ObjectError::InvalidS3Uri {
-            uri: uri.to_owned(),
+            uri: redacted_s3_identity(uri),
         })?;
         let key = parsed.path().trim_start_matches('/');
         let managed_prefix = format!("{}/", self.prefix);
@@ -631,6 +631,16 @@ impl S3ObjectStore {
                 .build(),
         ))
     }
+}
+
+fn redacted_s3_identity(uri: &str) -> String {
+    let Ok(parsed) = Url::parse(uri) else {
+        return "<redacted-invalid-s3-uri>".to_owned();
+    };
+    let Some(host) = parsed.host_str() else {
+        return "<redacted-invalid-s3-uri>".to_owned();
+    };
+    format!("{}://{}{}", parsed.scheme(), host, parsed.path())
 }
 
 #[async_trait]
