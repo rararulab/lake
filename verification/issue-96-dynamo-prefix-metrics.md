@@ -26,4 +26,13 @@
   hot calls only perform an atomic deadline check, and the documented queries
   aggregate matching label sets over explicit ranges.
 - The corrected full gate and documentation check passed after these fixes.
-- Independent corrected-head review is pending.
+- The final frozen code head passed the lane-1 lifecycle again (4/4), and the
+  docs-only follow-up passed `mise run site-check`.
+- Correctness/security review approved the best-effort refresh, state timing,
+  and finite identity-free labels.
+- Performance and release review confirmed the implementation and
+  amplification queries, then found that global `absent_over_time` could miss
+  one absent pod in a multi-pod deployment. Rollout docs now reconcile each
+  `up` target with the authority series via `unless on (service, instance)` and
+  separately alert on authority `== 0`.
+- Independent docs-only confirmation is pending.

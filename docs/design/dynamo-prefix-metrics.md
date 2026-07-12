@@ -31,9 +31,14 @@ gauge and never changes startup or metastore error semantics.
 
 After finalization and the required runtime restart:
 
-- `max by (service, instance) (lake_dynamo_v2_authoritative)` must be `1` for
-  every Query and Metasrv target; also alert on
-  `absent_over_time(lake_dynamo_v2_authoritative[5m])`.
+- Alert on an explicitly v1-authoritative target with
+  `max by (service, instance) (lake_dynamo_v2_authoritative) == 0`.
+- Detect a missing series per scrape target by reconciling against inventory:
+  `max by (service, instance) (up{job=~"lake-query|lake-metasrv"})
+  unless on (service, instance)
+  max by (service, instance) (lake_dynamo_v2_authoritative)`. Configure the
+  alert rule with `for: 5m`; the scrape configuration must relabel `up` with
+  the same `service` and `instance` identity as lake metrics.
 - `sum by (service, instance)
   (rate(lake_dynamo_prefix_requests_total{layout="v1"}[5m]))` must fall to
   zero.
