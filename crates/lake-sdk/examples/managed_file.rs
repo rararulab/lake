@@ -91,6 +91,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_upload_checkpoint_dir(root.path().join("upload-checkpoints"))
         .connect()
         .await?;
+    // Production startup resumes exact appends whose prior commit response was
+    // lost. Run this before LAKE_APPEND_OPERATION_RETENTION_SECS elapses
+    // (seven days by default); it never reuploads objects or allocates a new ID.
+    for operation_id in client.pending_append_ids().await? {
+        client.resume_pending_append(&operation_id).await?;
+    }
     client
         .insert_many(
             "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",

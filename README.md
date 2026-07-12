@@ -197,6 +197,39 @@ verified multipart completion; `ManagedObjectStore::cancel_upload` explicitly
 aborts an abandoned upload. Reader-backed uploads remain one-shot because an
 arbitrary stream cannot be replayed after process restart.
 
+The same directory also makes the metadata append durable after every object
+has uploaded. Before its first append RPC, the SDK atomically fsyncs the exact
+UUIDv7 operation ID and encoded Arrow metadata (never object bytes or
+credentials). If the process dies while the commit result is unknown, a new
+client can enumerate the bounded recovery set and resume one exact operation:
+
+If the final rename succeeds but directory sync fails, preparation returns a
+typed uncertainty error whose `into_pending_append()` preserves that exact
+operation and published path; do not start a fresh insert.
+
+```rust
+for operation_id in client.pending_append_ids().await? {
+    let committed_version = client.resume_pending_append(&operation_id).await?;
+    println!("recovered {operation_id} at version {committed_version:?}");
+}
+```
+
+Success and explicit server rejection remove the append checkpoint; ambiguous
+transport, response protocol/decoding, and invalid-result failures retain the
+same operation. Cleanup I/O failure is logged without changing a
+conclusive commit result, and any leftover remains replay-safe. A crash after
+server commit but before local cleanup safely replays to the original version.
+Checkpoint discovery is capped at 1,024 directory entries and each file is
+size-bounded and integrity-checked. Use one checkpoint directory only within a
+single trusted SDK/tenant boundary.
+
+Recovery is finite, not a permanent work queue: resume within the metadata
+server's `LAKE_APPEND_OPERATION_RETENTION_SECS` horizon (seven days by
+default). After that horizon the server rejects the UUIDv7 operation as
+expired; the SDK treats that rejection as conclusive and removes the local
+append checkpoint. Monitor pending checkpoints and run the startup recovery
+loop before the shortest retention configured across the deployment.
+
 Query results stream back through the same SDK connection. Decode the logical
 `FILE` value into its stable `DataLocation`, then open the object directly:
 

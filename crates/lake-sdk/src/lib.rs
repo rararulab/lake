@@ -14,6 +14,8 @@
 
 //! Rust SDK for parameterized SQL inserts containing managed `FILE` values.
 
+mod append_checkpoint;
+
 use std::{
     collections::BTreeMap,
     fmt,
@@ -65,6 +67,7 @@ const MAX_INSERT_BATCH_ROWS: usize = 10_000;
 const MAX_INSERT_INPUT_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INSERT_OUTPUT_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INSERT_FLIGHT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PENDING_APPEND_CHECKPOINTS: usize = 1_024;
 
 fn ambiguous_append_error(error: &SdkError) -> bool {
     match error {
@@ -79,9 +82,10 @@ fn ambiguous_append_error(error: &SdkError) -> bool {
                 | tonic::Code::Internal
                 | tonic::Code::Unavailable
         ),
-        SdkError::Flight {
-            source: arrow_flight::error::FlightError::ExternalError(_),
-        } => true,
+        // Non-status Flight failures describe the response transport or
+        // decoding path. The request may already have committed, so none of
+        // them proves a server-side rejection.
+        SdkError::Flight { .. } => true,
         _ => false,
     }
 }
@@ -117,6 +121,53 @@ where
     .map_err(|_| AppendRetryFailure::Expired)?
 }
 
+async fn resume_pending_with<F, Fut>(
+    pending: PendingAppend,
+    window: std::time::Duration,
+    mut attempt: F,
+) -> Result<Version>
+where
+    F: FnMut(Vec<FlightData>) -> Fut,
+    Fut: std::future::Future<Output = Result<PutResult>>,
+{
+    let result =
+        retry_ambiguous_append_with_window(|| attempt(pending.messages.clone()), window).await;
+    let result = match result {
+        Ok(result) => result,
+        Err(AppendRetryFailure::Sdk(error)) => {
+            if append_checkpoint::remove(pending.checkpoint.as_deref())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    operation_id = %pending.operation_id,
+                    "conclusive append rejection could not remove its durable checkpoint"
+                );
+            }
+            return Err(error);
+        }
+        Err(AppendRetryFailure::Expired) => {
+            return Err(SdkError::AppendRetryExpired { window, pending });
+        }
+    };
+    let version = serde_json::from_slice(&result.app_metadata).map_err(|source| {
+        SdkError::AppendResultUncertain {
+            pending: pending.clone(),
+            source,
+        }
+    })?;
+    if append_checkpoint::remove(pending.checkpoint.as_deref())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            operation_id = %pending.operation_id,
+            "committed append could not remove its replay-safe durable checkpoint"
+        );
+    }
+    Ok(version)
+}
+
 /// Errors raised by the typed Rust SDK.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -126,6 +177,43 @@ pub enum SdkError {
 
     #[snafu(display("invalid SDK schema cache configuration: {message}"))]
     InvalidSchemaCacheConfig { message: String },
+
+    #[snafu(display("durable append checkpoints are not configured"))]
+    AppendCheckpointingDisabled,
+
+    #[snafu(display("append checkpoint I/O failed while {action} {path:?}"))]
+    AppendCheckpointIo {
+        action: &'static str,
+        path:   PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display(
+        "append checkpoint was published at {path:?}, but its directory sync failed; recover the \
+         returned pending append instead of preparing a new operation"
+    ))]
+    AppendCheckpointPublishUncertain {
+        path:    PathBuf,
+        pending: PendingAppend,
+        source:  std::io::Error,
+    },
+
+    #[snafu(display("append checkpoint {path:?} is invalid: {message}"))]
+    InvalidAppendCheckpoint { path: PathBuf, message: String },
+
+    #[snafu(display(
+        "append checkpoint {path:?} is {actual} bytes, above the {maximum}-byte limit"
+    ))]
+    AppendCheckpointTooLarge {
+        path:    PathBuf,
+        actual:  u64,
+        maximum: u64,
+    },
+
+    #[snafu(display(
+        "append checkpoint directory contains more than {maximum} pending operations"
+    ))]
+    TooManyPendingAppendCheckpoints { maximum: usize },
 
     #[snafu(display(
         "ambiguous FILE append did not converge within {window:?}; resume the returned pending \
@@ -200,6 +288,15 @@ pub enum SdkError {
     #[snafu(display("query returned an invalid FILE append version"))]
     InvalidAppendResult { source: serde_json::Error },
 
+    #[snafu(display(
+        "FILE append may have committed, but its result metadata was invalid; resume the returned \
+         pending append"
+    ))]
+    AppendResultUncertain {
+        pending: PendingAppend,
+        source:  serde_json::Error,
+    },
+
     #[snafu(display("managed object operation failed"))]
     Object { source: lake_objects::ObjectError },
 
@@ -231,6 +328,7 @@ pub type Result<T> = std::result::Result<T, SdkError>;
 pub struct PendingAppend {
     operation_id: AppendOperationId,
     messages:     Vec<FlightData>,
+    checkpoint:   Option<PathBuf>,
 }
 
 impl PendingAppend {
@@ -244,7 +342,9 @@ impl SdkError {
     #[must_use]
     pub fn into_pending_append(self) -> Option<PendingAppend> {
         match self {
-            Self::AppendRetryExpired { pending, .. } => Some(pending),
+            Self::AppendRetryExpired { pending, .. }
+            | Self::AppendCheckpointPublishUncertain { pending, .. }
+            | Self::AppendResultUncertain { pending, .. } => Some(pending),
             _ => None,
         }
     }
@@ -573,7 +673,8 @@ impl LakeClientBuilder {
         Ok(self)
     }
 
-    /// Persist resumable path-upload checkpoints in this local directory.
+    /// Persist resumable path-upload state and prepared append metadata in
+    /// this local directory.
     #[must_use]
     pub fn with_upload_checkpoint_dir(mut self, directory: impl Into<PathBuf>) -> Self {
         self.upload_checkpoint_dir = Some(directory.into());
@@ -711,19 +812,40 @@ impl LakeClient {
         pending: PendingAppend,
         window: std::time::Duration,
     ) -> Result<Version> {
-        let result = retry_ambiguous_append_with_window(
-            || self.put_append_once(pending.messages.clone()),
-            window,
+        resume_pending_with(pending, window, |messages| self.put_append_once(messages)).await
+    }
+
+    /// List durable append operation IDs without loading their Arrow payloads.
+    pub async fn pending_append_ids(&self) -> Result<Vec<AppendOperationId>> {
+        append_checkpoint::list(
+            self.upload_checkpoint_dir.as_deref(),
+            MAX_PENDING_APPEND_CHECKPOINTS,
         )
-        .await;
-        let result = match result {
-            Ok(result) => result,
-            Err(AppendRetryFailure::Sdk(error)) => return Err(error),
-            Err(AppendRetryFailure::Expired) => {
-                return Err(SdkError::AppendRetryExpired { window, pending });
-            }
-        };
-        serde_json::from_slice(&result.app_metadata).context(InvalidAppendResultSnafu)
+        .await
+    }
+
+    /// Load one exact durable append for explicit inspection or resumption.
+    pub async fn load_pending_append(
+        &self,
+        operation_id: &AppendOperationId,
+    ) -> Result<PendingAppend> {
+        append_checkpoint::load(
+            self.upload_checkpoint_dir.as_deref(),
+            operation_id,
+            &self.objects.stage_identity(),
+            MAX_INSERT_FLIGHT_BYTES,
+        )
+        .await
+    }
+
+    /// Resume one durable append by operation ID after an SDK restart.
+    ///
+    /// Resume before the server's `LAKE_APPEND_OPERATION_RETENTION_SECS`
+    /// horizon (seven days by default). An expired operation is conclusively
+    /// rejected and its local checkpoint is removed.
+    pub async fn resume_pending_append(&self, operation_id: &AppendOperationId) -> Result<Version> {
+        let pending = self.load_pending_append(operation_id).await?;
+        self.resume_append(pending).await
     }
 
     async fn prepare_insert(&self, sql: &str, values: Vec<InsertValue>) -> Result<PendingAppend> {
@@ -817,10 +939,19 @@ impl LakeClient {
             .expect("Flight encoder emits a schema message")
             .flight_descriptor = Some(descriptor);
         validate_flight_payload_size(&messages, MAX_INSERT_FLIGHT_BYTES)?;
-        Ok(PendingAppend {
+        let mut pending = PendingAppend {
             operation_id,
             messages,
-        })
+            checkpoint: None,
+        };
+        pending.checkpoint = append_checkpoint::save(
+            self.upload_checkpoint_dir.as_deref(),
+            &pending,
+            &self.objects.stage_identity(),
+            MAX_INSERT_FLIGHT_BYTES,
+        )
+        .await?;
+        Ok(pending)
     }
 
     async fn put_append_once(&self, messages: Vec<FlightData>) -> Result<PutResult> {
@@ -1294,8 +1425,9 @@ mod tests {
     use crate::{
         APPEND_RETRY_WINDOW, FileUpload, InsertValue, LakeClient, MAX_INSERT_BATCH_ROWS,
         MAX_INSERT_INPUT_METADATA_BYTES, MAX_SCHEMA_CACHE_CAPACITY, MAX_SCHEMA_CACHE_TTL,
-        PresignedRead, SchemaCache, SchemaCacheConfig, SdkError, data_location,
-        retry_ambiguous_append_with_window, validate_flight_payload_size,
+        PresignedRead, SchemaCache, SchemaCacheConfig, SdkError, ambiguous_append_error,
+        data_location, resume_pending_with, retry_ambiguous_append_with_window,
+        validate_flight_payload_size,
     };
 
     #[derive(Clone)]
@@ -1497,6 +1629,313 @@ mod tests {
             Version(2)
         );
         assert_eq!(object_count(&root.path().join("objects")).await, 1);
+    }
+
+    #[tokio::test]
+    async fn durable_append_checkpoint_survives_client_restart() {
+        let root = tempdir().unwrap();
+        let (mut client, _metasrv, _table, _meta, _engine) = setup_client(root.path()).await;
+        let checkpoints = root.path().join("checkpoints");
+        tokio::fs::create_dir_all(&checkpoints).await.unwrap();
+        client.upload_checkpoint_dir = Some(checkpoints.clone());
+        let source = root.path().join("episode.mp4");
+        tokio::fs::write(&source, b"one durable video")
+            .await
+            .unwrap();
+
+        let pending = client
+            .prepare_insert(
+                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    InsertValue::Utf8("episode-durable".to_owned()),
+                    InsertValue::File(FileUpload::from_path(&source, "video/mp4")),
+                ],
+            )
+            .await
+            .unwrap();
+        let expected_messages = pending
+            .messages
+            .iter()
+            .map(Message::encode_to_vec)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            client.pending_append_ids().await.unwrap(),
+            vec![pending.operation_id().clone()]
+        );
+        let restarted = LakeClient {
+            query:                 client.query.clone(),
+            objects:               client.objects.clone(),
+            security:              client.security.clone(),
+            schema_cache:          SchemaCache::new(SchemaCacheConfig::default()),
+            upload_checkpoint_dir: Some(checkpoints),
+        };
+        let recovered = restarted
+            .load_pending_append(pending.operation_id())
+            .await
+            .unwrap();
+
+        assert_eq!(recovered.operation_id(), pending.operation_id());
+        assert_eq!(
+            recovered
+                .messages
+                .iter()
+                .map(Message::encode_to_vec)
+                .collect::<Vec<_>>(),
+            expected_messages
+        );
+        assert_eq!(object_count(&root.path().join("objects")).await, 1);
+    }
+
+    #[tokio::test]
+    async fn durable_append_checkpoint_replays_post_commit_crash() {
+        let root = tempdir().unwrap();
+        let (mut client, metasrv, table, _meta, _engine) = setup_client(root.path()).await;
+        let checkpoints = root.path().join("checkpoints");
+        tokio::fs::create_dir_all(&checkpoints).await.unwrap();
+        client.upload_checkpoint_dir = Some(checkpoints.clone());
+        let source = root.path().join("episode.mp4");
+        tokio::fs::write(&source, b"one committed video")
+            .await
+            .unwrap();
+        let pending = client
+            .prepare_insert(
+                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    InsertValue::Utf8("episode-committed".to_owned()),
+                    InsertValue::File(FileUpload::from_path(&source, "video/mp4")),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let committed = client
+            .put_append_once(pending.messages.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Version>(&committed.app_metadata).unwrap(),
+            Version(2)
+        );
+        assert_eq!(client.pending_append_ids().await.unwrap().len(), 1);
+
+        let restarted = LakeClient {
+            query:                 client.query.clone(),
+            objects:               client.objects.clone(),
+            security:              client.security.clone(),
+            schema_cache:          SchemaCache::new(SchemaCacheConfig::default()),
+            upload_checkpoint_dir: Some(checkpoints),
+        };
+        assert_eq!(
+            restarted
+                .resume_pending_append(pending.operation_id())
+                .await
+                .unwrap(),
+            Version(2)
+        );
+        assert!(restarted.pending_append_ids().await.unwrap().is_empty());
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(2)
+        );
+        assert_eq!(object_count(&root.path().join("objects")).await, 1);
+    }
+
+    #[tokio::test]
+    async fn post_commit_response_decode_failure_retains_exact_checkpoint() {
+        let root = tempdir().unwrap();
+        let (mut client, metasrv, table, _meta, _engine) = setup_client(root.path()).await;
+        let checkpoints = root.path().join("checkpoints");
+        tokio::fs::create_dir_all(&checkpoints).await.unwrap();
+        client.upload_checkpoint_dir = Some(checkpoints);
+        let source = root.path().join("episode.mp4");
+        tokio::fs::write(&source, b"one response-ambiguous video")
+            .await
+            .unwrap();
+        let pending = client
+            .prepare_insert(
+                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    InsertValue::Utf8("episode-response-decode".to_owned()),
+                    InsertValue::File(FileUpload::from_path(&source, "video/mp4")),
+                ],
+            )
+            .await
+            .unwrap();
+        let operation_id = pending.operation_id().clone();
+        let attempt_client = client.clone();
+        let error = resume_pending_with(pending, Duration::from_millis(250), move |messages| {
+            let attempt_client = attempt_client.clone();
+            async move {
+                attempt_client.put_append_once(messages).await?;
+                Err(SdkError::Flight {
+                    source: arrow_flight::error::FlightError::DecodeError(
+                        "response truncated after commit".to_owned(),
+                    ),
+                })
+            }
+        })
+        .await
+        .unwrap_err();
+        let recovered = error
+            .into_pending_append()
+            .expect("response decoding remains replayable");
+
+        assert_eq!(recovered.operation_id(), &operation_id);
+        assert_eq!(
+            client.pending_append_ids().await.unwrap(),
+            vec![operation_id]
+        );
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(2)
+        );
+        assert_eq!(client.resume_append(recovered).await.unwrap(), Version(2));
+        assert!(client.pending_append_ids().await.unwrap().is_empty());
+        assert_eq!(object_count(&root.path().join("objects")).await, 1);
+    }
+
+    #[tokio::test]
+    async fn post_commit_invalid_result_metadata_returns_pending_append() {
+        let root = tempdir().unwrap();
+        let (mut client, metasrv, table, _meta, _engine) = setup_client(root.path()).await;
+        let checkpoints = root.path().join("checkpoints");
+        tokio::fs::create_dir_all(&checkpoints).await.unwrap();
+        client.upload_checkpoint_dir = Some(checkpoints);
+        let source = root.path().join("episode.mp4");
+        tokio::fs::write(&source, b"one invalid-result video")
+            .await
+            .unwrap();
+        let pending = client
+            .prepare_insert(
+                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    InsertValue::Utf8("episode-invalid-result".to_owned()),
+                    InsertValue::File(FileUpload::from_path(&source, "video/mp4")),
+                ],
+            )
+            .await
+            .unwrap();
+        let operation_id = pending.operation_id().clone();
+        let attempt_client = client.clone();
+        let error = resume_pending_with(pending, APPEND_RETRY_WINDOW, move |messages| {
+            let attempt_client = attempt_client.clone();
+            async move {
+                let mut result = attempt_client.put_append_once(messages).await?;
+                result.app_metadata = b"not a version".to_vec().into();
+                Ok(result)
+            }
+        })
+        .await
+        .unwrap_err();
+        let recovered = error
+            .into_pending_append()
+            .expect("invalid post-commit result returns operation ownership");
+
+        assert_eq!(recovered.operation_id(), &operation_id);
+        assert_eq!(
+            client.pending_append_ids().await.unwrap(),
+            vec![operation_id]
+        );
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(2)
+        );
+        assert_eq!(client.resume_append(recovered).await.unwrap(), Version(2));
+        assert!(client.pending_append_ids().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_append_checkpoint_cleans_up_conclusive_outcomes() {
+        let root = tempdir().unwrap();
+        let (mut client, _metasrv, _table, _meta, _engine) = setup_client(root.path()).await;
+        let checkpoints = root.path().join("checkpoints");
+        tokio::fs::create_dir_all(&checkpoints).await.unwrap();
+        client.upload_checkpoint_dir = Some(checkpoints.clone());
+        let source = root.path().join("episode.mp4");
+        tokio::fs::write(&source, b"one retryable video")
+            .await
+            .unwrap();
+
+        let pending = client
+            .prepare_insert(
+                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    InsertValue::Utf8("episode-ambiguous".to_owned()),
+                    InsertValue::File(FileUpload::from_path(&source, "video/mp4")),
+                ],
+            )
+            .await
+            .unwrap();
+        let broken = LakeClient {
+            query:                 tonic::transport::Endpoint::from_static("http://127.0.0.1:9")
+                .connect_lazy(),
+            objects:               client.objects.clone(),
+            security:              client.security.clone(),
+            schema_cache:          client.schema_cache.clone(),
+            upload_checkpoint_dir: Some(checkpoints.clone()),
+        };
+        let retained = broken
+            .resume_append_with_window(pending, Duration::from_millis(5))
+            .await
+            .unwrap_err()
+            .into_pending_append()
+            .expect("ambiguous expiry retains the append");
+        assert_eq!(client.pending_append_ids().await.unwrap().len(), 1);
+
+        let mut terminal = retained.clone();
+        terminal.messages[0].flight_descriptor =
+            Some(FlightDescriptor::new_cmd(b"not a FILE command".to_vec()));
+        let error = client
+            .resume_append_with_window(terminal, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.into_pending_append().is_none());
+        assert!(client.pending_append_ids().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn append_without_checkpoint_directory_remains_memory_only() {
+        let root = tempdir().unwrap();
+        let (client, _metasrv, _table, _meta, _engine) = setup_client(root.path()).await;
+        let source = root.path().join("episode.mp4");
+        tokio::fs::write(&source, b"one in-memory video")
+            .await
+            .unwrap();
+
+        let pending = client
+            .prepare_insert(
+                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    InsertValue::Utf8("episode-memory".to_owned()),
+                    InsertValue::File(FileUpload::from_path(&source, "video/mp4")),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert!(pending.checkpoint.is_none());
+        assert!(client.pending_append_ids().await.unwrap().is_empty());
+        assert!(matches!(
+            client.load_pending_append(pending.operation_id()).await,
+            Err(SdkError::AppendCheckpointingDisabled)
+        ));
+        assert_eq!(client.resume_append(pending).await.unwrap(), Version(2));
     }
 
     #[tokio::test]
@@ -1893,6 +2332,24 @@ mod tests {
             panic!("owned ArrowError source shape changed")
         };
         assert_eq!(message, "shape check");
+    }
+
+    #[test]
+    fn response_decode_and_protocol_failures_remain_ambiguous() {
+        for source in [
+            arrow_flight::error::FlightError::ProtocolError("post-commit response".to_owned()),
+            arrow_flight::error::FlightError::DecodeError("truncated PutResult".to_owned()),
+            arrow_flight::error::FlightError::Arrow(arrow::error::ArrowError::ParseError(
+                "invalid response metadata".to_owned(),
+            )),
+        ] {
+            assert!(ambiguous_append_error(&SdkError::Flight { source }));
+        }
+        assert!(!ambiguous_append_error(&SdkError::Flight {
+            source: arrow_flight::error::FlightError::Tonic(Box::new(
+                tonic::Status::invalid_argument("server rejected before commit"),
+            )),
+        }));
     }
 
     async fn object_count(path: &std::path::Path) -> usize {
