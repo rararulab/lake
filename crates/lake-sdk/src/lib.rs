@@ -64,28 +64,19 @@ const MAX_SCHEMA_CACHE_TTL: Duration = Duration::from_hours(1);
 fn ambiguous_append_error(error: &SdkError) -> bool {
     match error {
         SdkError::MissingAppendResult => true,
-        SdkError::Flight { source }
-            if matches!(
-                source.as_ref(),
-                arrow_flight::error::FlightError::Tonic(status) if matches!(status.code(),
-                tonic::Code::Cancelled
-                    | tonic::Code::Unknown
-                    | tonic::Code::DeadlineExceeded
-                    | tonic::Code::Internal
-                    | tonic::Code::Unavailable
-                )
-            ) =>
-        {
-            true
-        }
-        SdkError::Flight { source }
-            if matches!(
-                source.as_ref(),
-                arrow_flight::error::FlightError::ExternalError(_)
-            ) =>
-        {
-            true
-        }
+        SdkError::Flight {
+            source: arrow_flight::error::FlightError::Tonic(status),
+        } => matches!(
+            status.code(),
+            tonic::Code::Cancelled
+                | tonic::Code::Unknown
+                | tonic::Code::DeadlineExceeded
+                | tonic::Code::Internal
+                | tonic::Code::Unavailable
+        ),
+        SdkError::Flight {
+            source: arrow_flight::error::FlightError::ExternalError(_),
+        } => true,
         _ => false,
     }
 }
@@ -163,8 +154,7 @@ pub enum SdkError {
 
     #[snafu(display("query Flight operation failed"))]
     Flight {
-        #[snafu(source(from(arrow_flight::error::FlightError, Arc::new)))]
-        source: Arc<arrow_flight::error::FlightError>,
+        source: arrow_flight::error::FlightError,
     },
 
     #[snafu(display("query returned no managed FILE stage descriptor"))]
@@ -209,10 +199,7 @@ pub enum SdkError {
     },
 
     #[snafu(display("could not build INSERT record batch"))]
-    Arrow {
-        #[snafu(source(from(ArrowError, Arc::new)))]
-        source: Arc<ArrowError>,
-    },
+    Arrow { source: ArrowError },
 
     #[snafu(display("invalid query Flight security configuration"))]
     Security {
@@ -352,15 +339,139 @@ type SchemaLoadResult = std::result::Result<SchemaRef, SchemaLoadError>;
 
 #[derive(Clone, Debug)]
 enum SchemaLoadError {
-    Flight(Arc<arrow_flight::error::FlightError>),
-    Arrow(Arc<ArrowError>),
+    Flight(FlightErrorSnapshot),
+    Arrow(ArrowErrorSnapshot),
 }
 
 impl SchemaLoadError {
     fn into_sdk_error(self) -> SdkError {
         match self {
-            Self::Flight(source) => SdkError::Flight { source },
-            Self::Arrow(source) => SdkError::Arrow { source },
+            Self::Flight(source) => SdkError::Flight {
+                source: source.into_error(),
+            },
+            Self::Arrow(source) => SdkError::Arrow {
+                source: source.into_error(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum FlightErrorSnapshot {
+    Arrow(ArrowErrorSnapshot),
+    NotYetImplemented(String),
+    Tonic(tonic::Status),
+    Protocol(String),
+    Decode(String),
+    External(String),
+}
+
+impl FlightErrorSnapshot {
+    fn from_error(error: arrow_flight::error::FlightError) -> Self {
+        use arrow_flight::error::FlightError;
+        match error {
+            FlightError::Arrow(source) => Self::Arrow(ArrowErrorSnapshot::from_error(source)),
+            FlightError::NotYetImplemented(message) => Self::NotYetImplemented(message),
+            FlightError::Tonic(status) => Self::Tonic(*status),
+            FlightError::ProtocolError(message) => Self::Protocol(message),
+            FlightError::DecodeError(message) => Self::Decode(message),
+            FlightError::ExternalError(source) => Self::External(source.to_string()),
+        }
+    }
+
+    fn into_error(self) -> arrow_flight::error::FlightError {
+        use arrow_flight::error::FlightError;
+        match self {
+            Self::Arrow(source) => FlightError::Arrow(source.into_error()),
+            Self::NotYetImplemented(message) => FlightError::NotYetImplemented(message),
+            Self::Tonic(status) => FlightError::Tonic(Box::new(status)),
+            Self::Protocol(message) => FlightError::ProtocolError(message),
+            Self::Decode(message) => FlightError::DecodeError(message),
+            Self::External(message) => {
+                FlightError::ExternalError(Box::new(std::io::Error::other(message)))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ArrowErrorSnapshot {
+    NotYetImplemented(String),
+    External(String),
+    Cast(String),
+    Memory(String),
+    Parse(String),
+    Schema(String),
+    Compute(String),
+    DivideByZero,
+    ArithmeticOverflow(String),
+    Csv(String),
+    Json(String),
+    Avro(String),
+    Io(String, std::io::ErrorKind, String),
+    Ipc(String),
+    InvalidArgument(String),
+    Parquet(String),
+    CDataInterface(String),
+    DictionaryKeyOverflow,
+    RunEndIndexOverflow,
+    OffsetOverflow(usize),
+}
+
+impl ArrowErrorSnapshot {
+    fn from_error(error: ArrowError) -> Self {
+        match error {
+            ArrowError::NotYetImplemented(message) => Self::NotYetImplemented(message),
+            ArrowError::ExternalError(source) => Self::External(source.to_string()),
+            ArrowError::CastError(message) => Self::Cast(message),
+            ArrowError::MemoryError(message) => Self::Memory(message),
+            ArrowError::ParseError(message) => Self::Parse(message),
+            ArrowError::SchemaError(message) => Self::Schema(message),
+            ArrowError::ComputeError(message) => Self::Compute(message),
+            ArrowError::DivideByZero => Self::DivideByZero,
+            ArrowError::ArithmeticOverflow(message) => Self::ArithmeticOverflow(message),
+            ArrowError::CsvError(message) => Self::Csv(message),
+            ArrowError::JsonError(message) => Self::Json(message),
+            ArrowError::AvroError(message) => Self::Avro(message),
+            ArrowError::IoError(message, source) => {
+                Self::Io(message, source.kind(), source.to_string())
+            }
+            ArrowError::IpcError(message) => Self::Ipc(message),
+            ArrowError::InvalidArgumentError(message) => Self::InvalidArgument(message),
+            ArrowError::ParquetError(message) => Self::Parquet(message),
+            ArrowError::CDataInterface(message) => Self::CDataInterface(message),
+            ArrowError::DictionaryKeyOverflowError => Self::DictionaryKeyOverflow,
+            ArrowError::RunEndIndexOverflowError => Self::RunEndIndexOverflow,
+            ArrowError::OffsetOverflowError(offset) => Self::OffsetOverflow(offset),
+        }
+    }
+
+    fn into_error(self) -> ArrowError {
+        match self {
+            Self::NotYetImplemented(message) => ArrowError::NotYetImplemented(message),
+            Self::External(message) => {
+                ArrowError::ExternalError(Box::new(std::io::Error::other(message)))
+            }
+            Self::Cast(message) => ArrowError::CastError(message),
+            Self::Memory(message) => ArrowError::MemoryError(message),
+            Self::Parse(message) => ArrowError::ParseError(message),
+            Self::Schema(message) => ArrowError::SchemaError(message),
+            Self::Compute(message) => ArrowError::ComputeError(message),
+            Self::DivideByZero => ArrowError::DivideByZero,
+            Self::ArithmeticOverflow(message) => ArrowError::ArithmeticOverflow(message),
+            Self::Csv(message) => ArrowError::CsvError(message),
+            Self::Json(message) => ArrowError::JsonError(message),
+            Self::Avro(message) => ArrowError::AvroError(message),
+            Self::Io(message, kind, source) => {
+                ArrowError::IoError(message, std::io::Error::new(kind, source))
+            }
+            Self::Ipc(message) => ArrowError::IpcError(message),
+            Self::InvalidArgument(message) => ArrowError::InvalidArgumentError(message),
+            Self::Parquet(message) => ArrowError::ParquetError(message),
+            Self::CDataInterface(message) => ArrowError::CDataInterface(message),
+            Self::DictionaryKeyOverflow => ArrowError::DictionaryKeyOverflowError,
+            Self::RunEndIndexOverflow => ArrowError::RunEndIndexOverflowError,
+            Self::OffsetOverflow(offset) => ArrowError::OffsetOverflowError(offset),
         }
     }
 }
@@ -721,9 +832,9 @@ impl LakeClient {
         let info = client
             .execute(format!("SELECT * FROM lake.{table} LIMIT 0"), None)
             .await
-            .map_err(|source| SchemaLoadError::Flight(Arc::new(source)))?;
-        let schema =
-            Schema::try_from(info).map_err(|source| SchemaLoadError::Arrow(Arc::new(source)))?;
+            .map_err(|source| SchemaLoadError::Flight(FlightErrorSnapshot::from_error(source)))?;
+        let schema = Schema::try_from(info)
+            .map_err(|source| SchemaLoadError::Arrow(ArrowErrorSnapshot::from_error(source)))?;
         Ok(Arc::new(schema))
     }
 
@@ -1151,9 +1262,9 @@ mod tests {
                     let committed = attempt_client.put_append_once(messages).await?;
                     if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                         Err(SdkError::Flight {
-                            source: Arc::new(arrow_flight::error::FlightError::Tonic(Box::new(
+                            source: arrow_flight::error::FlightError::Tonic(Box::new(
                                 tonic::Status::unavailable("response lost after commit"),
-                            ))),
+                            )),
                         })
                     } else {
                         Ok(committed)
@@ -1468,7 +1579,7 @@ mod tests {
         assert!(failures.iter().all(|result| matches!(
             result,
             Err(SdkError::Flight { source }) if matches!(
-                source.as_ref(),
+                source,
                 arrow_flight::error::FlightError::Tonic(status)
                     if status.code() == tonic::Code::Unavailable
             )
@@ -1612,6 +1723,33 @@ mod tests {
         let defaults = SchemaCacheConfig::default();
         assert_eq!(defaults.capacity, 1_024);
         assert_eq!(defaults.ttl, Duration::from_mins(1));
+    }
+
+    #[test]
+    fn sdk_error_sources_remain_owned_public_types() {
+        let flight = SdkError::Flight {
+            source: arrow_flight::error::FlightError::Tonic(Box::new(tonic::Status::unavailable(
+                "shape check",
+            ))),
+        };
+        let SdkError::Flight {
+            source: arrow_flight::error::FlightError::Tonic(status),
+        } = flight
+        else {
+            panic!("owned FlightError source shape changed")
+        };
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+
+        let arrow = SdkError::Arrow {
+            source: arrow::error::ArrowError::SchemaError("shape check".to_owned()),
+        };
+        let SdkError::Arrow {
+            source: arrow::error::ArrowError::SchemaError(message),
+        } = arrow
+        else {
+            panic!("owned ArrowError source shape changed")
+        };
+        assert_eq!(message, "shape check");
     }
 
     async fn object_count(path: &std::path::Path) -> usize {
