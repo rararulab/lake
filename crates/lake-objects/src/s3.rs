@@ -50,6 +50,7 @@ const MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024;
 const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
 pub(crate) const MAX_UPLOAD_CONCURRENCY: usize = 16;
 const MULTIPART_ABORT_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_SCOPED_DELETE_OBJECTS: usize = 4_100;
 
 type PartFuture<'a> = Pin<Box<dyn Future<Output = Result<UploadedPipelinePart>> + Send + 'a>>;
 
@@ -107,7 +108,7 @@ impl MultipartCleanupOwner {
         });
         Self {
             decision: Some(decision),
-            task: Some(task),
+            task:     Some(task),
         }
     }
 
@@ -940,6 +941,75 @@ impl ManagedObjectStore for S3ObjectStore {
             .size_bytes(size_bytes)
             .sha256(sha256)
             .build())
+    }
+
+    async fn put_scoped_reader(
+        &self,
+        scope: &crate::ManagedObjectScope,
+        class: &str,
+        input: ObjectReader,
+        content_type: String,
+    ) -> Result<DataLocation> {
+        let scoped = Self {
+            client:             self.client.clone(),
+            bucket:             self.bucket.clone(),
+            prefix:             format!("{}/{}", self.prefix, scope.relative_prefix(class)?),
+            upload_concurrency: self.upload_concurrency,
+        };
+        ManagedObjectStore::put_reader(&scoped, input, content_type).await
+    }
+
+    async fn delete_scope(&self, scope: &crate::ManagedObjectScope) -> Result<()> {
+        let prefix = format!("{}/{}/", self.prefix, scope.relative_scope_prefix());
+        let mut continuation = None;
+        let mut deleted = 0_usize;
+        loop {
+            let output = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&prefix)
+                .set_continuation_token(continuation.take())
+                .send()
+                .await
+                .map_err(|error| ObjectError::S3 {
+                    action:  "list_objects_v2",
+                    message: error.to_string(),
+                })?;
+            if deleted.saturating_add(output.contents().len()) > MAX_SCOPED_DELETE_OBJECTS {
+                return Err(ObjectError::ScopedDeleteTooLarge);
+            }
+            for object in output.contents() {
+                let key = object.key().ok_or_else(|| ObjectError::S3 {
+                    action:  "list_objects_v2",
+                    message: "scoped S3 object omitted key".to_owned(),
+                })?;
+                self.client
+                    .delete_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .map_err(|error| ObjectError::S3 {
+                        action:  "delete_object",
+                        message: error.to_string(),
+                    })?;
+                deleted += 1;
+            }
+            if output.is_truncated() != Some(true) {
+                return Ok(());
+            }
+            continuation = Some(
+                output
+                    .next_continuation_token()
+                    .ok_or_else(|| ObjectError::S3 {
+                        action:  "list_objects_v2",
+                        message: "truncated scoped S3 listing omitted continuation token"
+                            .to_owned(),
+                    })?
+                    .to_owned(),
+            );
+        }
     }
 
     async fn open_reader(&self, location: &DataLocation) -> Result<ObjectReader> {

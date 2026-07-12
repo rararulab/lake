@@ -253,6 +253,30 @@ impl ManagedObjectStore for LocalObjectStore {
         LocalObjectStore::put_reader(self, input, content_type).await
     }
 
+    async fn put_scoped_reader(
+        &self,
+        scope: &crate::ManagedObjectScope,
+        class: &str,
+        input: ObjectReader,
+        content_type: String,
+    ) -> Result<DataLocation> {
+        let scoped = LocalObjectStore::open(self.root.join(scope.relative_prefix(class)?)).await?;
+        LocalObjectStore::put_reader(&scoped, input, content_type).await
+    }
+
+    async fn delete_scope(&self, scope: &crate::ManagedObjectScope) -> Result<()> {
+        let path = self.root.join(scope.relative_scope_prefix());
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(ObjectError::Io {
+                action: "deleting scoped objects".to_owned(),
+                path,
+                source,
+            }),
+        }
+    }
+
     async fn open_reader(&self, location: &DataLocation) -> Result<ObjectReader> {
         Ok(Box::pin(
             LocalObjectStore::open_reader(self, location).await?,

@@ -24,6 +24,7 @@
 //! `execute_sql` runs SQL in-process; [`serve`] exposes the same engine over
 //! the Arrow Flight SQL wire (see `flight`).
 
+mod async_query;
 mod flight;
 mod telemetry;
 mod ticket;
@@ -32,7 +33,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use arrow_flight::flight_service_server::FlightServiceServer;
@@ -44,6 +45,7 @@ use datafusion::{
     execution::{memory_pool::FairSpillPool, runtime_env::RuntimeEnvBuilder},
     prelude::{SQLOptions, SessionConfig, SessionContext},
 };
+use futures::StreamExt;
 use lake_catalog::{
     CatalogGeneration, CatalogRefreshHealth, LakeCatalog, ProviderLoadError, TableSnapshot,
 };
@@ -51,6 +53,7 @@ use lake_common::{ManagedStageDescriptor, TableRef};
 use lake_engine::TableEngineRef;
 use lake_flight::{ClientSecurity, ServerSecurity};
 use lake_meta::MetaStoreRef;
+use lake_objects::ManagedObjectStore;
 use snafu::{ResultExt, Snafu};
 pub use ticket::{QueryTicketError, QueryTicketKeyRing};
 use tokio_util::sync::CancellationToken;
@@ -115,6 +118,9 @@ pub enum QueryError {
 
     #[snafu(display("invalid Query statement-ticket configuration"))]
     InvalidTicketConfiguration,
+
+    #[snafu(display("invalid Query asynchronous-result configuration"))]
+    InvalidAsyncConfiguration,
 
     #[snafu(display("failed to initialize Query execution resources"))]
     Runtime { source: DataFusionError },
@@ -331,6 +337,77 @@ impl Default for QueryResources {
 }
 
 /// Complete network configuration for one stateless Query server.
+#[derive(Clone)]
+pub struct AsyncQueryConfig {
+    state:              MetaStoreRef,
+    results:            Arc<dyn ManagedObjectStore>,
+    job_lifetime:       Duration,
+    poll_ttl:           Duration,
+    worker_lease:       Duration,
+    scan_interval:      Duration,
+    worker_concurrency: usize,
+}
+
+impl AsyncQueryConfig {
+    #[must_use]
+    pub fn new(state: MetaStoreRef, results: Arc<dyn ManagedObjectStore>) -> Self {
+        Self {
+            state,
+            results,
+            job_lifetime: Duration::from_hours(6),
+            poll_ttl: Duration::from_mins(5),
+            worker_lease: Duration::from_secs(30),
+            scan_interval: Duration::from_secs(1),
+            worker_concurrency: 4,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_job_lifetime(mut self, lifetime: Duration) -> Self {
+        self.job_lifetime = lifetime;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_poll_ttl(mut self, ttl: Duration) -> Self {
+        self.poll_ttl = ttl;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_worker_lease(mut self, lease: Duration) -> Self {
+        self.worker_lease = lease;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_scan_interval(mut self, interval: Duration) -> Self {
+        self.scan_interval = interval;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_worker_concurrency(mut self, concurrency: usize) -> Self {
+        self.worker_concurrency = concurrency;
+        self
+    }
+}
+
+impl std::fmt::Debug for AsyncQueryConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AsyncQueryConfig")
+            .field("state", &"<redacted>")
+            .field("results", &self.results.stage_identity())
+            .field("job_lifetime", &self.job_lifetime)
+            .field("poll_ttl", &self.poll_ttl)
+            .field("worker_lease", &self.worker_lease)
+            .field("scan_interval", &self.scan_interval)
+            .field("worker_concurrency", &self.worker_concurrency)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct QueryServerConfig {
     metadata_endpoint: Option<String>,
@@ -343,6 +420,7 @@ pub struct QueryServerConfig {
     ticket_keys:       Option<QueryTicketKeyRing>,
     ticket_ttl:        Duration,
     shutdown_grace:    Duration,
+    async_queries:     Option<AsyncQueryConfig>,
 }
 
 impl QueryServerConfig {
@@ -360,6 +438,7 @@ impl QueryServerConfig {
             ticket_keys:       None,
             ticket_ttl:        DEFAULT_STATEMENT_TICKET_TTL,
             shutdown_grace:    Duration::from_secs(30),
+            async_queries:     None,
         }
     }
 
@@ -412,6 +491,14 @@ impl QueryServerConfig {
     #[must_use]
     pub fn with_ticket_keys(mut self, keys: QueryTicketKeyRing) -> Self {
         self.ticket_keys = Some(keys);
+        self
+    }
+
+    /// Enable durable PollFlightInfo jobs using an independent state store
+    /// and service-owned result object store.
+    #[must_use]
+    pub fn with_async_queries(mut self, config: AsyncQueryConfig) -> Self {
+        self.async_queries = Some(config);
         self
     }
 
@@ -638,8 +725,45 @@ where
         .server_security
         .validate_exposure(socket, config.allow_insecure)
         .context(SecuritySnafu)?;
-    let ticket_codec =
-        statement_ticket_codec_for_listener(socket, config.ticket_keys, config.ticket_ttl)?;
+    let ticket_keys = ticket_keys_for_listener(socket, config.ticket_keys.clone())?;
+    let ticket_codec = ticket::StatementTicketCodec::try_new(
+        ticket_keys.clone(),
+        config.ticket_ttl,
+        STATEMENT_TICKET_AUDIENCE,
+    )
+    .map_err(|_| QueryError::InvalidTicketConfiguration)?;
+    let async_runtime = match config.async_queries.clone() {
+        Some(async_config) => {
+            if async_config.scan_interval.is_zero()
+                || !(1..=64).contains(&async_config.worker_concurrency)
+            {
+                return Err(QueryError::InvalidAsyncConfiguration);
+            }
+            let coordinator = async_query::AsyncQueryCoordinator::try_new(
+                async_config.state,
+                async_config.results,
+                ticket_keys,
+                async_config.job_lifetime,
+                async_config.poll_ttl,
+            )
+            .map_err(|_| QueryError::InvalidAsyncConfiguration)?;
+            let identity = async_query::WorkerIdentity::new(*uuid::Uuid::now_v7().as_bytes());
+            let worker = async_query::AsyncQueryWorker::try_new(
+                coordinator.clone(),
+                engine.clone(),
+                identity,
+                async_config.worker_lease,
+            )
+            .map_err(|_| QueryError::InvalidAsyncConfiguration)?;
+            Some((
+                coordinator,
+                worker,
+                async_config.scan_interval,
+                async_config.worker_concurrency,
+            ))
+        }
+        None => None,
+    };
     let mut server = tonic::transport::Server::builder();
     if let Some(tls) = config.server_security.tls_config() {
         server = server.tls_config(tls).context(ServeSnafu)?;
@@ -666,17 +790,31 @@ where
         cancellation: cancellation.clone(),
         engine:       engine.clone(),
         refresher:    Some(refresher),
+        async_worker: None,
     };
-    let service =
-        FlightServiceServer::new(flight::TracedFlightSqlService::new(FlightSqlServiceImpl {
-            engine: engine.clone(),
-            metadata_addr: config.metadata_endpoint,
-            metadata_security: config.metadata_security,
-            managed_stage: config.managed_stage,
-            admission: flight::QueryAdmission::new(config.limits),
-            discovery_limits: config.discovery_limits,
-            ticket_codec,
-        }));
+    let inner = FlightSqlServiceImpl {
+        engine: engine.clone(),
+        metadata_addr: config.metadata_endpoint,
+        metadata_security: config.metadata_security,
+        managed_stage: config.managed_stage,
+        admission: flight::QueryAdmission::new(config.limits),
+        discovery_limits: config.discovery_limits,
+        ticket_codec,
+    };
+    let traced =
+        if let Some((coordinator, worker, scan_interval, worker_concurrency)) = async_runtime {
+            background.async_worker = Some(tokio::spawn(run_async_query_loop(
+                coordinator.clone(),
+                worker,
+                scan_interval,
+                worker_concurrency,
+                cancellation.clone(),
+            )));
+            flight::TracedFlightSqlService::with_async_queries(inner, coordinator)
+        } else {
+            flight::TracedFlightSqlService::new(inner)
+        };
+    let service = FlightServiceServer::new(traced);
 
     tracing::info!(%addr, "Flight SQL server ready");
     let server_shutdown = cancellation.clone();
@@ -721,23 +859,39 @@ where
             task: "catalog-refresh",
             source,
         });
+    let async_worker_result = match background.async_worker.take() {
+        Some(worker) => worker.await.map_err(|source| QueryError::BackgroundTask {
+            task: "async-query-worker",
+            source,
+        }),
+        None => Ok(()),
+    };
     server_result?;
     refresher_result?;
+    async_worker_result?;
     Ok(())
 }
 
-fn statement_ticket_codec_for_listener(
+fn ticket_keys_for_listener(
     socket: SocketAddr,
     keys: Option<QueryTicketKeyRing>,
-    ttl: Duration,
-) -> Result<ticket::StatementTicketCodec> {
-    let keys = match keys {
+) -> Result<QueryTicketKeyRing> {
+    Ok(match keys {
         Some(keys) => keys,
         None if socket.ip().is_loopback() => {
             QueryTicketKeyRing::ephemeral().map_err(|_| QueryError::InvalidTicketConfiguration)?
         }
         None => return Err(QueryError::InvalidTicketConfiguration),
-    };
+    })
+}
+
+#[cfg(test)]
+fn statement_ticket_codec_for_listener(
+    socket: SocketAddr,
+    keys: Option<QueryTicketKeyRing>,
+    ttl: Duration,
+) -> Result<ticket::StatementTicketCodec> {
+    let keys = ticket_keys_for_listener(socket, keys)?;
     ticket::StatementTicketCodec::try_new(keys, ttl, STATEMENT_TICKET_AUDIENCE)
         .map_err(|_| QueryError::InvalidTicketConfiguration)
 }
@@ -746,6 +900,7 @@ struct QueryBackgroundGuard {
     cancellation: CancellationToken,
     engine:       Arc<QueryEngine>,
     refresher:    Option<tokio::task::JoinHandle<()>>,
+    async_worker: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for QueryBackgroundGuard {
@@ -754,6 +909,69 @@ impl Drop for QueryBackgroundGuard {
         self.engine.catalog.abort_revalidation();
         if let Some(refresher) = self.refresher.take() {
             refresher.abort();
+        }
+        if let Some(worker) = self.async_worker.take() {
+            worker.abort();
+        }
+    }
+}
+
+async fn run_async_query_loop(
+    coordinator: async_query::AsyncQueryCoordinator,
+    worker: async_query::AsyncQueryWorker,
+    scan_interval: Duration,
+    worker_concurrency: usize,
+    shutdown: CancellationToken,
+) {
+    let mut interval = tokio::time::interval(scan_interval);
+    let mut scan_cursor = None;
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            _ = interval.tick() => {
+                let (query_ids, next_cursor) = match coordinator
+                    .store()
+                    .list_query_ids_page(scan_cursor.as_deref())
+                    .await
+                {
+                    Ok(page) => page,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "async query state scan failed");
+                        scan_cursor = None;
+                        continue;
+                    }
+                };
+                scan_cursor = next_cursor;
+                futures::stream::iter(query_ids)
+                    .for_each_concurrent(worker_concurrency, |query_id| {
+                        let coordinator = coordinator.clone();
+                        let worker = worker.clone();
+                        let shutdown = shutdown.clone();
+                        async move {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map_or(0, |duration| duration.as_secs());
+                            match coordinator.cleanup_if_expired(&query_id, now).await {
+                                Ok(true) => return,
+                                Ok(false) => {}
+                                Err(error) => {
+                                    tracing::warn!(query_id, error = %error, "async query cleanup failed");
+                                    return;
+                                }
+                            }
+                            let should_run = matches!(coordinator.store().load(&query_id).await,
+                                Ok(Some(record)) if record.is_pending());
+                            if should_run {
+                                tokio::select! {
+                                    () = shutdown.cancelled() => {}
+                                    _ = worker.run(&query_id) => {}
+                                }
+                            }
+                        }
+                    })
+                    .await;
+            }
         }
     }
 }

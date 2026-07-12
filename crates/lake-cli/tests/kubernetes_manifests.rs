@@ -245,6 +245,9 @@ fn kubernetes_reference_is_secure_and_matches_runtime_contract() {
         "LAKE_TABLE_PREFIX",
         "LAKE_MANAGED_OBJECT_PREFIX",
         "LAKE_DYNAMODB_TABLE",
+        "LAKE_ASYNC_QUERIES",
+        "LAKE_ASYNC_DYNAMODB_TABLE",
+        "LAKE_ASYNC_RESULT_PREFIX",
     ] {
         assert!(
             config["data"][key].is_string(),

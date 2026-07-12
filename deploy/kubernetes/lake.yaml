@@ -31,6 +31,10 @@ data:
   LAKE_MANAGED_OBJECT_PREFIX: managed-objects
   LAKE_DYNAMODB_TABLE: lake-registry
   # Lake derives the prefix-query companion as lake-registry_prefix_v2.
+  LAKE_ASYNC_QUERIES: "true"
+  LAKE_ASYNC_DYNAMODB_TABLE: lake-async-queries
+  LAKE_ASYNC_RESULT_PREFIX: async-query-results
+  # Async state uses lake-async-queries_prefix_v2, never the catalog tables.
 ---
 apiVersion: v1
 kind: Service
