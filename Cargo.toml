@@ -53,8 +53,8 @@ metrics = "^0.24"
 metrics-exporter-prometheus = { version = "^0.18", default-features = false }
 object_store = "^0.13"
 opentelemetry = { version = "^0.32", features = ["trace"] }
-opentelemetry-otlp = { version = "^0.32", default-features = false, features = ["grpc-tonic", "trace"] }
-opentelemetry_sdk = { version = "^0.32", features = ["rt-tokio", "trace"] }
+opentelemetry-otlp = { version = "^0.32", default-features = false, features = ["grpc-tonic", "tls-ring", "tls-webpki-roots", "trace"] }
+opentelemetry_sdk = { version = "^0.32", features = ["trace"] }
 prost = "^0.14"
 prost-types = "^0.14"
 rocksdb = "^0.24"

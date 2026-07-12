@@ -83,15 +83,17 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    observability::init_from_env()?;
+    let telemetry = observability::init_from_env()?;
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "lake process starting");
     let Cli { data_dir, command } = Cli::parse();
-    match command {
+    let result = match command {
         // A pure network client: it holds no local storage, so it must not
         // build a Context (which would require a data-dir or S3 config).
         Command::Client { addr, command } => commands::client::run(&addr, command).await,
         command => run_with_context(&data_dir, command).await,
-    }
+    };
+    telemetry.shutdown();
+    result
 }
 
 /// Run a command that needs the in-process tiers wired from `--data-dir`.
