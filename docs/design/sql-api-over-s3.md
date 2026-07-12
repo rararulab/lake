@@ -116,10 +116,13 @@ policy and resource controls below:
 - Short-lived result tickets bound to principal, tenant, query, and exact part;
   storage stays below a result prefix unique to the tenant and query.
 - Per-replica concurrency, queue wait, execution duration, SQL/ticket size,
-  DataFusion memory, and local spill are now bounded. Add per-tenant limits for
-  scanned bytes, result bytes, memory, spill, and egress plus fair queuing.
-  Process ceilings are defense in depth, not tenant accounting. Cancellation
-  must propagate to DataFusion and multipart uploads.
+  DataFusion memory, and local spill are bounded. Authenticated tenants now
+  acquire a bounded tenant gate before the global FIFO, covering planning,
+  interactive/discovery streams, and async result downloads without identity
+  labels or metadata traffic. Add distributed async scheduling and per-tenant
+  scanned bytes, result bytes, memory, spill, and egress accounting. Replica
+  ceilings are not cluster-global entitlements. Cancellation must propagate to
+  DataFusion and multipart uploads.
 - Encryption at rest, result-bucket lifecycle deletion, audit logs, and
   metrics for planning, scanning, spilling, materialization, and download.
 

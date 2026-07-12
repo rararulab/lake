@@ -479,11 +479,14 @@ uses an ephemeral process-local key. `LAKE_QUERY_TICKET_TTL_SECS` defaults to
 preload/activate/retire procedure.
 
 Each Query replica also enforces finite admission limits. Defaults are 64
-concurrent queries, 100 ms queue wait, 30 minutes execution time, and 1 MiB of
-SQL/ticket text. Override them at process startup:
+concurrent queries globally, 8 concurrent queries per authenticated tenant,
+4096 tracked tenant gates, 100 ms total queue wait, 30 minutes execution time,
+and 1 MiB of SQL/ticket text. Override them at process startup:
 
 ```bash
 LAKE_QUERY_MAX_CONCURRENT=32 \
+LAKE_QUERY_MAX_CONCURRENT_PER_TENANT=4 \
+LAKE_QUERY_MAX_TRACKED_TENANTS=4096 \
 LAKE_QUERY_QUEUE_TIMEOUT_MS=250 \
 LAKE_QUERY_EXECUTION_TIMEOUT_MS=900000 \
 LAKE_QUERY_MAX_SQL_BYTES=262144 \
@@ -492,11 +495,14 @@ LAKE_QUERY_TICKET_TTL_SECS=300 \
 lake query ...
 ```
 
-Saturation returns gRPC `ResourceExhausted`; execution expiry terminates the
-result stream with `DeadlineExceeded`. The concurrency permit remains owned by
-the DoGet stream, so completing, timing out, or dropping the stream releases
-capacity. These are per-replica safety limits; tenant quotas and distributed
-fair queuing remain separate policy layers.
+Requests acquire their tenant gate before joining the global FIFO and use one
+absolute queue deadline, so a noisy tenant cannot reserve global capacity while
+waiting for its own share. Saturation returns gRPC `ResourceExhausted`;
+execution expiry terminates the result stream with `DeadlineExceeded`. The
+concurrency permit owns both gates for the full DoGet stream, so completion,
+timeout, cancellation, or drop releases both. Inactive gates are weakly held
+and synchronously pruned; a full active tracker fails closed instead of growing
+memory. These are per-replica limits, not cluster-global quotas.
 
 Lance maintenance preserves the ten most recent dataset versions by default.
 Set `LAKE_LANCE_RETAIN_VERSIONS` to a value in `1..=10000` to choose a different

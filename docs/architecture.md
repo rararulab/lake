@@ -497,9 +497,12 @@ design-level ones:
   weakening Query/Metasrv append validation.
 - Each stateless Query replica has finite process-local admission: bounded
   concurrent planning/execution, bounded queue wait, a stream-held execution
-  deadline, and pre-planning SQL/ticket size checks. This protects one replica
-  without adding metadata traffic. Tenant quotas, fair queuing, and distributed
-  admission remain production policy work.
+  deadline, and pre-planning SQL/ticket size checks. Authenticated tenants first
+  acquire a finite tenant gate and only then enter the global FIFO under one
+  deadline; a bounded weak registry reclaims inactive gates without background
+  work. This protects one replica without adding metadata traffic or exporting
+  identities. Cluster-global quotas, durable async fairness, and byte/resource
+  accounting remain production policy work.
 - Each Metasrv replica separately bounds concurrent FILE appends and reserves
   worst-case buffered control bytes before reading a request. A follower and
   leader each enforce their own local ceiling while one forwarded upload is in
@@ -611,7 +614,8 @@ design-level ones:
   maintenance are wired. Structured process logging and authenticated gRPC
   health readiness, bounded Prometheus metrics, and distributed tracing are
   wired. Durable SDK append state and finite client-side schema caching are
-  wired. Remaining production policy work is tenant quotas/fair queuing. A
+  wired. Per-replica tenant concurrency isolation is wired; remaining policy
+  work is distributed async fairness and tenant byte/resource accounting. A
   self-built engine slots in behind `TableEngine`
   if/when Lance's ceiling is hit.
 

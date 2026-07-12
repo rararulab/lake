@@ -284,11 +284,22 @@ fn kubernetes_reference_is_secure_and_matches_runtime_contract() {
         entry["name"].as_str() == Some("LAKE_QUERY_TICKET_TTL_SECS")
             && entry["value"].as_str() == Some("300")
     }));
-    let runbook = fs::read_to_string(root().join("docs/guides/kubernetes.md"))
-        .expect("Kubernetes runbook");
+    for (name, value) in [
+        ("LAKE_QUERY_MAX_CONCURRENT_PER_TENANT", "8"),
+        ("LAKE_QUERY_MAX_TRACKED_TENANTS", "4096"),
+    ] {
+        assert!(query_env.iter().any(|entry| {
+            entry["name"].as_str() == Some(name) && entry["value"].as_str() == Some(value)
+        }));
+    }
+    let runbook =
+        fs::read_to_string(root().join("docs/guides/kubernetes.md")).expect("Kubernetes runbook");
     assert!(runbook.contains("--from-file=ticket-keys.json=query/ticket-keys.json"));
     for step in ["preload", "activate", "retire"] {
-        assert!(runbook.contains(step), "missing ticket key rotation step {step}");
+        assert!(
+            runbook.contains(step),
+            "missing ticket key rotation step {step}"
+        );
     }
 
     let metasrv = find(&documents, "StatefulSet", "lake-metasrv");

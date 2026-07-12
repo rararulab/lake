@@ -193,11 +193,15 @@ fn shutdown_grace_from_value(value: Option<&str>) -> anyhow::Result<Duration> {
 
 pub(crate) fn query_limits_from_env() -> anyhow::Result<QueryLimits> {
     let max_concurrent = env_value("LAKE_QUERY_MAX_CONCURRENT")?;
+    let max_concurrent_per_tenant = env_value("LAKE_QUERY_MAX_CONCURRENT_PER_TENANT")?;
+    let max_tracked_tenants = env_value("LAKE_QUERY_MAX_TRACKED_TENANTS")?;
     let queue_ms = env_value("LAKE_QUERY_QUEUE_TIMEOUT_MS")?;
     let execution_ms = env_value("LAKE_QUERY_EXECUTION_TIMEOUT_MS")?;
     let max_sql_bytes = env_value("LAKE_QUERY_MAX_SQL_BYTES")?;
     query_limits_from_values(
         max_concurrent.as_deref(),
+        max_concurrent_per_tenant.as_deref(),
+        max_tracked_tenants.as_deref(),
         queue_ms.as_deref(),
         execution_ms.as_deref(),
         max_sql_bytes.as_deref(),
@@ -263,6 +267,8 @@ fn query_resources_from_values(
 
 fn query_limits_from_values(
     max_concurrent: Option<&str>,
+    max_concurrent_per_tenant: Option<&str>,
+    max_tracked_tenants: Option<&str>,
     queue_ms: Option<&str>,
     execution_ms: Option<&str>,
     max_sql_bytes: Option<&str>,
@@ -272,6 +278,16 @@ fn query_limits_from_values(
         "LAKE_QUERY_MAX_CONCURRENT",
         max_concurrent,
         defaults.max_concurrent(),
+    )?;
+    let max_concurrent_per_tenant = parse_or(
+        "LAKE_QUERY_MAX_CONCURRENT_PER_TENANT",
+        max_concurrent_per_tenant,
+        defaults.max_concurrent_per_tenant().min(max_concurrent),
+    )?;
+    let max_tracked_tenants = parse_or(
+        "LAKE_QUERY_MAX_TRACKED_TENANTS",
+        max_tracked_tenants,
+        defaults.max_tracked_tenants(),
     )?;
     let queue_ms = parse_or(
         "LAKE_QUERY_QUEUE_TIMEOUT_MS",
@@ -295,6 +311,9 @@ fn query_limits_from_values(
         Duration::from_millis(execution_ms),
         max_sql_bytes,
     )
+    .and_then(|limits| {
+        limits.try_with_tenant_limits(max_concurrent_per_tenant, max_tracked_tenants)
+    })
     .context("invalid Query admission limits")
 }
 
@@ -434,16 +453,50 @@ mod tests {
 
     #[test]
     fn query_limit_values_are_validated_before_serving() {
-        assert!(query_limits_from_values(Some("0"), None, None, None).is_err());
-        assert!(query_limits_from_values(Some("many"), None, None, None).is_err());
-        assert!(query_limits_from_values(None, Some("0"), None, None).is_err());
+        assert!(query_limits_from_values(Some("0"), None, None, None, None, None).is_err());
+        assert!(query_limits_from_values(Some("many"), None, None, None, None, None).is_err());
+        assert!(query_limits_from_values(None, None, None, Some("0"), None, None).is_err());
 
-        let limits = query_limits_from_values(Some("7"), Some("250"), Some("5000"), Some("4096"))
-            .expect("valid limits");
+        let limits = query_limits_from_values(
+            Some("7"),
+            None,
+            None,
+            Some("250"),
+            Some("5000"),
+            Some("4096"),
+        )
+        .expect("valid limits");
         assert_eq!(limits.max_concurrent(), 7);
         assert_eq!(limits.queue_wait(), Duration::from_millis(250));
         assert_eq!(limits.execution_time(), Duration::from_secs(5));
         assert_eq!(limits.max_sql_bytes(), 4096);
+    }
+
+    #[test]
+    fn query_tenant_limit_values_are_validated_before_serving() {
+        assert!(query_limits_from_values(Some("8"), Some("0"), None, None, None, None).is_err());
+        assert!(query_limits_from_values(Some("8"), Some("9"), None, None, None, None).is_err());
+        assert!(
+            query_limits_from_values(Some("8"), Some("2"), Some("0"), None, None, None).is_err()
+        );
+        assert!(
+            query_limits_from_values(Some("8"), Some("2"), Some("65537"), None, None, None,)
+                .is_err()
+        );
+        assert!(query_limits_from_values(Some("8"), Some("many"), None, None, None, None).is_err());
+
+        let limits = query_limits_from_values(
+            Some("8"),
+            Some("2"),
+            Some("128"),
+            Some("250"),
+            Some("5000"),
+            Some("4096"),
+        )
+        .expect("valid tenant limits");
+        assert_eq!(limits.max_concurrent(), 8);
+        assert_eq!(limits.max_concurrent_per_tenant(), 2);
+        assert_eq!(limits.max_tracked_tenants(), 128);
     }
 
     #[test]

@@ -23,12 +23,12 @@
 //! `unimplemented` [`Status`]).
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     future::Future,
     io::Cursor,
     ops::Bound::{Excluded, Unbounded},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex, Weak},
     task::{Context, Poll},
 };
 
@@ -82,37 +82,92 @@ use crate::{
 
 const MAX_STATEMENT_TICKET_OVERHEAD: usize = 320 * 1024;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct QueryAdmission {
     semaphore: Arc<Semaphore>,
+    tenants:   Arc<Mutex<HashMap<String, Weak<Semaphore>>>>,
     limits:    QueryLimits,
+}
+
+impl std::fmt::Debug for QueryAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QueryAdmission")
+            .field("global", &self.semaphore)
+            .field("tenants", &"<redacted>")
+            .field("limits", &self.limits)
+            .finish()
+    }
 }
 
 impl QueryAdmission {
     pub(crate) fn new(limits: QueryLimits) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(limits.max_concurrent())),
+            tenants: Arc::new(Mutex::new(HashMap::with_capacity(
+                limits.max_tracked_tenants().min(limits.max_concurrent()),
+            ))),
             limits,
         }
     }
 
-    pub(crate) async fn acquire(&self) -> std::result::Result<QueryPermit, Status> {
-        let permit = tokio::time::timeout(
-            self.limits.queue_wait(),
-            self.semaphore.clone().acquire_owned(),
-        )
-        .await
-        .map_err(|_| {
-            telemetry::admission("saturated");
-            Status::resource_exhausted("query concurrency limit reached")
-        })?
-        .map_err(|_| {
-            telemetry::admission("shutting_down");
-            Status::unavailable("query admission is shutting down")
-        })?;
+    pub(crate) async fn acquire(
+        &self,
+        principal: &Principal,
+    ) -> std::result::Result<QueryPermit, Status> {
+        let deadline = Instant::now() + self.limits.queue_wait();
+        let tenant = self.tenant_gate(principal)?;
+        let tenant_permit = tokio::time::timeout_at(deadline, tenant.acquire_owned())
+            .await
+            .map_err(|_| {
+                telemetry::admission("scope_saturated");
+                Status::resource_exhausted("tenant query concurrency limit reached")
+            })?
+            .map_err(|_| {
+                telemetry::admission("shutting_down");
+                Status::unavailable("query admission is shutting down")
+            })?;
+        let global_permit =
+            tokio::time::timeout_at(deadline, self.semaphore.clone().acquire_owned())
+                .await
+                .map_err(|_| {
+                    telemetry::admission("saturated");
+                    Status::resource_exhausted("query concurrency limit reached")
+                })?
+                .map_err(|_| {
+                    telemetry::admission("shutting_down");
+                    Status::unavailable("query admission is shutting down")
+                })?;
         telemetry::admission("admitted");
         telemetry::inflight_increment();
-        Ok(QueryPermit { _permit: permit })
+        Ok(QueryPermit {
+            _global_permit: global_permit,
+            _tenant_permit: tenant_permit,
+        })
+    }
+
+    fn tenant_gate(&self, principal: &Principal) -> std::result::Result<Arc<Semaphore>, Status> {
+        let mut tenants = self.tenants.lock().map_err(|_| {
+            telemetry::admission("shutting_down");
+            Status::unavailable("query admission is unavailable")
+        })?;
+        tenants.retain(|_, gate| gate.strong_count() > 0);
+        let tenant = principal.tenant().as_str();
+        if let Some(existing) = tenants.get(tenant) {
+            if let Some(gate) = existing.upgrade() {
+                return Ok(gate);
+            }
+            tenants.remove(tenant);
+        }
+        if tenants.len() >= self.limits.max_tracked_tenants() {
+            telemetry::admission("scope_tracker_saturated");
+            return Err(Status::resource_exhausted(
+                "tenant admission tracker capacity reached",
+            ));
+        }
+        let gate = Arc::new(Semaphore::new(self.limits.max_concurrent_per_tenant()));
+        tenants.insert(tenant.to_owned(), Arc::downgrade(&gate));
+        Ok(gate)
     }
 
     pub(crate) fn validate_sql_size(&self, bytes: &[u8]) -> std::result::Result<(), Status> {
@@ -143,7 +198,8 @@ impl QueryAdmission {
 }
 
 pub(crate) struct QueryPermit {
-    _permit: OwnedSemaphorePermit,
+    _global_permit: OwnedSemaphorePermit,
+    _tenant_permit: OwnedSemaphorePermit,
 }
 
 impl Drop for QueryPermit {
@@ -902,7 +958,7 @@ impl TracedFlightSqlService {
         let references = self
             .inner
             .authorized_table_references(&principal, &query.query)?;
-        let _permit = self.inner.admission.acquire().await?;
+        let _permit = self.inner.admission.acquire(&principal).await?;
         let deadline = self.inner.admission.execution_deadline();
         let (snapshots, schema) = tokio::time::timeout_at(deadline, async {
             let snapshots = self
@@ -975,7 +1031,7 @@ impl TracedFlightSqlService {
         if !record.belongs_to(&principal) || !record.is_completed() {
             return Err(Status::unauthenticated("invalid async result handle"));
         }
-        let permit = self.inner.admission.acquire().await?;
+        let permit = self.inner.admission.acquire(&principal).await?;
         let deadline = self.inner.admission.execution_deadline();
         let manifest = coordinator
             .load_manifest(&record)
@@ -1220,7 +1276,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
             self.admission.validate_sql_size(sql.as_bytes())?;
             let principal = self.principal(&request)?;
             let references = self.authorized_table_references(&principal, &sql)?;
-            let _permit = self.admission.acquire().await?;
+            let _permit = self.admission.acquire(&principal).await?;
             let deadline = self.admission.execution_deadline();
             let (snapshots, schema) = tokio::time::timeout_at(deadline, async {
                 let snapshots = self
@@ -1338,7 +1394,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
                 {
                     return Err(invalid_statement_ticket());
                 }
-                let permit = self.admission.acquire().await?;
+                let permit = self.admission.acquire(&principal).await?;
                 let deadline = self.admission.execution_deadline();
 
                 let batches = tokio::time::timeout_at(deadline, async {
@@ -1376,7 +1432,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let span = query_server_span(&request, "do_get_schemas");
         let result = async move {
             let principal = self.principal(&request)?;
-            let permit = self.admission.acquire().await?;
+            let permit = self.admission.acquire(&principal).await?;
             let deadline = self.admission.execution_deadline();
             let schema = query.clone().into_builder().schema();
             let generation = self.engine.cached_catalog_generation();
@@ -1406,7 +1462,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let span = query_server_span(&request, "do_get_tables");
         let result = async move {
             let principal = self.principal(&request)?;
-            let permit = self.admission.acquire().await?;
+            let permit = self.admission.acquire(&principal).await?;
             let deadline = self.admission.execution_deadline();
             let schema = query.clone().into_builder().schema();
             let generation = self.engine.cached_catalog_generation();
@@ -2952,7 +3008,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flight_discovery_error_releases_admission_permit() {
+    async fn flight_discovery_error_releases_tenant_admission_permit() {
         let mut service = discovery_service(
             &["alpha/events_0", "alpha/events_1"],
             DiscoveryLimits::try_new(1, 1).expect("discovery limits"),
@@ -3002,6 +3058,112 @@ mod tests {
             "reading a terminal stream error must release admission immediately"
         );
         drop(failed_stream);
+    }
+
+    fn admission_principal(subject: &str, tenant: &str) -> Principal {
+        Principal::try_new(
+            PrincipalId::try_new(subject).expect("valid admission principal"),
+            TenantId::try_new(tenant).expect("valid admission tenant"),
+            PrincipalRole::User,
+            [tenant],
+        )
+        .expect("valid admission principal binding")
+    }
+
+    fn tenant_limits(global: usize, per_tenant: usize, tracked_tenants: usize) -> QueryLimits {
+        QueryLimits::try_new(
+            global,
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            1024,
+        )
+        .expect("global query limits")
+        .try_with_tenant_limits(per_tenant, tracked_tenants)
+        .expect("tenant query limits")
+    }
+
+    #[tokio::test]
+    async fn tenant_query_admission_isolates_noisy_neighbor() {
+        let admission = QueryAdmission::new(tenant_limits(2, 1, 8));
+        let alpha = admission_principal("alpha-reader", "alpha");
+        let beta = admission_principal("beta-reader", "beta");
+        let alpha_permit = admission.acquire(&alpha).await.expect("alpha admitted");
+        let queued_admission = admission.clone();
+        let queued_alpha = alpha.clone();
+        let queued = tokio::spawn(async move { queued_admission.acquire(&queued_alpha).await });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let beta_permit = admission
+            .acquire(&beta)
+            .await
+            .expect("beta uses the free global slot");
+        let error = queued
+            .await
+            .expect("queued alpha joins")
+            .err()
+            .expect("second alpha request reaches its queue deadline");
+
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(error.message(), "tenant query concurrency limit reached");
+        drop((alpha_permit, beta_permit));
+    }
+
+    #[tokio::test]
+    async fn tenant_query_admission_preserves_global_limit() {
+        let admission = QueryAdmission::new(tenant_limits(2, 2, 8));
+        let alpha = admission_principal("alpha-reader", "alpha");
+        let beta = admission_principal("beta-reader", "beta");
+        let gamma = admission_principal("gamma-reader", "gamma");
+        let alpha_permit = admission.acquire(&alpha).await.expect("alpha admitted");
+        let beta_permit = admission.acquire(&beta).await.expect("beta admitted");
+
+        let error = admission
+            .acquire(&gamma)
+            .await
+            .err()
+            .expect("global replica ceiling remains enforced");
+
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(error.message(), "query concurrency limit reached");
+        drop((alpha_permit, beta_permit));
+    }
+
+    #[tokio::test]
+    async fn tenant_query_admission_reclaims_inactive_trackers() {
+        let admission = QueryAdmission::new(tenant_limits(2, 1, 1));
+        let alpha = admission_principal("alpha-reader", "alpha");
+        let beta = admission_principal("beta-reader", "beta");
+        let alpha_permit = admission.acquire(&alpha).await.expect("alpha admitted");
+
+        let error = admission
+            .acquire(&beta)
+            .await
+            .err()
+            .expect("active tenant tracker consumes the finite registry");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(error.message(), "tenant admission tracker capacity reached");
+
+        drop(alpha_permit);
+        let beta_permit = admission
+            .acquire(&beta)
+            .await
+            .expect("inactive alpha tracker is reclaimed");
+        drop(beta_permit);
+    }
+
+    #[tokio::test]
+    async fn tenant_query_admission_debug_redacts_identity() {
+        let admission = QueryAdmission::new(tenant_limits(2, 1, 8));
+        let principal = admission_principal("secret-subject", "secret-tenant");
+        let permit = admission
+            .acquire(&principal)
+            .await
+            .expect("principal admitted");
+
+        let debug = format!("{admission:?}");
+        assert!(!debug.contains("secret-subject"));
+        assert!(!debug.contains("secret-tenant"));
+        drop(permit);
     }
 
     #[tokio::test]

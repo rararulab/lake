@@ -42,6 +42,8 @@ tables. clap derive, thin `main.rs`, one handler module per command.
 ## Query admission
 
 - `LAKE_QUERY_MAX_CONCURRENT` (default 64)
+- `LAKE_QUERY_MAX_CONCURRENT_PER_TENANT` (default 8; at most the global maximum)
+- `LAKE_QUERY_MAX_TRACKED_TENANTS` (default 4096; range 1..=65536)
 - `LAKE_QUERY_QUEUE_TIMEOUT_MS` (default 100)
 - `LAKE_QUERY_EXECUTION_TIMEOUT_MS` (default 1800000)
 - `LAKE_QUERY_MAX_SQL_BYTES` (default 1048576)
