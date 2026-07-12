@@ -119,3 +119,34 @@ revision drift.
 
 Push the jj bookmark, open a PR closing #81, merge after APPROVE/PASS, and
 confirm the issue is closed.
+
+### Reviewer fix: Isolate integration credentials and redact endpoints
+
+**Files:**
+- Create: `scripts/test-integration-env.ts`
+- Create: `scripts/test-integration-env.test.ts`
+- Modify: `scripts/test-integration.ts`
+- Modify: `crates/lake-objects/tests/s3_localstack.rs`
+
+**Step 1: Write the failing sentinel tests**
+
+Set ambient session-token, profile, web-identity, container-provider, and a
+future unknown `AWS_*` sentinel. Require the child environment to retain no
+ambient `AWS_*` keys before injecting only LocalStack credentials. Require a
+credential-bearing endpoint to render as origin only.
+
+**Step 2: Verify RED**
+
+Run `bun test scripts/test-integration-env.test.ts`. Expected: FAIL because the
+pure environment helper module does not exist.
+
+**Step 3: Implement and wire the pure helper**
+
+Strip every ambient key beginning with `AWS_`, inject only test access key,
+secret, region/default-region, and metadata-disabled values, then pass the two
+explicit LocalStack endpoints. Log only parsed URL origin, or a fixed redacted
+placeholder for invalid input.
+
+**Step 4: Verify GREEN**
+
+Run the Bun test and the Rust integration-runner selector. Expected: both pass.

@@ -33,7 +33,7 @@ Cargo.toml
 Cargo.lock
 mise.toml
 crates/lake-objects/**
-scripts/test-integration.ts
+scripts/test-integration*.ts
 scripts/AGENT.md
 .github/workflows/ci.yml
 docs/guides/mise-ci.md

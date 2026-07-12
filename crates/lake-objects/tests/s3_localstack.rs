@@ -170,6 +170,18 @@ fn managed_s3_integration_runner_is_shared_with_ci() {
     assert!(mise.contains("bun scripts/test-integration.ts --external"));
     assert!(workflow.contains("mise run test-integration-external"));
     assert!(!workflow.contains("cargo nextest run -p lake-meta -p lake-engine-lance"));
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = std::process::Command::new("bun")
+        .args(["test", "scripts/test-integration-env.test.ts"])
+        .current_dir(root)
+        .output()
+        .expect("run integration environment isolation tests");
+    assert!(
+        output.status.success(),
+        "integration environment isolation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]

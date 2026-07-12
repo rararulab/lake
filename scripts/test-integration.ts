@@ -11,6 +11,8 @@
 import { $ } from "bun";
 import { readFile } from "node:fs/promises";
 
+import { integrationEnvironment, redactedEndpoint } from "./test-integration-env";
+
 async function endpoint(): Promise<string> {
   const env = await readFile(".lake/test-env.env", "utf8");
   const match = env.match(/^LAKE_DYNAMODB_ENDPOINT=(.+)$/m);
@@ -29,7 +31,7 @@ async function runIntegration(
   s3Endpoint: string,
   profile?: string,
 ): Promise<number> {
-  console.log(`running ignored integration tests against ${s3Endpoint}`);
+  console.log(`running ignored integration tests against ${redactedEndpoint(s3Endpoint)}`);
   const profileArgs = profile ? ["--profile", profile] : [];
   const proc = Bun.spawn(
     [
@@ -51,19 +53,7 @@ async function runIntegration(
     {
       stdout: "inherit",
       stderr: "inherit",
-      env: {
-        ...process.env,
-        LAKE_DYNAMODB_ENDPOINT: dynamoEndpoint,
-        LAKE_S3_ENDPOINT: s3Endpoint,
-        AWS_ACCESS_KEY_ID: "test",
-        AWS_SECRET_ACCESS_KEY: "test",
-        AWS_REGION: "us-east-1",
-        // Bypass an ambient corporate/system proxy for the loopback endpoint
-        // (no-op on machines/CI without one) — see commands/mod.rs.
-        LAKE_S3_PROXY_EXCLUDES: "localhost,127.0.0.1,::1",
-        NO_PROXY: "localhost,127.0.0.1,::1",
-        no_proxy: "localhost,127.0.0.1,::1",
-      },
+      env: integrationEnvironment(process.env, dynamoEndpoint, s3Endpoint),
     },
   );
   return proc.exited;
