@@ -358,9 +358,11 @@ Interactive results stream over `DoGet`. The durable result tier accepts
 standard `PollFlightInfo`, persists encrypted snapshot-pinned jobs in a
 dedicated CAS store, materializes bounded Arrow IPC parts below a
 tenant/query-scoped result prefix, and publishes only an immutable manifest.
-Completed part capabilities are redeemed through `DoGet`; the SDK hides
-polling and endpoint fan-in behind `query_async`. The complete API and security
-boundary are in
+Completed part capabilities are redeemed through `DoGet`; the SDK offers both
+the `query_async` convenience path and a versioned, bounded, redacted
+`AsyncQueryHandle` for explicit submit/poll/resume/cancel across caller and
+Query-replica restarts. Initial retries carry one 128-bit submission id and
+converge through the same state-record CAS. The complete API and security boundary are in
 [`docs/design/sql-api-over-s3.md`](design/sql-api-over-s3.md).
 
 ## Crate map

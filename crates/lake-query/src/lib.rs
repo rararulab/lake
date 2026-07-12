@@ -926,6 +926,7 @@ async fn run_async_query_loop(
     let mut interval = tokio::time::interval(scan_interval);
     let mut scan_cursor = None;
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return,

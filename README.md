@@ -284,6 +284,24 @@ while let Some(batch) = results.try_next().await? {
 }
 ```
 
+For workflow engines and long jobs, persist the opaque handle and resume after
+a process or Query-connection restart:
+
+```rust
+let handle = client.submit_async("SELECT * FROM lake.robots.training_samples").await?;
+checkpoint.write(handle.to_json()?).await?;
+
+// A later process may connect through another Query replica.
+let restored = lake_sdk::AsyncQueryHandle::from_json(&checkpoint.read().await?)?;
+let mut results = restarted_client.resume_async(restored).await?;
+```
+
+`poll_async` performs one non-blocking poll and returns a refreshed handle that
+the caller can checkpoint; `cancel_async` uses standard `CancelFlightInfo`.
+Handles contain only versioned encrypted capability bytes and expiry, enforce a
+16 KiB bound, and redact capability contents from `Debug`. Initial submission
+retries reuse one 128-bit ID, so a lost response cannot execute the SQL twice.
+
 Enable it on `lake query` with `LAKE_ASYNC_QUERIES=true`. Local mode creates
 separate `async-query-state` and `async-query-results` directories beside the
 catalog. S3 mode uses the dedicated `LAKE_ASYNC_DYNAMODB_TABLE` (default

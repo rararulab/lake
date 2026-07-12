@@ -846,6 +846,41 @@ impl TracedFlightSqlService {
         self.inner
             .admission
             .validate_sql_size(query.query.as_bytes())?;
+        let submission_id = query
+            .transaction_id
+            .as_deref()
+            .map(<[u8; 16]>::try_from)
+            .transpose()
+            .map_err(|_| {
+                Status::invalid_argument(
+                    "async statement transaction_id must be a 16-byte submission id",
+                )
+            })?;
+        if let Some(submission_id) = submission_id {
+            let existing = coordinator
+                .resume_submission_with_id(&query.query, &principal, submission_id)
+                .await
+                .map_err(|error| match error {
+                    crate::async_query::AsyncQueryCoordinatorError::SubmissionConflict => {
+                        Status::failed_precondition(
+                            "async submission id is already bound to another statement",
+                        )
+                    }
+                    _ => Status::internal("could not resume async query submission"),
+                })?;
+            if let Some(submission) = existing {
+                let poll = PollInfo::new()
+                    .with_descriptor(FlightDescriptor::new_cmd(submission.poll_handle().to_vec()))
+                    .try_with_progress(0.0)
+                    .map_err(|_| Status::internal("could not encode async query progress"))?
+                    .with_expiration_time(poll_expiration(
+                        coordinator
+                            .capability_expires_at()
+                            .map_err(|_| Status::internal("invalid capability expiry"))?,
+                    )?);
+                return Ok(Response::new(poll));
+            }
+        }
         let references = self
             .inner
             .authorized_table_references(&principal, &query.query)?;
@@ -867,10 +902,22 @@ impl TracedFlightSqlService {
             sql:       query.query,
             snapshots: snapshots.iter().map(ticket_snapshot).collect(),
         };
-        let submission = coordinator
-            .submit_statement(&statement, &principal)
-            .await
-            .map_err(|_| Status::internal("could not persist async query"))?;
+        let submission = match submission_id {
+            Some(submission_id) => {
+                coordinator
+                    .submit_statement_with_id(&statement, &principal, submission_id)
+                    .await
+            }
+            None => coordinator.submit_statement(&statement, &principal).await,
+        }
+        .map_err(|error| match error {
+            crate::async_query::AsyncQueryCoordinatorError::SubmissionConflict => {
+                Status::failed_precondition(
+                    "async submission id is already bound to another statement",
+                )
+            }
+            _ => Status::internal("could not persist async query"),
+        })?;
         let info = FlightInfo::new()
             .try_with_schema(&schema)
             .map_err(|_| Status::internal("could not encode async query schema"))?
@@ -2201,9 +2248,10 @@ mod tests {
         let principal = robots_reader();
         let query = CommandStatementQuery {
             query:          "SELECT value FROM lake.robots.episodes".to_owned(),
-            transaction_id: None,
+            transaction_id: Some(bytes::Bytes::from_static(&[8_u8; 16])),
         };
-        let mut request = Request::new(FlightDescriptor::new_cmd(query.as_any().encode_to_vec()));
+        let initial_descriptor = FlightDescriptor::new_cmd(query.as_any().encode_to_vec());
+        let mut request = Request::new(initial_descriptor.clone());
         request.extensions_mut().insert(principal.clone());
 
         let poll = FlightService::poll_flight_info(&service, request)
@@ -2236,6 +2284,26 @@ mod tests {
             test_ticket_codec(),
         );
         let replica = TracedFlightSqlService::with_async_queries(replica, coordinator.clone());
+        let mut retried_submission = Request::new(initial_descriptor);
+        retried_submission
+            .extensions_mut()
+            .insert(principal.clone());
+        let retried_submission = FlightService::poll_flight_info(&replica, retried_submission)
+            .await
+            .expect("lost initial response retries without catalog access")
+            .into_inner();
+        assert_eq!(
+            coordinator
+                .open_poll_handle(
+                    &retried_submission
+                        .flight_descriptor
+                        .expect("retry handle")
+                        .cmd,
+                    &principal,
+                )
+                .unwrap(),
+            query_id
+        );
         let mut follow_up = Request::new(next.clone());
         follow_up.extensions_mut().insert(principal.clone());
         assert!(
@@ -2398,6 +2466,71 @@ mod tests {
                 .unwrap()
         );
         assert!(coordinator.store().load(&query_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn async_submission_id_retries_converge_on_one_job() {
+        let catalog_directory = tempfile::tempdir().unwrap();
+        let catalog: MetaStoreRef = Arc::new(RocksMeta::open(catalog_directory.path()).unwrap());
+        let service = snapshot_service(catalog, Arc::new(LanceEngine::new()), test_ticket_codec());
+        let state_directory = tempfile::tempdir().unwrap();
+        let state: MetaStoreRef = Arc::new(RocksMeta::open(state_directory.path()).unwrap());
+        let object_directory = tempfile::tempdir().unwrap();
+        let objects = Arc::new(
+            LocalObjectStore::open(object_directory.path())
+                .await
+                .unwrap(),
+        );
+        let coordinator = AsyncQueryCoordinator::try_new(
+            state,
+            objects,
+            test_ticket_keys(),
+            Duration::from_hours(1),
+            Duration::from_mins(5),
+        )
+        .unwrap();
+        let service = TracedFlightSqlService::with_async_queries(service, coordinator.clone());
+        let principal = robots_reader();
+        let descriptor = |sql: &str| {
+            FlightDescriptor::new_cmd(
+                CommandStatementQuery {
+                    query:          sql.to_owned(),
+                    transaction_id: Some(bytes::Bytes::from_static(&[7_u8; 16])),
+                }
+                .as_any()
+                .encode_to_vec(),
+            )
+        };
+        let poll = |descriptor: FlightDescriptor| {
+            let mut request = Request::new(descriptor);
+            request.extensions_mut().insert(principal.clone());
+            request
+        };
+
+        let first = FlightService::poll_flight_info(&service, poll(descriptor("SELECT 1")))
+            .await
+            .unwrap()
+            .into_inner();
+        let retried = FlightService::poll_flight_info(&service, poll(descriptor("SELECT 1")))
+            .await
+            .unwrap()
+            .into_inner();
+        let first_id = coordinator
+            .open_poll_handle(&first.flight_descriptor.unwrap().cmd, &principal)
+            .unwrap();
+        let retried_id = coordinator
+            .open_poll_handle(&retried.flight_descriptor.unwrap().cmd, &principal)
+            .unwrap();
+        assert_eq!(first_id, retried_id);
+        let (query_ids, continuation) =
+            coordinator.store().list_query_ids_page(None).await.unwrap();
+        assert_eq!(query_ids, [first_id]);
+        assert!(continuation.is_none());
+
+        let error = FlightService::poll_flight_info(&service, poll(descriptor("SELECT 2")))
+            .await
+            .expect_err("submission id cannot alias another statement");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]
