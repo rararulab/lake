@@ -16,6 +16,7 @@ futures.workspace = true
 lake-common.workspace = true
 lake-flight.workspace = true
 lake-objects.workspace = true
+libc.workspace = true
 moka.workspace = true
 prost.workspace = true
 prost-types.workspace = true
@@ -24,6 +25,7 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tonic.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

@@ -16,6 +16,10 @@ The Rust SDK's typed write and direct-read surface.
   does not force callers to generate a second logical operation.
 - Retry expiry returns a `PendingAppend`; resuming it must preserve the UUIDv7
   operation identity, encoded Arrow payload, and already-uploaded objects.
+- With an operator-owned checkpoint directory, the exact append operation is
+  atomically durable before its first RPC. Restart loading is bounded and
+  validates file identity, stage identity, integrity, descriptor operation,
+  and payload digest before replay; only conclusive outcomes remove it.
 - The primary public client receives only a query endpoint, discovers the
   credential-free managed-stage descriptor once, and uses process credentials;
   the production crate must not depend on, construct, or start `lake-metasrv`.

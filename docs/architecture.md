@@ -248,7 +248,9 @@ digest of its ordered Flight control payload:
    30-second bounded window, longer than the 10-second metadata lease. If that
    window expires ambiguously, the error returns a `PendingAppend`; callers can
    resume it throughout operation retention with the same identity and without
-   uploading the object again.
+   uploading the object again. When SDK checkpointing is configured, that exact
+   pending identity and payload are fsynced before the first RPC and can be
+   discovered and resumed by a replacement process.
 2. Metasrv authenticates the tenant, verifies the digest, claims a durable
    per-table fence, and CAS-creates a compact `reserved` operation record.
 3. The engine writes the new immutable version. Lance disables automatic
@@ -500,6 +502,14 @@ design-level ones:
   may add Range while retaining any required signed headers. Server-issued
   capabilities for credentialless SDK processes and codec indexes are
   deferred.
+  When the operator configures the SDK checkpoint directory, the exact append
+  operation also becomes restart-durable before its first RPC: UUIDv7 identity,
+  encoded metadata, stage identity, and integrity digest are atomically fsynced
+  without object bytes or credentials. Bounded discovery loads one selected
+  operation under the Flight ceiling and revalidates its descriptor/digest.
+  Ambiguous outcomes retain it; conclusive outcomes remove it. Post-commit
+  process loss therefore replays to the original version instead of creating a
+  second logical insert.
 - Managed-object reachability is incremental rather than a table-row scan.
   Every version-producing Lance commit publishes a canonical chunked
   reference edge before the registry pointer can advance. The separate
@@ -544,7 +554,8 @@ design-level ones:
   leadership-gated writes, per-table serialization, and leader-only
   maintenance are wired. Structured process logging and authenticated gRPC
   health readiness, bounded Prometheus metrics, and distributed tracing are
-  wired. Remaining: durable operation state and client-side SDK caching. A
+  wired. Durable SDK append state and finite client-side schema caching are
+  wired. Remaining production policy work is tenant quotas/fair queuing. A
   self-built engine slots in behind `TableEngine`
   if/when Lance's ceiling is hit.
 

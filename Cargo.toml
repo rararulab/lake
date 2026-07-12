@@ -48,6 +48,7 @@ datafusion = "^53.0"
 futures = "^0.3"
 lance = "^8.0"
 lance-table = "^8.0"
+libc = "^0.2"
 moka = { version = "^0.12", features = ["future"] }
 metrics = "^0.24"
 metrics-exporter-prometheus = { version = "^0.18", default-features = false }

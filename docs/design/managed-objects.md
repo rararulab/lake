@@ -94,6 +94,37 @@ requires its size and SHA-256 to match before clearing the checkpoint. Only
 verified completion produces a `DataLocation`; empty objects use one ordinary
 `PutObject`.
 
+After all values have become `DataLocation`s, the SDK persists a separate
+versioned append checkpoint before the first Flight RPC when the same
+operator-owned directory is configured. It contains the exact UUIDv7 operation
+ID, encoded Flight messages, credential-free managed-stage identity, and an
+integrity digest; it never contains object bytes or credentials. Publication is
+file sync, atomic rename, then directory sync. Restart recovery first lists at
+most 1,024 entries without loading payloads, then loads one selected operation
+under the normal 64 MiB Flight ceiling plus fixed format overhead. It validates
+the filename/content operation ID, stage identity, checkpoint digest, FILE
+descriptor operation, and declared Flight payload digest before any replay.
+If rename publishes the final file but parent sync fails, the typed error
+returns the exact `PendingAppend` and published path so the caller never loses
+operation ownership behind an ordinary preparation failure.
+
+Ambiguous transport, Flight response protocol/decoding, and invalid-result
+metadata failures retain the checkpoint because the commit may already be
+durable. Success or an explicit server rejection removes and directory-syncs
+it. Cleanup I/O failure is logged
+but never changes a conclusive append result; a leftover checkpoint remains
+replay-safe. Thus a crash after commit but before deletion merely replays the
+same server-side idempotency identity and converges to the original version; it
+cannot upload the large objects again or append a second row. The directory is
+local trusted SDK state, not a cross-tenant operation queue.
+
+The checkpoint is replayable only inside the coordinator's append-operation
+retention horizon, configured by `LAKE_APPEND_OPERATION_RETENTION_SECS` and
+defaulting to seven days. An older UUIDv7 operation is rejected before replay;
+the SDK classifies that explicit server rejection as terminal and removes the
+local checkpoint. Operators therefore recover and alert on pending entries
+before the shortest retention horizon used by any metadata server.
+
 ```text
 Rust SDK INSERT (logical FILE)
   -> schema + parameter validation

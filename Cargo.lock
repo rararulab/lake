@@ -4382,6 +4382,7 @@ dependencies = [
  "lake-metasrv",
  "lake-objects",
  "lake-query",
+ "libc",
  "moka",
  "prost",
  "prost-types",
@@ -4392,6 +4393,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
+ "tracing",
 ]
 
 [[package]]
