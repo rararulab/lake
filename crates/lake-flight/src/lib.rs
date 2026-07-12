@@ -19,15 +19,22 @@ use std::{fmt, net::SocketAddr, sync::Arc};
 use arrow_flight::{FlightClient, FlightData, sql::client::FlightSqlServiceClient};
 use lake_common::AppendPayloadDigest;
 pub use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
+use opentelemetry::{
+    Context,
+    propagation::{Extractor, Injector, TextMapPropagator as _},
+};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use sha2::{Digest, Sha256};
 use snafu::Snafu;
 use subtle::ConstantTimeEq;
 use tonic::{
     Request, Status,
-    metadata::{Ascii, MetadataValue},
+    metadata::{Ascii, MetadataMap, MetadataValue},
     service::Interceptor,
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig},
 };
+use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 /// Metadata key used by trusted Query and metadata peers to preserve an
 /// already-authorized namespace across an internal Flight hop.
@@ -36,6 +43,73 @@ pub const DELEGATED_NAMESPACE_HEADER: &str = "x-lake-delegated-namespace";
 pub const DELEGATED_TENANT_HEADER: &str = "x-lake-delegated-tenant";
 
 const APPEND_DIGEST_DOMAIN: &[u8] = b"lake.append.flight-metadata.v1\0";
+
+const TRACEPARENT_HEADER: &str = "traceparent";
+const TRACESTATE_HEADER: &str = "tracestate";
+
+struct FlightMetadataInjector<'metadata>(&'metadata mut MetadataMap);
+
+impl Injector for FlightMetadataInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        let Ok(value) = value.parse() else {
+            return;
+        };
+        match key {
+            TRACEPARENT_HEADER => {
+                self.0.insert(TRACEPARENT_HEADER, value);
+            }
+            TRACESTATE_HEADER => {
+                self.0.insert(TRACESTATE_HEADER, value);
+            }
+            _ => {}
+        }
+    }
+}
+
+struct FlightMetadataExtractor<'metadata>(&'metadata MetadataMap);
+
+impl Extractor for FlightMetadataExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        match key {
+            TRACEPARENT_HEADER | TRACESTATE_HEADER => {
+                self.0.get(key).and_then(|value| value.to_str().ok())
+            }
+            _ => None,
+        }
+    }
+
+    fn keys(&self) -> Vec<&str> { vec![TRACEPARENT_HEADER, TRACESTATE_HEADER] }
+}
+
+/// Inject one OpenTelemetry context into the standard W3C Flight metadata
+/// headers. Baggage and Lake authentication/delegation metadata are never
+/// copied by this operation.
+pub fn inject_trace_context(context: &Context, metadata: &mut MetadataMap) {
+    TraceContextPropagator::new().inject_context(context, &mut FlightMetadataInjector(metadata));
+}
+
+/// Extract standard W3C trace context from Flight metadata. Missing or
+/// malformed context becomes an invalid remote parent and never weakens the
+/// independent authentication interceptor.
+#[must_use]
+pub fn extract_trace_context(metadata: &MetadataMap) -> Context {
+    TraceContextPropagator::new().extract(&FlightMetadataExtractor(metadata))
+}
+
+/// Inject the OpenTelemetry context attached to the current tracing span into
+/// a generated Flight request.
+pub fn inject_current_trace_context<T>(request: &mut Request<T>) {
+    inject_trace_context(&Span::current().context(), request.metadata_mut());
+}
+
+/// Parent a bounded server span from standard W3C Flight metadata. Invalid or
+/// absent metadata leaves the span as a new root.
+pub fn set_span_parent_from_request<T>(
+    span: &Span,
+    request: &Request<T>,
+) -> std::result::Result<(), tracing_opentelemetry::SetParentError> {
+    span.set_parent(extract_trace_context(request.metadata()))
+}
 
 /// Incrementally hashes the ordered Arrow Flight metadata messages in one
 /// append. The descriptor is excluded because it carries the digest itself;
@@ -479,6 +553,7 @@ impl ClientSecurity {
 
     /// Attach credentials to a generated low-level Flight request.
     pub fn authorize_request<T>(&self, mut request: Request<T>) -> Request<T> {
+        inject_current_trace_context(&mut request);
         if let Some(bearer) = &self.bearer {
             request
                 .metadata_mut()
@@ -508,11 +583,15 @@ mod tests {
 
     use arrow_flight::{FlightClient, sql::client::FlightSqlServiceClient};
     use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
+    use opentelemetry::{
+        Context, TraceFlags, TraceId,
+        trace::{SpanContext, SpanId, TraceContextExt as _, TraceState},
+    };
     use tonic::{Request, service::Interceptor};
 
     use super::{
-        BearerAuthenticator, BearerPrincipalBinding, ClientSecurity, ServerSecurity,
-        append_flight_payload_digest,
+        BearerAuthenticator, BearerPrincipalBinding, ClientSecurity, DELEGATED_TENANT_HEADER,
+        ServerSecurity, append_flight_payload_digest, extract_trace_context, inject_trace_context,
     };
 
     fn request_with_authorization(value: &str) -> Request<()> {
@@ -521,6 +600,54 @@ mod tests {
             .metadata_mut()
             .insert("authorization", value.parse().expect("valid metadata"));
         request
+    }
+
+    #[test]
+    fn trace_context_roundtrips_through_flight_metadata_without_sensitive_fields() {
+        let span = SpanContext::new(
+            TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").expect("trace id"),
+            SpanId::from_hex("00f067aa0ba902b7").expect("span id"),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::from_key_value([("vendor", "opaque")]).expect("trace state"),
+        );
+        let parent = Context::new().with_remote_span_context(span.clone());
+        let mut request = request_with_authorization("Bearer must-stay-redacted");
+        request.metadata_mut().insert(
+            DELEGATED_TENANT_HEADER,
+            "sensitive-tenant".parse().expect("metadata"),
+        );
+
+        inject_trace_context(&parent, request.metadata_mut());
+        let extracted = extract_trace_context(request.metadata());
+
+        assert_eq!(extracted.span().span_context(), &span);
+        assert_eq!(
+            request
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer must-stay-redacted")
+        );
+        assert_eq!(
+            request
+                .metadata()
+                .get(DELEGATED_TENANT_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("sensitive-tenant")
+        );
+        let trace_keys = request
+            .metadata()
+            .keys()
+            .filter_map(|key| match key {
+                tonic::metadata::KeyRef::Ascii(key) => Some(key.as_str()),
+                tonic::metadata::KeyRef::Binary(_) => None,
+            })
+            .filter(|key| key.starts_with("trace"))
+            .collect::<Vec<_>>();
+        assert_eq!(trace_keys, ["traceparent", "tracestate"]);
+        assert!(!format!("{extracted:?}").contains("must-stay-redacted"));
+        assert!(!format!("{extracted:?}").contains("sensitive-tenant"));
     }
 
     #[test]

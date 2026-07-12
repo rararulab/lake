@@ -11,11 +11,15 @@ description = "Shared Flight TLS and RPC authentication primitives"
 [dependencies]
 arrow-flight.workspace = true
 lake-common.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
 rustls.workspace = true
 sha2.workspace = true
 snafu.workspace = true
 subtle.workspace = true
 tonic.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
