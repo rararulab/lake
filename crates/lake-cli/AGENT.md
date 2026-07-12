@@ -50,6 +50,13 @@ tables. clap derive, thin `main.rs`, one handler module per command.
 
 All values are positive integers parsed once before serving.
 
+## Lance maintenance policy
+
+- `LAKE_LANCE_RETAIN_VERSIONS` (default 10, range 1..=10000)
+
+The policy is parsed before local or cloud storage construction and remains
+immutable for the process lifetime.
+
 ## Append operation policy
 
 - `LAKE_APPEND_OPERATION_RETENTION_SECS` (default 604800)

@@ -345,6 +345,20 @@ the DoGet stream, so completing, timing out, or dropping the stream releases
 capacity. These are per-replica safety limits; tenant quotas and distributed
 fair queuing remain separate policy layers.
 
+Lance maintenance preserves the ten most recent dataset versions by default.
+Set `LAKE_LANCE_RETAIN_VERSIONS` to a value in `1..=10000` to choose a different
+snapshot window for both local and S3 tables:
+
+```bash
+LAKE_LANCE_RETAIN_VERSIONS=100 lake meta ...
+```
+
+The value is parsed before RocksDB, DynamoDB, local paths, or S3 are opened, so
+invalid configuration fails startup without partial storage initialization.
+Lance tags and referenced branches remain protected even when they fall
+outside the recent-version window; external manifest history is reclaimed only
+after Lance confirms the corresponding manifest is obsolete.
+
 `lake query` and `lake meta` handle SIGINT and SIGTERM as graceful shutdowns.
 They stop accepting new Flight connections, allow existing RPCs to drain for
 30 seconds, then close any remaining connections. Override the bound with a

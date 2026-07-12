@@ -17,12 +17,29 @@
 use std::{path::PathBuf, str::FromStr, time::Duration};
 
 use anyhow::Context as _;
+use lake_engine_lance::{DEFAULT_RETAINED_VERSIONS, LanceMaintenancePolicy};
 use lake_metasrv::{AppendLimits, DEFAULT_APPEND_OPERATION_RETENTION, MaintenanceLimits};
 use lake_query::{DiscoveryLimits, QueryLimits, QueryResources};
 
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 const DEFAULT_OPERATION_GC_PAGE_SIZE: usize = 128;
 const MAX_OPERATION_GC_PAGE_SIZE: usize = 10_000;
+
+pub(crate) fn lance_maintenance_policy_from_env() -> anyhow::Result<LanceMaintenancePolicy> {
+    let retained_versions = env_value("LAKE_LANCE_RETAIN_VERSIONS")?;
+    lance_maintenance_policy_from_value(retained_versions.as_deref())
+}
+
+fn lance_maintenance_policy_from_value(
+    retained_versions: Option<&str>,
+) -> anyhow::Result<LanceMaintenancePolicy> {
+    let retained_versions = parse_or(
+        "LAKE_LANCE_RETAIN_VERSIONS",
+        retained_versions,
+        DEFAULT_RETAINED_VERSIONS,
+    )?;
+    LanceMaintenancePolicy::try_new(retained_versions).context("invalid Lance maintenance policy")
+}
 
 pub(crate) fn operation_policy_from_env() -> anyhow::Result<(Duration, usize)> {
     let retention = env_value("LAKE_APPEND_OPERATION_RETENTION_SECS")?;
@@ -281,10 +298,33 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        append_limits_from_values, discovery_limits_from_values, maintenance_limits_from_values,
+        append_limits_from_values, discovery_limits_from_values,
+        lance_maintenance_policy_from_value, maintenance_limits_from_values,
         operation_policy_from_values, query_limits_from_values, query_resources_from_values,
         shutdown_grace_from_value,
     };
+
+    #[test]
+    fn lance_retention_values_are_validated_before_storage_open() {
+        assert_eq!(
+            lance_maintenance_policy_from_value(None)
+                .unwrap()
+                .retained_versions(),
+            10
+        );
+        assert_eq!(
+            lance_maintenance_policy_from_value(Some("37"))
+                .unwrap()
+                .retained_versions(),
+            37
+        );
+        for invalid in ["0", "10001", "18446744073709551616", "many"] {
+            assert!(
+                lance_maintenance_policy_from_value(Some(invalid)).is_err(),
+                "accepted invalid retention {invalid}"
+            );
+        }
+    }
 
     #[test]
     fn append_operation_policy_values_are_validated_before_serving() {

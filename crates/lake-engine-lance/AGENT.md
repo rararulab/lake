@@ -25,6 +25,8 @@ Lance dataset.
   new one, so identical version/path bytes cannot produce cross-cycle ABA.
 - Historical records carry the same incarnation (legacy path-only records are
   upgraded lazily), so finalize convergence cannot cross a recreate boundary.
+- `LanceMaintenancePolicy` is immutable and bounded to 1..=10000 recent
+  versions (default 10); cleanup preserves Lance tags and referenced branches.
 - After successful Lance retention cleanup, maintenance reconciles at most 256
   history records by exact manifest existence and advances a durable cursor;
   deletes and cursor writes are guarded by exact incarnation-bound latest.

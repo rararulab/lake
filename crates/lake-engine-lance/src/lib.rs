@@ -66,9 +66,54 @@ use lance_table::io::commit::{
     external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
 };
 use object_store::{ObjectStoreExt, PutMode};
+use snafu::Snafu;
 
 mod manifest_store;
 pub use manifest_store::MetaManifestStore;
+
+/// Default number of recent Lance versions preserved by maintenance.
+pub const DEFAULT_RETAINED_VERSIONS: usize = 10;
+/// Maximum accepted Lance version-retention window.
+pub const MAX_RETAINED_VERSIONS: usize = 10_000;
+
+/// Invalid immutable maintenance-policy configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Snafu)]
+pub enum LanceMaintenancePolicyError {
+    #[snafu(display(
+        "retained_versions must be within 1..={MAX_RETAINED_VERSIONS}, got {retained_versions}"
+    ))]
+    InvalidRetainedVersions { retained_versions: usize },
+}
+
+/// Immutable Lance-specific snapshot-retention policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LanceMaintenancePolicy {
+    retained_versions: usize,
+}
+
+impl LanceMaintenancePolicy {
+    /// Validate a finite, non-zero retained-version window.
+    pub fn try_new(
+        retained_versions: usize,
+    ) -> std::result::Result<Self, LanceMaintenancePolicyError> {
+        if !(1..=MAX_RETAINED_VERSIONS).contains(&retained_versions) {
+            return Err(LanceMaintenancePolicyError::InvalidRetainedVersions { retained_versions });
+        }
+        Ok(Self { retained_versions })
+    }
+
+    /// Number of recent untagged versions preserved during cleanup.
+    #[must_use]
+    pub const fn retained_versions(&self) -> usize { self.retained_versions }
+}
+
+impl Default for LanceMaintenancePolicy {
+    fn default() -> Self {
+        Self {
+            retained_versions: DEFAULT_RETAINED_VERSIONS,
+        }
+    }
+}
 
 /// How this engine writes and opens datasets: which commit handler (external
 /// manifest store) and which object-store options (S3 endpoint, credentials).
@@ -79,13 +124,14 @@ struct WriteConfig {
     // ponytail: `None` -> Lance's default object-store commit (atomic on local
     // FS). `Some` -> commits route through our `MetaStore`-backed external
     // manifest store, giving put-if-not-exists semantics on S3.
-    commit_handler:  Option<Arc<dyn CommitHandler>>,
-    manifest_store:  Option<MetaManifestStore>,
+    commit_handler:     Option<Arc<dyn CommitHandler>>,
+    manifest_store:     Option<MetaManifestStore>,
     // Empty -> local filesystem. Non-empty -> object_store config keys
     // (`aws_endpoint`, `aws_access_key_id`, …) threaded into every read/write.
-    storage_options: HashMap<String, String>,
+    storage_options:    HashMap<String, String>,
+    maintenance_policy: LanceMaintenancePolicy,
     #[cfg(test)]
-    history_scans:   Arc<std::sync::atomic::AtomicUsize>,
+    history_scans:      Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl WriteConfig {
@@ -134,6 +180,13 @@ impl LanceEngine {
     #[must_use]
     pub fn new() -> Self { Self::default() }
 
+    /// Apply an immutable snapshot-retention policy to future maintenance.
+    #[must_use]
+    pub fn with_maintenance_policy(mut self, policy: LanceMaintenancePolicy) -> Self {
+        self.config.maintenance_policy = policy;
+        self
+    }
+
     /// Build an engine whose commits route through `meta` (external manifest
     /// store) on the local filesystem.
     ///
@@ -178,15 +231,6 @@ fn external_handler(manifest_store: MetaManifestStore) -> Arc<dyn CommitHandler>
     })
 }
 
-/// How many recent committed versions [`maintain`](LanceEngine::maintain)
-/// keeps when reclaiming old ones; everything before them is eligible for GC.
-// ponytail: a fixed version-count is the chrono-free retention policy. The
-// preferred policy is time-based (keep everything newer than, e.g.,
-// `chrono::Duration::days(7)` via `Dataset::cleanup_old_versions`), and both
-// the count and the horizon should be operator-configurable. Time-based
-// retention needs `chrono` as a workspace dependency (Lance does not re-export
-// it), which is not wired up yet.
-const RETAIN_VERSIONS: usize = 10;
 const MANIFEST_HISTORY_CLEANUP_PAGE_SIZE: usize = 256;
 
 #[cfg(not(test))]
@@ -296,7 +340,7 @@ impl TableEngine for LanceEngine {
         }
         let policy = CleanupPolicyBuilder::default()
             .error_if_tagged_old_versions(false)
-            .retain_n_versions(&dataset, RETAIN_VERSIONS)
+            .retain_n_versions(&dataset, self.config.maintenance_policy.retained_versions())
             .await
             .map_err(EngineError::backend)?
             .build();
@@ -1081,6 +1125,23 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap()
     }
 
+    #[test]
+    fn maintenance_policy_rejects_unbounded_retention() {
+        assert_eq!(
+            LanceMaintenancePolicy::default().retained_versions(),
+            DEFAULT_RETAINED_VERSIONS
+        );
+        assert_eq!(DEFAULT_RETAINED_VERSIONS, 10);
+        assert!(LanceMaintenancePolicy::try_new(0).is_err());
+        assert!(LanceMaintenancePolicy::try_new(MAX_RETAINED_VERSIONS + 1).is_err());
+        assert_eq!(
+            LanceMaintenancePolicy::try_new(MAX_RETAINED_VERSIONS)
+                .unwrap()
+                .retained_versions(),
+            MAX_RETAINED_VERSIONS
+        );
+    }
+
     fn file_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
             "video",
@@ -1513,6 +1574,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn maintenance_uses_configured_version_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let loc = TableLocation::new(dir.path().join("retention.lance").to_str().unwrap());
+        let policy = LanceMaintenancePolicy::try_new(3).unwrap();
+        let engine = LanceEngine::new().with_maintenance_policy(policy);
+        let handle = engine.create(&loc, batch().schema()).await.unwrap();
+        let mut version = handle.current_version();
+        for _ in 0..6 {
+            let value = batch();
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                value.schema(),
+                futures::stream::iter(vec![Ok::<_, DataFusionError>(value)]),
+            ));
+            version = handle.append(&operation(), stream).await.unwrap();
+        }
+        let before = engine
+            .config
+            .open_dataset(loc.as_str())
+            .await
+            .unwrap()
+            .versions()
+            .await
+            .unwrap();
+        assert!(before.len() > policy.retained_versions());
+
+        engine.maintain(&loc, version).await.unwrap();
+
+        let after = engine
+            .config
+            .open_dataset(loc.as_str())
+            .await
+            .unwrap()
+            .versions()
+            .await
+            .unwrap();
+        assert_eq!(after.len(), policy.retained_versions());
+    }
+
+    #[tokio::test]
     async fn maintenance_reclaims_external_manifest_history() {
         let dir = tempfile::tempdir().unwrap();
         let meta_dir = tempfile::tempdir().unwrap();
@@ -1530,7 +1630,10 @@ mod tests {
             version = handle.append(&operation(), stream).await.unwrap();
         }
         let before = meta.list_prefix("lance-manifest/").await.unwrap().len();
-        assert!(before > RETAIN_VERSIONS, "fixture has reclaimable history");
+        assert!(
+            before > DEFAULT_RETAINED_VERSIONS,
+            "fixture has reclaimable history"
+        );
         engine
             .config
             .open_dataset(loc.as_str())

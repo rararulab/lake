@@ -168,13 +168,17 @@ only when both target path and incarnation match, never merely by path.
 
 External manifest history reclamation runs only after Lance's cleanup succeeds;
 Lance therefore remains authoritative for tags, referenced branches, and the
-retention window. Maintenance scans a durable, incarnation-bound page of at
-most 256 external records and HEADs each exact stored manifest path. It deletes
-only confirmed-absent paths, using a guarded transaction over exact latest and
-history bytes, then advances the cursor under the same latest guard. Existing
-objects—including tagged or branch-retained manifests—keep their records. A
-crash before cursor advancement replays idempotently, while drop/recreate makes
-stale work fail closed and clears the old cursor.
+retention window. The CLI validates one immutable Lance maintenance policy
+before opening storage: keep 10 recent versions by default, configurable within
+`1..=10000` through `LAKE_LANCE_RETAIN_VERSIONS`. The same policy is threaded
+through local and object-store engine construction. Maintenance then scans a
+durable, incarnation-bound page of at most 256 external records and HEADs each
+exact stored manifest path. It deletes only confirmed-absent paths, using a
+guarded transaction over exact latest and history bytes, then advances the
+cursor under the same latest guard. Existing objects—including tagged or
+branch-retained manifests—keep their records. A crash before cursor advancement
+replays idempotently, while drop/recreate makes stale work fail closed and
+clears the old cursor.
 
 The fixed pointer is a commit-protocol boundary. A pre-pointer binary can write
 a newer per-version record without advancing it, so commit-capable binaries on

@@ -4230,6 +4230,7 @@ dependencies = [
  "object_store",
  "serde",
  "serde_json",
+ "snafu",
  "tempfile",
  "tokio",
  "url",
