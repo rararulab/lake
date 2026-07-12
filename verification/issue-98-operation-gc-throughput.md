@@ -40,4 +40,6 @@
 - Performance re-review approved the page plus wall-clock fairness bounds, and
   release/operations re-review passed the corrected configuration, metrics,
   docs, and LocalStack evidence.
-- Final correctness confirmation is pending.
+- Correctness re-review approved after the partial-page shutdown regression
+  was fixed; no P0/P1 findings remain.
+- The final exact code head passed the full gate again after that fix.
