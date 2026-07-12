@@ -79,6 +79,9 @@ pub enum ObjectError {
     #[snafu(display("managed S3 stage requires a non-empty bucket and prefix"))]
     InvalidS3Stage,
 
+    #[snafu(display("S3 upload concurrency {value} is outside the supported range 1..={maximum}"))]
+    InvalidS3UploadConcurrency { value: usize, maximum: usize },
+
     #[snafu(display("DataLocation URI '{uri}' is not a valid s3:// URI"))]
     InvalidS3Uri { uri: String },
 

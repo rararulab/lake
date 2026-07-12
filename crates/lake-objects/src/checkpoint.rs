@@ -71,11 +71,12 @@ pub(crate) struct SourceIdentity {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CheckpointBinding {
-    pub(crate) bucket:          String,
-    pub(crate) prefix:          String,
-    pub(crate) content_type:    String,
-    pub(crate) part_size_bytes: usize,
-    pub(crate) source:          SourceIdentity,
+    pub(crate) bucket:             String,
+    pub(crate) prefix:             String,
+    pub(crate) content_type:       String,
+    pub(crate) part_size_bytes:    usize,
+    pub(crate) upload_concurrency: usize,
+    pub(crate) source:             SourceIdentity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -89,16 +90,20 @@ pub(crate) struct CheckpointPart {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct UploadCheckpointV1 {
-    version:         u8,
-    bucket:          String,
-    prefix:          String,
-    content_type:    String,
-    part_size_bytes: usize,
-    source:          SourceIdentity,
-    object_key:      String,
-    upload_id:       String,
-    parts:           Vec<CheckpointPart>,
+    version:            u8,
+    bucket:             String,
+    prefix:             String,
+    content_type:       String,
+    part_size_bytes:    usize,
+    #[serde(default = "legacy_upload_concurrency")]
+    upload_concurrency: usize,
+    source:             SourceIdentity,
+    object_key:         String,
+    upload_id:          String,
+    parts:              Vec<CheckpointPart>,
 }
+
+const fn legacy_upload_concurrency() -> usize { 1 }
 
 impl UploadCheckpointV1 {
     pub(crate) fn new(binding: CheckpointBinding, object_key: String, upload_id: String) -> Self {
@@ -108,6 +113,7 @@ impl UploadCheckpointV1 {
             prefix: binding.prefix,
             content_type: binding.content_type,
             part_size_bytes: binding.part_size_bytes,
+            upload_concurrency: binding.upload_concurrency,
             source: binding.source,
             object_key,
             upload_id,
@@ -122,6 +128,18 @@ impl UploadCheckpointV1 {
     pub(crate) fn upload_id(&self) -> &str { &self.upload_id }
 
     pub(crate) fn parts(&self) -> &[CheckpointPart] { &self.parts }
+
+    pub(crate) const fn upload_concurrency(&self) -> usize { self.upload_concurrency }
+
+    /// Persist a wider possible crash suffix before starting more concurrent
+    /// requests. Never shrink the bound recorded by an earlier attempt.
+    pub(crate) fn raise_upload_concurrency(&mut self, value: usize) -> bool {
+        if value <= self.upload_concurrency {
+            return false;
+        }
+        self.upload_concurrency = value;
+        true
+    }
 
     pub(crate) fn stage_matches(&self, bucket: &str, prefix: &str) -> bool {
         self.bucket == bucket && self.prefix == prefix
@@ -141,6 +159,11 @@ impl UploadCheckpointV1 {
         }
         if self.part_size_bytes != binding.part_size_bytes {
             return Err(ObjectError::CheckpointMismatch { field: "part size" });
+        }
+        if !(1..=crate::s3::MAX_UPLOAD_CONCURRENCY).contains(&self.upload_concurrency) {
+            return Err(ObjectError::CheckpointMismatch {
+                field: "upload concurrency",
+            });
         }
         if self.source != binding.source {
             return Err(ObjectError::CheckpointMismatch { field: "source" });
@@ -258,11 +281,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("episode.upload.json");
         let binding = CheckpointBinding {
-            bucket:          "lake-managed".to_owned(),
-            prefix:          "objects".to_owned(),
-            content_type:    "video/mp4".to_owned(),
-            part_size_bytes: 5 * 1024 * 1024,
-            source:          SourceIdentity {
+            bucket:             "lake-managed".to_owned(),
+            prefix:             "objects".to_owned(),
+            content_type:       "video/mp4".to_owned(),
+            part_size_bytes:    5 * 1024 * 1024,
+            upload_concurrency: 4,
+            source:             SourceIdentity {
                 size_bytes:          8 * 1024 * 1024,
                 modified_unix_nanos: 42,
             },
@@ -291,6 +315,7 @@ mod tests {
         let loaded = UploadCheckpointV1::load(&path).await.unwrap();
         loaded.validate(&binding).unwrap();
         assert_eq!(loaded, checkpoint);
+        assert_eq!(loaded.upload_concurrency(), 4);
 
         let json = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(!json.contains("credential"));
@@ -310,5 +335,49 @@ mod tests {
             loaded.validate(&changed_stage),
             Err(ObjectError::CheckpointMismatch { field: "stage" })
         ));
+    }
+
+    #[test]
+    fn legacy_checkpoint_defaults_to_serial_creator_window() {
+        let legacy = r#"{
+          "version": 1,
+          "bucket": "lake-managed",
+          "prefix": "objects",
+          "content_type": "video/mp4",
+          "part_size_bytes": 5242880,
+          "source": {"size_bytes": 8, "modified_unix_nanos": 42},
+          "object_key": "objects/random-key",
+          "upload_id": "upload-id",
+          "parts": []
+        }"#;
+
+        let checkpoint: UploadCheckpointV1 = serde_json::from_str(legacy).unwrap();
+
+        assert_eq!(checkpoint.upload_concurrency(), 1);
+    }
+
+    #[test]
+    fn checkpoint_creator_window_only_grows() {
+        let binding = CheckpointBinding {
+            bucket:             "lake-managed".to_owned(),
+            prefix:             "objects".to_owned(),
+            content_type:       "video/mp4".to_owned(),
+            part_size_bytes:    5 * 1024 * 1024,
+            upload_concurrency: 1,
+            source:             SourceIdentity {
+                size_bytes:          10 * 1024 * 1024,
+                modified_unix_nanos: 42,
+            },
+        };
+        let mut checkpoint = UploadCheckpointV1::new(
+            binding,
+            "objects/random-key".to_owned(),
+            "upload-id".to_owned(),
+        );
+
+        assert!(checkpoint.raise_upload_concurrency(4));
+        assert_eq!(checkpoint.upload_concurrency(), 4);
+        assert!(!checkpoint.raise_upload_concurrency(2));
+        assert_eq!(checkpoint.upload_concurrency(), 4);
     }
 }

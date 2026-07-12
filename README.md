@@ -197,6 +197,13 @@ verified multipart completion; `ManagedObjectStore::cancel_upload` explicitly
 aborts an abandoned upload. Reader-backed uploads remain one-shot because an
 arbitrary stream cannot be replayed after process restart.
 
+S3 uploads overlap four parts by default while hashing and checkpointing in
+source order. That is an exact 20 MiB request-body bound per object at Lake's
+5 MiB part size. Advanced embedders using `S3ObjectStore` directly may set
+`with_upload_concurrency(1..=16)`; zero and larger values fail before S3 I/O.
+On restart, any remote responses ahead of the durable contiguous checkpoint
+are treated as untrusted and overwritten from the verified source.
+
 The same directory also makes the metadata append durable after every object
 has uploaded. Before its first append RPC, the SDK atomically fsyncs the exact
 UUIDv7 operation ID and encoded Arrow metadata (never object bytes or

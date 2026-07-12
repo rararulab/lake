@@ -15,8 +15,12 @@
 //! S3-backed managed object stage.
 
 use std::{
+    collections::BTreeMap,
+    future::Future,
+    marker::PhantomData,
     ops::Range,
     path::{Path, PathBuf},
+    pin::Pin,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -27,6 +31,7 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart},
 };
+use futures::{StreamExt, stream::FuturesUnordered};
 use lake_common::DataLocation;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -42,13 +47,145 @@ use crate::{
 };
 
 const MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024;
+const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
+pub(crate) const MAX_UPLOAD_CONCURRENCY: usize = 16;
+
+type PartFuture<'a> = Pin<Box<dyn Future<Output = Result<UploadedPipelinePart>> + Send + 'a>>;
+
+struct UploadedPipelinePart {
+    number:     i32,
+    size_bytes: usize,
+    sha256:     String,
+    completed:  CompletedPart,
+}
+
+struct UploadPipelineSummary {
+    size_bytes: u64,
+    sha256:     String,
+}
+
+/// Reads and hashes parts in source order while polling a finite set of upload
+/// futures concurrently and yielding their metadata in part-number order. No
+/// detached tasks outlive this value.
+struct PartUploadPipeline<'a, R, U, Fut>
+where
+    R: AsyncRead + Unpin,
+    U: Fn(i32, Vec<u8>) -> Fut,
+    Fut: Future<Output = Result<CompletedPart>> + Send + 'a,
+{
+    input:         &'a mut R,
+    first:         Option<Vec<u8>>,
+    next_number:   i32,
+    concurrency:   usize,
+    exhausted:     bool,
+    pending:       FuturesUnordered<PartFuture<'a>>,
+    ready:         BTreeMap<i32, UploadedPipelinePart>,
+    next_yield:    i32,
+    uploader:      U,
+    hasher:        Sha256,
+    size_bytes:    u64,
+    future_marker: PhantomData<fn() -> Fut>,
+}
+
+impl<'a, R, U, Fut> PartUploadPipeline<'a, R, U, Fut>
+where
+    R: AsyncRead + Unpin,
+    U: Fn(i32, Vec<u8>) -> Fut,
+    Fut: Future<Output = Result<CompletedPart>> + Send + 'a,
+{
+    fn new(
+        input: &'a mut R,
+        first: Vec<u8>,
+        first_number: i32,
+        concurrency: usize,
+        uploader: U,
+        hasher: Sha256,
+        size_bytes: u64,
+    ) -> Self {
+        Self {
+            input,
+            first: Some(first),
+            next_number: first_number,
+            concurrency,
+            exhausted: false,
+            pending: FuturesUnordered::new(),
+            ready: BTreeMap::new(),
+            next_yield: first_number,
+            uploader,
+            hasher,
+            size_bytes,
+            future_marker: PhantomData,
+        }
+    }
+
+    async fn fill(&mut self) -> Result<()> {
+        while self.pending.len() + self.ready.len() < self.concurrency && !self.exhausted {
+            let bytes = match self.first.take() {
+                Some(first) => first,
+                None => read_part(self.input).await?,
+            };
+            if bytes.is_empty() {
+                self.exhausted = true;
+                break;
+            }
+            let number = self.next_number;
+            self.next_number = number.checked_add(1).ok_or_else(|| ObjectError::S3 {
+                action:  "upload_part",
+                message: "multipart upload exceeded the S3 part limit".to_owned(),
+            })?;
+            let size_bytes = bytes.len();
+            let sha256 = format!("{:x}", Sha256::digest(&bytes));
+            self.hasher.update(&bytes);
+            self.size_bytes = self.size_bytes.saturating_add(size_bytes as u64);
+            let upload = (self.uploader)(number, bytes);
+            self.pending.push(Box::pin(async move {
+                let completed = upload.await?;
+                Ok(UploadedPipelinePart {
+                    number,
+                    size_bytes,
+                    sha256,
+                    completed,
+                })
+            }));
+        }
+        Ok(())
+    }
+
+    async fn next(&mut self) -> Result<Option<UploadedPipelinePart>> {
+        self.fill().await?;
+        if let Some(part) = self.ready.remove(&self.next_yield) {
+            self.next_yield += 1;
+            return Ok(Some(part));
+        }
+        while let Some(result) = self.pending.next().await {
+            let part = result?;
+            self.ready.insert(part.number, part);
+            if let Some(part) = self.ready.remove(&self.next_yield) {
+                self.next_yield += 1;
+                return Ok(Some(part));
+            }
+        }
+        Ok(None)
+    }
+
+    fn finish(self) -> UploadPipelineSummary {
+        debug_assert!(self.exhausted);
+        debug_assert!(self.pending.is_empty());
+        debug_assert!(self.ready.is_empty());
+        UploadPipelineSummary {
+            size_bytes: self.size_bytes,
+            sha256:     format!("{:x}", self.hasher.finalize()),
+        }
+    }
+}
 
 /// Lake-owned S3 bucket prefix used for managed `FILE` values.
 #[derive(Clone, Debug)]
 pub struct S3ObjectStore {
-    client: Client,
-    bucket: String,
-    prefix: String,
+    client:             Client,
+    bucket:             String,
+    prefix:             String,
+    upload_concurrency: usize,
 }
 
 impl S3ObjectStore {
@@ -67,7 +204,21 @@ impl S3ObjectStore {
             client,
             bucket,
             prefix,
+            upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
         })
+    }
+
+    /// Set the finite number of S3 UploadPart requests one object may keep in
+    /// flight. Each request owns at most one 5 MiB part buffer.
+    pub fn with_upload_concurrency(mut self, value: usize) -> Result<Self> {
+        if !(1..=MAX_UPLOAD_CONCURRENCY).contains(&value) {
+            return Err(ObjectError::InvalidS3UploadConcurrency {
+                value,
+                maximum: MAX_UPLOAD_CONCURRENCY,
+            });
+        }
+        self.upload_concurrency = value;
+        Ok(self)
     }
 
     /// Open an S3 response body only after enforcing this stage's ownership
@@ -188,7 +339,6 @@ impl S3ObjectStore {
         first_part: Vec<u8>,
         input: &mut ObjectReader,
         content_type: &str,
-        hasher: &mut Sha256,
     ) -> Result<(u64, String)> {
         let created = self
             .client
@@ -208,16 +358,65 @@ impl S3ObjectStore {
             message: "S3 response omitted upload_id".to_owned(),
         })?;
 
-        let result = self
-            .upload_parts(key, upload_id, first_part, input, hasher)
-            .await;
-        let (parts, size_bytes) = match result {
-            Ok(value) => value,
-            Err(error) => {
-                self.abort(key, upload_id).await;
-                return Err(error);
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key_owned = key.to_owned();
+        let upload_id_owned = upload_id.to_owned();
+        let uploader = move |part_number, bytes| {
+            let client = client.clone();
+            let bucket = bucket.clone();
+            let key = key_owned.clone();
+            let upload_id = upload_id_owned.clone();
+            async move {
+                let uploaded = client
+                    .upload_part()
+                    .bucket(bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .part_number(part_number)
+                    .body(ByteStream::from(bytes))
+                    .send()
+                    .await
+                    .map_err(|error| ObjectError::S3 {
+                        action:  "upload_part",
+                        message: format!("{error:?}"),
+                    })?;
+                let e_tag = uploaded.e_tag().ok_or_else(|| ObjectError::S3 {
+                    action:  "upload_part",
+                    message: "S3 response omitted ETag".to_owned(),
+                })?;
+                Ok(CompletedPart::builder()
+                    .part_number(part_number)
+                    .e_tag(e_tag)
+                    .set_checksum_crc32(uploaded.checksum_crc32().map(ToOwned::to_owned))
+                    .build())
             }
         };
+        let mut pipeline = PartUploadPipeline::new(
+            input,
+            first_part,
+            1,
+            self.upload_concurrency,
+            uploader,
+            Sha256::new(),
+            0,
+        );
+        let mut parts = Vec::new();
+        loop {
+            match pipeline.next().await {
+                Ok(Some(part)) => parts.push(part.completed),
+                Ok(None) => break,
+                Err(error) => {
+                // Cancel every request still owned by the pipeline before the
+                // upload itself is aborted. Otherwise a late UploadPart may
+                // race the AbortMultipartUpload request.
+                    drop(pipeline);
+                    self.abort(key, upload_id).await;
+                    return Err(error);
+                }
+            }
+        }
+        let summary = pipeline.finish();
         let completed = CompletedMultipartUpload::builder()
             .set_parts(Some(parts))
             .build();
@@ -237,55 +436,7 @@ impl S3ObjectStore {
                 message: error.to_string(),
             });
         }
-        Ok((size_bytes, format!("{:x}", hasher.finalize_reset())))
-    }
-
-    async fn upload_parts(
-        &self,
-        key: &str,
-        upload_id: &str,
-        mut part: Vec<u8>,
-        input: &mut ObjectReader,
-        hasher: &mut Sha256,
-    ) -> Result<(Vec<CompletedPart>, u64)> {
-        let mut completed = Vec::new();
-        let mut size_bytes = 0_u64;
-        let mut part_number = 1_i32;
-        loop {
-            hasher.update(&part);
-            size_bytes = size_bytes.saturating_add(part.len() as u64);
-            let uploaded = self
-                .client
-                .upload_part()
-                .bucket(&self.bucket)
-                .key(key)
-                .upload_id(upload_id)
-                .part_number(part_number)
-                .body(ByteStream::from(part))
-                .send()
-                .await
-                .map_err(|error| ObjectError::S3 {
-                    action:  "upload_part",
-                    message: format!("{error:?}"),
-                })?;
-            let e_tag = uploaded.e_tag().ok_or_else(|| ObjectError::S3 {
-                action:  "upload_part",
-                message: "S3 response omitted ETag".to_owned(),
-            })?;
-            let part_builder = CompletedPart::builder()
-                .part_number(part_number)
-                .e_tag(e_tag)
-                .set_checksum_crc32(uploaded.checksum_crc32().map(ToOwned::to_owned));
-            completed.push(part_builder.build());
-            part = read_part(input).await?;
-            if part.is_empty() {
-                return Ok((completed, size_bytes));
-            }
-            part_number = part_number.checked_add(1).ok_or_else(|| ObjectError::S3 {
-                action:  "upload_part",
-                message: "multipart upload exceeded the S3 part limit".to_owned(),
-            })?;
-        }
+        Ok((summary.size_bytes, summary.sha256))
     }
 
     async fn abort(&self, key: &str, upload_id: &str) {
@@ -334,11 +485,12 @@ impl S3ObjectStore {
                 source: source_error,
             })?;
         let binding = CheckpointBinding {
-            bucket:          self.bucket.clone(),
-            prefix:          self.prefix.clone(),
-            content_type:    content_type.clone(),
-            part_size_bytes: MULTIPART_PART_BYTES,
-            source:          SourceIdentity {
+            bucket:             self.bucket.clone(),
+            prefix:             self.prefix.clone(),
+            content_type:       content_type.clone(),
+            part_size_bytes:    MULTIPART_PART_BYTES,
+            upload_concurrency: self.upload_concurrency,
+            source:             SourceIdentity {
                 size_bytes:          metadata.len(),
                 modified_unix_nanos: u64::try_from(modified.as_nanos()).map_err(|_| {
                     ObjectError::CheckpointMismatch {
@@ -445,48 +597,81 @@ impl S3ObjectStore {
             }
             return Err(reconcile_error);
         }
+        if checkpoint.raise_upload_concurrency(self.upload_concurrency) {
+            checkpoint.save_atomic(checkpoint_path).await?;
+        }
 
-        loop {
-            let part = read_part(&mut input).await?;
-            if part.is_empty() {
-                break;
+        let first = read_part(&mut input).await?;
+        let first_number =
+            i32::try_from(checkpoint.parts().len() + 1).map_err(|_| ObjectError::S3 {
+                action:  "upload_part",
+                message: "multipart upload exceeded the S3 part limit".to_owned(),
+            })?;
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = checkpoint.object_key().to_owned();
+        let upload_id = checkpoint.upload_id().to_owned();
+        let uploader = move |number, bytes| {
+            let client = client.clone();
+            let bucket = bucket.clone();
+            let key = key.clone();
+            let upload_id = upload_id.clone();
+            async move {
+                let uploaded = client
+                    .upload_part()
+                    .bucket(bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .part_number(number)
+                    .body(ByteStream::from(bytes))
+                    .send()
+                    .await
+                    .map_err(|error| ObjectError::S3 {
+                        action:  "upload_part",
+                        message: format!("{error:?}"),
+                    })?;
+                let e_tag = uploaded.e_tag().ok_or_else(|| ObjectError::S3 {
+                    action:  "upload_part",
+                    message: "S3 response omitted ETag".to_owned(),
+                })?;
+                Ok(CompletedPart::builder()
+                    .part_number(number)
+                    .e_tag(e_tag)
+                    .set_checksum_crc32(uploaded.checksum_crc32().map(ToOwned::to_owned))
+                    .build())
             }
-            let number =
-                i32::try_from(checkpoint.parts().len() + 1).map_err(|_| ObjectError::S3 {
-                    action:  "upload_part",
-                    message: "multipart upload exceeded the S3 part limit".to_owned(),
-                })?;
-            let part_sha256 = format!("{:x}", Sha256::digest(&part));
-            hasher.update(&part);
-            let size_bytes = part.len();
-            let uploaded = self
-                .client
-                .upload_part()
-                .bucket(&self.bucket)
-                .key(checkpoint.object_key())
-                .upload_id(checkpoint.upload_id())
-                .part_number(number)
-                .body(ByteStream::from(part))
-                .send()
-                .await
-                .map_err(|error| ObjectError::S3 {
-                    action:  "upload_part",
-                    message: format!("{error:?}"),
-                })?;
+        };
+        let mut pipeline = PartUploadPipeline::new(
+            &mut input,
+            first,
+            first_number,
+            self.upload_concurrency,
+            uploader,
+            hasher,
+            completed_size,
+        );
+        while let Some(part) = pipeline.next().await? {
             checkpoint.push_part(CheckpointPart {
-                number,
-                size_bytes,
-                e_tag: uploaded
+                number:         part.number,
+                size_bytes:     part.size_bytes,
+                e_tag:          part
+                    .completed
                     .e_tag()
                     .ok_or_else(|| ObjectError::S3 {
                         action:  "upload_part",
                         message: "S3 response omitted ETag".to_owned(),
                     })?
                     .to_owned(),
-                checksum_crc32: uploaded.checksum_crc32().map(ToOwned::to_owned),
-                sha256: part_sha256,
+                checksum_crc32: part.completed.checksum_crc32().map(ToOwned::to_owned),
+                sha256:         part.sha256,
             });
             checkpoint.save_atomic(checkpoint_path).await?;
+        }
+        let summary = pipeline.finish();
+        if summary.size_bytes != metadata.len() {
+            return Err(ObjectError::CheckpointMismatch {
+                field: "source size during upload",
+            });
         }
 
         let completed = CompletedMultipartUpload::builder()
@@ -527,7 +712,7 @@ impl S3ObjectStore {
             .uri(format!("s3://{}/{}", self.bucket, checkpoint.object_key()))
             .content_type(content_type)
             .size_bytes(metadata.len())
-            .sha256(format!("{:x}", hasher.finalize()))
+            .sha256(summary.sha256)
             .build())
     }
 
@@ -562,11 +747,13 @@ impl S3ObjectStore {
             );
         }
 
-        if !(remote_parts.len() == checkpoint.parts().len()
-            || remote_parts.len() == checkpoint.parts().len() + 1)
+        let prefix_len = checkpoint.parts().len();
+        let suffix_max_number = prefix_len.saturating_add(checkpoint.upload_concurrency());
+        if remote_parts.len() < prefix_len
+            || remote_parts.len() > prefix_len.saturating_add(checkpoint.upload_concurrency())
             || !remote_parts
                 .iter()
-                .take(checkpoint.parts().len())
+                .take(prefix_len)
                 .zip(checkpoint.parts())
                 .all(|(remote, local)| {
                     remote.part_number() == Some(local.number)
@@ -575,6 +762,12 @@ impl S3ObjectStore {
                             == Some(local.size_bytes)
                         && remote.checksum_crc32() == local.checksum_crc32.as_deref()
                 })
+            || !remote_parts.iter().skip(prefix_len).all(|remote| {
+                remote
+                    .part_number()
+                    .and_then(|number| usize::try_from(number).ok())
+                    .is_some_and(|number| number > prefix_len && number <= suffix_max_number)
+            })
         {
             return Err(ObjectError::CheckpointMismatch {
                 field: "remote completed parts",
@@ -654,7 +847,7 @@ impl ManagedObjectStore for S3ObjectStore {
     ) -> Result<DataLocation> {
         let key = format!("{}/{}", self.prefix, uuid::Uuid::now_v7());
         let first_part = read_part(&mut input).await?;
-        let mut hasher = Sha256::new();
+        let hasher = Sha256::new();
         let (size_bytes, sha256) = if first_part.is_empty() {
             self.client
                 .put_object()
@@ -670,7 +863,7 @@ impl ManagedObjectStore for S3ObjectStore {
                 })?;
             (0, format!("{:x}", hasher.finalize()))
         } else {
-            self.upload_nonempty(&key, first_part, &mut input, &content_type, &mut hasher)
+            self.upload_nonempty(&key, first_part, &mut input, &content_type)
                 .await?
         };
         Ok(DataLocation::builder()
@@ -865,4 +1058,296 @@ where
         part.extend_from_slice(&buffer[..read]);
     }
     Ok(part)
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use aws_config::BehaviorVersion;
+    use aws_sdk_s3::{
+        config::{Credentials, Region},
+        types::CompletedPart,
+    };
+    use sha2::{Digest, Sha256};
+    use tokio::sync::{Notify, Semaphore};
+
+    use super::{
+        MAX_UPLOAD_CONCURRENCY, MULTIPART_PART_BYTES, PartUploadPipeline, S3ObjectStore, read_part,
+    };
+    use crate::{
+        ObjectReader,
+        checkpoint::{CheckpointBinding, CheckpointPart, SourceIdentity, UploadCheckpointV1},
+    };
+
+    fn update_peak(peak: &AtomicUsize, value: usize) {
+        let mut observed = peak.load(Ordering::SeqCst);
+        while value > observed {
+            match peak.compare_exchange(observed, value, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    fn test_store() -> S3ObjectStore {
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .endpoint_url("http://127.0.0.1:1")
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .force_path_style(true)
+            .build();
+        S3ObjectStore::new(
+            aws_sdk_s3::Client::from_conf(config),
+            "lake-managed",
+            "managed/objects",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn s3_upload_concurrency_rejects_unbounded_values() {
+        let store = test_store();
+        assert!(store.clone().with_upload_concurrency(0).is_err());
+        assert!(store.clone().with_upload_concurrency(1).is_ok());
+        assert!(
+            store
+                .clone()
+                .with_upload_concurrency(MAX_UPLOAD_CONCURRENCY)
+                .is_ok()
+        );
+        assert!(
+            store
+                .with_upload_concurrency(MAX_UPLOAD_CONCURRENCY + 1)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_multipart_pipeline_overlaps_with_exact_resource_cap() {
+        let concurrency = 3;
+        let source = (0..(MULTIPART_PART_BYTES * 5 + 17))
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<Vec<_>>();
+        let live_requests = Arc::new(AtomicUsize::new(0));
+        let peak_requests = Arc::new(AtomicUsize::new(0));
+        let live_bytes = Arc::new(AtomicUsize::new(0));
+        let peak_bytes = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+
+        let task = tokio::spawn({
+            let live_requests = live_requests.clone();
+            let peak_requests = peak_requests.clone();
+            let live_bytes = live_bytes.clone();
+            let peak_bytes = peak_bytes.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                let mut input: ObjectReader = Box::pin(std::io::Cursor::new(source));
+                let first = read_part(&mut input).await.unwrap();
+                let uploader = move |number, bytes: Vec<u8>| {
+                    let live_requests = live_requests.clone();
+                    let peak_requests = peak_requests.clone();
+                    let live_bytes = live_bytes.clone();
+                    let peak_bytes = peak_bytes.clone();
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    Box::pin(async move {
+                        let requests = live_requests.fetch_add(1, Ordering::SeqCst) + 1;
+                        let bytes_live =
+                            live_bytes.fetch_add(bytes.len(), Ordering::SeqCst) + bytes.len();
+                        update_peak(&peak_requests, requests);
+                        update_peak(&peak_bytes, bytes_live);
+                        entered.notify_waiters();
+                        release.acquire().await.unwrap().forget();
+                        live_requests.fetch_sub(1, Ordering::SeqCst);
+                        live_bytes.fetch_sub(bytes.len(), Ordering::SeqCst);
+                        Ok(CompletedPart::builder()
+                            .part_number(number)
+                            .e_tag(format!("part-{number}"))
+                            .build())
+                    })
+                };
+                let mut pipeline = PartUploadPipeline::new(
+                    &mut input,
+                    first,
+                    1,
+                    concurrency,
+                    uploader,
+                    Sha256::new(),
+                    0,
+                );
+                let mut parts = Vec::new();
+                while let Some(part) = pipeline.next().await.unwrap() {
+                    parts.push(part.completed);
+                }
+                (parts, pipeline.finish())
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while peak_requests.load(Ordering::SeqCst) < concurrency {
+                entered.notified().await;
+            }
+        })
+        .await
+        .expect("the configured request window fills");
+        assert_eq!(peak_requests.load(Ordering::SeqCst), concurrency);
+        assert_eq!(
+            peak_bytes.load(Ordering::SeqCst),
+            concurrency * MULTIPART_PART_BYTES
+        );
+        release.add_permits(6);
+        let (parts, summary) = task.await.unwrap();
+        assert_eq!(parts.len(), 6);
+        assert_eq!(summary.size_bytes, (MULTIPART_PART_BYTES * 5 + 17) as u64);
+    }
+
+    #[tokio::test]
+    async fn multipart_pipeline_orders_parts_and_source_hash() {
+        let source = (0..(MULTIPART_PART_BYTES * 3 + 11))
+            .map(|index| u8::try_from(index % 239).unwrap())
+            .collect::<Vec<_>>();
+        let expected_hash = format!("{:x}", Sha256::digest(&source));
+        let mut input: ObjectReader = Box::pin(std::io::Cursor::new(source.clone()));
+        let first = read_part(&mut input).await.unwrap();
+        let uploader = |number, _bytes: Vec<u8>| {
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    u64::try_from(5 - number).unwrap(),
+                ))
+                .await;
+                Ok(CompletedPart::builder()
+                    .part_number(number)
+                    .e_tag(format!("part-{number}"))
+                    .build())
+            })
+        };
+        let mut pipeline =
+            PartUploadPipeline::new(&mut input, first, 1, 4, uploader, Sha256::new(), 0);
+        let mut numbers = Vec::new();
+        while let Some(part) = pipeline.next().await.unwrap() {
+            numbers.push(part.number);
+        }
+        let summary = pipeline.finish();
+
+        assert_eq!(numbers, vec![1, 2, 3, 4]);
+        assert_eq!(summary.size_bytes, source.len() as u64);
+        assert_eq!(summary.sha256, expected_hash);
+    }
+
+    #[tokio::test]
+    async fn multipart_pipeline_failure_stops_admission() {
+        let concurrency = 3;
+        let source = vec![7_u8; MULTIPART_PART_BYTES * 6];
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let hold_first = Arc::new(Semaphore::new(0));
+        let mut input: ObjectReader = Box::pin(std::io::Cursor::new(source));
+        let first = read_part(&mut input).await.unwrap();
+        let uploader = {
+            let admitted = admitted.clone();
+            let hold_first = hold_first.clone();
+            move |number, _bytes: Vec<u8>| {
+                let admitted = admitted.clone();
+                let hold_first = hold_first.clone();
+                Box::pin(async move {
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                    if number == 1 {
+                        hold_first.acquire().await.unwrap().forget();
+                    }
+                    if number == 2 {
+                        return Err(crate::ObjectError::S3 {
+                            action:  "upload_part",
+                            message: "injected failure".to_owned(),
+                        });
+                    }
+                    Ok(CompletedPart::builder()
+                        .part_number(number)
+                        .e_tag(format!("part-{number}"))
+                        .build())
+                })
+            }
+        };
+        let mut pipeline = PartUploadPipeline::new(
+            &mut input,
+            first,
+            1,
+            concurrency,
+            uploader,
+            Sha256::new(),
+            0,
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), pipeline.next())
+            .await
+            .expect("a later failed request must not wait for an earlier response");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("the injected upload failure must be returned"),
+        };
+
+        assert!(error.to_string().contains("injected failure"));
+        assert!((2..=concurrency).contains(&admitted.load(Ordering::SeqCst)));
+    }
+
+    #[tokio::test]
+    async fn resumable_pipeline_checkpoint_stays_contiguous() {
+        let source = vec![3_u8; MULTIPART_PART_BYTES * 4];
+        let mut input: ObjectReader = Box::pin(std::io::Cursor::new(source.clone()));
+        let first = read_part(&mut input).await.unwrap();
+        let uploader = |number, _bytes: Vec<u8>| {
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    u64::try_from(5 - number).unwrap(),
+                ))
+                .await;
+                Ok(CompletedPart::builder()
+                    .part_number(number)
+                    .e_tag(format!("part-{number}"))
+                    .build())
+            })
+        };
+        let mut pipeline =
+            PartUploadPipeline::new(&mut input, first, 1, 4, uploader, Sha256::new(), 0);
+        let mut checkpoint = UploadCheckpointV1::new(
+            CheckpointBinding {
+                bucket:             "lake-managed".to_owned(),
+                prefix:             "objects".to_owned(),
+                content_type:       "video/mp4".to_owned(),
+                part_size_bytes:    MULTIPART_PART_BYTES,
+                upload_concurrency: 4,
+                source:             SourceIdentity {
+                    size_bytes:          source.len() as u64,
+                    modified_unix_nanos: 42,
+                },
+            },
+            "objects/random".to_owned(),
+            "upload-id".to_owned(),
+        );
+
+        while let Some(part) = pipeline.next().await.unwrap() {
+            assert_eq!(part.number as usize, checkpoint.parts().len() + 1);
+            checkpoint.push_part(CheckpointPart {
+                number:         part.number,
+                size_bytes:     part.size_bytes,
+                e_tag:          part.completed.e_tag().unwrap().to_owned(),
+                checksum_crc32: None,
+                sha256:         part.sha256,
+            });
+        }
+
+        assert_eq!(
+            checkpoint
+                .parts()
+                .iter()
+                .map(|part| part.number)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+    }
 }

@@ -190,7 +190,7 @@ async fn s3_multipart_roundtrip_localstack() {
     let Some((_client, store, bucket)) = stage().await else {
         return;
     };
-    let bytes = (0..(PART_BYTES + 12_345))
+    let bytes = (0..(PART_BYTES * 5 + 12_345))
         .map(|index| u8::try_from(index % 251).unwrap())
         .collect::<Vec<_>>();
 
@@ -532,6 +532,121 @@ async fn resumable_s3_upload_reuses_completed_parts_localstack() {
 fn resumable_s3_upload_reuses_completed_parts_localstack_is_wired() {
     let integration = include_str!("../../../scripts/test-integration.ts");
     assert!(integration.contains("--run-ignored"));
+}
+
+#[tokio::test]
+#[ignore = "requires LocalStack S3; set LAKE_S3_ENDPOINT and run with --ignored"]
+async fn resumable_s3_pipeline_overwrites_ambiguous_suffix_localstack() {
+    let Some((client, store, bucket)) = stage().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("episode.mp4");
+    let checkpoint = dir.path().join("episode.upload.json");
+    let bytes = (0..(PART_BYTES * 3 + 12_345))
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect::<Vec<_>>();
+    tokio::fs::write(&source, &bytes).await.unwrap();
+    seed_resumable_checkpoint(&client, &bucket, &source, &checkpoint).await;
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(&checkpoint).await.unwrap()).unwrap();
+    document["upload_concurrency"] = serde_json::json!(4);
+    tokio::fs::write(&checkpoint, serde_json::to_vec_pretty(&document).unwrap())
+        .await
+        .unwrap();
+    let key = document["object_key"].as_str().unwrap();
+    let upload_id = document["upload_id"].as_str().unwrap();
+    for number in [2, 4] {
+        client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(number)
+            .body(ByteStream::from(vec![
+                0_u8;
+                if number == 4 {
+                    12_345
+                } else {
+                    PART_BYTES
+                }
+            ]))
+            .send()
+            .await
+            .expect("seed an uncheckpointed remote suffix part");
+    }
+
+    let location = store
+        .put_path(source, "video/mp4".to_owned(), Some(checkpoint.clone()))
+        .await
+        .expect("resume overwrites every untrusted suffix part");
+
+    assert!(!checkpoint.exists());
+    assert_eq!(location.size_bytes, bytes.len() as u64);
+    assert_eq!(location.sha256, format!("{:x}", Sha256::digest(&bytes)));
+    let mut reader = store.open_reader(&location).await.unwrap();
+    let mut actual = Vec::new();
+    reader.read_to_end(&mut actual).await.unwrap();
+    assert_eq!(actual, bytes);
+}
+
+#[test]
+fn resumable_s3_pipeline_overwrites_ambiguous_suffix_localstack_is_wired() {
+    let integration = include_str!("../../../scripts/test-integration.ts");
+    assert!(integration.contains("lake-objects"));
+    assert!(integration.contains("--run-ignored"));
+}
+
+#[tokio::test]
+#[ignore = "requires LocalStack S3; set LAKE_S3_ENDPOINT and run with --ignored"]
+async fn resumable_s3_pipeline_rejects_suffix_outside_creator_window_localstack() {
+    let Some((client, store, bucket)) = stage().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("episode.mp4");
+    let checkpoint = dir.path().join("episode.upload.json");
+    let bytes = vec![7_u8; PART_BYTES * 3];
+    tokio::fs::write(&source, &bytes).await.unwrap();
+    seed_resumable_checkpoint(&client, &bucket, &source, &checkpoint).await;
+    let document: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(&checkpoint).await.unwrap()).unwrap();
+    client
+        .upload_part()
+        .bucket(&bucket)
+        .key(document["object_key"].as_str().unwrap())
+        .upload_id(document["upload_id"].as_str().unwrap())
+        .part_number(3)
+        .body(ByteStream::from(vec![0_u8; PART_BYTES]))
+        .send()
+        .await
+        .unwrap();
+
+    let result = store
+        .put_path(source, "video/mp4".to_owned(), Some(checkpoint))
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(ObjectError::CheckpointMismatch {
+            field: "remote completed parts",
+        })
+    ));
+}
+
+#[test]
+fn bounded_s3_upload_pipeline_localstack_is_wired() {
+    let integration = include_str!("../../../scripts/test-integration.ts");
+    let tests = include_str!("s3_localstack.rs");
+    assert!(integration.contains("lake-objects"));
+    assert!(integration.contains("--run-ignored"));
+    for selector in [
+        "s3_multipart_roundtrip_localstack",
+        "interrupted_s3_upload_is_aborted",
+        "resumable_s3_pipeline_overwrites_ambiguous_suffix_localstack",
+    ] {
+        assert!(tests.contains(selector));
+    }
 }
 
 #[tokio::test]
