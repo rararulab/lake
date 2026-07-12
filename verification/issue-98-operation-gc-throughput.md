@@ -33,4 +33,11 @@
   its unprocessed entries.
 - Corrected lane-1 lifecycle passed 7/7, strict Clippy passed across the three
   affected crates, and the corrected full gate and rustdoc passed.
-- Independent corrected-head re-review is pending.
+- Correctness re-review found one remaining shutdown branch that broke out of
+  the entry loop and then published a partial-page cursor. It now returns
+  immediately without publishing; a regression test resumes with a fresh token
+  and proves all three entries remain reachable.
+- Performance re-review approved the page plus wall-clock fairness bounds, and
+  release/operations re-review passed the corrected configuration, metrics,
+  docs, and LocalStack evidence.
+- Final correctness confirmation is pending.

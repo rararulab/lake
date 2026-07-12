@@ -394,7 +394,7 @@ async fn sweep_operation_pages_at_until(
         stats.scanned += entries.len();
         for (stripped, bytes) in entries {
             if shutdown.is_cancelled() {
-                break;
+                return stats;
             }
             let key = format!("{OPERATION_PREFIX}{stripped}");
             let record = match AppendRecord::decode(&stripped, &bytes) {
@@ -1429,9 +1429,9 @@ mod tests {
         seed_committed_operations(inner.as_ref(), 3).await;
         let shutdown = CancellationToken::new();
         let recording = Arc::new(CancelAfterPageMeta {
-            inner,
+            inner:      inner.clone(),
             page_calls: AtomicUsize::new(0),
-            shutdown: shutdown.clone(),
+            shutdown:   shutdown.clone(),
         });
         let meta: MetaStoreRef = recording.clone();
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
@@ -1451,6 +1451,23 @@ mod tests {
         assert_eq!(
             stats.deleted, 0,
             "cancelled page performs no reconciliation"
+        );
+
+        let resumed = sweep_operation_pages_at_until(
+            &metasrv,
+            u64::MAX / 2,
+            &CancellationToken::new(),
+            10,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(resumed.deleted, 3, "partial page cursor was not published");
+        assert!(
+            inner
+                .scan_prefix(OPERATION_PREFIX)
+                .await
+                .expect("scan resumed operation prefix")
+                .is_empty()
         );
     }
 
