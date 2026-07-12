@@ -352,15 +352,24 @@ until `complete` is true, then finalize with an explicit rollout acknowledgement
 ```bash
 lake dynamo-migrate --page-size 500 --json
 lake dynamo-migrate --page-size 500 \
-  --finalize --acknowledge-dual-rollout --json
+  --finalize --acknowledge-dual-rollout \
+  --acknowledge-write-quiescence --json
 ```
 
-The cursor is durable, so rerunning after a crash resumes safely. Finalization
-checks exact key/value parity in both directions and rejects concurrent writes
-by checking a monotonic dual-write generation. Once finalized, reads use v2
-and never fall back to a legacy table scan. Retain the legacy table for at
-least `LAKE_APPEND_OPERATION_RETENTION_SECS` before removing it; rollback after
+The cursor is durable, so rerunning after a crash resumes safely. Before the
+second command, pause metadata write admission. Finalization installs a durable
+write barrier, checks exact key/value parity in both directions, and publishes
+the authority marker while the barrier is still held. Restart Query and
+Metasrv pods immediately afterward: refreshed nodes read v2, while the retained
+barrier rejects stale pre-finalization writers. Reads may keep serving their
+last-good cache during this short write-quiescent window. Retain the legacy
+table for at least `LAKE_APPEND_OPERATION_RETENTION_SECS`; rollback after
 finalization requires a dual-capable binary.
+
+If exact verification reports an incomplete or divergent copy, the barrier is
+left in place deliberately. Keep write admission paused, run bounded backfill
+again, and retry finalization; do not manually remove the barrier while a
+verifier or stale dual node may still be running.
 
 For a local deployment, start metadata and query separately. The query process
 is told where metadata lives; clients are not:

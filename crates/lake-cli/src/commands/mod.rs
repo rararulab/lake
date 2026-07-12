@@ -91,7 +91,7 @@ impl Context {
         let endpoint = std::env::var("LAKE_DYNAMODB_ENDPOINT").ok();
         let table = std::env::var("LAKE_DYNAMODB_TABLE").unwrap_or_else(|_| "lake_registry".into());
         let dynamo = DynamoMeta::connect(endpoint.as_deref(), &table).await?;
-        dynamo.ensure_table().await?;
+        dynamo.open_tables().await?;
         let meta: MetaStoreRef = Arc::new(dynamo);
         let engine: TableEngineRef = Arc::new(
             LanceEngine::for_object_store(meta.clone(), s3_storage_options())

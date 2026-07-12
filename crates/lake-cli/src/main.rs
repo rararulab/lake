@@ -242,7 +242,29 @@ mod tests {
 
         assert!(
             Cli::try_parse_from(["lake", "dynamo-migrate", "--finalize", "--json"]).is_err(),
-            "finalization must require an explicit dual-rollout acknowledgement"
+            "finalization must require explicit rollout and write-quiescence acknowledgements"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "lake",
+                "dynamo-migrate",
+                "--finalize",
+                "--acknowledge-dual-rollout",
+                "--json",
+            ])
+            .is_err(),
+            "dual rollout acknowledgement alone is insufficient"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "lake",
+                "dynamo-migrate",
+                "--finalize",
+                "--acknowledge-dual-rollout",
+                "--acknowledge-write-quiescence",
+                "--json",
+            ])
+            .is_ok()
         );
         assert!(
             Cli::try_parse_from(["lake", "dynamo-migrate", "--page-size", "0", "--json",]).is_err()

@@ -27,8 +27,8 @@ pub struct DynamoMigrationPage {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DynamoMigrationVerification {
-    pub generation:   u64,
-    pub legacy_items: usize,
-    pub v2_items:     usize,
-    pub finalized:    bool,
+    pub write_barrier: bool,
+    pub legacy_items:  usize,
+    pub v2_items:      usize,
+    pub finalized:     bool,
 }

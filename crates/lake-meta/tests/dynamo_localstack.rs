@@ -26,6 +26,7 @@
 //! When `LAKE_DYNAMODB_ENDPOINT` is unset the test is a no-op (returns early),
 //! so it is safe to invoke via `--run-ignored all` without the env present.
 
+use aws_sdk_dynamodb::{primitives::Blob, types::AttributeValue};
 use lake_meta::{DynamoMeta, GuardedMutation, MetaStore};
 
 #[tokio::test]
@@ -49,6 +50,34 @@ async fn dynamo_v1_dual_v2_migration_roundtrip() {
         .await
         .expect("connect to localstack dynamodb");
     meta.ensure_table().await.expect("create test table");
+    let shared = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let raw = aws_sdk_dynamodb::Client::from_conf(
+        aws_sdk_dynamodb::config::Builder::from(&shared)
+            .endpoint_url(&endpoint)
+            .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+                "test",
+                "test",
+                None,
+                None,
+                "localstack",
+            ))
+            .build(),
+    );
+    raw.put_item()
+        .table_name(&table)
+        .item("pk", AttributeValue::S("ptr/legacy".to_owned()))
+        .item("val", AttributeValue::B(Blob::new(b"old")))
+        .send()
+        .await
+        .expect("seed a pre-upgrade v1-only key");
+    let stale_dual = DynamoMeta::connect(Some(&endpoint), &table)
+        .await
+        .expect("connect second dual node");
+    stale_dual
+        .open_tables()
+        .await
+        .expect("open pre-provisioned layouts without creating them");
 
     // Same assertions as the RocksMeta unit tests.
 
@@ -75,12 +104,16 @@ async fn dynamo_v1_dual_v2_migration_roundtrip() {
     }
     let mut listed = meta.list_prefix("ptr/").await.unwrap();
     listed.sort();
-    assert_eq!(listed, vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(
+        listed,
+        vec!["a".to_string(), "b".to_string(), "legacy".to_string()]
+    );
     assert_eq!(
         meta.scan_prefix("ptr/").await.unwrap(),
         vec![
             ("a".to_owned(), b"v".to_vec()),
             ("b".to_owned(), b"v".to_vec()),
+            ("legacy".to_owned(), b"old".to_vec()),
         ]
     );
     let mut continuation = None;
@@ -104,6 +137,7 @@ async fn dynamo_v1_dual_v2_migration_roundtrip() {
         vec![
             ("a".to_owned(), b"v".to_vec()),
             ("b".to_owned(), b"v".to_vec()),
+            ("legacy".to_owned(), b"old".to_vec()),
         ]
     );
 
@@ -159,6 +193,21 @@ async fn dynamo_v1_dual_v2_migration_roundtrip() {
     assert_eq!(verification.legacy_items, verification.v2_items);
     assert!(meta.is_v2_authoritative());
     assert_eq!(meta.get("k").await.unwrap().as_deref(), Some(&b"2"[..]));
+    assert!(
+        !stale_dual
+            .cas("blocked-by-finalize", None, b"v")
+            .await
+            .unwrap(),
+        "a stale pre-finalization node must fail closed on the durable barrier"
+    );
+    stale_dual.refresh_authority().await.unwrap();
+    assert!(stale_dual.is_v2_authoritative());
+    assert!(
+        stale_dual
+            .cas("accepted-after-refresh", None, b"v")
+            .await
+            .unwrap()
+    );
 
     let mut continuation = None;
     let mut v2_paged = Vec::new();
@@ -181,6 +230,7 @@ async fn dynamo_v1_dual_v2_migration_roundtrip() {
         vec![
             ("a".to_owned(), b"v".to_vec()),
             ("b".to_owned(), b"v".to_vec()),
+            ("legacy".to_owned(), b"old".to_vec()),
         ]
     );
 }

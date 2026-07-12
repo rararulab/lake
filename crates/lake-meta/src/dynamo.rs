@@ -34,7 +34,7 @@ use aws_sdk_dynamodb::{
     primitives::Blob,
     types::{
         AttributeDefinition, AttributeValue, BillingMode, ConditionCheck, Delete, KeySchemaElement,
-        KeyType, Put, ScalarAttributeType, TransactWriteItem, Update,
+        KeyType, Put, ScalarAttributeType, TransactWriteItem,
     },
 };
 use snafu::IntoError;
@@ -49,7 +49,8 @@ use crate::{
 const V2_TABLE_SUFFIX: &str = "_prefix_v2";
 const V2_AUTHORITY_MARKER: &str = "__lake_internal/dynamo-prefix-v2-authority";
 const V2_AUTHORITY_VALUE: &[u8] = b"complete-v1";
-const V2_GENERATION_KEY: &str = "__lake_internal/dynamo-prefix-v2-generation";
+const V2_FINALIZE_BARRIER_KEY: &str = "__lake_internal/dynamo-prefix-v2-finalize-barrier";
+const V2_FINALIZE_BARRIER_VALUE: &[u8] = b"locked-v1";
 const V2_BACKFILL_CURSOR_KEY: &str = "__lake_internal/dynamo-prefix-v2-backfill-cursor";
 const MIGRATION_PAGE_LIMIT_MAX: usize = 10_000;
 
@@ -197,6 +198,13 @@ impl DynamoMeta {
                     .is_some_and(|error| error.is_resource_in_use_exception()) => {}
             Err(err) => return Err(dynamo_err("create v2 prefix table")(err)),
         }
+        self.open_tables().await
+    }
+
+    /// Open pre-provisioned tables using only `DescribeTable` plus normal
+    /// data-plane read permissions. Runtime Query/Metasrv identities use this
+    /// path and do not need `CreateTable`.
+    pub async fn open_tables(&self) -> Result<()> {
         self.client
             .wait_until_table_exists()
             .table_name(&self.table)
@@ -510,39 +518,53 @@ impl DynamoMeta {
         })
     }
 
-    async fn migration_generation(&self) -> Result<u64> {
+    async fn acquire_finalize_barrier(&self) -> Result<()> {
+        self.client
+            .put_item()
+            .table_name(&self.table)
+            .item("pk", AttributeValue::S(V2_FINALIZE_BARRIER_KEY.to_owned()))
+            .item(
+                "val",
+                AttributeValue::B(Blob::new(V2_FINALIZE_BARRIER_VALUE)),
+            )
+            .condition_expression("attribute_not_exists(pk) OR val = :barrier")
+            .expression_attribute_values(
+                ":barrier",
+                AttributeValue::B(Blob::new(V2_FINALIZE_BARRIER_VALUE)),
+            )
+            .send()
+            .await
+            .map_err(dynamo_err("acquire v2 finalization write barrier"))?;
+        Ok(())
+    }
+
+    async fn finalize_barrier_is_held(&self) -> Result<bool> {
         let response = self
             .client
             .get_item()
             .table_name(&self.table)
-            .key("pk", AttributeValue::S(V2_GENERATION_KEY.to_owned()))
+            .key("pk", AttributeValue::S(V2_FINALIZE_BARRIER_KEY.to_owned()))
             .consistent_read(true)
             .send()
             .await
-            .map_err(dynamo_err("read migration generation"))?;
-        response
+            .map_err(dynamo_err("read v2 finalization write barrier"))?;
+        Ok(response
             .item()
-            .and_then(|item| item.get("generation"))
-            .map_or(Ok(0), |value| match value {
-                AttributeValue::N(value) => {
-                    value.parse().map_err(|error| MetaError::MigrationConflict {
-                        message: format!("invalid migration generation: {error}"),
-                    })
-                }
-                _ => Err(MetaError::MigrationConflict {
-                    message: "migration generation is not numeric".to_owned(),
-                }),
-            })
+            .and_then(|item| item.get("val"))
+            .is_some_and(|value| {
+                matches!(value, AttributeValue::B(blob) if blob.as_ref() == V2_FINALIZE_BARRIER_VALUE)
+            }))
     }
 
-    /// Verify exact v1/v2 parity under a stable dual-write generation and
-    /// publish the monotonic v2 authority marker.
+    /// Stop dual writes, verify exact v1/v2 parity, and publish the monotonic
+    /// v2 authority marker. The durable barrier intentionally remains after
+    /// success so stale pre-finalization nodes cannot publish.
     pub async fn verify_and_finalize_v2(
         &self,
         page_size: usize,
     ) -> Result<DynamoMigrationVerification> {
         let page_size = Self::validate_migration_page_size(page_size)?;
-        let generation = self.migration_generation().await?;
+        self.acquire_finalize_barrier().await?;
         let mut legacy_items = 0;
         let mut start = None;
         loop {
@@ -618,29 +640,22 @@ impl DynamoMeta {
                 message: format!("item counts differ: v1={legacy_items}, v2={v2_items}"),
             });
         }
-        let after = self.migration_generation().await?;
-        if after != generation {
+        if !self.finalize_barrier_is_held().await? {
             return Err(MetaError::MigrationConflict {
-                message: format!("dual-write generation moved from {generation} to {after}"),
+                message: "v2 finalization write barrier was removed during verification".to_owned(),
             });
         }
 
-        let generation_condition = ConditionCheck::builder()
+        let barrier = ConditionCheck::builder()
             .table_name(&self.table)
-            .key("pk", AttributeValue::S(V2_GENERATION_KEY.to_owned()))
-            .condition_expression(if generation == 0 {
-                "attribute_not_exists(generation)"
-            } else {
-                "generation = :generation"
-            })
-            .set_expression_attribute_values((generation != 0).then(|| {
-                HashMap::from([(
-                    ":generation".to_owned(),
-                    AttributeValue::N(generation.to_string()),
-                )])
-            }))
+            .key("pk", AttributeValue::S(V2_FINALIZE_BARRIER_KEY.to_owned()))
+            .condition_expression("val = :barrier")
+            .expression_attribute_values(
+                ":barrier",
+                AttributeValue::B(Blob::new(V2_FINALIZE_BARRIER_VALUE)),
+            )
             .build()
-            .expect("generation finalization condition is complete");
+            .expect("finalize barrier publication condition is complete");
         let marker = Put::builder()
             .table_name(&self.table)
             .item("pk", AttributeValue::S(V2_AUTHORITY_MARKER.to_owned()))
@@ -657,7 +672,7 @@ impl DynamoMeta {
             .transact_write_items()
             .transact_items(
                 TransactWriteItem::builder()
-                    .condition_check(generation_condition)
+                    .condition_check(barrier)
                     .build(),
             )
             .transact_items(TransactWriteItem::builder().put(marker).build())
@@ -671,13 +686,13 @@ impl DynamoMeta {
                     .is_some_and(transaction_condition_mismatch) =>
             {
                 return Err(MetaError::MigrationConflict {
-                    message: "dual-write generation changed during finalization".to_owned(),
+                    message: "v2 authority marker contains an unexpected value".to_owned(),
                 });
             }
             Err(error) => return Err(dynamo_err("publish v2 authority marker")(error)),
         }
         Ok(DynamoMigrationVerification {
-            generation,
+            write_barrier: true,
             legacy_items,
             v2_items,
             finalized: true,
@@ -789,7 +804,7 @@ impl DynamoMeta {
                 )
             }
         };
-        vec![
+        let mut items = vec![
             TransactWriteItem::builder()
                 .condition_check(legacy_guard)
                 .build(),
@@ -798,19 +813,23 @@ impl DynamoMeta {
                 .build(),
             legacy_target.build(),
             v2_target.build(),
-            self.generation_update(),
-        ]
+        ];
+        if !self.is_v2_authoritative() {
+            items.push(self.finalize_barrier_condition());
+        }
+        items
     }
 
-    fn generation_update(&self) -> TransactWriteItem {
-        let update = Update::builder()
+    fn finalize_barrier_condition(&self) -> TransactWriteItem {
+        let condition = ConditionCheck::builder()
             .table_name(&self.table)
-            .key("pk", AttributeValue::S(V2_GENERATION_KEY.to_owned()))
-            .update_expression("ADD generation :one")
-            .expression_attribute_values(":one", AttributeValue::N("1".to_owned()))
+            .key("pk", AttributeValue::S(V2_FINALIZE_BARRIER_KEY.to_owned()))
+            .condition_expression("attribute_not_exists(pk)")
             .build()
-            .expect("generation update is complete");
-        TransactWriteItem::builder().update(update).build()
+            .expect("finalize barrier condition is complete");
+        TransactWriteItem::builder()
+            .condition_check(condition)
+            .build()
     }
 
     fn cas_transaction_items(
@@ -853,15 +872,18 @@ impl DynamoMeta {
                     );
             }
         }
-        vec![
+        let mut items = vec![
             TransactWriteItem::builder()
                 .put(legacy.build().expect("legacy CAS put is complete"))
                 .build(),
             TransactWriteItem::builder()
                 .put(v2.build().expect("v2 CAS put is complete"))
                 .build(),
-            self.generation_update(),
-        ]
+        ];
+        if !self.is_v2_authoritative() {
+            items.push(self.finalize_barrier_condition());
+        }
+        items
     }
 }
 
@@ -1092,12 +1114,17 @@ impl MetaStore for DynamoMeta {
             )
             .build()
             .expect("v2 conditional delete is complete");
+        let mut items = vec![
+            TransactWriteItem::builder().delete(legacy).build(),
+            TransactWriteItem::builder().delete(v2).build(),
+        ];
+        if !self.is_v2_authoritative() {
+            items.push(self.finalize_barrier_condition());
+        }
         let result = self
             .client
             .transact_write_items()
-            .transact_items(TransactWriteItem::builder().delete(legacy).build())
-            .transact_items(TransactWriteItem::builder().delete(v2).build())
-            .transact_items(self.generation_update())
+            .set_transact_items(Some(items))
             .send()
             .await;
         match result {
@@ -1225,7 +1252,10 @@ mod tests {
             create[1].put().expect("v2 put").condition_expression(),
             Some("attribute_not_exists(pk)")
         );
-        assert!(create[2].update().is_some(), "generation moves atomically");
+        assert!(
+            create[2].condition_check().is_some(),
+            "pre-finalization writes honor the durable barrier"
+        );
 
         let update = meta.cas_transaction_items("tbl/ns/t", Some(b"one"), b"two");
         assert_eq!(
@@ -1258,7 +1288,7 @@ mod tests {
                 .condition_expression(),
             "attribute_not_exists(pk) OR val = :guard"
         );
-        assert!(items[4].update().is_some());
+        assert!(items[4].condition_check().is_some());
     }
 
     #[test]
@@ -1307,6 +1337,24 @@ mod tests {
             items[1].put().expect("v2 copy").table_name(),
             "meta_prefix_v2"
         );
-        assert!(items[2].update().is_some());
+        assert!(items[2].condition_check().is_some());
+    }
+
+    #[test]
+    fn dynamo_v2_authority_removes_migration_barrier_from_writes() {
+        let meta = test_meta();
+        meta.v2_authoritative.store(true, Ordering::Release);
+        assert_eq!(
+            meta.cas_transaction_items("tbl/ns/t", Some(b"old"), b"new")
+                .len(),
+            2
+        );
+        assert_eq!(
+            meta.guarded_transaction_items(GuardedMutation::update(
+                "lease", b"epoch", "tbl/ns/t", b"old", b"new",
+            ))
+            .len(),
+            4
+        );
     }
 }

@@ -23,7 +23,7 @@ strongly consistent Query, SHA-256 stable sharding, Clap, LocalStack.
 - Modify: `crates/lake-meta/src/lib.rs`
 - Test: `crates/lake-meta/src/dynamo_layout.rs`
 
-1. Add RED tests for family parsing, 64-way stable shard derivation, full-key
+1. Add RED tests for family parsing, bounded stable shard derivation, full-key
    preservation, cursor version/family binding, invalid cursor rejection, and
    shard advancement.
 2. Run `cargo test -p lake-meta dynamo_v2_layout_is_stable_and_family_isolated`
@@ -78,8 +78,8 @@ strongly consistent Query, SHA-256 stable sharding, Clap, LocalStack.
    conditionally create v2; equal existing bytes converge, differing bytes
    trigger a strongly consistent v1 reload and retry without stale overwrite.
 3. Persist the migration cursor only after every item in the page converges.
-4. Verify v1/v2 exact key/value parity in bounded passes and CAS-publish the
-   completion marker only from an exact verified generation.
+4. Install a durable write barrier, verify v1/v2 exact key/value parity in
+   bounded passes, and publish the completion marker while the barrier is held.
 5. Add crash/replay and concurrent dual-writer tests.
 
 ### Task 5: Add the explicit migration command and startup modes
@@ -97,8 +97,8 @@ strongly consistent Query, SHA-256 stable sharding, Clap, LocalStack.
    network mutation.
 3. Make normal cloud startup select v1 authority before the marker and v2
    authority after it; dual writes remain enabled through the rollback horizon.
-4. Refuse `--finalize` without an explicit rollout acknowledgement and exact
-   verification result.
+4. Refuse `--finalize` without explicit rollout and write-quiescence
+   acknowledgements and an exact verification result.
 
 ### Task 6: Document rollout and prove the complete lifecycle
 
@@ -110,7 +110,7 @@ strongly consistent Query, SHA-256 stable sharding, Clap, LocalStack.
 - Modify: `deploy/kubernetes/lake.yaml`
 - Create: `verification/issue-94-dynamo-prefix-isolation.md`
 
-1. Document v1→dual→backfill→finalize→v2 rollout, rollback limits, metrics,
+1. Document v1→dual→backfill→finalize→v2 rollout, rollback limits,
    and the prohibition on v1-only writers after finalization.
 2. Add Kubernetes environment/config examples without embedding credentials.
 3. Run `mise run spec-lifecycle specs/issue-94-dynamo-prefix-isolation.spec.md`.

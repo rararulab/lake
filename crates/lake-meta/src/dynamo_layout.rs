@@ -42,7 +42,7 @@ pub(crate) struct PrefixCursor {
 pub(crate) fn physical_key(logical_key: &str) -> DynamoPhysicalKey {
     let family = family(logical_key);
     let digest = Sha256::digest(logical_key.as_bytes());
-    let shard = digest[0] % DYNAMO_V2_SHARDS;
+    let shard = digest[0] % shard_count(family);
     DynamoPhysicalKey {
         bucket:      format!("{family}#{shard:02x}"),
         logical_key: logical_key.to_owned(),
@@ -50,7 +50,7 @@ pub(crate) fn physical_key(logical_key: &str) -> DynamoPhysicalKey {
 }
 
 pub(crate) fn bucket_for_prefix(prefix: &str, shard: u8) -> Result<String> {
-    if shard >= DYNAMO_V2_SHARDS {
+    if shard >= shard_count(family(prefix)) {
         return Err(MetaError::InvalidScanCursor {
             message: format!("shard {shard} is out of range"),
         });
@@ -70,6 +70,14 @@ fn family(key: &str) -> &str {
             if family.is_empty() { "root" } else { family }
         },
     )
+}
+
+fn shard_count(family: &str) -> u8 {
+    match family {
+        "append-operation" | "append-active" => DYNAMO_V2_SHARDS,
+        "lance-manifest" | "lance-manifest-latest" | "lance-manifest-cleanup" => 32,
+        _ => 8,
+    }
 }
 
 fn prefix_digest(prefix: &str) -> String {
@@ -92,7 +100,7 @@ impl PrefixCursor {
     }
 
     pub(crate) fn after_key(prefix: &str, shard: u8, key: &str) -> Result<Self> {
-        if shard >= DYNAMO_V2_SHARDS {
+        if shard >= shard_count(family(prefix)) {
             return Err(MetaError::InvalidScanCursor {
                 message: format!("shard {shard} is out of range"),
             });
@@ -102,6 +110,7 @@ impl PrefixCursor {
                 message: "last key does not belong to prefix".to_owned(),
             });
         }
+        validate_key_shard(prefix, shard, key)?;
         Ok(Self {
             version: CURSOR_VERSION,
             prefix_digest: prefix_digest(prefix),
@@ -112,7 +121,7 @@ impl PrefixCursor {
 
     pub(crate) fn next_shard(prefix: &str, shard: u8) -> Option<Self> {
         let shard = shard.checked_add(1)?;
-        (shard < DYNAMO_V2_SHARDS).then(|| Self {
+        (shard < shard_count(family(prefix))).then(|| Self {
             version: CURSOR_VERSION,
             prefix_digest: prefix_digest(prefix),
             shard,
@@ -130,7 +139,7 @@ impl PrefixCursor {
                 message: format!("unsupported version {}", cursor.version),
             });
         }
-        if cursor.shard >= DYNAMO_V2_SHARDS {
+        if cursor.shard >= shard_count(family(prefix)) {
             return Err(MetaError::InvalidScanCursor {
                 message: format!("shard {} is out of range", cursor.shard),
             });
@@ -149,6 +158,9 @@ impl PrefixCursor {
                 message: "last key does not belong to prefix".to_owned(),
             });
         }
+        if let Some(key) = cursor.last_key.as_deref() {
+            validate_key_shard(prefix, cursor.shard, key)?;
+        }
         Ok(cursor)
     }
 
@@ -163,9 +175,19 @@ impl PrefixCursor {
     pub(crate) fn last_key(&self) -> Option<&str> { self.last_key.as_deref() }
 }
 
+fn validate_key_shard(prefix: &str, shard: u8, key: &str) -> Result<()> {
+    let expected = bucket_for_prefix(prefix, shard)?;
+    if physical_key(key).bucket != expected {
+        return Err(MetaError::InvalidScanCursor {
+            message: "last key belongs to a different physical shard".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DYNAMO_V2_SHARDS, PrefixCursor, physical_key};
+    use super::{CURSOR_VERSION, DYNAMO_V2_SHARDS, PrefixCursor, physical_key, prefix_digest};
 
     #[test]
     fn dynamo_v2_layout_is_stable_and_family_isolated() {
@@ -196,7 +218,17 @@ mod tests {
     #[test]
     fn dynamo_v2_cursor_resumes_across_shards() {
         let prefix = "tbl/";
-        let cursor = PrefixCursor::after_key(prefix, 17, "tbl/ns/video").expect("valid cursor");
+        let key = "tbl/ns/video";
+        let shard = u8::from_str_radix(
+            physical_key(key)
+                .bucket
+                .split_once('#')
+                .expect("family#shard")
+                .1,
+            16,
+        )
+        .expect("hex shard");
+        let cursor = PrefixCursor::after_key(prefix, shard, key).expect("valid cursor");
         let encoded = cursor.encode().expect("encodable cursor");
         assert_eq!(
             PrefixCursor::decode(prefix, &encoded).expect("same prefix"),
@@ -204,9 +236,32 @@ mod tests {
         );
         assert!(PrefixCursor::decode("append-operation/", &encoded).is_err());
 
-        let next = PrefixCursor::next_shard(prefix, 17).expect("next shard");
-        assert_eq!(next.shard(), 18);
+        let next = PrefixCursor::next_shard(prefix, 3).expect("next shard");
+        assert_eq!(next.shard(), 4);
         assert_eq!(next.last_key(), None);
         assert!(PrefixCursor::next_shard(prefix, DYNAMO_V2_SHARDS - 1).is_none());
+    }
+
+    #[test]
+    fn dynamo_v2_cursor_rejects_a_last_key_from_another_shard() {
+        let prefix = "tbl/";
+        let key = "tbl/ns/video";
+        let actual = u8::from_str_radix(
+            physical_key(key)
+                .bucket
+                .split_once('#')
+                .expect("family#shard")
+                .1,
+            16,
+        )
+        .expect("hex shard");
+        let forged = PrefixCursor {
+            version:       CURSOR_VERSION,
+            prefix_digest: prefix_digest(prefix),
+            shard:         (actual + 1) % 8,
+            last_key:      Some(key.to_owned()),
+        };
+        let encoded = forged.encode().unwrap();
+        assert!(PrefixCursor::decode(prefix, &encoded).is_err());
     }
 }

@@ -45,8 +45,17 @@ Provision both `$LAKE_DYNAMODB_TABLE` (HASH key `pk`) and its companion
 billing, or grant the one-shot migration identity `CreateTable`. Roll all
 Query and Metasrv pods to a dual-capable image before running
 `lake dynamo-migrate`. Do not set `--acknowledge-dual-rollout` while an old
-v1-only writer exists. After finalization, keep both table ARNs in the runtime
-IAM policy and retain v1 for at least one append-operation retention horizon.
+v1-only writer exists. Pause metadata write admission before acknowledging
+`--acknowledge-write-quiescence`; after finalization, roll Query and Metasrv so
+they observe v2 authority before resuming writes. Runtime identities need
+`DescribeTable` plus their normal data-plane permissions, not `CreateTable`.
+Keep both table ARNs in the runtime IAM policy and retain v1 for at least one
+append-operation retention horizon.
+
+A failed finalize leaves its durable barrier held. Keep admission paused,
+finish backfill, and rerun finalize. Do not delete the barrier as a routine
+rollback mechanism; doing so can re-admit stale dual writers during parity
+verification.
 
 ## Create required secrets
 

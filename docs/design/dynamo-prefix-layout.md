@@ -21,12 +21,13 @@ V2 is a companion on-demand table named `<LAKE_DYNAMODB_TABLE>_prefix_v2`:
 
 `family` is the first path segment (`tbl`, `append-operation`,
 `lance-manifest`, and so on); keys without `/` use `root`. The shard is a
-stable 64-way SHA-256 shard of the complete logical key. One hot family can
-therefore use multiple Dynamo partitions without changing the `MetaStore`
-contract.
+stable SHA-256 shard of the complete logical key. High-rate append families
+use 64 shards, manifest families use 32, and registry/default families use 8.
+This avoids a 64-request floor for catalog refresh while spreading hot write
+families without changing the `MetaStore` contract.
 
 A point read computes one bucket and uses strongly consistent `GetItem`.
-Prefix reads query all 64 family shards with
+Prefix reads query every configured family shard with
 `bucket = :bucket AND begins_with(pk, :prefix)`. A page cursor contains the
 current shard and last complete `pk`; one backend request evaluates at most the
 requested limit and never evaluates another family or non-matching sort-key
@@ -52,15 +53,16 @@ durable states:
 The marker is monotonic and exact-value guarded. Publishing it while a
 v1-only writer still runs is forbidden: operators first roll out dual mode to
 all metadata nodes, then finalize migration. Query readers may continue serving
-their last-good cache throughout; write admission need not be stopped.
+their last-good cache, but metadata write admission is paused for finalization.
 
-Each dual mutation increments an internal generation in the same Dynamo
-transaction as both physical copies. Finalization reads the generation,
-performs bounded bidirectional key/value verification, reads it again, and
-publishes the marker under an exact generation condition. A concurrent write
-therefore makes finalization fail closed. Backfill progress is stored as a
-durable v1 scan cursor only after every evaluated item converges; replay after
-a crash is idempotent.
+Every pre-finalization dual mutation condition-checks that a durable write
+barrier is absent. Finalization installs that barrier, performs bounded
+bidirectional key/value verification, and publishes the marker in a transaction
+that checks the barrier is still held. The barrier remains durable so stale
+pre-finalization nodes fail closed. Operators restart runtime pods immediately;
+refreshed v2-authoritative nodes no longer need the barrier check. Backfill
+progress is stored as a durable v1 scan cursor only after every evaluated item
+converges; replay after a crash is idempotent.
 
 ## Mutation invariants
 
@@ -80,9 +82,10 @@ a crash is idempotent.
    v1-only peers.
 2. Run `lake dynamo-migrate --page-size N` repeatedly or let it resume its
    durable cursor until backfill verification completes.
-3. Finalize the marker only after the binary rollout check passes.
-4. Verify v2-only prefix reads and evaluated-item metrics.
-5. Roll to v2-authoritative mode. Retain v1 for rollback through at least one
+3. Pause metadata write admission and finalize only after the binary rollout
+   check passes.
+4. Restart runtime pods so they observe v2 authority, then resume writes.
+5. Verify v2-only prefix reads. Retain v1 for rollback through at least one
    append-operation retention horizon before destructive removal.
 
 Rollback before finalization is v1-only. After finalization, rollback must use

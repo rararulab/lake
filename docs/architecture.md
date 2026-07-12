@@ -377,9 +377,9 @@ surfaced through `lake-catalog`.
   verified migration marker exists. Current nodes atomically dual-write a
   companion `(family#shard, full-key)` table; after finalization, point reads
   use strongly consistent `GetItem` and prefix reads drain bounded,
-  strongly-consistent `Query` pages across 64 shards. The migration marker is
-  published only when bidirectional parity was verified under an unchanged
-  monotonic write generation. See
+  strongly-consistent `Query` pages across 8 registry/default, 32 manifest, or
+  64 append shards. Finalization pauses metadata writes with a durable barrier
+  and publishes the marker only after bidirectional parity succeeds. See
   [`dynamo-prefix-layout.md`](design/dynamo-prefix-layout.md).
 
 No self-built consensus: read HA comes from stateless replicas, write HA

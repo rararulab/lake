@@ -15,8 +15,9 @@ guarded-mutation, and incarnation semantics of the current authority.
 
 - Use a strongly consistent companion v2 table, not an eventually consistent
   GSI over the v1 table.
-- Partition each logical family across 64 stable shards and keep the complete
-  logical key as the range key.
+- Partition each logical family across a stable bounded shard count (8 for
+  registry/default, 32 for manifests, 64 for append traffic) and keep the
+  complete logical key as the range key.
 - Point reads address one shard. Prefix pages advance through shards with an
   opaque versioned cursor and one bounded Dynamo Query per page.
 - Upgrade through v1 authority, atomic dual writes, bounded conditional

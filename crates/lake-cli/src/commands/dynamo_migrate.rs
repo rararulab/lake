@@ -26,12 +26,19 @@ pub struct DynamoMigrateCmd {
     pub page_size: usize,
 
     /// Verify exact parity and publish the monotonic v2 authority marker.
-    #[arg(long, requires = "acknowledge_dual_rollout")]
+    #[arg(
+        long,
+        requires_all = ["acknowledge_dual_rollout", "acknowledge_write_quiescence"]
+    )]
     pub finalize: bool,
 
     /// Confirm every commit-capable metadata node is running dual-write code.
     #[arg(long)]
     pub acknowledge_dual_rollout: bool,
+
+    /// Confirm write admission is paused until runtime pods restart on v2.
+    #[arg(long)]
+    pub acknowledge_write_quiescence: bool,
 
     /// Emit one machine-readable JSON object.
     #[arg(long)]
@@ -40,7 +47,7 @@ pub struct DynamoMigrateCmd {
 
 #[derive(Serialize)]
 struct MigrationOutput {
-    page:         DynamoMigrationPage,
+    page:         Option<DynamoMigrationPage>,
     verification: Option<DynamoMigrationVerification>,
 }
 
@@ -67,15 +74,7 @@ pub async fn run(command: DynamoMigrateCmd) -> anyhow::Result<()> {
     meta.ensure_table()
         .await
         .context("ensure DynamoDB layouts")?;
-    let page = meta
-        .migrate_v2_page(command.page_size)
-        .await
-        .context("migrate one DynamoDB page")?;
     let verification = if command.finalize {
-        anyhow::ensure!(
-            page.complete,
-            "backfill is incomplete; rerun without --finalize until complete"
-        );
         Some(
             meta.verify_and_finalize_v2(command.page_size)
                 .await
@@ -83,6 +82,15 @@ pub async fn run(command: DynamoMigrateCmd) -> anyhow::Result<()> {
         )
     } else {
         None
+    };
+    let page = if command.finalize {
+        None
+    } else {
+        Some(
+            meta.migrate_v2_page(command.page_size)
+                .await
+                .context("migrate one DynamoDB page")?,
+        )
     };
     let output = MigrationOutput { page, verification };
     if command.json {

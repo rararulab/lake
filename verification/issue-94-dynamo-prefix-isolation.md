@@ -33,8 +33,22 @@ catalog and maintenance authority work.
   projection and key condition. The projection now omits the unused field and
   the key condition uses an expression-name alias; the exact lifecycle then
   passed.
+- Independent review of the first frozen commit found a forged-cursor shard
+  omission, runtime `CreateTable` IAM mismatch, non-resumable documented
+  finalize flow, global generation hot item, and fixed 64-query registry
+  fan-out. The corrected implementation binds cursor keys to their derived
+  shard, opens pre-provisioned runtime tables without `CreateTable`, finalizes
+  without restarting backfill, replaces the hot generation with a durable
+  write barrier, and uses 8/32/64 family-specific shard counts.
+- The corrected LocalStack lifecycle seeds a genuine v1-only key, backfills
+  it, proves a stale dual node is blocked by finalization, refreshes that node
+  to v2 authority, and then proves writes resume.
 - `cargo clippy -p lake-meta -p lake-cli --all-targets -- -D warnings` passed.
-- `mise run gate` passed: workspace all-target tests, self-check, repository
+- The first `mise run gate` passed: workspace all-target tests, self-check, repository
   hooks, and site typecheck/tests/build all completed successfully.
 - `mise run doc` passed and generated documentation for all public crates.
-- Independent frozen-head verification is recorded below when run.
+- Corrected `mise run test-integration` passed all 15 LocalStack integration
+  tests from a fresh checkout-scoped container.
+- Corrected `mise run gate` passed all workspace tests, e2e, hooks, and site
+  checks; `mise run doc` passed with rustdoc warnings denied.
+- Independent corrected-head verification is recorded below when run.
