@@ -124,28 +124,21 @@ struct WriteConfig {
     // ponytail: `None` -> Lance's default object-store commit (atomic on local
     // FS). `Some` -> commits route through our `MetaStore`-backed external
     // manifest store, giving put-if-not-exists semantics on S3.
-    commit_handler:       Option<Arc<dyn CommitHandler>>,
-    manifest_store:       Option<MetaManifestStore>,
+    commit_handler:           Option<Arc<dyn CommitHandler>>,
+    manifest_store:           Option<MetaManifestStore>,
     // Empty -> local filesystem. Non-empty -> object_store config keys
     // (`aws_endpoint`, `aws_access_key_id`, …) threaded into every read/write.
-    storage_options:      HashMap<String, String>,
-    maintenance_policy:   LanceMaintenancePolicy,
+    storage_options:          HashMap<String, String>,
+    maintenance_policy:       LanceMaintenancePolicy,
+    // The conservative public append path has no coordinator reservation.
+    // Serialize it per engine so two handles cannot both miss history before
+    // committing the same operation. Metasrv uses `append_reserved` and its
+    // finer-grained durable per-table fence instead.
+    conservative_append_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
-    history_scans:        Arc<std::sync::atomic::AtomicUsize>,
+    history_scans:            Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
-    stage_persist_hooks:  Option<Arc<StagePersistRaceHooks>>,
-    #[cfg(test)]
-    stage_finalize_hooks: Option<Arc<StageFinalizeRaceHooks>>,
-}
-
-#[cfg(test)]
-#[derive(Debug, Default)]
-struct StagePersistRaceHooks {
-    stage_owner_claimed:         std::sync::atomic::AtomicBool,
-    winner_staged:               tokio::sync::Notify,
-    allow_winner_commit:         tokio::sync::Notify,
-    contender_observed_existing: tokio::sync::Notify,
-    allow_contender_stage_read:  tokio::sync::Notify,
+    stage_finalize_hooks:     Option<Arc<StageFinalizeRaceHooks>>,
 }
 
 #[cfg(test)]
@@ -692,14 +685,19 @@ async fn persist_staged_references(
     operation: &AppendOperation,
     parent_version: Version,
     added: Vec<ObjectIdentity>,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let url = dataset_url(location)?;
     let (store, root) = object_store::parse_url_opts(&url, config.storage_options.clone())
         .map_err(EngineError::backend)?;
     let stage = reference_stage(operation);
     let chunks = added.len().max(1).div_ceil(REFERENCE_CHUNK_SIZE);
     let chunk_count = u32::try_from(chunks).map_err(EngineError::backend)?;
-    for index in 0..chunks {
+    let mut observed_existing = false;
+    // Chunk zero publishes the stage because it carries the chunk count.
+    // Materialize every non-header chunk first, then create the header last.
+    // A successful late persister must therefore republish the header and
+    // cannot leave a terminal cleanup unaware of newly created chunks.
+    for index in (1..chunks).chain(std::iter::once(0)) {
         let start = index * REFERENCE_CHUNK_SIZE;
         let end = (start + REFERENCE_CHUNK_SIZE).min(added.len());
         let chunk = StagedReferenceChunk {
@@ -726,11 +724,7 @@ async fn persist_staged_references(
         {
             Ok(_) => {}
             Err(object_store::Error::AlreadyExists { .. }) => {
-                #[cfg(test)]
-                if let Some(hooks) = &config.stage_persist_hooks {
-                    hooks.contender_observed_existing.notify_one();
-                    hooks.allow_contender_stage_read.notified().await;
-                }
+                observed_existing = true;
                 let existing = store
                     .get(&path)
                     .await
@@ -747,16 +741,7 @@ async fn persist_staged_references(
             Err(error) => return Err(EngineError::backend(error)),
         }
     }
-    #[cfg(test)]
-    if let Some(hooks) = &config.stage_persist_hooks
-        && !hooks
-            .stage_owner_claimed
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-    {
-        hooks.winner_staged.notify_one();
-        hooks.allow_winner_commit.notified().await;
-    }
-    Ok(stage)
+    Ok((stage, observed_existing))
 }
 
 async fn finalize_staged_references(
@@ -944,8 +929,16 @@ async fn delete_staged_references(
     let base = root.join("_lake").join("object_refs_staging").join(stage);
     let first_path = base.clone().join("0.json");
     let first = match store.get(&first_path).await {
-        Ok(result) => result.bytes().await.map_err(EngineError::backend)?,
-        Err(object_store::Error::NotFound { .. }) => return Ok(()),
+        Ok(result) => match result.bytes().await {
+            Ok(bytes) => bytes,
+            Err(object_store::Error::NotFound { .. }) => {
+                return drain_unpublished_stage(store.as_ref(), &base, location, stage).await;
+            }
+            Err(error) => return Err(EngineError::backend(error)),
+        },
+        Err(object_store::Error::NotFound { .. }) => {
+            return drain_unpublished_stage(store.as_ref(), &base, location, stage).await;
+        }
         Err(error) => return Err(EngineError::backend(error)),
     };
     let first: StagedReferenceChunk =
@@ -956,9 +949,36 @@ async fn delete_staged_references(
             reason:   format!("invalid staged reference header {stage}"),
         });
     }
-    for index in 0..first.chunk_count {
-        let path = base.clone().join(format!("{index}.json"));
-        match store.delete(&path).await {
+    // Withdraw the publication marker first. The coordinator invokes expiry
+    // under the same table lock as append, so no legally admitted persister can
+    // recreate chunks while this bounded drain is in progress.
+    match store.delete(&first_path).await {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+        Err(error) => return Err(EngineError::backend(error)),
+    }
+    drain_unpublished_stage(store.as_ref(), &base, location, stage).await
+}
+
+async fn drain_unpublished_stage(
+    store: &dyn object_store::ObjectStore,
+    base: &object_store::path::Path,
+    location: &TableLocation,
+    stage: &str,
+) -> Result<()> {
+    let maximum = MAX_REFERENCES_PER_APPEND
+        .max(1)
+        .div_ceil(REFERENCE_CHUNK_SIZE);
+    let mut listed = store.list(Some(base));
+    let mut drained = 0usize;
+    while let Some(meta) = listed.try_next().await.map_err(EngineError::backend)? {
+        drained = drained.saturating_add(1);
+        if drained > maximum {
+            return Err(EngineError::ReferenceLineageUnavailable {
+                location: location.clone(),
+                reason:   format!("reference stage {stage} exceeds {maximum} bounded chunks"),
+            });
+        }
+        match store.delete(&meta.location).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
             Err(error) => return Err(EngineError::backend(error)),
         }
@@ -1065,6 +1085,7 @@ impl TableHandle for LanceTable {
         operation: &AppendOperation,
         batches: SendableRecordBatchStream,
     ) -> Result<Version> {
+        let _guard = self.config.conservative_append_lock.lock().await;
         if let Some(version) = self.reconcile_append(operation).await? {
             return Ok(version);
         }
@@ -1135,7 +1156,7 @@ impl TableHandle for LanceTable {
             .iter()
             .cloned()
             .collect();
-        let persisted_stage = match persist_staged_references(
+        let (persisted_stage, observed_existing) = match persist_staged_references(
             &self.config,
             &self.location,
             operation,
@@ -1151,6 +1172,13 @@ impl TableHandle for LanceTable {
             },
         };
         debug_assert_eq!(persisted_stage, stage);
+        // An existing exact stage means this is a replay or a concurrent
+        // contender. Reconcile once more after validating the shared journal:
+        // the original writer may have committed between our initial history
+        // lookup and this point. Healthy first writers keep the no-scan path.
+        if observed_existing && let Some(version) = self.reconcile_append(operation).await? {
+            return Ok(version);
+        }
         let committed = CommitBuilder::new(self.dataset.clone())
             .with_max_retries(0)
             .execute(transaction)
@@ -1162,8 +1190,10 @@ impl TableHandle for LanceTable {
                 None => return Err(EngineError::backend(error)),
             },
         };
+        // Keep the exact operation stage until the coordinator expires its
+        // durable operation record. A retry admitted before that boundary may
+        // still need the stage to finish lineage publication after a crash.
         finalize_staged_references(&self.config, &self.location, &stage, table_version).await?;
-        delete_staged_references(&self.config, &self.location, &stage).await?;
         Ok(table_version)
     }
 
@@ -1172,8 +1202,16 @@ impl TableHandle for LanceTable {
             return Ok(None);
         };
         finalize_staged_references(&self.config, &self.location, &stage, version).await?;
-        delete_staged_references(&self.config, &self.location, &stage).await?;
         Ok(Some(version))
+    }
+
+    async fn expire_append(&self, operation: &AppendOperation) -> Result<()> {
+        delete_staged_references(
+            &self.config,
+            &self.location,
+            reference_stage(operation).as_str(),
+        )
+        .await
     }
 }
 
@@ -1275,7 +1313,7 @@ mod tests {
         input: RecordBatch,
     ) -> (Version, String) {
         let references = object_identities(&input).unwrap();
-        let stage =
+        let (stage, _) =
             persist_staged_references(&engine.config, location, operation, Version(1), references)
                 .await
                 .unwrap();
@@ -1452,55 +1490,157 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_operation_append_survives_terminal_stage_cleanup() {
+    async fn append_stage_is_retained_until_explicit_expiry() {
         let dir = tempfile::tempdir().unwrap();
         let location = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
-        let hooks = Arc::new(StagePersistRaceHooks::default());
-        let mut engine = LanceEngine::new();
-        engine.config.stage_persist_hooks = Some(hooks.clone());
+        let engine = LanceEngine::new();
+        let handle = engine.create(&location, file_schema()).await.unwrap();
+        let operation = operation();
+        let value = file_batch(0);
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            value.schema(),
+            futures::stream::iter(vec![Ok::<_, DataFusionError>(value)]),
+        ));
+        handle.append(&operation, stream).await.unwrap();
+
+        let stage = reference_stage(&operation);
+        let url = dataset_url(&location).unwrap();
+        let (store, root) =
+            object_store::parse_url_opts(&url, engine.config.storage_options.clone()).unwrap();
+        let header = root
+            .join("_lake")
+            .join("object_refs_staging")
+            .join(stage.as_str())
+            .join("0.json");
+        assert!(
+            store.get(&header).await.is_ok(),
+            "replayable stage is retained"
+        );
+
+        handle.expire_append(&operation).await.unwrap();
+
+        assert!(matches!(
+            store.get(&header).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn expire_append_drains_headerless_multichunk_crash_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
+        let engine = LanceEngine::new();
+        let handle = engine.create(&location, file_schema()).await.unwrap();
+        let operation = operation();
+        let base = dir
+            .path()
+            .join("t.lance/_lake/object_refs_staging")
+            .join(reference_stage(&operation));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let mut residues = Vec::new();
+        for index in 1..=2 {
+            let path = base.join(format!("{index}.json"));
+            let chunk = StagedReferenceChunk {
+                format_version: 1,
+                parent_version: Version(1),
+                chunk_index:    index,
+                chunk_count:    3,
+                added:          Vec::new(),
+            };
+            tokio::fs::write(&path, serde_json::to_vec(&chunk).unwrap())
+                .await
+                .unwrap();
+            residues.push(path);
+        }
+        assert!(
+            !base.join("0.json").exists(),
+            "publisher crashed before header"
+        );
+
+        handle.expire_append(&operation).await.unwrap();
+
+        assert!(
+            residues.iter().all(|path| !path.exists()),
+            "bounded expiry drain removes every invisible non-header chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_cleanup_rejects_malformed_publication_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
+        let engine = LanceEngine::new();
+        engine.create(&location, file_schema()).await.unwrap();
+        let stage = "tenant-a--019f5519-cb8f-7f91-9c74-14ffb241311e";
+        let header = dir
+            .path()
+            .join(format!("t.lance/_lake/object_refs_staging/{stage}/0.json"));
+        tokio::fs::create_dir_all(header.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&header, br#"{"format_version":1,"chunk_index":0}"#)
+            .await
+            .unwrap();
+
+        assert!(
+            delete_staged_references(&engine.config, &location, stage)
+                .await
+                .is_err()
+        );
+        assert!(header.exists(), "malformed publication remains fail-closed");
+    }
+
+    #[tokio::test]
+    async fn same_operation_append_reuses_stage_until_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
+        let engine = LanceEngine::new();
         let handle = engine.create(&location, batch().schema()).await.unwrap();
         let competing = engine.open(&location).await.unwrap().unwrap();
         let operation = Arc::new(operation());
 
-        let winner_operation = operation.clone();
-        let winner = tokio::spawn(async move {
+        let first_operation = operation.clone();
+        let first = tokio::spawn(async move {
             let input = batch();
             let stream = Box::pin(RecordBatchStreamAdapter::new(
                 input.schema(),
                 futures::stream::iter(vec![Ok::<_, DataFusionError>(input)]),
             ));
-            handle.append(&winner_operation, stream).await
+            handle.append(&first_operation, stream).await
         });
-        hooks.winner_staged.notified().await;
 
-        let contender_operation = operation.clone();
-        let contender = tokio::spawn(async move {
+        let second_operation = operation.clone();
+        let second = tokio::spawn(async move {
             let input = batch();
             let stream = Box::pin(RecordBatchStreamAdapter::new(
                 input.schema(),
                 futures::stream::iter(vec![Ok::<_, DataFusionError>(input)]),
             ));
-            competing.append(&contender_operation, stream).await
+            competing.append(&second_operation, stream).await
         });
-        hooks.contender_observed_existing.notified().await;
-
-        hooks.allow_winner_commit.notify_one();
-        let committed = winner.await.unwrap().unwrap();
+        let (first, second) = tokio::join!(first, second);
+        let committed = first.unwrap().unwrap();
+        assert_eq!(second.unwrap().unwrap(), committed);
         let stage_path = dir.path().join(format!(
             "t.lance/_lake/object_refs_staging/{}/0.json",
             reference_stage(&operation)
         ));
-        assert!(!stage_path.exists(), "winner performed terminal cleanup");
-
-        hooks.allow_contender_stage_read.notify_one();
-        let replayed = contender.await.unwrap().unwrap();
-        assert_eq!(replayed, committed);
+        assert!(stage_path.exists(), "winner keeps the replay journal");
         assert_eq!(committed, Version(2));
-        assert!(!stage_path.exists(), "reconciliation leaves no staging");
+        assert!(stage_path.exists(), "reconciliation keeps replay state");
+        engine
+            .open(&location)
+            .await
+            .unwrap()
+            .unwrap()
+            .expire_append(&operation)
+            .await
+            .unwrap();
+        assert!(!stage_path.exists(), "operation expiry removes staging");
     }
 
     #[tokio::test]
-    async fn concurrent_recovery_survives_terminal_stage_cleanup() {
+    async fn concurrent_recovery_shares_stage_until_expiry() {
         let dir = tempfile::tempdir().unwrap();
         let location = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
         let hooks = Arc::new(StageFinalizeRaceHooks::default());
@@ -1522,7 +1662,7 @@ mod tests {
         let stage_path = dir
             .path()
             .join(format!("t.lance/_lake/object_refs_staging/{stage}/0.json"));
-        assert!(!stage_path.exists(), "second reconciler cleaned staging");
+        assert!(stage_path.exists(), "second reconciler keeps replay state");
 
         hooks.allow_finalizer_stage_read.notify_one();
         let recovered = first.await.unwrap().unwrap();
@@ -1534,6 +1674,15 @@ mod tests {
             ObjectReferenceDelta::decode(&tokio::fs::read(final_sidecar).await.unwrap()).unwrap();
         assert_eq!(delta.table_version(), committed);
         assert_eq!(delta.added()[0].uri, "s3://lake/objects/9");
+        engine
+            .open(&location)
+            .await
+            .unwrap()
+            .unwrap()
+            .expire_append(&operation)
+            .await
+            .unwrap();
+        assert!(!stage_path.exists(), "operation expiry removes staging");
     }
 
     #[tokio::test]
@@ -1628,12 +1777,12 @@ mod tests {
         assert_eq!(repaired.table_version(), committed);
         assert_eq!(repaired.added().len(), 1);
         assert_eq!(repaired.added()[0].uri, "s3://lake/objects/7");
-        assert!(
-            !dir.path()
-                .join(format!("t.lance/_lake/object_refs_staging/{stage}/0.json"))
-                .exists(),
-            "terminal recovery removes the durable staging journal"
-        );
+        let stage_path = dir
+            .path()
+            .join(format!("t.lance/_lake/object_refs_staging/{stage}/0.json"));
+        assert!(stage_path.exists(), "recovery keeps the replay journal");
+        handle.expire_append(&operation).await.unwrap();
+        assert!(!stage_path.exists(), "operation expiry removes staging");
     }
 
     #[tokio::test]

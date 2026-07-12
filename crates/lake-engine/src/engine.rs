@@ -183,6 +183,14 @@ pub trait TableHandle: Send + Sync {
     /// Discover and finish an append already present in engine history.
     /// Implementations return `None` only when the operation never committed.
     async fn reconcile_append(&self, operation: &AppendOperation) -> Result<Option<Version>>;
+
+    /// Reclaim engine-private state for an operation that can no longer be
+    /// replayed by the coordinator.
+    ///
+    /// The coordinator calls this while holding the table lock and before it
+    /// deletes the durable operation record. Engines without per-operation
+    /// state may keep the default no-op.
+    async fn expire_append(&self, _operation: &AppendOperation) -> Result<()> { Ok(()) }
 }
 
 #[cfg(test)]

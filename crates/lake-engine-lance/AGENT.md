@@ -14,10 +14,13 @@ Lance dataset.
   digest, and reference-stage identity in Lance transaction properties.
 - Reference lineage is staged before manifest visibility and repaired from
   transaction history before a recovered version is returned.
-- Terminal staging cleanup may race another exact-operation writer or
-  reconciler. A missing stage converges only when transaction history proves
-  the exact tenant/operation/digest and complete final reference chunks prove
-  lineage; otherwise the original storage/lineage error remains fail-closed.
+- Reference staging lives until the durable coordinator operation expires.
+  Expiry holds the same table lock as append, cleans the exact stage first,
+  and only then permits the operation record to be deleted.
+- Stage persistence creates non-header chunks before publishing chunk zero;
+  expiry cleanup withdraws chunk zero first, then bounded-prefix drains. A
+  crash before header publication leaves a headerless prefix that expiry
+  drains under the per-append chunk bound.
 - The external manifest store resolves current state through one fixed
   `{version,path}` pointer. Advancing it archives the exact prior pointer, then
   CASes latest; legacy per-version-only datasets scan once to install latest.
