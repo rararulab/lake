@@ -45,7 +45,7 @@ use lake_objects::{
     LocalObjectStore, ManagedObjectStore, ObjectReader, S3ObjectStore, data_location_array,
     data_location_field, data_location_from_array,
 };
-use moka::future::Cache;
+use moka::{future::Cache, ops::compute::Op};
 use prost::Message;
 use prost_types::Any;
 use sha2::{Digest, Sha256};
@@ -64,19 +64,28 @@ const MAX_SCHEMA_CACHE_TTL: Duration = Duration::from_hours(1);
 fn ambiguous_append_error(error: &SdkError) -> bool {
     match error {
         SdkError::MissingAppendResult => true,
-        SdkError::Flight {
-            source: arrow_flight::error::FlightError::Tonic(status),
-        } => matches!(
-            status.code(),
-            tonic::Code::Cancelled
-                | tonic::Code::Unknown
-                | tonic::Code::DeadlineExceeded
-                | tonic::Code::Internal
-                | tonic::Code::Unavailable
-        ),
-        SdkError::Flight {
-            source: arrow_flight::error::FlightError::ExternalError(_),
-        } => true,
+        SdkError::Flight { source }
+            if matches!(
+                source.as_ref(),
+                arrow_flight::error::FlightError::Tonic(status) if matches!(status.code(),
+                tonic::Code::Cancelled
+                    | tonic::Code::Unknown
+                    | tonic::Code::DeadlineExceeded
+                    | tonic::Code::Internal
+                    | tonic::Code::Unavailable
+                )
+            ) =>
+        {
+            true
+        }
+        SdkError::Flight { source }
+            if matches!(
+                source.as_ref(),
+                arrow_flight::error::FlightError::ExternalError(_)
+            ) =>
+        {
+            true
+        }
         _ => false,
     }
 }
@@ -154,7 +163,8 @@ pub enum SdkError {
 
     #[snafu(display("query Flight operation failed"))]
     Flight {
-        source: arrow_flight::error::FlightError,
+        #[snafu(source(from(arrow_flight::error::FlightError, Arc::new)))]
+        source: Arc<arrow_flight::error::FlightError>,
     },
 
     #[snafu(display("query returned no managed FILE stage descriptor"))]
@@ -199,7 +209,10 @@ pub enum SdkError {
     },
 
     #[snafu(display("could not build INSERT record batch"))]
-    Arrow { source: ArrowError },
+    Arrow {
+        #[snafu(source(from(ArrowError, Arc::new)))]
+        source: Arc<ArrowError>,
+    },
 
     #[snafu(display("invalid query Flight security configuration"))]
     Security {
@@ -332,7 +345,24 @@ impl SchemaCacheConfig {
 
 #[derive(Clone)]
 struct SchemaCache {
-    entries: Cache<TableRef, Arc<Mutex<Option<SchemaRef>>>>,
+    entries: Cache<TableRef, Arc<Mutex<Option<SchemaLoadResult>>>>,
+}
+
+type SchemaLoadResult = std::result::Result<SchemaRef, SchemaLoadError>;
+
+#[derive(Clone, Debug)]
+enum SchemaLoadError {
+    Flight(Arc<arrow_flight::error::FlightError>),
+    Arrow(Arc<ArrowError>),
+}
+
+impl SchemaLoadError {
+    fn into_sdk_error(self) -> SdkError {
+        match self {
+            Self::Flight(source) => SdkError::Flight { source },
+            Self::Arrow(source) => SdkError::Arrow { source },
+        }
+    }
 }
 
 impl SchemaCache {
@@ -345,25 +375,47 @@ impl SchemaCache {
         }
     }
 
-    async fn resolve<F, Fut>(&self, table: TableRef, load: F) -> Result<SchemaRef>
+    async fn resolve<F, Fut>(&self, table: TableRef, load: F) -> SchemaLoadResult
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<SchemaRef>>,
+        Fut: std::future::Future<Output = SchemaLoadResult>,
     {
         // The cell is published before the loader starts. Invalidating the key
         // therefore detaches an in-flight loader: it can finish for its caller,
         // but it cannot repopulate the cache after a table incarnation change.
         let cell = self
             .entries
-            .get_with(table, async { Arc::new(Mutex::new(None)) })
+            .get_with(table.clone(), async { Arc::new(Mutex::new(None)) })
             .await;
         let mut cached = cell.lock().await;
-        if let Some(schema) = cached.as_ref() {
-            return Ok(schema.clone());
+        if let Some(result) = cached.as_ref() {
+            return result.clone();
         }
-        let schema = load().await?;
-        *cached = Some(schema.clone());
-        Ok(schema)
+        let result = load().await;
+        *cached = Some(result.clone());
+        drop(cached);
+
+        if result.is_err() {
+            // Existing waiters retain this cell and observe the same typed
+            // failure. Remove only this exact generation so a request arriving
+            // after the cohort can retry immediately; never remove a newer cell
+            // installed by explicit invalidation.
+            let failed_cell = cell.clone();
+            self.entries
+                .entry(table)
+                .and_compute_with(move |entry| {
+                    let op = entry.map_or(Op::Nop, |entry| {
+                        if Arc::ptr_eq(&entry.into_value(), &failed_cell) {
+                            Op::Remove
+                        } else {
+                            Op::Nop
+                        }
+                    });
+                    std::future::ready(op)
+                })
+                .await;
+        }
+        result
     }
 
     async fn invalidate(&self, table: &TableRef) { self.entries.invalidate(table).await; }
@@ -660,16 +712,18 @@ impl LakeClient {
         self.schema_cache
             .resolve(table.clone(), || self.fetch_table_schema(table))
             .await
+            .map_err(SchemaLoadError::into_sdk_error)
     }
 
-    async fn fetch_table_schema(&self, table: &TableRef) -> Result<SchemaRef> {
+    async fn fetch_table_schema(&self, table: &TableRef) -> SchemaLoadResult {
         let mut client = FlightSqlServiceClient::new(self.query.clone());
         self.security.apply_to_sql_client(&mut client);
         let info = client
             .execute(format!("SELECT * FROM lake.{table} LIMIT 0"), None)
             .await
-            .context(FlightSnafu)?;
-        let schema = Schema::try_from(info).context(ArrowSnafu)?;
+            .map_err(|source| SchemaLoadError::Flight(Arc::new(source)))?;
+        let schema =
+            Schema::try_from(info).map_err(|source| SchemaLoadError::Arrow(Arc::new(source)))?;
         Ok(Arc::new(schema))
     }
 
@@ -1097,9 +1151,9 @@ mod tests {
                     let committed = attempt_client.put_append_once(messages).await?;
                     if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                         Err(SdkError::Flight {
-                            source: arrow_flight::error::FlightError::Tonic(Box::new(
+                            source: Arc::new(arrow_flight::error::FlightError::Tonic(Box::new(
                                 tonic::Status::unavailable("response lost after commit"),
-                            )),
+                            ))),
                         })
                     } else {
                         Ok(committed)
@@ -1399,13 +1453,26 @@ mod tests {
             }
         };
 
-        let failure = prepare(&table).await.expect_err("first lookup fails");
-        assert!(matches!(
-            failure,
-            SdkError::Flight {
-                source: arrow_flight::error::FlightError::Tonic(ref status),
-            } if status.code() == tonic::Code::Unavailable
-        ));
+        let failures = futures::future::join_all((0..8).map(|_| {
+            let client = client.clone();
+            async move {
+                client
+                    .prepare_insert(
+                        "INSERT INTO robots.episodes (episode_id) VALUES (?)",
+                        vec![InsertValue::Utf8("episode-1".to_owned())],
+                    )
+                    .await
+            }
+        }))
+        .await;
+        assert!(failures.iter().all(|result| matches!(
+            result,
+            Err(SdkError::Flight { source }) if matches!(
+                source.as_ref(),
+                arrow_flight::error::FlightError::Tonic(status)
+                    if status.code() == tonic::Code::Unavailable
+            )
+        )));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         prepare(&table).await.expect("failure is not cached");

@@ -66,8 +66,8 @@ Scenario: Expiry and explicit invalidation refetch while failures remain retryab
     Package: lake-sdk
     Filter: schema_cache_expiry_and_invalidation_refetch_without_caching_failures
   Given a short-lived schema cache and a Query endpoint whose first lookup can fail
-  When lookup is retried, the entry expires, one table is invalidated, or the cache is cleared
-  Then failures are not retained and each stale or invalidated entry is refetched without affecting unrelated entries
+  When concurrent lookup fails, lookup is retried, the entry expires, one table is invalidated, or the cache is cleared
+  Then the concurrent cohort shares one typed failure, failures are not retained, and each stale or invalidated entry is refetched without affecting unrelated entries
 
 Scenario: Schema cache configuration is finite and validated before connect
   Test:
