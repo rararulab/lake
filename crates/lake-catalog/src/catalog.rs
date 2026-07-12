@@ -30,7 +30,7 @@ use datafusion::{
     catalog::{CatalogProvider, SchemaProvider},
     datasource::TableProvider,
 };
-use lake_common::{Namespace, TableLocation, TableName, TableRef};
+use lake_common::{Namespace, TableLocation, TableName, TableRef, Version};
 use lake_engine::TableEngineRef;
 use lake_meta::{MetaStoreRef, registry, registry::TableRegistration};
 use moka::future::Cache;
@@ -73,12 +73,81 @@ impl ProviderGeneration {
             version:        registration.current_version.0,
         }
     }
+
+    fn from_snapshot(snapshot: &TableSnapshot) -> Self {
+        Self {
+            table:          snapshot.table.clone(),
+            location:       snapshot.location.clone(),
+            engine:         snapshot.engine.clone(),
+            incarnation_id: Some(snapshot.incarnation_id.clone()),
+            version:        snapshot.version.0,
+        }
+    }
+}
+
+/// Immutable physical identity of one table input used by a query plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableSnapshot {
+    table:          TableRef,
+    location:       TableLocation,
+    engine:         String,
+    incarnation_id: String,
+    version:        Version,
+}
+
+impl TableSnapshot {
+    #[must_use]
+    pub fn new(
+        table: TableRef,
+        location: TableLocation,
+        engine: impl Into<String>,
+        incarnation_id: impl Into<String>,
+        version: Version,
+    ) -> Self {
+        Self {
+            table,
+            location,
+            engine: engine.into(),
+            incarnation_id: incarnation_id.into(),
+            version,
+        }
+    }
+
+    fn from_registration(table: &TableRef, registration: &TableRegistration) -> Option<Self> {
+        Some(Self::new(
+            table.clone(),
+            registration.location.clone(),
+            registration.engine.clone(),
+            registration.incarnation_id()?,
+            registration.current_version,
+        ))
+    }
+
+    #[must_use]
+    pub const fn table(&self) -> &TableRef { &self.table }
+
+    #[must_use]
+    pub const fn location(&self) -> &TableLocation { &self.location }
+
+    #[must_use]
+    pub fn engine(&self) -> &str { &self.engine }
+
+    #[must_use]
+    pub fn incarnation_id(&self) -> &str { &self.incarnation_id }
+
+    #[must_use]
+    pub const fn version(&self) -> Version { self.version }
 }
 
 #[derive(Debug, Snafu)]
-pub(crate) enum ProviderLoadError {
+pub enum ProviderLoadError {
     #[snafu(display("no table exists at {}", location.0))]
     Missing { location: TableLocation },
+    #[snafu(display("snapshot engine '{claimed}' is not served by '{available}'"))]
+    WrongEngine {
+        claimed:   String,
+        available: String,
+    },
     #[snafu(transparent)]
     Engine { source: lake_engine::EngineError },
 }
@@ -213,6 +282,37 @@ impl CatalogState {
             })
             .await
     }
+
+    async fn provider_for_snapshot(
+        &self,
+        snapshot: &TableSnapshot,
+    ) -> Result<Arc<dyn TableProvider>, Arc<ProviderLoadError>> {
+        if snapshot.engine != self.engine.kind() {
+            return Err(Arc::new(ProviderLoadError::WrongEngine {
+                claimed:   snapshot.engine.clone(),
+                available: self.engine.kind().to_owned(),
+            }));
+        }
+        let generation = ProviderGeneration::from_snapshot(snapshot);
+        let engine = self.engine.clone();
+        let location = snapshot.location.clone();
+        let version = snapshot.version;
+        self.providers
+            .try_get_with(generation, async move {
+                let handle = engine
+                    .open(&location)
+                    .await
+                    .map_err(|source| ProviderLoadError::Engine { source })?
+                    .ok_or_else(|| ProviderLoadError::Missing {
+                        location: location.clone(),
+                    })?;
+                handle
+                    .table_provider(version)
+                    .await
+                    .map_err(|source| ProviderLoadError::Engine { source })
+            })
+            .await
+    }
 }
 
 /// DataFusion catalog over the lake registry + storage engine.
@@ -283,6 +383,29 @@ impl LakeCatalog {
     }
 
     pub fn state(&self) -> Arc<CatalogState> { self.state.clone() }
+
+    /// Resolve the cached registry pointer to one self-contained immutable
+    /// table generation. Legacy registrations without an incarnation are not
+    /// pinnable and return `None`.
+    pub async fn resolve_snapshot(
+        &self,
+        table: &TableRef,
+    ) -> lake_meta::Result<Option<TableSnapshot>> {
+        Ok(self
+            .state
+            .registration(table)
+            .await?
+            .and_then(|registration| TableSnapshot::from_registration(table, &registration)))
+    }
+
+    /// Load the exact provider named by `snapshot` without consulting a
+    /// mutable registry pointer or substituting the handle's latest version.
+    pub async fn provider_for_snapshot(
+        &self,
+        snapshot: &TableSnapshot,
+    ) -> Result<Arc<dyn TableProvider>, Arc<ProviderLoadError>> {
+        self.state.provider_for_snapshot(snapshot).await
+    }
 
     /// Pin the current immutable listing/schema generation in O(1).
     #[must_use]
@@ -574,13 +697,24 @@ impl CatalogProvider for LakeCatalog {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool as StdAtomicBool, AtomicU8, AtomicUsize, Ordering};
+    use std::sync::{
+        Mutex as TestMutex,
+        atomic::{AtomicBool as StdAtomicBool, AtomicU8, AtomicUsize, Ordering},
+    };
 
     use arrow_flight::{IpcMessage, SchemaAsIpc};
     use async_trait::async_trait;
-    use datafusion::arrow::{
-        datatypes::{DataType, Field, Schema},
-        ipc::writer::IpcWriteOptions,
+    use datafusion::{
+        arrow::{
+            datatypes::{DataType, Field, Schema},
+            ipc::writer::IpcWriteOptions,
+        },
+        execution::SendableRecordBatchStream,
+    };
+    use lake_common::{AppendOperation, Version};
+    use lake_engine::{
+        EngineError, ObjectReferencePage, ObjectReferenceRequest, TableEngine, TableHandle,
+        TableHandleRef,
     };
     use lake_engine_lance::LanceEngine;
     use lake_meta::{MetaError, MetaStore, RocksMeta};
@@ -589,6 +723,93 @@ mod tests {
     use super::*;
 
     struct FailingGetMeta;
+
+    struct SnapshotProbeEngine {
+        location: TableLocation,
+        versions: Arc<TestMutex<Vec<Version>>>,
+    }
+
+    struct SnapshotProbeHandle {
+        schema:   SchemaRef,
+        versions: Arc<TestMutex<Vec<Version>>>,
+    }
+
+    #[async_trait]
+    impl TableEngine for SnapshotProbeEngine {
+        fn kind(&self) -> &'static str { "probe" }
+
+        async fn create(
+            &self,
+            _location: &TableLocation,
+            _schema: SchemaRef,
+        ) -> lake_engine::Result<TableHandleRef> {
+            unreachable!()
+        }
+
+        async fn open(
+            &self,
+            location: &TableLocation,
+        ) -> lake_engine::Result<Option<TableHandleRef>> {
+            assert_eq!(location, &self.location, "must open the claimed location");
+            Ok(Some(Arc::new(SnapshotProbeHandle {
+                schema:   Arc::new(Schema::empty()),
+                versions: self.versions.clone(),
+            })))
+        }
+
+        async fn remove(&self, _location: &TableLocation) -> lake_engine::Result<()> {
+            unreachable!()
+        }
+
+        async fn maintain(
+            &self,
+            _location: &TableLocation,
+            _version: Version,
+        ) -> lake_engine::Result<Option<Version>> {
+            unreachable!()
+        }
+
+        async fn retained_object_references(
+            &self,
+            _location: &TableLocation,
+            _request: ObjectReferenceRequest,
+        ) -> lake_engine::Result<ObjectReferencePage> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait]
+    impl TableHandle for SnapshotProbeHandle {
+        fn schema(&self) -> SchemaRef { self.schema.clone() }
+
+        fn current_version(&self) -> Version { Version(99) }
+
+        async fn table_provider(
+            &self,
+            version: Version,
+        ) -> lake_engine::Result<Arc<dyn TableProvider>> {
+            self.versions.lock().unwrap().push(version);
+            Err(EngineError::backend(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "claimed historical snapshot was reclaimed",
+            )))
+        }
+
+        async fn append(
+            &self,
+            _operation: &AppendOperation,
+            _batches: SendableRecordBatchStream,
+        ) -> lake_engine::Result<Version> {
+            unreachable!()
+        }
+
+        async fn reconcile_append(
+            &self,
+            _operation: &AppendOperation,
+        ) -> lake_engine::Result<Option<Version>> {
+            unreachable!()
+        }
+    }
 
     struct CountingMeta {
         inner:              Arc<RocksMeta>,
@@ -752,6 +973,36 @@ mod tests {
         assert!(
             err.to_string().contains("injected get failure"),
             "registry outage must not be reported as a missing table: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_pinned_snapshot_never_falls_back_to_latest() {
+        let versions = Arc::new(TestMutex::new(Vec::new()));
+        let location = TableLocation::new("s3://lake/old-incarnation");
+        let engine: TableEngineRef = Arc::new(SnapshotProbeEngine {
+            location: location.clone(),
+            versions: versions.clone(),
+        });
+        let catalog = LakeCatalog::new(Arc::new(FailingGetMeta), engine);
+        let snapshot = TableSnapshot::new(
+            TableRef::new("robots", "episodes"),
+            location,
+            "probe",
+            "old-incarnation",
+            Version(7),
+        );
+
+        let error = catalog
+            .provider_for_snapshot(&snapshot)
+            .await
+            .expect_err("a reclaimed exact snapshot must fail");
+
+        assert!(error.to_string().contains("reclaimed"));
+        assert_eq!(
+            *versions.lock().unwrap(),
+            vec![Version(7)],
+            "the provider must not retry the handle's latest version"
         );
     }
 

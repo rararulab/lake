@@ -14,6 +14,9 @@ authority.
 - DataFusion providers are cached per exact table generation (name, engine,
   location, incarnation, version); concurrent misses coalesce and the cache is
   capacity-bounded.
+- `TableSnapshot` loading uses its claimed engine, unique location,
+  incarnation, and version directly. It never consults a current registration
+  or substitutes the handle's latest version.
 - Listing names and schemas are published together as one immutable
   `Arc<CatalogGeneration>`; request readers pin the Arc and never mix refresh
   generations.

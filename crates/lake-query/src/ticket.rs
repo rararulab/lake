@@ -18,12 +18,18 @@ use snafu::Snafu;
 use subtle::ConstantTimeEq;
 
 const TICKET_MAGIC: &[u8; 4] = b"LQTK";
-const TICKET_VERSION: u8 = 1;
+const TICKET_VERSION: u8 = 2;
 const KEY_ID_BYTES: usize = 16;
 const NONCE_BYTES: usize = 12;
 const NONCE_PREFIX_BYTES: usize = 8;
 const HEADER_BYTES: usize = TICKET_MAGIC.len() + 1 + KEY_ID_BYTES + NONCE_BYTES;
 const MAX_KEYS: usize = 4;
+pub(crate) const MAX_TABLE_SNAPSHOTS: usize = 64;
+const MAX_NAMESPACE_BYTES: usize = 256;
+const MAX_TABLE_BYTES: usize = 256;
+const MAX_ENGINE_BYTES: usize = 64;
+const MAX_LOCATION_BYTES: usize = 4096;
+const MAX_INCARNATION_BYTES: usize = 256;
 const MIN_SECRET_BYTES: usize = 32;
 const MAX_SECRET_BYTES: usize = 4096;
 const FUTURE_SKEW: Duration = Duration::from_secs(30);
@@ -135,6 +141,33 @@ struct StatementTicketPayload {
     tenant_id:       String,
     #[prost(string, tag = "5")]
     sql:             String,
+    #[prost(message, repeated, tag = "6")]
+    snapshots:       Vec<StatementTableSnapshot>,
+}
+
+/// One exact physical lake table generation carried inside an encrypted
+/// statement ticket.
+#[derive(Clone, Eq, PartialEq, Message)]
+pub(crate) struct StatementTableSnapshot {
+    #[prost(string, tag = "1")]
+    pub(crate) namespace:      String,
+    #[prost(string, tag = "2")]
+    pub(crate) table:          String,
+    #[prost(string, tag = "3")]
+    pub(crate) engine:         String,
+    #[prost(string, tag = "4")]
+    pub(crate) location:       String,
+    #[prost(string, tag = "5")]
+    pub(crate) incarnation_id: String,
+    #[prost(uint64, tag = "6")]
+    pub(crate) version:        u64,
+}
+
+/// Authenticated statement and its complete immutable input set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StatementTicket {
+    pub(crate) sql:       String,
+    pub(crate) snapshots: Vec<StatementTableSnapshot>,
 }
 
 #[derive(Clone)]
@@ -169,6 +202,7 @@ impl StatementTicketCodec {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn seal(
         &self,
         sql: &str,
@@ -177,15 +211,48 @@ impl StatementTicketCodec {
         self.seal_at(sql, principal, SystemTime::now())
     }
 
+    pub(crate) fn seal_statement(
+        &self,
+        statement: &StatementTicket,
+        principal: &Principal,
+    ) -> Result<Vec<u8>, QueryTicketError> {
+        self.seal_statement_at(statement, principal, SystemTime::now())
+    }
+
+    #[cfg(test)]
     fn seal_at(
         &self,
         sql: &str,
         principal: &Principal,
         now: SystemTime,
     ) -> Result<Vec<u8>, QueryTicketError> {
-        if sql.is_empty() {
-            return Err(QueryTicketError::Invalid);
-        }
+        self.seal_statement_at(
+            &StatementTicket {
+                sql:       sql.to_owned(),
+                snapshots: Vec::new(),
+            },
+            principal,
+            now,
+        )
+    }
+
+    fn seal_statement_at(
+        &self,
+        statement: &StatementTicket,
+        principal: &Principal,
+        now: SystemTime,
+    ) -> Result<Vec<u8>, QueryTicketError> {
+        self.seal_statement_at_version(statement, principal, now, TICKET_VERSION)
+    }
+
+    fn seal_statement_at_version(
+        &self,
+        statement: &StatementTicket,
+        principal: &Principal,
+        now: SystemTime,
+        version: u8,
+    ) -> Result<Vec<u8>, QueryTicketError> {
+        validate_statement(statement)?;
         let issued_at_secs = unix_seconds(now)?;
         let expires_at_secs = issued_at_secs
             .checked_add(self.ttl.as_secs())
@@ -195,14 +262,15 @@ impl StatementTicketCodec {
             expires_at_secs,
             principal_id: principal.subject().to_owned(),
             tenant_id: principal.tenant().as_str().to_owned(),
-            sql: sql.to_owned(),
+            sql: statement.sql.clone(),
+            snapshots: statement.snapshots.clone(),
         };
         let mut plaintext = payload.encode_to_vec();
         let key = self.keys.active();
         let nonce_bytes = self.next_nonce()?;
         let mut header = Vec::with_capacity(HEADER_BYTES);
         header.extend_from_slice(TICKET_MAGIC);
-        header.push(TICKET_VERSION);
+        header.push(version);
         header.extend_from_slice(&key.id);
         header.extend_from_slice(&nonce_bytes);
         let aad = self.aad(&header);
@@ -217,6 +285,7 @@ impl StatementTicketCodec {
         Ok(header)
     }
 
+    #[cfg(test)]
     pub(crate) fn open(
         &self,
         ticket: &[u8],
@@ -225,12 +294,31 @@ impl StatementTicketCodec {
         self.open_at(ticket, principal, SystemTime::now())
     }
 
+    pub(crate) fn open_statement(
+        &self,
+        ticket: &[u8],
+        principal: &Principal,
+    ) -> Result<StatementTicket, QueryTicketError> {
+        self.open_statement_at(ticket, principal, SystemTime::now())
+    }
+
+    #[cfg(test)]
     fn open_at(
         &self,
         ticket: &[u8],
         principal: &Principal,
         now: SystemTime,
     ) -> Result<String, QueryTicketError> {
+        self.open_statement_at(ticket, principal, now)
+            .map(|statement| statement.sql)
+    }
+
+    fn open_statement_at(
+        &self,
+        ticket: &[u8],
+        principal: &Principal,
+        now: SystemTime,
+    ) -> Result<StatementTicket, QueryTicketError> {
         if ticket.len() <= HEADER_BYTES + aead::AES_256_GCM.tag_len()
             || &ticket[..TICKET_MAGIC.len()] != TICKET_MAGIC
             || ticket[TICKET_MAGIC.len()] != TICKET_VERSION
@@ -277,11 +365,15 @@ impl StatementTicketCodec {
                 .ct_eq(principal.tenant().as_str().as_bytes())
                 .unwrap_u8()
                 == 0
-            || payload.sql.is_empty()
         {
             return Err(QueryTicketError::Invalid);
         }
-        Ok(payload.sql)
+        let statement = StatementTicket {
+            sql:       payload.sql,
+            snapshots: payload.snapshots,
+        };
+        validate_statement(&statement)?;
+        Ok(statement)
     }
 
     fn aad(&self, header: &[u8]) -> Vec<u8> {
@@ -303,6 +395,34 @@ impl StatementTicketCodec {
         nonce[NONCE_PREFIX_BYTES..].copy_from_slice(&counter.to_be_bytes());
         Ok(nonce)
     }
+}
+
+fn validate_statement(statement: &StatementTicket) -> Result<(), QueryTicketError> {
+    if statement.sql.is_empty() || statement.snapshots.len() > MAX_TABLE_SNAPSHOTS {
+        return Err(QueryTicketError::Invalid);
+    }
+    let mut previous: Option<(&str, &str)> = None;
+    for snapshot in &statement.snapshots {
+        if snapshot.namespace.is_empty()
+            || snapshot.namespace.len() > MAX_NAMESPACE_BYTES
+            || snapshot.table.is_empty()
+            || snapshot.table.len() > MAX_TABLE_BYTES
+            || snapshot.engine.is_empty()
+            || snapshot.engine.len() > MAX_ENGINE_BYTES
+            || snapshot.location.is_empty()
+            || snapshot.location.len() > MAX_LOCATION_BYTES
+            || snapshot.incarnation_id.is_empty()
+            || snapshot.incarnation_id.len() > MAX_INCARNATION_BYTES
+        {
+            return Err(QueryTicketError::Invalid);
+        }
+        let identity = (snapshot.namespace.as_str(), snapshot.table.as_str());
+        if previous.is_some_and(|previous| previous >= identity) {
+            return Err(QueryTicketError::Invalid);
+        }
+        previous = Some(identity);
+    }
+    Ok(())
 }
 
 impl fmt::Debug for StatementTicketCodec {
@@ -332,7 +452,10 @@ mod tests {
 
     use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
 
-    use super::{QueryTicketError, QueryTicketKeyRing, StatementTicketCodec};
+    use super::{
+        MAX_LOCATION_BYTES, MAX_TABLE_SNAPSHOTS, QueryTicketError, QueryTicketKeyRing,
+        StatementTableSnapshot, StatementTicket, StatementTicketCodec,
+    };
 
     fn principal(id: &str, tenant: &str) -> Principal {
         Principal::try_new(
@@ -382,14 +505,114 @@ mod tests {
     }
 
     #[test]
-    fn statement_ticket_rejects_tamper_time_audience_and_unknown_key() {
-        let active = b"active-ticket-key-material-00000001";
+    fn statement_ticket_roundtrips_bounded_table_snapshots() {
         let codec = StatementTicketCodec::try_new(
-            ring(active, &[]),
-            Duration::from_mins(1),
+            ring(b"snapshot-ticket-key-material-00000001", &[]),
+            Duration::from_mins(5),
             "lake-query",
         )
         .unwrap();
+        let alice = principal("alice@example", "alpha");
+        let now = UNIX_EPOCH + Duration::from_secs(10_000);
+        let snapshot = StatementTableSnapshot {
+            namespace:      "alpha".to_owned(),
+            table:          "episodes".to_owned(),
+            engine:         "lance".to_owned(),
+            location:       "s3://lake/alpha/episodes/0198".to_owned(),
+            incarnation_id: "0198f73b-12b0-7d20-b8ab-8195ce8bfe73".to_owned(),
+            version:        41,
+        };
+        let statement = StatementTicket {
+            sql:       "SELECT * FROM lake.alpha.episodes".to_owned(),
+            snapshots: vec![snapshot.clone()],
+        };
+
+        let encrypted = codec
+            .seal_statement_at(&statement, &alice, now)
+            .expect("seal exact table snapshot");
+        assert_eq!(
+            codec
+                .open_statement_at(&encrypted, &alice, now)
+                .expect("open exact table snapshot"),
+            statement
+        );
+        for forbidden in [
+            snapshot.location.as_bytes(),
+            snapshot.incarnation_id.as_bytes(),
+        ] {
+            assert!(
+                !encrypted
+                    .windows(forbidden.len())
+                    .any(|window| window == forbidden),
+                "snapshot identity must remain encrypted"
+            );
+        }
+
+        let unbounded = StatementTicket {
+            sql:       "SELECT 1".to_owned(),
+            snapshots: vec![snapshot; MAX_TABLE_SNAPSHOTS + 1],
+        };
+        assert!(matches!(
+            codec.seal_statement_at(&unbounded, &alice, now),
+            Err(QueryTicketError::Invalid)
+        ));
+        let duplicate = StatementTicket {
+            sql:       "SELECT 1".to_owned(),
+            snapshots: vec![unbounded.snapshots[0].clone(); 2],
+        };
+        assert!(matches!(
+            codec.seal_statement_at(&duplicate, &alice, now),
+            Err(QueryTicketError::Invalid)
+        ));
+        let mut oversized = unbounded.snapshots[0].clone();
+        oversized.location = "x".repeat(MAX_LOCATION_BYTES + 1);
+        assert!(matches!(
+            codec.seal_statement_at(
+                &StatementTicket {
+                    sql:       "SELECT 1".to_owned(),
+                    snapshots: vec![oversized],
+                },
+                &alice,
+                now
+            ),
+            Err(QueryTicketError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn legacy_statement_ticket_fails_closed_after_snapshot_upgrade() {
+        let codec = StatementTicketCodec::try_new(
+            ring(b"legacy-ticket-key-material-0000000001", &[]),
+            Duration::from_mins(5),
+            "lake-query",
+        )
+        .unwrap();
+        let alice = principal("alice@example", "alpha");
+        let now = UNIX_EPOCH + Duration::from_secs(10_000);
+        let legacy = codec
+            .seal_statement_at_version(
+                &StatementTicket {
+                    sql:       "SELECT * FROM lake.alpha.episodes".to_owned(),
+                    snapshots: Vec::new(),
+                },
+                &alice,
+                now,
+                1,
+            )
+            .expect("construct a cryptographically valid v1 ticket");
+
+        assert!(matches!(
+            codec.open_statement_at(&legacy, &alice, now),
+            Err(QueryTicketError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn statement_ticket_rejects_tamper_time_audience_and_unknown_key() {
+        let active = b"active-ticket-key-material-00000001";
+        let codec =
+            StatementTicketCodec::try_new(ring(active, &[]), Duration::from_mins(1), "lake-query")
+                .unwrap();
         let alice = principal("alice@example", "alpha");
         let issued = UNIX_EPOCH + Duration::from_secs(10_000);
         let ticket = codec.seal_at("SELECT 1", &alice, issued).unwrap();
@@ -437,19 +660,13 @@ mod tests {
         let new = b"new-ticket-key-material-000000000001";
         let issued = UNIX_EPOCH + Duration::from_secs(10_000);
         let alice = principal("alice@example", "alpha");
-        let old_codec = StatementTicketCodec::try_new(
-            ring(old, &[]),
-            Duration::from_mins(5),
-            "lake-query",
-        )
-        .unwrap();
+        let old_codec =
+            StatementTicketCodec::try_new(ring(old, &[]), Duration::from_mins(5), "lake-query")
+                .unwrap();
         let old_ticket = old_codec.seal_at("SELECT 1", &alice, issued).unwrap();
-        let rotated = StatementTicketCodec::try_new(
-            ring(new, &[old]),
-            Duration::from_mins(5),
-            "lake-query",
-        )
-        .unwrap();
+        let rotated =
+            StatementTicketCodec::try_new(ring(new, &[old]), Duration::from_mins(5), "lake-query")
+                .unwrap();
 
         assert_eq!(
             rotated.open_at(&old_ticket, &alice, issued).unwrap(),
@@ -467,19 +684,13 @@ mod tests {
         let secret = b"stable-ticket-key-material-00000000001";
         let issued = UNIX_EPOCH + Duration::from_secs(10_000);
         let alice = principal("alice@example", "alpha");
-        let old = StatementTicketCodec::try_new(
-            ring(secret, &[]),
-            Duration::from_mins(5),
-            "lake-query",
-        )
-        .unwrap();
+        let old =
+            StatementTicketCodec::try_new(ring(secret, &[]), Duration::from_mins(5), "lake-query")
+                .unwrap();
         let ticket = old.seal_at("SELECT 1", &alice, issued).unwrap();
-        let reconfigured = StatementTicketCodec::try_new(
-            ring(secret, &[]),
-            Duration::from_mins(1),
-            "lake-query",
-        )
-        .unwrap();
+        let reconfigured =
+            StatementTicketCodec::try_new(ring(secret, &[]), Duration::from_mins(1), "lake-query")
+                .unwrap();
 
         assert_eq!(
             reconfigured
@@ -497,9 +708,7 @@ mod tests {
             "lake-query",
         )
         .unwrap();
-        codec
-            .nonce_counter
-            .store(u32::MAX, Ordering::Relaxed);
+        codec.nonce_counter.store(u32::MAX, Ordering::Relaxed);
 
         assert!(matches!(
             codec.seal_at(

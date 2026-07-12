@@ -245,6 +245,17 @@ loop before the shortest retention configured across the deployment.
 Query results stream back through the same SDK connection. Decode the logical
 `FILE` value into its stable `DataLocation`, then open the object directly:
 
+The Flight SQL statement capability is snapshot-stable across its two RPCs.
+`GetFlightInfo` resolves every physical table in joins, subqueries, and CTEs
+to `{location, engine, incarnation, version}`, plans against those exact
+providers, and encrypts the bounded set into the tenant/principal-bound
+ticket. `DoGet` reconstructs the same request-local catalog on any Query
+replica without reading a mutable current-version pointer. A concurrent append
+therefore cannot change the advertised schema or rows; a reclaimed historical
+snapshot fails explicitly and never falls forward to latest. Ticket protocol
+upgrades require blue/green or drained cutover because older replicas are
+intentionally unable to ignore new snapshot claims.
+
 ```rust
 let mut results = client
     .query("SELECT video FROM lake.robots.episodes")
