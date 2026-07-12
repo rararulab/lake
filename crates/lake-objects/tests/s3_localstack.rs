@@ -31,6 +31,7 @@ use lake_objects::{
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+use tokio::sync::oneshot;
 
 const PART_BYTES: usize = 5 * 1024 * 1024;
 
@@ -363,6 +364,31 @@ struct FailingReader {
     fail_after: usize,
 }
 
+struct BlockingReader {
+    bytes_remaining: usize,
+    blocked:         Option<oneshot::Sender<()>>,
+}
+
+impl AsyncRead for BlockingReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.bytes_remaining == 0 {
+            if let Some(blocked) = self.blocked.take() {
+                let _ = blocked.send(());
+            }
+            return Poll::Pending;
+        }
+        let count = self.bytes_remaining.min(output.remaining());
+        output.initialize_unfilled_to(count).fill(7);
+        output.advance(count);
+        self.bytes_remaining -= count;
+        Poll::Ready(Ok(()))
+    }
+}
+
 impl AsyncRead for FailingReader {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -420,6 +446,64 @@ async fn interrupted_s3_upload_is_aborted() {
         objects.contents().is_empty(),
         "failed upload published an object"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires LocalStack S3; set LAKE_S3_ENDPOINT and run with --ignored"]
+async fn cancelled_s3_upload_is_aborted() {
+    let Some((client, store, bucket)) = stage().await else {
+        return;
+    };
+    let (blocked_tx, blocked_rx) = oneshot::channel();
+    let upload = tokio::spawn(async move {
+        store
+            .put_reader(
+                Box::pin(BlockingReader {
+                    bytes_remaining: PART_BYTES,
+                    blocked:         Some(blocked_tx),
+                }),
+                "application/octet-stream".to_owned(),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), blocked_rx)
+        .await
+        .expect("upload reached the blocked second source part")
+        .expect("blocking reader remained alive");
+    let uploads = client
+        .list_multipart_uploads()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(uploads.uploads().len(), 1);
+
+    upload.abort();
+    assert!(upload.await.unwrap_err().is_cancelled());
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let uploads = client
+                .list_multipart_uploads()
+                .bucket(&bucket)
+                .send()
+                .await
+                .unwrap();
+            if uploads.uploads().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cancelled upload cleanup must converge");
+}
+
+#[test]
+fn cancelled_s3_upload_is_aborted_is_wired() {
+    let integration = include_str!("../../../scripts/test-integration.ts");
+    assert!(integration.contains("--run-ignored"));
+    assert!(integration.contains("ignored-only"));
 }
 
 #[test]

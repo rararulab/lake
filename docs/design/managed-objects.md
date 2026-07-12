@@ -84,7 +84,14 @@ request owns one 5 MiB buffer, so the default request-body ceiling is 20 MiB
 per object; the public S3 store configuration accepts `1..=16`, whose hard
 ceiling is 80 MiB. Response order cannot change the completed-part order or
 whole-object SHA-256.
-Reader-backed uploads abort on failure. Path-backed uploads become resumable
+Reader-backed uploads abort on failure. Each ordinary multipart upload owns
+one metadata-only cleanup task while it is active. Normal completion disarms
+the task; explicit failure cancels all part futures and waits for abort; caller
+cancellation drops the decision channel and makes the task attempt abort for
+at most 30 seconds. The task never owns source bytes or part buffers. A process
+or host crash cannot execute client cleanup, so production S3 buckets must
+still configure an `AbortIncompleteMultipartUpload` lifecycle rule.
+Path-backed uploads become resumable
 when `LakeClientBuilder::with_upload_checkpoint_dir` is configured: a
 credential-free versioned checkpoint records the random managed key, upload
 id, source identity, and each part's ETag/checksum/SHA-256 after an atomic
