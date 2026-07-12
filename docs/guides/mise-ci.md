@@ -55,6 +55,9 @@ first.
   a broken Rust build.
 - `mise run gate` is the fast local push gate. It must include hooks, Rust
   tests, the e2e self-check, and `site-check` for the marketing site.
+- `mise run test-integration` owns checkout-scoped LocalStack lifecycle;
+  `mise run test-integration-external` runs the identical ignored-only package
+  suite against a caller-managed endpoint and is the GitHub CI entry point.
 - `mise run ci` is the full CI gate. It must include `gate`, Rustdoc warnings,
   and spec tooling self-tests.
 - If a CI check protects a repo invariant, expose it as a `mise` task and run

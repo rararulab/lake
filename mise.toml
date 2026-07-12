@@ -106,6 +106,10 @@ run = "bun scripts/test-env.ts down"
 description = "run the LocalStack integration tests (up -> ignored tests -> down)"
 run = "bun scripts/test-integration.ts"
 
+[tasks.test-integration-external]
+description = "run ignored integration tests against an externally managed LocalStack"
+run = "bun scripts/test-integration.ts --external"
+
 [tasks.k8s-validate]
 description = "strictly validate the checked-in Kubernetes reference against Kubernetes 1.32"
 run = "kubeconform -strict -summary -kubernetes-version 1.32.0 deploy/kubernetes/lake.yaml"

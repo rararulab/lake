@@ -16,4 +16,5 @@ files instead). Read `docs/guides/mise-ci.md` before changing Bun Shell usage.
   `.lake/test-env.env`
 - `test-integration.ts` — `mise run test-integration`: up → run the `#[ignore]`
   LocalStack tests (`--run-ignored ignored-only`) against the endpoint → down.
-  CI runs the same tests against a LocalStack service container.
+  `mise run test-integration-external` skips Docker lifecycle and runs the same
+  package list against CI's already-provisioned LocalStack service container.
