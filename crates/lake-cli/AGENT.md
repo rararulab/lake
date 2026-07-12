@@ -52,6 +52,11 @@ tables. clap derive, thin `main.rs`, one handler module per command.
 
 All values are positive integers parsed once before serving.
 
+Durable async workers use `LAKE_ASYNC_WORKER_CONCURRENCY` (default 4),
+`LAKE_ASYNC_WORKER_CONCURRENCY_PER_TENANT` (default 1; at most the worker
+total), and `LAKE_ASYNC_EXECUTION_TIMEOUT_MS` (default 1800000; maximum
+86400000). These limits are per Query replica.
+
 ## Lance maintenance policy
 
 - `LAKE_LANCE_RETAIN_VERSIONS` (default 10, range 1..=10000)

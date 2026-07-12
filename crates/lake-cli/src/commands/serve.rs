@@ -27,9 +27,9 @@ use lake_query::{AsyncQueryConfig, QueryEngine, QueryServerConfig};
 use super::{
     Context,
     limits::{
-        append_limits_from_env, discovery_limits_from_env, maintenance_limits_from_env,
-        query_limits_from_env, query_resources_from_env, query_ticket_ttl_from_env,
-        shutdown_grace_from_env,
+        append_limits_from_env, async_scheduler_limits_from_env, discovery_limits_from_env,
+        maintenance_limits_from_env, query_limits_from_env, query_resources_from_env,
+        query_ticket_ttl_from_env, shutdown_grace_from_env,
     },
     security::{
         allow_insecure_from_env, metadata_client_security_from_env, peer_client_security_from_env,
@@ -142,7 +142,10 @@ async fn async_query_config(ctx: &Context) -> anyhow::Result<AsyncQueryConfig> {
                 (state, results)
             }
         };
-    Ok(AsyncQueryConfig::new(state, results))
+    let (workers, workers_per_tenant, execution_time) = async_scheduler_limits_from_env()?;
+    AsyncQueryConfig::new(state, results)
+        .try_with_scheduler_limits(workers, workers_per_tenant, execution_time)
+        .map_err(Into::into)
 }
 
 pub async fn meta(ctx: &Context, addr: &str) -> anyhow::Result<()> {

@@ -119,10 +119,13 @@ policy and resource controls below:
   DataFusion memory, and local spill are bounded. Authenticated tenants now
   acquire a bounded tenant gate before the global FIFO, covering planning,
   interactive/discovery streams, and async result downloads without identity
-  labels or metadata traffic. Add distributed async scheduling and per-tenant
-  scanned bytes, result bytes, memory, spill, and egress accounting. Replica
-  ceilings are not cluster-global entitlements. Cancellation must propagate to
-  DataFusion and multipart uploads.
+  labels or metadata traffic. Background async workers also have a bounded
+  per-replica tenant-fair scheduler and absolute execution deadline; timeout
+  stops DataFusion execution and lease renewal before publishing a terminal
+  failure. Add cluster-global scheduling and per-tenant scanned bytes, result
+  bytes, memory, spill, and egress accounting. Replica ceilings are not
+  cluster-global entitlements. Cancellation must propagate to multipart
+  uploads.
 - Encryption at rest, result-bucket lifecycle deletion, audit logs, and
   metrics for planning, scanning, spilling, materialization, and download.
 

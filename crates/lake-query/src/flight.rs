@@ -2439,7 +2439,7 @@ mod tests {
             Duration::from_secs(30),
         )
         .unwrap()
-        .run(&query_id)
+        .run(&query_id, Duration::from_secs(30))
         .await
         .expect("worker materializes the pinned query");
         let mut completed = Request::new(next);
@@ -2627,10 +2627,15 @@ mod tests {
             .open_poll_handle(&retried.flight_descriptor.unwrap().cmd, &principal)
             .unwrap();
         assert_eq!(first_id, retried_id);
-        let (query_ids, continuation) =
-            coordinator.store().list_query_ids_page(None).await.unwrap();
+        let (records, invalid, continuation) =
+            coordinator.store().list_records_page(None).await.unwrap();
+        let query_ids = records
+            .iter()
+            .map(|record| record.query_id())
+            .collect::<Vec<_>>();
         assert_eq!(query_ids, [first_id]);
         assert!(continuation.is_none());
+        assert_eq!(invalid, 0);
 
         let error = FlightService::poll_flight_info(&service, poll(descriptor("SELECT 2")))
             .await

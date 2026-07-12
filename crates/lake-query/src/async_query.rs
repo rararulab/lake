@@ -228,6 +228,8 @@ pub(crate) enum AsyncQueryWorkerError {
     Manifest { source: serde_json::Error },
     #[snafu(display("async query result exceeded configured bounds"))]
     ResultBound,
+    #[snafu(display("async query execution deadline exceeded"))]
+    ExecutionDeadline,
     #[snafu(display("async query state is unavailable"))]
     Missing,
     #[snafu(display("system time is invalid"))]
@@ -776,7 +778,11 @@ impl AsyncQueryWorker {
         })
     }
 
-    pub(crate) async fn run(&self, query_id: &str) -> Result<(), AsyncQueryWorkerError> {
+    pub(crate) async fn run(
+        &self,
+        query_id: &str,
+        execution_time: Duration,
+    ) -> Result<(), AsyncQueryWorkerError> {
         let claimed_at = unix_now()?;
         let lease = self
             .coordinator
@@ -784,44 +790,34 @@ impl AsyncQueryWorker {
             .claim(query_id, claimed_at, self.identity, self.lease.as_secs())
             .await
             .map_err(|source| AsyncQueryWorkerError::Store { source })?;
-        let heartbeat_stop = tokio_util::sync::CancellationToken::new();
-        let lease_lost = tokio_util::sync::CancellationToken::new();
-        let heartbeat = tokio::spawn({
-            let worker = self.clone();
-            let query_id = query_id.to_owned();
-            let heartbeat_stop = heartbeat_stop.clone();
-            let lease_lost = lease_lost.clone();
-            async move {
-                let mut interval = tokio::time::interval(worker.lease / 3);
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                interval.tick().await;
-                loop {
-                    tokio::select! {
-                        () = heartbeat_stop.cancelled() => return,
-                        _ = interval.tick() => {
-                            if worker.renew(&query_id, &lease).await.is_err() {
-                                lease_lost.cancel();
-                                return;
-                            }
-                        }
+        let mut heartbeat = tokio::time::interval(self.lease / 3);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        let deadline = tokio::time::sleep(execution_time);
+        let execution = self.run_claimed(query_id, &lease);
+        tokio::pin!(deadline, execution);
+        let result = loop {
+            tokio::select! {
+                result = &mut execution => break result,
+                () = &mut deadline => break Err(AsyncQueryWorkerError::ExecutionDeadline),
+                _ = heartbeat.tick() => {
+                    if let Err(source) = self.renew(query_id, &lease).await {
+                        break Err(source);
                     }
                 }
             }
-        });
-        let result = tokio::select! {
-            result = self.run_claimed(query_id, &lease) => result,
-            () = lease_lost.cancelled() => Err(AsyncQueryWorkerError::Store {
-                source: AsyncQueryStoreError::Conflict,
-            }),
         };
-        heartbeat_stop.cancel();
-        let _ = heartbeat.await;
         if result.is_err() {
             if let Ok(now) = unix_now() {
+                let code = if matches!(result, Err(AsyncQueryWorkerError::ExecutionDeadline)) {
+                    "execution_timeout"
+                } else {
+                    "execution_failed"
+                };
                 let _ = self
                     .coordinator
                     .store()
-                    .fail(query_id, &lease, now, "execution_failed")
+                    .fail(query_id, &lease, now, code)
                     .await;
             }
         }
@@ -1047,27 +1043,25 @@ impl AsyncQueryStore {
             .map(|loaded| loaded.map(|(_, record)| record))
     }
 
-    pub(crate) async fn list_query_ids_page(
+    pub(crate) async fn list_records_page(
         &self,
         continuation: Option<&str>,
-    ) -> Result<(Vec<String>, Option<String>), AsyncQueryStoreError> {
+    ) -> Result<(Vec<AsyncQueryRecord>, usize, Option<String>), AsyncQueryStoreError> {
         let page = self
             .meta
             .scan_prefix_page(STATE_KEY_PREFIX, continuation, SCAN_PAGE_JOBS)
             .await
             .map_err(|source| AsyncQueryStoreError::Meta { source })?;
         let (entries, continuation) = page.into_parts();
-        let query_ids = entries
-            .into_iter()
-            .map(|(query_id, _)| query_id)
-            .map(|query_id| {
-                state_key(&query_id)
-                    .filter(|expected| expected == &format!("{STATE_KEY_PREFIX}{query_id}"))
-                    .map(|_| query_id)
-                    .ok_or(AsyncQueryStoreError::InvalidStateRecord)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok((query_ids, continuation))
+        let mut records = Vec::with_capacity(entries.len());
+        let mut invalid = 0;
+        for (query_id, encoded) in entries {
+            match decode_scanned_record(&query_id, &encoded) {
+                Ok(record) => records.push(record),
+                Err(_) => invalid += 1,
+            }
+        }
+        Ok((records, invalid, continuation))
     }
 
     pub(crate) async fn claim(
@@ -1218,7 +1212,29 @@ impl AsyncQueryStore {
     }
 }
 
+fn decode_scanned_record(
+    query_id: &str,
+    encoded: &[u8],
+) -> Result<AsyncQueryRecord, AsyncQueryStoreError> {
+    if encoded.len() > MAX_STATE_RECORD_BYTES {
+        return Err(AsyncQueryStoreError::RecordTooLarge);
+    }
+    let record: AsyncQueryRecord = serde_json::from_slice(encoded)
+        .map_err(|source| AsyncQueryStoreError::Decode { source })?;
+    record
+        .validate()
+        .map_err(|_| AsyncQueryStoreError::InvalidStateRecord)?;
+    if record.query_id != query_id || state_key(query_id).is_none() {
+        return Err(AsyncQueryStoreError::InvalidStateRecord);
+    }
+    Ok(record)
+}
+
 impl AsyncQueryRecord {
+    pub(crate) fn query_id(&self) -> &str { &self.query_id }
+
+    pub(crate) fn tenant_id(&self) -> &str { &self.tenant_id }
+
     pub(crate) fn try_new(
         query_id: impl Into<String>,
         tenant_id: impl Into<String>,
@@ -1507,6 +1523,14 @@ impl AsyncQueryRecord {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn failure_code(&self) -> Option<&str> {
+        match &self.state {
+            AsyncQueryState::Failed { code, .. } => Some(code),
+            _ => None,
+        }
+    }
+
     fn validate(&self) -> Result<(), AsyncQueryTransitionError> {
         if self.schema_version != 1
             || state_key(&self.query_id).is_none()
@@ -1609,14 +1633,18 @@ fn encode_record(record: &AsyncQueryRecord) -> Result<Vec<u8>, AsyncQueryStoreEr
 mod tests {
     use std::{
         io::Cursor,
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, UNIX_EPOCH},
     };
 
+    use async_trait::async_trait;
     use datafusion::arrow::{array::Int64Array, ipc::reader::StreamReader};
     use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
     use lake_engine_lance::LanceEngine;
-    use lake_meta::{MetaStoreRef, RocksMeta};
+    use lake_meta::{MetaScanPage, MetaStore, MetaStoreRef, RocksMeta};
     use lake_objects::LocalObjectStore;
     use tokio::io::AsyncReadExt;
 
@@ -1624,7 +1652,52 @@ mod tests {
         ASYNC_MANIFEST_CONTENT_TYPE, AsyncQueryCoordinator, AsyncQueryRecord, AsyncQueryStore,
         AsyncQueryStoreError, AsyncQueryTransitionError, AsyncQueryWorker, WorkerIdentity,
     };
-    use crate::{QueryEngine, QueryTicketKeyRing, ticket::StatementTicket};
+    use crate::{
+        QueryEngine, QueryTicketKeyRing,
+        async_scheduler::{AsyncCandidate, AsyncScheduler, AsyncSchedulerLimits},
+        ticket::StatementTicket,
+    };
+
+    struct ScanCountingMeta {
+        inner: RocksMeta,
+        gets:  Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl MetaStore for ScanCountingMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.gets.fetch_add(1, Ordering::Relaxed);
+            self.inner.get(key).await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn scan_prefix_page(
+            &self,
+            prefix: &str,
+            continuation: Option<&str>,
+            limit: usize,
+        ) -> lake_meta::Result<MetaScanPage> {
+            self.inner
+                .scan_prefix_page(prefix, continuation, limit)
+                .await
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
+        }
+    }
 
     fn job_spec() -> lake_common::DataLocation {
         lake_common::DataLocation {
@@ -1729,6 +1802,92 @@ mod tests {
         .unwrap();
         expired.expire(2_000).expect("deadline expires queued job");
         assert!(expired.is_expired());
+    }
+
+    #[test]
+    fn async_timeout_state_fences_stale_worker_completion() {
+        let mut record = AsyncQueryRecord::try_new(
+            "0198f73b-12b0-7d20-b8ab-8195ce8bfe76",
+            "tenant-a",
+            "alice@example",
+            job_spec(),
+            1_000,
+            2_000,
+        )
+        .unwrap();
+        let lease = record
+            .claim(1_010, WorkerIdentity::new([4; 16]), 30)
+            .unwrap();
+        record.fail(&lease, 1_020, "execution_timeout").unwrap();
+
+        assert_eq!(record.failure_code(), Some("execution_timeout"));
+        assert!(matches!(
+            record.renew(&lease, 1_021, 30),
+            Err(AsyncQueryTransitionError::Terminal)
+        ));
+        assert!(matches!(
+            record.complete(&lease, 1_021, result_manifest(), 1, 1, 1),
+            Err(AsyncQueryTransitionError::Terminal)
+        ));
+        assert_eq!(record.failure_code(), Some("execution_timeout"));
+    }
+
+    #[tokio::test]
+    async fn async_scheduler_uses_bounded_scan_records_without_point_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let gets = Arc::new(AtomicUsize::new(0));
+        let meta: MetaStoreRef = Arc::new(ScanCountingMeta {
+            inner: RocksMeta::open(directory.path()).unwrap(),
+            gets:  gets.clone(),
+        });
+        let store = AsyncQueryStore::new(meta);
+        for (query_id, tenant) in [
+            ("0198f73b-12b0-7d20-b8ab-8195ce8bfe77", "tenant-a"),
+            ("0198f73b-12b0-7d20-b8ab-8195ce8bfe78", "tenant-b"),
+        ] {
+            store
+                .create(
+                    AsyncQueryRecord::try_new(
+                        query_id,
+                        tenant,
+                        "reader@example",
+                        job_spec(),
+                        1_000,
+                        2_000,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let terminal_id = "0198f73b-12b0-7d20-b8ab-8195ce8bfe78";
+        let lease = store
+            .claim(terminal_id, 1_010, WorkerIdentity::new([5; 16]), 30)
+            .await
+            .unwrap();
+        store
+            .fail(terminal_id, &lease, 1_020, "execution_failed")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .meta
+                .cas("async-query/corrupt", None, b"{")
+                .await
+                .unwrap()
+        );
+        gets.store(0, Ordering::Relaxed);
+
+        let (records, invalid, continuation) = store.list_records_page(None).await.unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records.iter().filter(|record| record.is_pending()).count(),
+            1
+        );
+        assert!(continuation.is_none());
+        assert_eq!(invalid, 1);
+        assert_eq!(gets.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -1911,7 +2070,10 @@ mod tests {
         )
         .unwrap();
 
-        worker.run(submission.query_id()).await.unwrap();
+        worker
+            .run(submission.query_id(), Duration::from_secs(30))
+            .await
+            .unwrap();
 
         let record = coordinator
             .store()
@@ -1953,6 +2115,75 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(values.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn async_worker_deadline_fails_job_and_releases_tenant_capacity() {
+        let state_directory = tempfile::tempdir().unwrap();
+        let state: MetaStoreRef = Arc::new(RocksMeta::open(state_directory.path()).unwrap());
+        let catalog_directory = tempfile::tempdir().unwrap();
+        let catalog: MetaStoreRef = Arc::new(RocksMeta::open(catalog_directory.path()).unwrap());
+        let object_directory = tempfile::tempdir().unwrap();
+        let objects = Arc::new(
+            LocalObjectStore::open(object_directory.path())
+                .await
+                .unwrap(),
+        );
+        let coordinator = AsyncQueryCoordinator::try_new(
+            state,
+            objects,
+            QueryTicketKeyRing::try_new(
+                b"async-deadline-ticket-key-material-0001",
+                std::iter::empty(),
+            )
+            .unwrap(),
+            Duration::from_hours(6),
+            Duration::from_mins(5),
+        )
+        .unwrap();
+        let submission = coordinator
+            .submit_statement(
+                &StatementTicket {
+                    sql:       "SELECT CAST(42 AS BIGINT) AS answer".to_owned(),
+                    snapshots: Vec::new(),
+                },
+                &principal("deadline@example"),
+            )
+            .await
+            .unwrap();
+        let worker = AsyncQueryWorker::try_new(
+            coordinator.clone(),
+            Arc::new(QueryEngine::new(catalog, Arc::new(LanceEngine::new()))),
+            WorkerIdentity::new([8; 16]),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+
+        let error = worker
+            .run(submission.query_id(), Duration::from_nanos(1))
+            .await
+            .expect_err("absolute deadline stops execution");
+        assert!(matches!(
+            error,
+            super::AsyncQueryWorkerError::ExecutionDeadline
+        ));
+        let record = coordinator
+            .store()
+            .load(submission.query_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.failure_code(), Some("execution_timeout"));
+
+        let limits = AsyncSchedulerLimits::try_new(1, 1, Duration::from_secs(1)).unwrap();
+        let mut scheduler = AsyncScheduler::new(limits);
+        let alpha = AsyncCandidate::new(submission.query_id(), "tenant-a");
+        scheduler.started(&alpha);
+        scheduler.finished(&alpha);
+        assert_eq!(
+            scheduler.select([AsyncCandidate::new("beta-query", "tenant-b")]),
+            [AsyncCandidate::new("beta-query", "tenant-b")]
+        );
     }
 
     #[tokio::test]
@@ -2000,10 +2231,15 @@ mod tests {
                 .open_poll_handle(retried.poll_handle(), &alice)
                 .unwrap()
         );
-        let (query_ids, continuation) =
-            coordinator.store().list_query_ids_page(None).await.unwrap();
+        let (records, invalid, continuation) =
+            coordinator.store().list_records_page(None).await.unwrap();
+        let query_ids = records
+            .iter()
+            .map(AsyncQueryRecord::query_id)
+            .collect::<Vec<_>>();
         assert_eq!(query_ids, [first.query_id()]);
         assert!(continuation.is_none());
+        assert_eq!(invalid, 0);
     }
 
     #[tokio::test]

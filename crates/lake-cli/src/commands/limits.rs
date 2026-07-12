@@ -242,6 +242,48 @@ pub(crate) fn query_resources_from_env() -> anyhow::Result<QueryResources> {
     )
 }
 
+pub(crate) fn async_scheduler_limits_from_env() -> anyhow::Result<(usize, usize, Duration)> {
+    let workers = env_value("LAKE_ASYNC_WORKER_CONCURRENCY")?;
+    let workers_per_tenant = env_value("LAKE_ASYNC_WORKER_CONCURRENCY_PER_TENANT")?;
+    let execution_ms = env_value("LAKE_ASYNC_EXECUTION_TIMEOUT_MS")?;
+    async_scheduler_limits_from_values(
+        workers.as_deref(),
+        workers_per_tenant.as_deref(),
+        execution_ms.as_deref(),
+    )
+}
+
+fn async_scheduler_limits_from_values(
+    workers: Option<&str>,
+    workers_per_tenant: Option<&str>,
+    execution_ms: Option<&str>,
+) -> anyhow::Result<(usize, usize, Duration)> {
+    let workers = parse_or("LAKE_ASYNC_WORKER_CONCURRENCY", workers, 4_usize)?;
+    let workers_per_tenant = parse_or(
+        "LAKE_ASYNC_WORKER_CONCURRENCY_PER_TENANT",
+        workers_per_tenant,
+        1_usize,
+    )?;
+    let execution_ms = parse_or(
+        "LAKE_ASYNC_EXECUTION_TIMEOUT_MS",
+        execution_ms,
+        30_u64 * 60 * 1_000,
+    )?;
+    if !(1..=64).contains(&workers)
+        || workers_per_tenant == 0
+        || workers_per_tenant > workers
+        || execution_ms == 0
+        || execution_ms > 24 * 60 * 60 * 1_000
+    {
+        anyhow::bail!("invalid async scheduler limits");
+    }
+    Ok((
+        workers,
+        workers_per_tenant,
+        Duration::from_millis(execution_ms),
+    ))
+}
+
 fn query_resources_from_values(
     memory_bytes: Option<&str>,
     spill_bytes: Option<&str>,
@@ -361,10 +403,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        append_limits_from_values, discovery_limits_from_values,
-        lance_maintenance_policy_from_value, maintenance_limits_from_values,
-        operation_policy_from_values, query_limits_from_values, query_resources_from_values,
-        query_ticket_ttl_from_value, shutdown_grace_from_value,
+        append_limits_from_values, async_scheduler_limits_from_values,
+        discovery_limits_from_values, lance_maintenance_policy_from_value,
+        maintenance_limits_from_values, operation_policy_from_values, query_limits_from_values,
+        query_resources_from_values, query_ticket_ttl_from_value, shutdown_grace_from_value,
     };
 
     #[test]
@@ -512,6 +554,25 @@ mod tests {
         for invalid in ["0", "3601", "forever"] {
             assert!(query_ticket_ttl_from_value(Some(invalid)).is_err());
         }
+    }
+
+    #[test]
+    fn async_scheduler_limit_values_are_validated_before_serving() {
+        for values in [
+            (Some("0"), None, None),
+            (Some("65"), None, None),
+            (Some("2"), Some("0"), None),
+            (Some("2"), Some("3"), None),
+            (None, None, Some("0")),
+            (None, None, Some("86400001")),
+            (Some("many"), None, None),
+        ] {
+            assert!(async_scheduler_limits_from_values(values.0, values.1, values.2).is_err());
+        }
+        assert_eq!(
+            async_scheduler_limits_from_values(Some("8"), Some("2"), Some("5000")).unwrap(),
+            (8, 2, Duration::from_secs(5))
+        );
     }
 
     #[test]
