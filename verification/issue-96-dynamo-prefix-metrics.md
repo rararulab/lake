@@ -35,4 +35,6 @@
   one absent pod in a multi-pod deployment. Rollout docs now reconcile each
   `up` target with the authority series via `unless on (service, instance)` and
   separately alert on authority `== 0`.
-- Independent docs-only confirmation is pending.
+- Performance re-review approved the per-target inventory reconciliation and
+  explicit v1 predicate; release/operations re-review passed the docs-only
+  frozen head.
