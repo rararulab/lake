@@ -314,6 +314,17 @@ version: the pointer only ever advances to a fully-written one. Consistency
 is snapshot-by-version with at-most-one-commit staleness on cache-served
 reads — acceptable for training/eval, see `goal.md`.
 
+Flight SQL preserves that exact snapshot across its two protocol phases.
+`GetFlightInfo` resolves all physical SQL references through the bounded
+registration cache, captures table name + engine + unique location +
+incarnation + version, and plans through a request-local catalog containing
+only those providers. The encrypted ticket carries the canonical bounded
+snapshot set. `DoGet` reconstructs the same catalog directly from the claims,
+so it neither re-resolves current registry pointers nor falls forward when a
+historical engine snapshot has been reclaimed. Unique per-incarnation object
+locations are the storage fence for drop/recreate; the incarnation remains in
+the claim and provider-cache key.
+
 ## SQL over object storage
 
 The public query protocol keeps arbitrary SQL execution read-only. Query nodes

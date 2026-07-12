@@ -25,10 +25,8 @@
 //! the Arrow Flight SQL wire (see `flight`).
 
 mod flight;
-mod ticket;
 mod telemetry;
-
-pub use ticket::{QueryTicketError, QueryTicketKeyRing};
+mod ticket;
 
 use std::{
     net::SocketAddr,
@@ -40,17 +38,21 @@ use std::{
 use arrow_flight::flight_service_server::FlightServiceServer;
 use datafusion::{
     arrow::array::RecordBatch,
+    catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider},
     dataframe::DataFrame,
     error::DataFusionError,
     execution::{memory_pool::FairSpillPool, runtime_env::RuntimeEnvBuilder},
     prelude::{SQLOptions, SessionConfig, SessionContext},
 };
-use lake_catalog::{CatalogGeneration, CatalogRefreshHealth, LakeCatalog};
-use lake_common::ManagedStageDescriptor;
+use lake_catalog::{
+    CatalogGeneration, CatalogRefreshHealth, LakeCatalog, ProviderLoadError, TableSnapshot,
+};
+use lake_common::{ManagedStageDescriptor, TableRef};
 use lake_engine::TableEngineRef;
 use lake_flight::{ClientSecurity, ServerSecurity};
 use lake_meta::MetaStoreRef;
 use snafu::{ResultExt, Snafu};
+pub use ticket::{QueryTicketError, QueryTicketKeyRing};
 use tokio_util::sync::CancellationToken;
 use tonic_health::{ServingStatus, server::health_reporter};
 
@@ -75,6 +77,21 @@ pub enum QueryError {
 
     #[snafu(display("query execution failed: {source}"))]
     Execute { source: DataFusionError },
+
+    #[snafu(display("failed to resolve snapshot for {table}: {source}"))]
+    SnapshotResolution {
+        table:  TableRef,
+        source: lake_meta::MetaError,
+    },
+
+    #[snafu(display("table {table} has no pinnable incarnation"))]
+    UnpinnableTable { table: TableRef },
+
+    #[snafu(display("failed to load snapshot for {table}: {source}"))]
+    SnapshotProvider {
+        table:  TableRef,
+        source: Arc<ProviderLoadError>,
+    },
 
     #[snafu(display("invalid listen address {addr:?}"))]
     Address {
@@ -474,6 +491,69 @@ impl QueryEngine {
         self.catalog.invalidate_registration(table).await;
     }
 
+    /// Resolve each authorized SQL name to one immutable physical generation.
+    pub(crate) async fn resolve_snapshots(
+        &self,
+        tables: &[TableRef],
+    ) -> Result<Vec<TableSnapshot>> {
+        self.refresh_if_stale().await?;
+        let mut snapshots = Vec::with_capacity(tables.len());
+        for table in tables {
+            let snapshot = self
+                .catalog
+                .resolve_snapshot(table)
+                .await
+                .map_err(|source| QueryError::SnapshotResolution {
+                    table: table.clone(),
+                    source,
+                })?
+                .ok_or_else(|| QueryError::UnpinnableTable {
+                    table: table.clone(),
+                })?;
+            snapshots.push(snapshot);
+        }
+        Ok(snapshots)
+    }
+
+    /// Plan SQL using only the exact immutable providers in `snapshots`.
+    /// This path never resolves current registry pointers.
+    pub(crate) async fn plan_sql_at(
+        &self,
+        sql: &str,
+        snapshots: &[TableSnapshot],
+    ) -> Result<DataFrame> {
+        let ctx =
+            SessionContext::new_with_config_rt(self.ctx.copied_config(), self.ctx.runtime_env());
+        let catalog = Arc::new(MemoryCatalogProvider::new());
+        ctx.register_catalog("lake", catalog.clone());
+        for snapshot in snapshots {
+            let namespace = &snapshot.table().namespace.0;
+            let schema = if let Some(schema) = catalog.schema(namespace) {
+                schema
+            } else {
+                let schema: Arc<dyn SchemaProvider> = Arc::new(MemorySchemaProvider::new());
+                catalog
+                    .register_schema(namespace, schema.clone())
+                    .context(ExecuteSnafu)?;
+                schema
+            };
+            let provider =
+                self.catalog
+                    .provider_for_snapshot(snapshot)
+                    .await
+                    .map_err(|source| QueryError::SnapshotProvider {
+                        table: snapshot.table().clone(),
+                        source,
+                    })?;
+            schema
+                .register_table(snapshot.table().name.0.clone(), provider)
+                .context(ExecuteSnafu)?;
+        }
+        ctx.sql_with_options(sql, read_only_sql_options())
+            .await
+            .context(ExecuteSnafu)
+    }
+
     async fn shutdown_catalog_revalidation(&self) { self.catalog.shutdown_revalidation().await; }
 
     pub(crate) fn cached_catalog_generation(&self) -> Arc<CatalogGeneration> {
@@ -589,12 +669,12 @@ where
     };
     let service =
         FlightServiceServer::new(flight::TracedFlightSqlService::new(FlightSqlServiceImpl {
-            engine:            engine.clone(),
-            metadata_addr:     config.metadata_endpoint,
+            engine: engine.clone(),
+            metadata_addr: config.metadata_endpoint,
             metadata_security: config.metadata_security,
-            managed_stage:     config.managed_stage,
-            admission:         flight::QueryAdmission::new(config.limits),
-            discovery_limits:  config.discovery_limits,
+            managed_stage: config.managed_stage,
+            admission: flight::QueryAdmission::new(config.limits),
+            discovery_limits: config.discovery_limits,
             ticket_codec,
         }));
 
@@ -653,8 +733,9 @@ fn statement_ticket_codec_for_listener(
 ) -> Result<ticket::StatementTicketCodec> {
     let keys = match keys {
         Some(keys) => keys,
-        None if socket.ip().is_loopback() => QueryTicketKeyRing::ephemeral()
-            .map_err(|_| QueryError::InvalidTicketConfiguration)?,
+        None if socket.ip().is_loopback() => {
+            QueryTicketKeyRing::ephemeral().map_err(|_| QueryError::InvalidTicketConfiguration)?
+        }
         None => return Err(QueryError::InvalidTicketConfiguration),
     };
     ticket::StatementTicketCodec::try_new(keys, ttl, STATEMENT_TICKET_AUDIENCE)
@@ -711,16 +792,18 @@ mod tests {
     };
 
     use arrow_flight::{
-        Action, flight_service_client::FlightServiceClient, sql::client::FlightSqlServiceClient,
+        Action, IpcMessage, SchemaAsIpc, flight_service_client::FlightServiceClient,
+        sql::client::FlightSqlServiceClient,
     };
     use async_trait::async_trait;
     use datafusion::{
         arrow::{
             array::Int64Array,
             datatypes::{DataType, Field, Schema, SchemaRef},
+            ipc::writer::IpcWriteOptions,
             record_batch::RecordBatch,
         },
-        catalog::streaming::StreamingTable,
+        catalog::{TableProvider, streaming::StreamingTable},
         error::DataFusionError,
         execution::TaskContext,
         physical_plan::{
@@ -729,12 +812,15 @@ mod tests {
     };
     use futures::{StreamExt, TryStreamExt};
     use lake_common::{
-        MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor, Principal, PrincipalId,
-        PrincipalRole, TenantId,
+        AppendOperation, MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor, Principal,
+        PrincipalId, PrincipalRole, TableLocation, TenantId, Version,
+    };
+    use lake_engine::{
+        ObjectReferencePage, ObjectReferenceRequest, TableEngine, TableHandle, TableHandleRef,
     };
     use lake_engine_lance::LanceEngine;
     use lake_flight::{BearerPrincipalBinding, ClientSecurity, ServerSecurity};
-    use lake_meta::{MetaStore, MetaStoreRef};
+    use lake_meta::{MetaStore, MetaStoreRef, registry::TableRegistration};
     use rcgen::generate_simple_self_signed;
     use tokio::sync::Notify;
     use tonic::Request;
@@ -756,25 +842,21 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            statement_ticket_codec_for_listener(
-                remote,
-                None,
-                DEFAULT_STATEMENT_TICKET_TTL
-            ),
+            statement_ticket_codec_for_listener(remote, None, DEFAULT_STATEMENT_TICKET_TTL),
             Err(QueryError::InvalidTicketConfiguration)
         ));
-        assert!(statement_ticket_codec_for_listener(
-            loopback,
-            None,
-            DEFAULT_STATEMENT_TICKET_TTL
-        )
-        .is_ok());
-        assert!(statement_ticket_codec_for_listener(
-            remote,
-            Some(keys.clone()),
-            DEFAULT_STATEMENT_TICKET_TTL
-        )
-        .is_ok());
+        assert!(
+            statement_ticket_codec_for_listener(loopback, None, DEFAULT_STATEMENT_TICKET_TTL)
+                .is_ok()
+        );
+        assert!(
+            statement_ticket_codec_for_listener(
+                remote,
+                Some(keys.clone()),
+                DEFAULT_STATEMENT_TICKET_TTL
+            )
+            .is_ok()
+        );
         assert!(matches!(
             statement_ticket_codec_for_listener(remote, Some(keys), Duration::ZERO),
             Err(QueryError::InvalidTicketConfiguration)
@@ -791,6 +873,121 @@ mod tests {
         pause:   AtomicBool,
         entered: Notify,
         release: Notify,
+    }
+
+    struct ShutdownMeta {
+        registration: Vec<u8>,
+    }
+
+    struct ShutdownEngine {
+        location: TableLocation,
+        provider: Arc<dyn TableProvider>,
+    }
+
+    struct ShutdownHandle {
+        provider: Arc<dyn TableProvider>,
+    }
+
+    #[async_trait]
+    impl TableEngine for ShutdownEngine {
+        fn kind(&self) -> &'static str { "shutdown-test" }
+
+        async fn create(
+            &self,
+            _location: &TableLocation,
+            _schema: SchemaRef,
+        ) -> lake_engine::Result<TableHandleRef> {
+            unreachable!()
+        }
+
+        async fn open(
+            &self,
+            location: &TableLocation,
+        ) -> lake_engine::Result<Option<TableHandleRef>> {
+            Ok((location == &self.location).then(|| {
+                Arc::new(ShutdownHandle {
+                    provider: self.provider.clone(),
+                }) as TableHandleRef
+            }))
+        }
+
+        async fn remove(&self, _location: &TableLocation) -> lake_engine::Result<()> {
+            unreachable!()
+        }
+
+        async fn maintain(
+            &self,
+            _location: &TableLocation,
+            _version: Version,
+        ) -> lake_engine::Result<Option<Version>> {
+            unreachable!()
+        }
+
+        async fn retained_object_references(
+            &self,
+            _location: &TableLocation,
+            _request: ObjectReferenceRequest,
+        ) -> lake_engine::Result<ObjectReferencePage> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait]
+    impl TableHandle for ShutdownHandle {
+        fn schema(&self) -> SchemaRef { self.provider.schema() }
+
+        fn current_version(&self) -> Version { Version(1) }
+
+        async fn table_provider(
+            &self,
+            version: Version,
+        ) -> lake_engine::Result<Arc<dyn TableProvider>> {
+            assert_eq!(version, Version(1));
+            Ok(self.provider.clone())
+        }
+
+        async fn append(
+            &self,
+            _operation: &AppendOperation,
+            _batches: SendableRecordBatchStream,
+        ) -> lake_engine::Result<Version> {
+            unreachable!()
+        }
+
+        async fn reconcile_append(
+            &self,
+            _operation: &AppendOperation,
+        ) -> lake_engine::Result<Option<Version>> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait]
+    impl MetaStore for ShutdownMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            Ok((key == "tbl/robots/shutdown_stream").then(|| self.registration.clone()))
+        }
+
+        async fn cas(
+            &self,
+            _key: &str,
+            _expected: Option<&[u8]>,
+            _new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            unreachable!()
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            Ok(if prefix == "tbl/" {
+                vec!["robots/shutdown_stream".to_owned()]
+            } else {
+                Vec::new()
+            })
+        }
+
+        async fn delete(&self, _key: &str, _expected: &[u8]) -> lake_meta::Result<bool> {
+            unreachable!()
+        }
     }
 
     #[async_trait]
@@ -856,9 +1053,6 @@ mod tests {
     }
 
     fn shutdown_query_engine(release: Arc<Notify>) -> Arc<QueryEngine> {
-        let meta: MetaStoreRef = Arc::new(CountingMeta::default());
-        let storage: TableEngineRef = Arc::new(LanceEngine::new());
-        let engine = Arc::new(QueryEngine::new(meta, storage));
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int64,
@@ -869,11 +1063,24 @@ mod tests {
             vec![Arc::new(ShutdownPartition { schema, release })],
         )
         .expect("streaming table");
-        engine
-            .context()
-            .register_table("shutdown_stream", Arc::new(table))
-            .expect("register table");
-        engine
+        let location = TableLocation::new("mem://robots/shutdown-stream/incarnation");
+        let IpcMessage(schema_ipc) = SchemaAsIpc::new(&table.schema(), &IpcWriteOptions::default())
+            .try_into()
+            .expect("encode shutdown schema");
+        let registration = TableRegistration::new(
+            location.clone(),
+            "shutdown-test",
+            Version(1),
+            schema_ipc.to_vec(),
+        );
+        let meta: MetaStoreRef = Arc::new(ShutdownMeta {
+            registration: serde_json::to_vec(&registration).expect("encode registration"),
+        });
+        let storage: TableEngineRef = Arc::new(ShutdownEngine {
+            location,
+            provider: Arc::new(table),
+        });
+        Arc::new(QueryEngine::new(meta, storage))
     }
 
     fn free_addr() -> std::net::SocketAddr {
@@ -902,7 +1109,7 @@ mod tests {
         client: &mut FlightSqlServiceClient<tonic::transport::Channel>,
     ) -> arrow_flight::decode::FlightRecordBatchStream {
         let info = client
-            .execute("SELECT * FROM shutdown_stream".to_owned(), None)
+            .execute("SELECT * FROM lake.robots.shutdown_stream".to_owned(), None)
             .await
             .expect("FlightInfo");
         let ticket = info
@@ -1126,18 +1333,14 @@ mod tests {
         let config = QueryServerConfig::new()
             .with_server_security(server_security)
             .with_ticket_keys(ticket_keys);
-        let server = tokio::spawn(async move {
-            serve_with_config(engine, &addr.to_string(), config).await
-        });
+        let server =
+            tokio::spawn(async move { serve_with_config(engine, &addr.to_string(), config).await });
 
         let endpoint = format!("https://localhost:{}", addr.port());
         let transport = ClientSecurity::new()
             .with_ca_certificate_pem(certificate.as_bytes().to_vec())
             .with_server_name("localhost");
-        let alice_security = transport
-            .clone()
-            .with_bearer_token(alice_token)
-            .unwrap();
+        let alice_security = transport.clone().with_bearer_token(alice_token).unwrap();
         let alice_channel = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Ok(channel) = alice_security.connect(endpoint.clone()).await {

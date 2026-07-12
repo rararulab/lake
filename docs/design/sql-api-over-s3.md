@@ -22,11 +22,20 @@ Flight SQL client
   -> streaming Arrow FlightData
 ```
 
-This path is implemented for interactive results. `GetFlightInfo` publishes the
-result schema and an opaque ticket; `DoGet` executes with
-`DataFrame::execute_stream` and applies backpressure batch by batch. Flight SQL
+This path is implemented for interactive results. `GetFlightInfo` resolves and
+plans every physical SQL reference at an exact table location, incarnation,
+and version, publishes that schema, and encrypts the canonical bounded
+snapshot set into its opaque tenant/principal-bound ticket. `DoGet` rebuilds a
+request-local catalog from those claims on any stateless replica and executes
+with `DataFrame::execute_stream`; it never consults current-version pointers
+or substitutes latest when a historical provider is unavailable. Flight SQL
 defines this `FlightInfo`/ticket/`DoGet` flow and uses Arrow as the result
 format ([Flight SQL specification](https://arrow.apache.org/docs/format/FlightSql.html)).
+
+The inner encrypted ticket protocol is versioned. Snapshot-aware replicas
+reject older SQL-only tickets, and older replicas reject the new envelope
+instead of silently ignoring claims. Use blue/green or drain/cutover for this
+protocol transition; mixed-version cross-routing is fail-closed.
 
 The public planner accepts `SELECT` and `EXPLAIN`. DDL, DML, session statements,
 and `CREATE EXTERNAL TABLE ... LOCATION 's3://...'` are rejected. Source S3
@@ -99,9 +108,9 @@ policy and resource controls below:
   text can never introduce a source URI or object-store credential.
 - Statement tickets are now opaque authenticated ciphertext bound to exact
   principal, tenant, audience, issued-at, and expiry, with a bounded shared key
-  ring for stateless replica rotation. Raw SQL and credentials are not ticket
-  plaintext. Still bind exact table snapshot versions before claiming
-  `GetFlightInfo`/`DoGet` snapshot continuity; async result mode needs its own
+  ring for stateless replica rotation. Raw SQL, storage locations, incarnation
+  ids, and credentials are not ticket plaintext. Exact table snapshots are
+  bound across `GetFlightInfo`/`DoGet`; async result mode still needs its own
   capability envelope.
 - Presigned result URLs with the shortest practical expiry, `GET` only, and a
   result prefix unique to the tenant and query.

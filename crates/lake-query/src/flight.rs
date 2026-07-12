@@ -15,13 +15,15 @@
 //! Arrow Flight SQL wire surface over [`QueryEngine`].
 //!
 //! [`FlightSqlServiceImpl`] implements the two-phase Flight SQL statement path:
-//! `GetFlightInfo` plans the SQL to publish its Arrow schema and hands back a
-//! ticket carrying the query text; `DoGet` decodes that ticket, executes the
-//! SQL on the engine, and streams the resulting record batches back as Flight
-//! data. Only the statement path is overridden — every other Flight SQL method
-//! keeps its trait default (an `unimplemented` [`Status`]).
+//! `GetFlightInfo` plans the SQL against exact table snapshots to publish its
+//! Arrow schema and hands back an encrypted identity-bound capability;
+//! `DoGet` reconstructs the same pinned catalog, executes the SQL, and streams
+//! the resulting record batches back as Flight data. Only the statement path
+//! is overridden — every other Flight SQL method keeps its trait default (an
+//! `unimplemented` [`Status`]).
 
 use std::{
+    collections::BTreeSet,
     future::Future,
     ops::Bound::{Excluded, Unbounded},
     pin::Pin,
@@ -50,10 +52,10 @@ use datafusion::{
     common::{TableReference, config::Dialect},
 };
 use futures::{Stream, StreamExt, TryStreamExt};
-use lake_catalog::CatalogGeneration;
+use lake_catalog::{CatalogGeneration, TableSnapshot};
 use lake_common::{
     FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION,
-    ManagedStageDescriptor, Namespace, Principal, PrincipalRole, TableName,
+    ManagedStageDescriptor, Namespace, Principal, TableLocation, TableName, TableRef, Version,
 };
 use lake_flight::{
     ClientSecurity, DELEGATED_NAMESPACE_HEADER, DELEGATED_TENANT_HEADER, TracedFlightStream,
@@ -68,11 +70,11 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{Instrument as _, Span, field};
 
 use crate::{
-    DiscoveryLimits, QueryEngine, QueryLimits, telemetry,
-    ticket::StatementTicketCodec,
+    DiscoveryLimits, QueryEngine, QueryError, QueryLimits, telemetry,
+    ticket::{MAX_TABLE_SNAPSHOTS, StatementTableSnapshot, StatementTicket, StatementTicketCodec},
 };
 
-const MAX_STATEMENT_TICKET_OVERHEAD: usize = 512;
+const MAX_STATEMENT_TICKET_OVERHEAD: usize = 320 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct QueryAdmission {
@@ -564,8 +566,16 @@ impl FlightSqlServiceImpl {
     ///
     /// Used by `GetFlightInfo` to advertise the result schema without
     /// materializing any rows.
-    async fn plan_schema(&self, sql: &str) -> std::result::Result<Schema, Status> {
-        let df = self.engine.plan_sql(sql).await.map_err(to_status)?;
+    async fn plan_schema(
+        &self,
+        sql: &str,
+        snapshots: &[TableSnapshot],
+    ) -> std::result::Result<Schema, Status> {
+        let df = self
+            .engine
+            .plan_sql_at(sql, snapshots)
+            .await
+            .map_err(query_status)?;
         Ok(df.schema().as_arrow().clone())
     }
 
@@ -590,6 +600,14 @@ impl FlightSqlServiceImpl {
     }
 
     fn authorize_sql(&self, principal: &Principal, sql: &str) -> std::result::Result<(), Status> {
+        self.authorized_table_references(principal, sql).map(drop)
+    }
+
+    fn authorized_table_references(
+        &self,
+        principal: &Principal,
+        sql: &str,
+    ) -> std::result::Result<Vec<TableRef>, Status> {
         let state = self.engine.context().state();
         let statement = state
             .sql_to_statement(sql, &Dialect::Generic)
@@ -597,27 +615,73 @@ impl FlightSqlServiceImpl {
         let references = state
             .resolve_table_references(&statement)
             .map_err(|_| Status::invalid_argument("invalid SQL statement"))?;
+        let mut tables = BTreeSet::new();
         for reference in references {
-            let namespace = match reference {
+            let table = match reference {
                 TableReference::Full {
-                    catalog, schema, ..
-                } if catalog.as_ref() == "lake" => schema,
-                TableReference::Partial { schema, .. } => schema,
-                TableReference::Bare { .. } if principal.role() == PrincipalRole::Admin => {
-                    continue;
+                    catalog,
+                    schema,
+                    table,
+                } if catalog.as_ref() == "lake" => TableRef::new(schema.as_ref(), table.as_ref()),
+                TableReference::Partial { schema, table } => {
+                    TableRef::new(schema.as_ref(), table.as_ref())
                 }
                 TableReference::Full { .. } | TableReference::Bare { .. } => {
                     return Err(Status::permission_denied("resource is not available"));
                 }
             };
-            self.authorize_namespace(principal, &namespace)?;
+            self.authorize_namespace(principal, &table.namespace.0)?;
+            tables.insert(table);
+            if tables.len() > MAX_TABLE_SNAPSHOTS {
+                return Err(Status::resource_exhausted(
+                    "statement references too many tables",
+                ));
+            }
         }
-        Ok(())
+        Ok(tables.into_iter().collect())
     }
+}
+
+fn ticket_snapshot(snapshot: &TableSnapshot) -> StatementTableSnapshot {
+    StatementTableSnapshot {
+        namespace:      snapshot.table().namespace.0.clone(),
+        table:          snapshot.table().name.0.clone(),
+        engine:         snapshot.engine().to_owned(),
+        location:       snapshot.location().0.clone(),
+        incarnation_id: snapshot.incarnation_id().to_owned(),
+        version:        snapshot.version().0,
+    }
+}
+
+fn catalog_snapshot(snapshot: &StatementTableSnapshot) -> TableSnapshot {
+    TableSnapshot::new(
+        TableRef::new(&snapshot.namespace, &snapshot.table),
+        TableLocation::new(&snapshot.location),
+        &snapshot.engine,
+        &snapshot.incarnation_id,
+        Version(snapshot.version),
+    )
+}
+
+fn invalid_statement_ticket() -> Status {
+    telemetry::rejection("invalid_ticket");
+    Status::unauthenticated("invalid statement ticket")
 }
 
 /// Collapse any displayable error into an internal [`Status`].
 fn to_status<E: std::fmt::Display>(err: E) -> Status { Status::internal(err.to_string()) }
+
+fn query_status(error: QueryError) -> Status {
+    match error {
+        QueryError::UnpinnableTable { .. } | QueryError::SnapshotProvider { .. } => {
+            Status::failed_precondition("the pinned table snapshot is unavailable")
+        }
+        QueryError::SnapshotResolution { .. } => {
+            Status::internal("could not resolve a table snapshot")
+        }
+        error => to_status(error),
+    }
+}
 
 fn record_rpc_outcome<T>(span: &Span, result: &std::result::Result<T, Status>) {
     span.record("rpc.outcome", if result.is_ok() { "ok" } else { "error" });
@@ -786,19 +850,30 @@ impl FlightSqlService for FlightSqlServiceImpl {
             let CommandStatementQuery { query: sql, .. } = query;
             self.admission.validate_sql_size(sql.as_bytes())?;
             let principal = self.principal(&request)?;
-            self.authorize_sql(&principal, &sql)?;
+            let references = self.authorized_table_references(&principal, &sql)?;
             let _permit = self.admission.acquire().await?;
-            let schema = tokio::time::timeout_at(
-                self.admission.execution_deadline(),
-                self.plan_schema(&sql),
-            )
+            let deadline = self.admission.execution_deadline();
+            let (snapshots, schema) = tokio::time::timeout_at(deadline, async {
+                let snapshots = self
+                    .engine
+                    .resolve_snapshots(&references)
+                    .await
+                    .map_err(query_status)?;
+                let schema = self.plan_schema(&sql, &snapshots).await?;
+                Ok::<_, Status>((snapshots, schema))
+            })
             .await
             .map_err(|_| Status::deadline_exceeded("query planning deadline exceeded"))??;
 
+            let statement = StatementTicket {
+                sql,
+                snapshots: snapshots.iter().map(ticket_snapshot).collect(),
+            };
             let statement_handle = self
                 .ticket_codec
-                .seal(&sql, &principal)
+                .seal_statement(&statement, &principal)
                 .map_err(|_| Status::internal("could not issue statement ticket"))?;
+            self.admission.validate_ticket_size(&statement_handle)?;
             let ticket = TicketStatementQuery {
                 statement_handle: statement_handle.into(),
             };
@@ -871,21 +946,38 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let result =
             async move {
                 let principal = self.principal(&request)?;
-                self.admission.validate_ticket_size(&ticket.statement_handle)?;
-                let sql = self
+                self.admission
+                    .validate_ticket_size(&ticket.statement_handle)?;
+                let statement = self
                     .ticket_codec
-                    .open(&ticket.statement_handle, &principal)
-                    .map_err(|_| {
-                        telemetry::rejection("invalid_ticket");
-                        Status::unauthenticated("invalid statement ticket")
-                    })?;
-                self.admission.validate_sql_size(sql.as_bytes())?;
-                self.authorize_sql(&principal, &sql)?;
+                    .open_statement(&ticket.statement_handle, &principal)
+                    .map_err(|_| invalid_statement_ticket())?;
+                self.admission.validate_sql_size(statement.sql.as_bytes())?;
+                let references = self
+                    .authorized_table_references(&principal, &statement.sql)
+                    .map_err(|_| invalid_statement_ticket())?;
+                let snapshots = statement
+                    .snapshots
+                    .iter()
+                    .map(catalog_snapshot)
+                    .collect::<Vec<_>>();
+                if references
+                    != snapshots
+                        .iter()
+                        .map(|snapshot| snapshot.table().clone())
+                        .collect::<Vec<_>>()
+                {
+                    return Err(invalid_statement_ticket());
+                }
                 let permit = self.admission.acquire().await?;
                 let deadline = self.admission.execution_deadline();
 
                 let batches = tokio::time::timeout_at(deadline, async {
-                    let df = self.engine.plan_sql(&sql).await.map_err(to_status)?;
+                    let df = self
+                        .engine
+                        .plan_sql_at(&statement.sql, &snapshots)
+                        .await
+                        .map_err(query_status)?;
                     df.execute_stream().await.map_err(to_status)
                 })
                 .await
@@ -1069,8 +1161,9 @@ impl FlightSqlService for FlightSqlServiceImpl {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         sync::{
-            RwLock,
+            Mutex as StdMutex, RwLock,
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
@@ -1089,7 +1182,8 @@ mod tests {
             ipc::writer::IpcWriteOptions,
             record_batch::RecordBatch,
         },
-        catalog::streaming::StreamingTable,
+        catalog::{TableProvider, streaming::StreamingTable},
+        datasource::MemTable,
         error::DataFusionError,
         execution::TaskContext,
         physical_plan::{
@@ -1099,11 +1193,14 @@ mod tests {
     use futures::{StreamExt, TryStreamExt};
     use lake_common::{
         MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor, Principal, PrincipalId,
-        PrincipalRole, TableLocation, TenantId, Version,
+        PrincipalRole, TableLocation, TableRef, TenantId, Version,
     };
-    use lake_engine::TableEngineRef;
+    use lake_engine::{
+        EngineError, ObjectReferencePage, ObjectReferenceRequest, TableEngine, TableEngineRef,
+        TableHandle, TableHandleRef,
+    };
     use lake_engine_lance::LanceEngine;
-    use lake_meta::{MetaStore, MetaStoreRef, registry::TableRegistration};
+    use lake_meta::{MetaStore, MetaStoreRef, RocksMeta, registry, registry::TableRegistration};
     use tokio::sync::Notify;
 
     use super::*;
@@ -1131,6 +1228,143 @@ mod tests {
     }
 
     struct EmptyMeta;
+
+    type TestProviders = Arc<StdMutex<HashMap<(TableLocation, u64), Arc<dyn TableProvider>>>>;
+
+    #[derive(Clone, Default)]
+    struct VersionedTestEngine {
+        providers: TestProviders,
+        opens:     Arc<StdMutex<Vec<TableLocation>>>,
+    }
+
+    impl VersionedTestEngine {
+        fn insert(
+            &self,
+            location: &TableLocation,
+            version: Version,
+            provider: Arc<dyn TableProvider>,
+        ) {
+            self.providers
+                .lock()
+                .unwrap()
+                .insert((location.clone(), version.0), provider);
+        }
+
+        fn remove_location(&self, location: &TableLocation) {
+            self.providers
+                .lock()
+                .unwrap()
+                .retain(|(candidate, _), _| candidate != location);
+        }
+    }
+
+    struct VersionedTestHandle {
+        location:  TableLocation,
+        schema:    SchemaRef,
+        providers: TestProviders,
+    }
+
+    #[async_trait]
+    impl TableEngine for VersionedTestEngine {
+        fn kind(&self) -> &'static str { "versioned-test" }
+
+        async fn create(
+            &self,
+            _location: &TableLocation,
+            _schema: SchemaRef,
+        ) -> lake_engine::Result<TableHandleRef> {
+            unreachable!()
+        }
+
+        async fn open(
+            &self,
+            location: &TableLocation,
+        ) -> lake_engine::Result<Option<TableHandleRef>> {
+            self.opens.lock().unwrap().push(location.clone());
+            let providers = self.providers.lock().unwrap();
+            let schema = providers
+                .iter()
+                .find(|((candidate, _), _)| candidate == location)
+                .map(|(_, provider)| provider.schema());
+            drop(providers);
+            Ok(schema.map(|schema| {
+                Arc::new(VersionedTestHandle {
+                    location: location.clone(),
+                    schema,
+                    providers: self.providers.clone(),
+                }) as TableHandleRef
+            }))
+        }
+
+        async fn remove(&self, location: &TableLocation) -> lake_engine::Result<()> {
+            self.remove_location(location);
+            Ok(())
+        }
+
+        async fn maintain(
+            &self,
+            _location: &TableLocation,
+            _version: Version,
+        ) -> lake_engine::Result<Option<Version>> {
+            Ok(None)
+        }
+
+        async fn retained_object_references(
+            &self,
+            _location: &TableLocation,
+            _request: ObjectReferenceRequest,
+        ) -> lake_engine::Result<ObjectReferencePage> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait]
+    impl TableHandle for VersionedTestHandle {
+        fn schema(&self) -> SchemaRef { self.schema.clone() }
+
+        fn current_version(&self) -> Version {
+            self.providers
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|(location, _)| location == &self.location)
+                .map(|(_, version)| Version(*version))
+                .max()
+                .unwrap_or(Version(0))
+        }
+
+        async fn table_provider(
+            &self,
+            version: Version,
+        ) -> lake_engine::Result<Arc<dyn TableProvider>> {
+            self.providers
+                .lock()
+                .unwrap()
+                .get(&(self.location.clone(), version.0))
+                .cloned()
+                .ok_or_else(|| {
+                    EngineError::backend(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("snapshot {version} was reclaimed"),
+                    ))
+                })
+        }
+
+        async fn append(
+            &self,
+            _operation: &lake_common::AppendOperation,
+            _batches: SendableRecordBatchStream,
+        ) -> lake_engine::Result<Version> {
+            unreachable!()
+        }
+
+        async fn reconcile_append(
+            &self,
+            _operation: &lake_common::AppendOperation,
+        ) -> lake_engine::Result<Option<Version>> {
+            unreachable!()
+        }
+    }
 
     #[async_trait]
     impl MetaStore for EmptyMeta {
@@ -1216,6 +1450,96 @@ mod tests {
             schema_ipc.to_vec(),
         ))
         .unwrap()
+    }
+
+    fn snapshot_registration(
+        location: &TableLocation,
+        version: Version,
+        schema: &Schema,
+    ) -> TableRegistration {
+        let IpcMessage(schema_ipc) = SchemaAsIpc::new(schema, &IpcWriteOptions::default())
+            .try_into()
+            .unwrap();
+        TableRegistration::new(
+            location.clone(),
+            "versioned-test",
+            version,
+            schema_ipc.to_vec(),
+        )
+    }
+
+    fn int_provider(schema: SchemaRef, values: Vec<i64>) -> Arc<dyn TableProvider> {
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))]).unwrap();
+        Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+    }
+
+    fn snapshot_service(
+        meta: MetaStoreRef,
+        engine: TableEngineRef,
+        ticket_codec: StatementTicketCodec,
+    ) -> FlightSqlServiceImpl {
+        FlightSqlServiceImpl {
+            engine: Arc::new(QueryEngine::new(meta, engine)),
+            metadata_addr: None,
+            metadata_security: ClientSecurity::new(),
+            managed_stage: None,
+            admission: QueryAdmission::new(QueryLimits::default()),
+            discovery_limits: DiscoveryLimits::default(),
+            ticket_codec,
+        }
+    }
+
+    fn robots_reader() -> Principal {
+        Principal::try_new(
+            PrincipalId::try_new("robots-reader").unwrap(),
+            TenantId::try_new("robots-tenant").unwrap(),
+            PrincipalRole::User,
+            ["robots"],
+        )
+        .unwrap()
+    }
+
+    async fn issue_statement_ticket(
+        service: &FlightSqlServiceImpl,
+        sql: &str,
+        principal: &Principal,
+    ) -> TicketStatementQuery {
+        let mut request = Request::new(FlightDescriptor::default());
+        request.extensions_mut().insert(principal.clone());
+        let info = service
+            .get_flight_info_statement(
+                CommandStatementQuery {
+                    query:          sql.to_owned(),
+                    transaction_id: None,
+                },
+                request,
+            )
+            .await
+            .expect("issue statement ticket")
+            .into_inner();
+        let outer = info.endpoint[0].ticket.as_ref().expect("endpoint ticket");
+        let any = Any::decode(&*outer.ticket).expect("standard Flight SQL ticket envelope");
+        TicketStatementQuery::decode(&*any.value).expect("statement ticket")
+    }
+
+    async fn execute_statement_ticket(
+        service: &FlightSqlServiceImpl,
+        ticket: TicketStatementQuery,
+        principal: &Principal,
+    ) -> std::result::Result<Vec<RecordBatch>, Status> {
+        let mut request = Request::new(Ticket::default());
+        request.extensions_mut().insert(principal.clone());
+        let stream = service
+            .do_get_statement(ticket, request)
+            .await?
+            .into_inner();
+        FlightRecordBatchStream::new_from_flight_data(
+            stream.map_err(arrow_flight::error::FlightError::from),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(Status::from)
     }
 
     fn test_ticket_codec() -> StatementTicketCodec {
@@ -1445,6 +1769,151 @@ mod tests {
             meta.scans.load(Ordering::Relaxed),
             0,
             "authorization must not consult the metastore"
+        );
+    }
+
+    #[test]
+    fn statement_ticket_pins_joins_subqueries_and_ctes() {
+        let meta: MetaStoreRef = Arc::new(EmptyMeta);
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let service = FlightSqlServiceImpl {
+            engine:            Arc::new(QueryEngine::new(meta, storage)),
+            metadata_addr:     None,
+            metadata_security: ClientSecurity::new(),
+            managed_stage:     None,
+            admission:         QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:  DiscoveryLimits::default(),
+            ticket_codec:      test_ticket_codec(),
+        };
+        let principal = Principal::try_new(
+            PrincipalId::try_new("alpha-reader").unwrap(),
+            TenantId::try_new("tenant-alpha").unwrap(),
+            PrincipalRole::User,
+            ["alpha"],
+        )
+        .unwrap();
+        let sql = "WITH recent AS (SELECT * FROM lake.alpha.events) SELECT * FROM recent r JOIN \
+                   lake.alpha.labels l ON r.id = l.id WHERE EXISTS (SELECT 1 FROM \
+                   lake.alpha.annotations a WHERE a.id = r.id)";
+
+        let references = service
+            .authorized_table_references(&principal, sql)
+            .expect("extract every authorized physical table");
+
+        assert_eq!(
+            references,
+            vec![
+                TableRef::new("alpha", "annotations"),
+                TableRef::new("alpha", "events"),
+                TableRef::new("alpha", "labels"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn statement_ticket_executes_original_snapshot_after_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let meta = Arc::new(RocksMeta::open(directory.path()).unwrap());
+        let table = TableRef::new("robots", "episodes");
+        let location = TableLocation::new("mem://robots/episodes/incarnation-a");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let registration = snapshot_registration(&location, Version(1), &schema);
+        registry::register(meta.as_ref(), &table, &registration)
+            .await
+            .unwrap();
+        let engine = VersionedTestEngine::default();
+        engine.insert(&location, Version(1), int_provider(schema.clone(), vec![1]));
+        engine.insert(&location, Version(2), int_provider(schema, vec![2]));
+        let codec = test_ticket_codec();
+        let engine_ref: TableEngineRef = Arc::new(engine.clone());
+        let meta_ref: MetaStoreRef = meta.clone();
+        let issuer = snapshot_service(meta_ref.clone(), engine_ref.clone(), codec.clone());
+        let principal = robots_reader();
+
+        let ticket = issue_statement_ticket(
+            &issuer,
+            "SELECT value FROM lake.robots.episodes",
+            &principal,
+        )
+        .await;
+        registry::set_version(meta.as_ref(), &table, &registration, Version(2))
+            .await
+            .unwrap();
+        issuer.engine.invalidate_registration(&table).await;
+
+        let executor = snapshot_service(meta_ref, engine_ref, codec);
+        let batches = execute_statement_ticket(&executor, ticket, &principal)
+            .await
+            .expect("a different replica executes the issued snapshot");
+        let values = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.values(), &[1]);
+    }
+
+    #[tokio::test]
+    async fn statement_ticket_never_redirects_to_recreated_table() {
+        let directory = tempfile::tempdir().unwrap();
+        let meta = Arc::new(RocksMeta::open(directory.path()).unwrap());
+        let table = TableRef::new("robots", "episodes");
+        let old_location = TableLocation::new("mem://robots/episodes/incarnation-old");
+        let new_location = TableLocation::new("mem://robots/episodes/incarnation-new");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let old_registration = snapshot_registration(&old_location, Version(1), &schema);
+        registry::register(meta.as_ref(), &table, &old_registration)
+            .await
+            .unwrap();
+        let engine = VersionedTestEngine::default();
+        engine.insert(
+            &old_location,
+            Version(1),
+            int_provider(schema.clone(), vec![1]),
+        );
+        let codec = test_ticket_codec();
+        let engine_ref: TableEngineRef = Arc::new(engine.clone());
+        let meta_ref: MetaStoreRef = meta.clone();
+        let issuer = snapshot_service(meta_ref.clone(), engine_ref.clone(), codec.clone());
+        let principal = robots_reader();
+        let ticket = issue_statement_ticket(
+            &issuer,
+            "SELECT value FROM lake.robots.episodes",
+            &principal,
+        )
+        .await;
+
+        registry::delete(meta.as_ref(), &table, &old_registration)
+            .await
+            .unwrap();
+        let new_registration = snapshot_registration(&new_location, Version(1), &schema);
+        registry::register(meta.as_ref(), &table, &new_registration)
+            .await
+            .unwrap();
+        engine.remove_location(&old_location);
+        engine.insert(&new_location, Version(1), int_provider(schema, vec![99]));
+        engine.opens.lock().unwrap().clear();
+
+        let executor = snapshot_service(meta_ref, engine_ref, codec);
+        let error = execute_statement_ticket(&executor, ticket, &principal)
+            .await
+            .expect_err("reclaimed old incarnation must fail explicitly");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.message(), "the pinned table snapshot is unavailable");
+        assert!(!error.message().contains("mem://"));
+        assert_eq!(
+            *engine.opens.lock().unwrap(),
+            vec![old_location],
+            "DoGet must not resolve or open the replacement location"
         );
     }
 
@@ -2046,8 +2515,7 @@ mod tests {
     #[tokio::test]
     async fn do_get_returns_before_the_input_stream_finishes() {
         let meta: MetaStoreRef = Arc::new(EmptyMeta);
-        let storage: TableEngineRef = Arc::new(LanceEngine::new());
-        let engine = Arc::new(QueryEngine::new(meta, storage));
+        let storage = VersionedTestEngine::default();
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int64,
@@ -2062,39 +2530,55 @@ mod tests {
             })],
         )
         .unwrap();
-        engine
-            .context()
-            .register_table("delayed", Arc::new(table))
-            .unwrap();
+        let location = TableLocation::new("mem://robots/delayed/incarnation");
+        storage.insert(&location, Version(1), Arc::new(table));
+        let storage: TableEngineRef = Arc::new(storage);
 
         let service = FlightSqlServiceImpl {
-            engine,
-            metadata_addr: None,
+            engine:            Arc::new(QueryEngine::new(meta, storage)),
+            metadata_addr:     None,
             metadata_security: ClientSecurity::new(),
-            managed_stage: None,
-            admission: QueryAdmission::new(QueryLimits::default()),
-            discovery_limits: DiscoveryLimits::default(),
-            ticket_codec: test_ticket_codec(),
+            managed_stage:     None,
+            admission:         QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:  DiscoveryLimits::default(),
+            ticket_codec:      test_ticket_codec(),
         };
-        let principal = Principal::deployment_admin();
+        let principal = robots_reader();
         let ticket = TicketStatementQuery {
             statement_handle: service
                 .ticket_codec
-                .seal("SELECT * FROM delayed", &principal)
+                .seal_statement(
+                    &StatementTicket {
+                        sql:       "SELECT * FROM lake.robots.delayed".to_owned(),
+                        snapshots: vec![StatementTableSnapshot {
+                            namespace:      "robots".to_owned(),
+                            table:          "delayed".to_owned(),
+                            engine:         "versioned-test".to_owned(),
+                            location:       location.0,
+                            incarnation_id: "incarnation".to_owned(),
+                            version:        1,
+                        }],
+                    },
+                    &principal,
+                )
                 .unwrap()
                 .into(),
         };
         let mut ticket_request = Request::new(Ticket::default());
         ticket_request.extensions_mut().insert(principal);
-        let mut request = tokio::spawn(async move {
-            service
-                .do_get_statement(ticket, ticket_request)
-                .await
-        });
+        let mut request =
+            tokio::spawn(async move { service.do_get_statement(ticket, ticket_request).await });
 
-        let returned_early = tokio::time::timeout(Duration::from_millis(100), &mut request)
-            .await
-            .is_ok();
+        let returned_early =
+            match tokio::time::timeout(Duration::from_millis(100), &mut request).await {
+                Ok(result) => {
+                    result
+                        .expect("DoGet task")
+                        .expect("DoGet must return a valid stream");
+                    true
+                }
+                Err(_) => false,
+            };
         release.notify_waiters();
         if !returned_early {
             request.await.unwrap().unwrap();
@@ -2109,8 +2593,7 @@ mod tests {
     #[tokio::test]
     async fn query_admission_rejects_when_saturated_and_releases_on_drop() {
         let meta: MetaStoreRef = Arc::new(EmptyMeta);
-        let storage: TableEngineRef = Arc::new(LanceEngine::new());
-        let engine = Arc::new(QueryEngine::new(meta, storage));
+        let storage = VersionedTestEngine::default();
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int64,
@@ -2125,34 +2608,45 @@ mod tests {
             })],
         )
         .expect("streaming table");
-        engine
-            .context()
-            .register_table("admitted", Arc::new(table))
-            .expect("register table");
+        let location = TableLocation::new("mem://robots/admitted/incarnation");
+        storage.insert(&location, Version(1), Arc::new(table));
+        let storage: TableEngineRef = Arc::new(storage);
         let limits =
             QueryLimits::try_new(1, Duration::from_millis(20), Duration::from_secs(5), 1024)
                 .expect("limits");
         let service = FlightSqlServiceImpl {
-            engine,
-            metadata_addr: None,
+            engine:            Arc::new(QueryEngine::new(meta, storage)),
+            metadata_addr:     None,
             metadata_security: ClientSecurity::new(),
-            managed_stage: None,
-            admission: QueryAdmission::new(limits),
-            discovery_limits: DiscoveryLimits::default(),
-            ticket_codec: test_ticket_codec(),
+            managed_stage:     None,
+            admission:         QueryAdmission::new(limits),
+            discovery_limits:  DiscoveryLimits::default(),
+            ticket_codec:      test_ticket_codec(),
         };
+        let principal = robots_reader();
         let statement_handle = service
             .ticket_codec
-            .seal("SELECT * FROM admitted", &Principal::deployment_admin())
+            .seal_statement(
+                &StatementTicket {
+                    sql:       "SELECT * FROM lake.robots.admitted".to_owned(),
+                    snapshots: vec![StatementTableSnapshot {
+                        namespace:      "robots".to_owned(),
+                        table:          "admitted".to_owned(),
+                        engine:         "versioned-test".to_owned(),
+                        location:       location.0,
+                        incarnation_id: "incarnation".to_owned(),
+                        version:        1,
+                    }],
+                },
+                &principal,
+            )
             .unwrap();
         let ticket = || TicketStatementQuery {
             statement_handle: statement_handle.clone().into(),
         };
         let request = || {
             let mut request = Request::new(Ticket::default());
-            request
-                .extensions_mut()
-                .insert(Principal::deployment_admin());
+            request.extensions_mut().insert(principal.clone());
             request
         };
 
@@ -2218,8 +2712,7 @@ mod tests {
     #[tokio::test]
     async fn query_execution_deadline_terminates_slow_stream() {
         let meta: MetaStoreRef = Arc::new(EmptyMeta);
-        let storage: TableEngineRef = Arc::new(LanceEngine::new());
-        let engine = Arc::new(QueryEngine::new(meta, storage));
+        let storage = VersionedTestEngine::default();
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int64,
@@ -2234,10 +2727,9 @@ mod tests {
             })],
         )
         .expect("streaming table");
-        engine
-            .context()
-            .register_table("deadline", Arc::new(table))
-            .expect("register table");
+        let location = TableLocation::new("mem://robots/deadline/incarnation");
+        storage.insert(&location, Version(1), Arc::new(table));
+        let storage: TableEngineRef = Arc::new(storage);
         let limits = QueryLimits::try_new(
             1,
             Duration::from_millis(20),
@@ -2246,25 +2738,37 @@ mod tests {
         )
         .expect("limits");
         let service = FlightSqlServiceImpl {
-            engine,
-            metadata_addr: None,
+            engine:            Arc::new(QueryEngine::new(meta, storage)),
+            metadata_addr:     None,
             metadata_security: ClientSecurity::new(),
-            managed_stage: None,
-            admission: QueryAdmission::new(limits),
-            discovery_limits: DiscoveryLimits::default(),
-            ticket_codec: test_ticket_codec(),
+            managed_stage:     None,
+            admission:         QueryAdmission::new(limits),
+            discovery_limits:  DiscoveryLimits::default(),
+            ticket_codec:      test_ticket_codec(),
         };
+        let principal = robots_reader();
         let statement_handle = service
             .ticket_codec
-            .seal("SELECT * FROM deadline", &Principal::deployment_admin())
+            .seal_statement(
+                &StatementTicket {
+                    sql:       "SELECT * FROM lake.robots.deadline".to_owned(),
+                    snapshots: vec![StatementTableSnapshot {
+                        namespace:      "robots".to_owned(),
+                        table:          "deadline".to_owned(),
+                        engine:         "versioned-test".to_owned(),
+                        location:       location.0,
+                        incarnation_id: "incarnation".to_owned(),
+                        version:        1,
+                    }],
+                },
+                &principal,
+            )
             .unwrap();
         let ticket = || TicketStatementQuery {
             statement_handle: statement_handle.clone().into(),
         };
         let mut request = Request::new(Ticket::default());
-        request
-            .extensions_mut()
-            .insert(Principal::deployment_admin());
+        request.extensions_mut().insert(principal.clone());
         let response = service
             .do_get_statement(ticket(), request)
             .await
@@ -2289,9 +2793,7 @@ mod tests {
         assert_eq!(deadline_status.code(), tonic::Code::DeadlineExceeded);
 
         let mut next_request = Request::new(Ticket::default());
-        next_request
-            .extensions_mut()
-            .insert(Principal::deployment_admin());
+        next_request.extensions_mut().insert(principal);
         let next = service.do_get_statement(ticket(), next_request).await;
         assert!(next.is_ok(), "deadline must release the admission permit");
         release.notify_waiters();
@@ -2332,8 +2834,7 @@ mod tests {
         request
             .extensions_mut()
             .insert(Principal::deployment_admin());
-        let Err(ticket_error) = service.do_get_statement(ticket, request).await
-        else {
+        let Err(ticket_error) = service.do_get_statement(ticket, request).await else {
             panic!("oversized ticket must fail");
         };
         assert_eq!(ticket_error.code(), tonic::Code::ResourceExhausted);
