@@ -36,12 +36,14 @@ mod checkpoint;
 mod gc;
 mod gc_apply;
 mod gc_plan;
+mod integrity;
 mod inventory;
 mod local;
 mod reference_index;
 pub use gc::{GcPlanPage, GcPlanner, ObjectCandidate};
 pub use gc_apply::{DeleteOutcome, GcApplyProgress, GcPlanApplier, ManagedObjectDeleter};
 pub use gc_plan::{GcPlan, GcPlanWriter};
+pub use integrity::{ObjectIntegrityError, open_verified};
 pub use inventory::{InventoryPage, InventoryRequest, ManagedObjectInventory};
 pub use local::LocalObjectStore;
 pub use reference_index::{LiveReferenceIndex, LiveReferenceIndexBuild, LiveReferenceIndexBuilder};
@@ -128,6 +130,9 @@ pub enum ObjectError {
 
     #[snafu(display("managed object store returned an invalid presigned capability lifetime"))]
     InvalidPresignedCapabilityLifetime,
+
+    #[snafu(display("DataLocation has an invalid integrity identity"))]
+    Integrity { source: ObjectIntegrityError },
 
     #[snafu(display("object GC cannot plan while retained reference lineage is incomplete"))]
     GcLineageIncomplete,
@@ -421,10 +426,14 @@ fn u64_value(array: &StructArray, column: &'static str, row: usize) -> Result<u6
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, SystemTime},
     };
 
+    use async_trait::async_trait;
     use aws_config::BehaviorVersion;
     use aws_sdk_s3::config::{Credentials, Region};
     use lake_common::DataLocation;
@@ -434,8 +443,55 @@ mod tests {
 
     use crate::{
         InventoryRequest, LocalObjectStore, ManagedObjectInventory, ManagedObjectStore,
-        ObjectError, S3ObjectStore, data_location_array, data_location_from_array,
+        ObjectError, ObjectIntegrityError, ObjectReader, Result as ObjectResult, S3ObjectStore,
+        data_location_array, data_location_from_array, open_verified,
     };
+
+    struct StaticReadStore {
+        bytes: Vec<u8>,
+        opens: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ManagedObjectStore for StaticReadStore {
+        async fn put_reader(
+            &self,
+            _input: ObjectReader,
+            _content_type: String,
+        ) -> ObjectResult<DataLocation> {
+            panic!("verification tests must not upload")
+        }
+
+        async fn open_reader(&self, _location: &DataLocation) -> ObjectResult<ObjectReader> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(std::io::Cursor::new(self.bytes.clone())))
+        }
+
+        async fn open_range(
+            &self,
+            _location: &DataLocation,
+            _range: std::ops::Range<u64>,
+        ) -> ObjectResult<ObjectReader> {
+            panic!("verification tests must not range-read")
+        }
+    }
+
+    fn integrity_location(expected: &[u8]) -> DataLocation {
+        DataLocation::builder()
+            .uri("s3://managed/objects/test")
+            .content_type("application/octet-stream")
+            .size_bytes(expected.len() as u64)
+            .sha256(format!("{:x}", Sha256::digest(expected)))
+            .build()
+    }
+
+    fn terminal_integrity_error(error: &std::io::Error) -> &ObjectIntegrityError {
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<ObjectIntegrityError>())
+            .expect("typed object integrity error")
+    }
 
     fn test_s3_store() -> S3ObjectStore {
         let config = aws_sdk_s3::config::Builder::new()
@@ -466,6 +522,81 @@ mod tests {
             .size_bytes(42)
             .sha256("unused")
             .build()
+    }
+
+    #[tokio::test]
+    async fn verified_reader_accepts_exact_identity_while_streaming() {
+        for expected in [b"streamed video model bytes".as_slice(), b"".as_slice()] {
+            let opens = Arc::new(AtomicUsize::new(0));
+            let store = StaticReadStore {
+                bytes: expected.to_vec(),
+                opens: opens.clone(),
+            };
+            let location = integrity_location(expected);
+            let mut reader = open_verified(&store, &location).await.unwrap();
+            let mut actual = Vec::new();
+            let mut chunk = [0_u8; 3];
+            loop {
+                let read = reader.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                actual.extend_from_slice(&chunk[..read]);
+            }
+
+            assert_eq!(actual, expected);
+            assert_eq!(opens.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn verified_reader_rejects_invalid_short_long_and_hash_mismatch() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let invalid_store = StaticReadStore {
+            bytes: b"unreachable".to_vec(),
+            opens: opens.clone(),
+        };
+        let invalid = DataLocation::builder()
+            .uri("s3://managed/objects/invalid")
+            .content_type("application/octet-stream")
+            .size_bytes(11)
+            .sha256("not-a-sha256")
+            .build();
+        assert!(matches!(
+            open_verified(&invalid_store, &invalid).await,
+            Err(ObjectError::Integrity {
+                source: ObjectIntegrityError::InvalidSha256,
+            })
+        ));
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+
+        let cases = [
+            (b"abc".as_slice(), integrity_location(b"abcd"), "short"),
+            (b"abcd".as_slice(), integrity_location(b"abc"), "long"),
+            (b"abc".as_slice(), integrity_location(b"xyz"), "hash"),
+        ];
+        for (bytes, location, expected_error) in cases {
+            let store = StaticReadStore {
+                bytes: bytes.to_vec(),
+                opens: Arc::new(AtomicUsize::new(0)),
+            };
+            let mut reader = open_verified(&store, &location).await.unwrap();
+            let mut actual = Vec::new();
+            let error = reader.read_to_end(&mut actual).await.unwrap_err();
+            match (expected_error, terminal_integrity_error(&error)) {
+                ("short", ObjectIntegrityError::PrematureEof { expected, actual }) => {
+                    assert_eq!((*expected, *actual), (4, 3));
+                }
+                ("long", ObjectIntegrityError::SizeExceeded { expected }) => {
+                    assert_eq!(*expected, 3);
+                    assert_eq!(actual, b"abc");
+                }
+                ("hash", ObjectIntegrityError::Sha256Mismatch { .. }) => {
+                    assert_eq!(actual, b"abc");
+                }
+                (name, error) => panic!("unexpected {name} integrity error: {error:?}"),
+            }
+        }
     }
 
     #[test]

@@ -454,8 +454,12 @@ design-level ones:
   local checkpoints make path-backed multipart writes resumable across process
   restarts: source/stage identity and per-part hashes are revalidated against
   paginated S3 state before only the missing suffix is sent. Sequential and
-  half-open byte-range readers share the same SDK/storage
-  boundary; local ranges seek + limit and S3 ranges issue one bounded GET. The
+  half-open byte-range readers share the same SDK/storage boundary. Full opens
+  validate the DataLocation hash before I/O and incrementally verify declared
+  size plus SHA-256 at EOF with constant memory; malformed, short, long, and
+  same-size corrupt identities fail closed. Local ranges seek + limit and S3
+  ranges issue one bounded GET, but partial intervals make no whole-object
+  integrity claim. The
   SDK can group 1..=10,000 fully validated rows into one Arrow batch and one
   append operation. FILE uploads remain sequential and directly target the
   managed stage, so object-byte memory and metadata commits do not scale with

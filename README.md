@@ -206,8 +206,17 @@ let mut results = client
     .await?;
 let batch = results.try_next().await?.expect("one result batch");
 let location = lake_sdk::data_location(&batch, "video", 0)?;
-let reader = client.open(&location).await?;
+let mut reader = client.open(&location).await?;
+let mut destination = tokio::fs::File::create("episode.mp4").await?;
+tokio::io::copy(&mut reader, &mut destination).await?; // drain to verified EOF
 ```
+
+`open` is integrity-verified by default. It validates the stored SHA-256 shape
+before storage I/O, caps the stream at `DataLocation.size_bytes`, and computes
+SHA-256 incrementally with constant memory. A full read succeeds only after
+EOF proves both size and hash. If the caller drops the reader early, no
+integrity claim has completed; short, overlong, and same-size corrupt objects
+end with `InvalidData` carrying a typed `ObjectIntegrityError` source.
 
 Video decoders and model loaders can fetch only the bytes they need. Ranges
 are half-open (`start..end`), validated against the immutable object size, and
@@ -221,7 +230,8 @@ let reader = client
 ```
 
 Empty, reversed, and out-of-bounds ranges return a typed SDK object error
-before storage I/O.
+before storage I/O. A partial range cannot prove the full-object SHA-256, so
+`open_range` intentionally makes no full-object integrity claim.
 
 A credentialed Rust process can delegate one S3 read without handing its AWS
 credentials to the consumer. The capability is valid for 1 second through 1
@@ -239,6 +249,8 @@ let headers = capability.headers(); // send these with the HTTP GET
 `Debug` redacts the URL and header values. HTTP clients may add a `Range`
 header for video/model seeking while also sending `capability.headers()`.
 Local stages and custom stores without signing support return a typed error.
+External presigned-URL consumers own their own integrity policy; minting a
+capability does not imply that its eventual body was drained and verified.
 
 The example performs a multi-row insert, query, `DataLocation` decoding, and
 direct open through `LakeClient`. Local development discovers a `file://`

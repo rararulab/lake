@@ -41,11 +41,11 @@ use lake_common::{
     MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageBackend, ManagedStageDescriptor, TableRef, Version,
 };
 use lake_flight::{ClientSecurity, append_flight_payload_digest};
-pub use lake_objects::PresignedRead;
 use lake_objects::{
     LocalObjectStore, ManagedObjectStore, ObjectReader, S3ObjectStore, data_location_array,
-    data_location_field, data_location_from_array, validate_presign_expiration,
+    data_location_field, data_location_from_array, open_verified, validate_presign_expiration,
 };
+pub use lake_objects::{ObjectIntegrityError, PresignedRead};
 use moka::{future::Cache, ops::compute::Op};
 use prost::Message;
 use prost_types::Any;
@@ -857,10 +857,11 @@ impl LakeClient {
         client.do_get(ticket).await.context(FlightSnafu)
     }
 
-    /// Open a direct storage reader for an immutable `DataLocation`.
+    /// Open a direct storage reader that verifies size and SHA-256 at EOF.
+    ///
+    /// Callers must drain the reader to EOF for verification to complete.
     pub async fn open(&self, location: &DataLocation) -> Result<ObjectReader> {
-        self.objects
-            .open_reader(location)
+        open_verified(self.objects.as_ref(), location)
             .await
             .context(ObjectSnafu)
     }
@@ -2688,6 +2689,48 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn sdk_open_verifies_datalocation_identity_without_query() {
+        let expected = b"immutable managed object bytes";
+        let opens = Arc::new(AtomicUsize::new(0));
+        let client = LakeClient {
+            query:                 tonic::transport::Endpoint::from_static("http://127.0.0.1:9")
+                .connect_lazy(),
+            objects:               Arc::new(StaticReadStore {
+                bytes: expected.to_vec(),
+                opens: opens.clone(),
+            }),
+            security:              ClientSecurity::new(),
+            schema_cache:          SchemaCache::new(SchemaCacheConfig::default()),
+            upload_checkpoint_dir: None,
+        };
+        let mut location = lake_common::DataLocation::builder()
+            .uri("s3://managed/tenant/object")
+            .content_type("application/octet-stream")
+            .size_bytes(expected.len() as u64)
+            .sha256(format!("{:x}", Sha256::digest(expected)))
+            .build();
+
+        let mut reader = client.open(&location).await.unwrap();
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).await.unwrap();
+        assert_eq!(actual, expected);
+
+        location.sha256 = format!("{:x}", Sha256::digest(vec![b'x'; expected.len()]));
+        let mut reader = client.open(&location).await.unwrap();
+        let mut corrupt = Vec::new();
+        let error = reader.read_to_end(&mut corrupt).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<crate::ObjectIntegrityError>()),
+            Some(crate::ObjectIntegrityError::Sha256Mismatch { .. })
+        ));
+        assert_eq!(corrupt, expected);
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn sdk_batch_insert_flight_bound_uses_protobuf_size() {
         let within = FlightData {
@@ -2890,6 +2933,38 @@ mod tests {
     struct SigningStore {
         seen:     Arc<StdMutex<Option<(String, Duration)>>>,
         overlong: Arc<AtomicBool>,
+    }
+
+    struct StaticReadStore {
+        bytes: Vec<u8>,
+        opens: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ManagedObjectStore for StaticReadStore {
+        async fn put_reader(
+            &self,
+            _input: ObjectReader,
+            _content_type: String,
+        ) -> ObjectResult<lake_common::DataLocation> {
+            panic!("verified reads must not upload")
+        }
+
+        async fn open_reader(
+            &self,
+            _location: &lake_common::DataLocation,
+        ) -> ObjectResult<ObjectReader> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(std::io::Cursor::new(self.bytes.clone())))
+        }
+
+        async fn open_range(
+            &self,
+            _location: &lake_common::DataLocation,
+            _range: std::ops::Range<u64>,
+        ) -> ObjectResult<ObjectReader> {
+            panic!("verified full reads must not use range I/O")
+        }
     }
 
     #[async_trait::async_trait]
