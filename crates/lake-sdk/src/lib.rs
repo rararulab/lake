@@ -41,9 +41,10 @@ use lake_common::{
     MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageBackend, ManagedStageDescriptor, TableRef, Version,
 };
 use lake_flight::{ClientSecurity, append_flight_payload_digest};
+pub use lake_objects::PresignedRead;
 use lake_objects::{
     LocalObjectStore, ManagedObjectStore, ObjectReader, S3ObjectStore, data_location_array,
-    data_location_field, data_location_from_array,
+    data_location_field, data_location_from_array, validate_presign_expiration,
 };
 use moka::{future::Cache, ops::compute::Op};
 use prost::Message;
@@ -876,6 +877,19 @@ impl LakeClient {
             .context(ObjectSnafu)
     }
 
+    /// Mint a short-lived direct HTTP GET capability for a managed object.
+    pub async fn presign_read(
+        &self,
+        location: &DataLocation,
+        expires_in: Duration,
+    ) -> Result<PresignedRead> {
+        validate_presign_expiration(expires_in).context(ObjectSnafu)?;
+        self.objects
+            .presign_read(location, expires_in)
+            .await
+            .context(ObjectSnafu)
+    }
+
     async fn table_schema(&self, table: &TableRef) -> Result<SchemaRef> {
         self.schema_cache
             .resolve(table.clone(), || self.fetch_table_schema(table))
@@ -1219,7 +1233,7 @@ mod tests {
         path::PathBuf,
         pin::Pin,
         sync::{
-            Arc,
+            Arc, Mutex as StdMutex,
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll},
@@ -1268,7 +1282,7 @@ mod tests {
     use crate::{
         APPEND_RETRY_WINDOW, FileUpload, InsertValue, LakeClient, MAX_INSERT_BATCH_ROWS,
         MAX_INSERT_INPUT_METADATA_BYTES, MAX_SCHEMA_CACHE_CAPACITY, MAX_SCHEMA_CACHE_TTL,
-        SchemaCache, SchemaCacheConfig, SdkError, data_location,
+        PresignedRead, SchemaCache, SchemaCacheConfig, SdkError, data_location,
         retry_ambiguous_append_with_window, validate_flight_payload_size,
     };
 
@@ -2608,6 +2622,47 @@ mod tests {
         assert_eq!(object_count(&root.path().join("objects")).await, 0);
     }
 
+    #[tokio::test]
+    async fn sdk_presigned_read_delegates_to_managed_store() {
+        let seen = Arc::new(StdMutex::new(None));
+        let client = LakeClient {
+            query:                 tonic::transport::Endpoint::from_static("http://127.0.0.1:9")
+                .connect_lazy(),
+            objects:               Arc::new(SigningStore { seen: seen.clone() }),
+            security:              ClientSecurity::new(),
+            schema_cache:          SchemaCache::new(SchemaCacheConfig::default()),
+            upload_checkpoint_dir: None,
+        };
+        let location = lake_common::DataLocation::builder()
+            .uri("s3://managed/tenant/object")
+            .content_type("video/mp4")
+            .size_bytes(42)
+            .sha256("unused")
+            .build();
+
+        assert!(matches!(
+            client.presign_read(&location, Duration::ZERO).await,
+            Err(SdkError::Object {
+                source: lake_objects::ObjectError::InvalidPresignExpiration { .. },
+            })
+        ));
+        assert!(seen.lock().unwrap().is_none());
+
+        let capability = client
+            .presign_read(&location, Duration::from_secs(90))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            capability.url(),
+            "https://example.invalid/redacted-capability"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some((location.uri, Duration::from_secs(90)))
+        );
+    }
+
     #[test]
     fn sdk_batch_insert_flight_bound_uses_protobuf_size() {
         let within = FlightData {
@@ -2806,6 +2861,49 @@ mod tests {
     }
 
     struct DelegatingStore(LocalObjectStore);
+
+    struct SigningStore {
+        seen: Arc<StdMutex<Option<(String, Duration)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ManagedObjectStore for SigningStore {
+        async fn put_reader(
+            &self,
+            _input: ObjectReader,
+            _content_type: String,
+        ) -> ObjectResult<lake_common::DataLocation> {
+            panic!("presigning must not upload")
+        }
+
+        async fn open_reader(
+            &self,
+            _location: &lake_common::DataLocation,
+        ) -> ObjectResult<ObjectReader> {
+            panic!("presigning must not GET the object")
+        }
+
+        async fn open_range(
+            &self,
+            _location: &lake_common::DataLocation,
+            _range: std::ops::Range<u64>,
+        ) -> ObjectResult<ObjectReader> {
+            panic!("presigning must not range-GET the object")
+        }
+
+        async fn presign_read(
+            &self,
+            location: &lake_common::DataLocation,
+            expires_in: Duration,
+        ) -> ObjectResult<PresignedRead> {
+            *self.seen.lock().unwrap() = Some((location.uri.clone(), expires_in));
+            Ok(PresignedRead::new(
+                "https://example.invalid/redacted-capability",
+                Vec::new(),
+                SystemTime::now() + expires_in,
+            ))
+        }
+    }
 
     struct PathRecordingStore {
         inner: LocalObjectStore,

@@ -14,7 +14,14 @@
 
 //! Managed large-object values and their Arrow representation.
 
-use std::{ops::Range, path::PathBuf, pin::Pin, sync::Arc};
+use std::{
+    fmt,
+    ops::Range,
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use async_trait::async_trait;
 use datafusion::arrow::{
@@ -113,6 +120,12 @@ pub enum ObjectError {
     #[snafu(display("this managed object store does not support resumable uploads"))]
     ResumeUnsupported,
 
+    #[snafu(display("this managed object store does not support presigned reads"))]
+    PresignUnsupported,
+
+    #[snafu(display("presigned read expiration {expires_in:?} is outside 1s..=1h"))]
+    InvalidPresignExpiration { expires_in: Duration },
+
     #[snafu(display("object GC cannot plan while retained reference lineage is incomplete"))]
     GcLineageIncomplete,
 
@@ -195,6 +208,64 @@ pub type Result<T> = std::result::Result<T, ObjectError>;
 /// A bounded-memory direct object stream returned by a managed stage.
 pub type ObjectReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
 
+/// A short-lived HTTP GET capability for one immutable managed object.
+///
+/// The URL and required header values are credentials. `Debug` deliberately
+/// redacts them; callers must explicitly access or consume the capability.
+pub struct PresignedRead {
+    url:        String,
+    headers:    Vec<(String, String)>,
+    expires_at: SystemTime,
+}
+
+impl PresignedRead {
+    /// Construct a capability returned by a custom managed object store.
+    #[must_use]
+    pub fn new(
+        url: impl Into<String>,
+        headers: Vec<(String, String)>,
+        expires_at: SystemTime,
+    ) -> Self {
+        Self {
+            url: url.into(),
+            headers,
+            expires_at,
+        }
+    }
+
+    /// Explicitly reveal the sensitive capability URL.
+    #[must_use]
+    pub fn url(&self) -> &str { &self.url }
+
+    /// Required HTTP headers, excluding `Host`.
+    #[must_use]
+    pub fn headers(&self) -> &[(String, String)] { &self.headers }
+
+    /// Wall-clock time after which this capability must be treated as expired.
+    #[must_use]
+    pub fn expires_at(&self) -> SystemTime { self.expires_at }
+
+    /// Consume the capability and reveal its URL and required headers.
+    #[must_use]
+    pub fn into_parts(self) -> (String, Vec<(String, String)>, SystemTime) {
+        (self.url, self.headers, self.expires_at)
+    }
+}
+
+impl fmt::Debug for PresignedRead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PresignedRead")
+            .field("url", &"<redacted>")
+            .field(
+                "headers",
+                &format_args!("<{} redacted>", self.headers.len()),
+            )
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
 /// Storage boundary used by the SDK for direct managed-object I/O.
 #[async_trait]
 pub trait ManagedObjectStore: Send + Sync {
@@ -234,6 +305,24 @@ pub trait ManagedObjectStore: Send + Sync {
 
     /// Open exactly one non-empty half-open byte range.
     async fn open_range(&self, location: &DataLocation, range: Range<u64>) -> Result<ObjectReader>;
+
+    /// Mint one short-lived HTTP GET capability after validating stage scope.
+    async fn presign_read(
+        &self,
+        _location: &DataLocation,
+        expires_in: Duration,
+    ) -> Result<PresignedRead> {
+        validate_presign_expiration(expires_in)?;
+        Err(ObjectError::PresignUnsupported)
+    }
+}
+
+/// Validate Lake's bounded lifetime policy for delegated read capabilities.
+pub fn validate_presign_expiration(expires_in: Duration) -> Result<()> {
+    if expires_in < Duration::from_secs(1) || expires_in > Duration::from_hours(1) {
+        return Err(ObjectError::InvalidPresignExpiration { expires_in });
+    }
+    Ok(())
 }
 
 fn validate_range(location: &DataLocation, range: &Range<u64>) -> Result<u64> {
@@ -323,7 +412,10 @@ fn u64_value(array: &StructArray, column: &'static str, row: usize) -> Result<u6
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        sync::Arc,
+        time::{Duration, SystemTime},
+    };
 
     use aws_config::BehaviorVersion;
     use aws_sdk_s3::config::{Credentials, Region};
@@ -336,6 +428,37 @@ mod tests {
         InventoryRequest, LocalObjectStore, ManagedObjectInventory, ManagedObjectStore,
         ObjectError, S3ObjectStore, data_location_array, data_location_from_array,
     };
+
+    fn test_s3_store() -> S3ObjectStore {
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .endpoint_url("http://127.0.0.1:1")
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new(
+                "test-key",
+                "test-secret",
+                None,
+                None,
+                "test",
+            ))
+            .force_path_style(true)
+            .build();
+        S3ObjectStore::new(
+            aws_sdk_s3::Client::from_conf(config),
+            "lake-managed",
+            "tenants/tenant-a/objects",
+        )
+        .unwrap()
+    }
+
+    fn s3_location(uri: &str) -> DataLocation {
+        DataLocation::builder()
+            .uri(uri)
+            .content_type("video/mp4")
+            .size_bytes(42)
+            .sha256("unused")
+            .build()
+    }
 
     #[test]
     fn datalocation_arrow_roundtrip_preserves_identity() {
@@ -544,5 +667,73 @@ mod tests {
                     | Err(ObjectError::InvalidS3Uri { .. })
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn s3_presigned_read_is_scoped_bounded_and_redacted() {
+        let store = test_s3_store();
+        let location = s3_location("s3://lake-managed/tenants/tenant-a/objects/0197f8b8-object");
+        let before = SystemTime::now();
+
+        let capability = store
+            .presign_read(&location, Duration::from_mins(1))
+            .await
+            .unwrap();
+
+        let url = url::Url::parse(capability.url()).unwrap();
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert!(
+            url.path()
+                .ends_with("/lake-managed/tenants/tenant-a/objects/0197f8b8-object")
+        );
+        assert!(
+            url.query_pairs().any(|(name, value)| {
+                name.eq_ignore_ascii_case("X-Amz-Expires") && value == "60"
+            })
+        );
+        assert!(capability.expires_at() >= before + Duration::from_mins(1));
+        assert!(capability.expires_at() <= SystemTime::now() + Duration::from_mins(1));
+        let debug = format!("{capability:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("X-Amz-Signature"));
+        assert!(!debug.contains("test-key"));
+    }
+
+    #[tokio::test]
+    async fn presigned_read_rejects_escape_and_invalid_expiration() {
+        let store = test_s3_store();
+        let valid = s3_location("s3://lake-managed/tenants/tenant-a/objects/object");
+        for expires_in in [
+            Duration::ZERO,
+            Duration::from_millis(999),
+            Duration::from_secs(3_601),
+        ] {
+            assert!(matches!(
+                store.presign_read(&valid, expires_in).await,
+                Err(ObjectError::InvalidPresignExpiration { .. })
+            ));
+        }
+        for uri in [
+            "s3://somebody-else/tenants/tenant-a/objects/object",
+            "s3://lake-managed/tenants/tenant-b/objects/object",
+            "s3://lake-managed/tenants/tenant-a/objects/object?versionId=secret",
+        ] {
+            assert!(matches!(
+                store
+                    .presign_read(&s3_location(uri), Duration::from_mins(1))
+                    .await,
+                Err(ObjectError::OutsideManagedS3Prefix { .. })
+                    | Err(ObjectError::InvalidS3Uri { .. })
+            ));
+        }
+
+        let local = LocalObjectStore::open(tempdir().unwrap().path())
+            .await
+            .unwrap();
+        assert!(matches!(
+            local.presign_read(&valid, Duration::from_mins(1)).await,
+            Err(ObjectError::PresignUnsupported)
+        ));
     }
 }

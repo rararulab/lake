@@ -464,8 +464,12 @@ design-level ones:
   lengths identical to Metasrv admission. The SDK receives only the query
   endpoint, discovers a credential-free managed
   stage descriptor once, and constructs local/S3 access using process
-  credentials; query forwards metadata to the leader-aware metasrv. Browser
-  presigning, authenticated expiring locations, and codec indexes are
+  credentials; query forwards metadata to the leader-aware metasrv. A
+  credentialed SDK process can mint a 1s..=1h S3 GET capability only after the
+  same tenant child-prefix validation used by direct reads. The opaque result
+  redacts URL/header values from Debug, signing performs no GET, and consumers
+  may add Range while retaining any required signed headers. Server-issued
+  capabilities for credentialless SDK processes and codec indexes are
   deferred.
 - Managed-object reachability is incremental rather than a table-row scan.
   Every version-producing Lance commit publishes a canonical chunked

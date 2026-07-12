@@ -17,12 +17,13 @@
 use std::{
     ops::Range,
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
 use aws_sdk_s3::{
     Client,
+    presigning::PresigningConfig,
     primitives::ByteStream,
     types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart},
 };
@@ -33,11 +34,11 @@ use url::Url;
 
 use crate::{
     DeleteOutcome, InventoryPage, InventoryRequest, ManagedObjectDeleter, ManagedObjectInventory,
-    ManagedObjectStore, ObjectCandidate, ObjectError, ObjectReader, Result,
+    ManagedObjectStore, ObjectCandidate, ObjectError, ObjectReader, PresignedRead, Result,
     checkpoint::{
         CheckpointBinding, CheckpointLock, CheckpointPart, SourceIdentity, UploadCheckpointV1,
     },
-    validate_range,
+    validate_presign_expiration, validate_range,
 };
 
 const MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024;
@@ -109,6 +110,46 @@ impl S3ObjectStore {
                 message: error.to_string(),
             })?;
         Ok(Box::pin(output.body.into_async_read()))
+    }
+
+    /// Mint a bounded GET capability without issuing an object request.
+    pub async fn presign_read(
+        &self,
+        location: &DataLocation,
+        expires_in: Duration,
+    ) -> Result<PresignedRead> {
+        validate_presign_expiration(expires_in)?;
+        let key = self.managed_key(&location.uri)?;
+        let start_time = SystemTime::now();
+        let config = PresigningConfig::builder()
+            .start_time(start_time)
+            .expires_in(expires_in)
+            .build()
+            .map_err(|error| ObjectError::S3 {
+                action:  "configure_presigned_get",
+                message: error.to_string(),
+            })?;
+        let request = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .presigned(config)
+            .await
+            .map_err(|error| ObjectError::S3 {
+                action:  "presign_get_object",
+                message: error.to_string(),
+            })?;
+        debug_assert_eq!(request.method(), "GET");
+        let headers = request
+            .headers()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect();
+        Ok(PresignedRead::new(
+            request.uri(),
+            headers,
+            start_time + expires_in,
+        ))
     }
 
     fn managed_key(&self, uri: &str) -> Result<String> {
@@ -687,6 +728,14 @@ impl ManagedObjectStore for S3ObjectStore {
 
     async fn open_range(&self, location: &DataLocation, range: Range<u64>) -> Result<ObjectReader> {
         S3ObjectStore::open_range(self, location, range).await
+    }
+
+    async fn presign_read(
+        &self,
+        location: &DataLocation,
+        expires_in: Duration,
+    ) -> Result<PresignedRead> {
+        S3ObjectStore::presign_read(self, location, expires_in).await
     }
 }
 

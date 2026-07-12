@@ -20,7 +20,7 @@ Managed large-object values and direct storage access for the Rust SDK.
 - `lib.rs` — public object value, Arrow conversion, and storage interfaces.
 - `local.rs` — local-development managed-object implementation.
 - `s3.rs` — production managed-prefix validation, multipart upload/abort, and
-  direct S3 reads/inventory/deletion.
+  direct S3 reads, bounded GET presigning, inventory, and deletion.
 - `reference_index.rs` — bounded external merge of retained reference deltas.
 - `inventory.rs`, `gc.rs` — bounded inventory and age-gated merge planning.
 - `gc_plan.rs`, `gc_apply.rs` — immutable content-addressed plans and resumable
