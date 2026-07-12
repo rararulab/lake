@@ -22,10 +22,7 @@ use std::{
 
 use arrow_flight::{IpcMessage, SchemaAsIpc};
 use bytes::Bytes;
-use datafusion::arrow::{
-    ipc::writer::{IpcWriteOptions, StreamWriter},
-    record_batch::RecordBatch,
-};
+use datafusion::arrow::{ipc::writer::IpcWriteOptions, record_batch::RecordBatch};
 use futures::{StreamExt, stream};
 use lake_catalog::TableSnapshot;
 use lake_common::{
@@ -41,6 +38,7 @@ use tokio_util::io::StreamReader as AsyncStreamReader;
 
 use crate::{
     QueryEngine, QueryError,
+    async_ipc::{IpcPipelineLimits, PipelineProbe, encoded_batch_reader},
     ticket::{
         QueryTicketError, QueryTicketKeyRing, StatementTableSnapshot, StatementTicket,
         StatementTicketCodec,
@@ -57,7 +55,7 @@ const MAX_JOB_LIFETIME_SECS: u64 = 24 * 60 * 60;
 const MAX_WORKER_LEASE_SECS: u64 = 5 * 60;
 const MAX_RESULT_PARTS: u64 = 4_096;
 const MAX_RESULT_BYTES: u64 = 1 << 40;
-const MAX_RESULT_PART_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_RESULT_PART_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RESULT_PART_ROWS: usize = 65_536;
 const MAX_RESULT_SCHEMA_BYTES: usize = 1024 * 1024;
 const MAX_STATE_RECORD_BYTES: usize = 16 * 1024;
@@ -879,14 +877,14 @@ impl AsyncQueryWorker {
                 .ok_or(AsyncQueryWorkerError::ResultBound)?;
             for offset in (0..batch.num_rows()).step_by(MAX_RESULT_PART_ROWS) {
                 let length = (batch.num_rows() - offset).min(MAX_RESULT_PART_ROWS);
-                self.write_part(&scope, &batch.slice(offset, length), &mut parts, &mut bytes)
+                self.write_part(&scope, batch.slice(offset, length), &mut parts, &mut bytes)
                     .await?;
                 self.renew(query_id, lease).await?;
             }
         }
         if parts.is_empty() {
             let empty = RecordBatch::new_empty(schema);
-            self.write_part(&scope, &empty, &mut parts, &mut bytes)
+            self.write_part(&scope, empty, &mut parts, &mut bytes)
                 .await?;
         }
         let manifest = AsyncResultManifest {
@@ -935,33 +933,25 @@ impl AsyncQueryWorker {
     async fn write_part(
         &self,
         scope: &ManagedObjectScope,
-        batch: &RecordBatch,
+        batch: RecordBatch,
         parts: &mut Vec<DataLocation>,
         total_bytes: &mut u64,
     ) -> Result<(), AsyncQueryWorkerError> {
         if parts.len() as u64 >= MAX_RESULT_PARTS {
             return Err(AsyncQueryWorkerError::ResultBound);
         }
-        let mut encoded = Vec::new();
-        {
-            let mut writer = StreamWriter::try_new(&mut encoded, &batch.schema())
-                .map_err(|source| AsyncQueryWorkerError::Arrow { source })?;
-            writer
-                .write(batch)
-                .map_err(|source| AsyncQueryWorkerError::Arrow { source })?;
-            writer
-                .finish()
-                .map_err(|source| AsyncQueryWorkerError::Arrow { source })?;
-        }
-        let part_bytes = encoded.len() as u64;
-        let next_total = total_bytes
-            .checked_add(part_bytes)
+        let remaining_total = MAX_RESULT_BYTES
+            .checked_sub(*total_bytes)
             .ok_or(AsyncQueryWorkerError::ResultBound)?;
-        if part_bytes == 0 || part_bytes > MAX_RESULT_PART_BYTES || next_total > MAX_RESULT_BYTES {
+        let encoded_limit = MAX_RESULT_PART_BYTES.min(remaining_total);
+        if encoded_limit == 0 {
             return Err(AsyncQueryWorkerError::ResultBound);
         }
-        let input =
-            AsyncStreamReader::new(stream::iter([Ok::<Bytes, io::Error>(Bytes::from(encoded))]));
+        let input = encoded_batch_reader(
+            batch,
+            IpcPipelineLimits::production(encoded_limit),
+            PipelineProbe::default(),
+        );
         let location = self
             .coordinator
             .objects
@@ -975,6 +965,13 @@ impl AsyncQueryWorker {
             .map_err(|source| AsyncQueryWorkerError::Coordinator {
                 source: AsyncQueryCoordinatorError::Object { source },
             })?;
+        let part_bytes = location.size_bytes;
+        let next_total = total_bytes
+            .checked_add(part_bytes)
+            .ok_or(AsyncQueryWorkerError::ResultBound)?;
+        if part_bytes == 0 || part_bytes > encoded_limit || next_total > MAX_RESULT_BYTES {
+            return Err(AsyncQueryWorkerError::ResultBound);
+        }
         *total_bytes = next_total;
         parts.push(location);
         Ok(())

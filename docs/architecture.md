@@ -365,6 +365,20 @@ Query-replica restarts. Initial retries carry one 128-bit submission id and
 converge through the same state-record CAS. The complete API and security boundary are in
 [`docs/design/sql-api-over-s3.md`](design/sql-api-over-s3.md).
 
+Result-part encoding and redemption are streaming and backpressured. A blocking
+Arrow IPC writer emits fixed chunks into a bounded async upload channel and
+enforces the encoded limit before an object can be published. On download, a
+fixed-window verified reader feeds Arrow's incremental `StreamDecoder`, whose
+record batches enter a second bounded channel consumed directly by the Flight
+encoder. Before Arrow sees a complete message, a framing validator caps metadata
+at 1 MiB, caps declared bodies at the part limit, and rejects compressed IPC so
+an untrusted decompressed-length prefix cannot allocate outside the encoded
+window. The client-visible stream owns both tasks and shares its admission
+permit with the blocking decoder; EOF, error, deadline, cancellation, and drop
+have one lifecycle boundary, and admission is released only after that decoder
+actually exits. This bounds duplicate serialization buffers; an individual
+Arrow batch can still be as large as the external 64 MiB part limit.
+
 Protocol conformance is intentionally not circular: a pinned official ADBC
 Flight SQL client black-box tests interactive typed streaming, bearer metadata,
 and read-only errors against a real listener. Rust's upstream Arrow Flight
