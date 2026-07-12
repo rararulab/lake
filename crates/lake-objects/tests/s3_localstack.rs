@@ -16,6 +16,7 @@ use std::{
     io,
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use aws_config::BehaviorVersion;
@@ -94,11 +95,93 @@ async fn s3_range_read_returns_requested_bytes_localstack() {
     assert_eq!(actual, bytes[PART_BYTES - 7..PART_BYTES + 13]);
 }
 
+#[tokio::test]
+#[ignore = "requires LocalStack S3; set LAKE_S3_ENDPOINT and run with --ignored"]
+async fn s3_presigned_range_get_localstack() {
+    let Some((_client, store, _bucket)) = stage().await else {
+        return;
+    };
+    let bytes = (0..4096)
+        .map(|index| u8::try_from(index % 251).expect("bounded byte"))
+        .collect::<Vec<_>>();
+    let location = store
+        .put_reader(
+            Box::pin(std::io::Cursor::new(bytes.clone())),
+            "video/mp4".to_owned(),
+        )
+        .await
+        .expect("upload managed object");
+    let capability = store
+        .presign_read(&location, Duration::from_mins(1))
+        .await
+        .expect("presign managed GET");
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build direct HTTP client");
+    let mut request = client.get(capability.url());
+    for (name, value) in capability.headers() {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let response = request
+        .header(reqwest::header::RANGE, "bytes=100-199")
+        .send()
+        .await
+        .expect("execute presigned Range GET");
+
+    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.bytes().await.expect("read partial body").as_ref(),
+        &bytes[100..200]
+    );
+}
+
 #[test]
 fn s3_range_read_localstack_is_wired() {
     let integration = include_str!("../../../scripts/test-integration.ts");
     assert!(integration.contains("lake-objects"));
     assert!(integration.contains("--run-ignored"));
+}
+
+#[test]
+fn s3_presigned_range_get_localstack_is_wired() {
+    let integration = include_str!("../../../scripts/test-integration.ts");
+    let workflow = include_str!("../../../.github/workflows/ci.yml");
+
+    assert!(integration.contains("lake-objects"));
+    assert!(integration.contains("--run-ignored"));
+    assert!(workflow.contains("mise run test-integration-external"));
+}
+
+#[test]
+fn managed_s3_integration_runner_is_shared_with_ci() {
+    let integration = include_str!("../../../scripts/test-integration.ts");
+    let workflow = include_str!("../../../.github/workflows/ci.yml");
+
+    for package in ["lake-objects", "lake-sdk", "lake-meta", "lake-engine-lance"] {
+        assert!(integration.contains(package));
+    }
+    assert!(integration.contains("ignored-only"));
+    assert!(integration.contains("profileArgs"));
+    assert!(integration.contains("\"ci\""));
+    let mise = include_str!("../../../mise.toml");
+    assert!(mise.contains("[tasks.test-integration-external]"));
+    assert!(mise.contains("bun scripts/test-integration.ts --external"));
+    assert!(workflow.contains("mise run test-integration-external"));
+    assert!(!workflow.contains("cargo nextest run -p lake-meta -p lake-engine-lance"));
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = std::process::Command::new("bun")
+        .args(["test", "scripts/test-integration-env.test.ts"])
+        .current_dir(root)
+        .output()
+        .expect("run integration environment isolation tests");
+    assert!(
+        output.status.success(),
+        "integration environment isolation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]

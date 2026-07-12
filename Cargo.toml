@@ -57,6 +57,7 @@ opentelemetry-otlp = { version = "^0.32", default-features = false, features = [
 opentelemetry_sdk = { version = "^0.32", features = ["trace"] }
 prost = "^0.14"
 prost-types = "^0.14"
+reqwest = { version = "^0.13", default-features = false }
 rocksdb = "^0.24"
 rustls = { version = "^0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "^1.0", features = ["derive"] }

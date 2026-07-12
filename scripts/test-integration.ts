@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 // test-integration.ts — run the `#[ignore]` LocalStack integration tests
 // locally: bring up the emulator, run the ignored tests against it, tear down.
+// In CI, `--external` consumes an already-provisioned LocalStack service.
 //
 //   mise run test-integration
 //
@@ -10,6 +11,8 @@
 import { $ } from "bun";
 import { readFile } from "node:fs/promises";
 
+import { integrationEnvironment, redactedEndpoint } from "./test-integration-env";
+
 async function endpoint(): Promise<string> {
   const env = await readFile(".lake/test-env.env", "utf8");
   const match = env.match(/^LAKE_DYNAMODB_ENDPOINT=(.+)$/m);
@@ -17,10 +20,19 @@ async function endpoint(): Promise<string> {
   return match[1]!.trim();
 }
 
-await $`bun scripts/test-env.ts up`;
-try {
-  const ep = await endpoint();
-  console.log(`running ignored integration tests against ${ep}`);
+function requiredEnvironment(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`${name} must be set in --external mode`);
+  return value;
+}
+
+async function runIntegration(
+  dynamoEndpoint: string,
+  s3Endpoint: string,
+  profile?: string,
+): Promise<number> {
+  console.log(`running ignored integration tests against ${redactedEndpoint(s3Endpoint)}`);
+  const profileArgs = profile ? ["--profile", profile] : [];
   const proc = Bun.spawn(
     [
       "cargo",
@@ -34,29 +46,31 @@ try {
       "lake-meta",
       "-p",
       "lake-engine-lance",
+      ...profileArgs,
       "--run-ignored",
       "ignored-only",
     ],
     {
       stdout: "inherit",
       stderr: "inherit",
-      env: {
-        ...process.env,
-        LAKE_DYNAMODB_ENDPOINT: ep,
-        LAKE_S3_ENDPOINT: ep,
-        AWS_ACCESS_KEY_ID: "test",
-        AWS_SECRET_ACCESS_KEY: "test",
-        AWS_REGION: "us-east-1",
-        // Bypass an ambient corporate/system proxy for the loopback endpoint
-        // (no-op on machines/CI without one) — see commands/mod.rs.
-        LAKE_S3_PROXY_EXCLUDES: "localhost,127.0.0.1,::1",
-        NO_PROXY: "localhost,127.0.0.1,::1",
-        no_proxy: "localhost,127.0.0.1,::1",
-      },
+      env: integrationEnvironment(process.env, dynamoEndpoint, s3Endpoint),
     },
   );
-  const code = await proc.exited;
-  if (code !== 0) process.exitCode = code;
-} finally {
-  await $`bun scripts/test-env.ts down`;
+  return proc.exited;
+}
+
+if (process.argv.slice(2).includes("--external")) {
+  process.exitCode = await runIntegration(
+    requiredEnvironment("LAKE_DYNAMODB_ENDPOINT"),
+    requiredEnvironment("LAKE_S3_ENDPOINT"),
+    "ci",
+  );
+} else {
+  await $`bun scripts/test-env.ts up`;
+  try {
+    const ep = await endpoint();
+    process.exitCode = await runIntegration(ep, ep);
+  } finally {
+    await $`bun scripts/test-env.ts down`;
+  }
 }

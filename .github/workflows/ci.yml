@@ -145,7 +145,7 @@ jobs:
         with:
           tool: cargo-nextest
       - name: run integration tests (ignored-only)
-        run: cargo nextest run -p lake-meta -p lake-engine-lance --profile ci --run-ignored ignored-only
+        run: mise run test-integration-external
 
   # Task-Contract spec self-test (bun tooling; no Rust build).
   spec:

@@ -22,6 +22,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 aws-config.workspace = true
+reqwest.workspace = true
 tempfile = "^3.0"
 
 [lints]
