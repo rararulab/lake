@@ -49,6 +49,7 @@ use crate::{
 const MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024;
 const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
 pub(crate) const MAX_UPLOAD_CONCURRENCY: usize = 16;
+const MULTIPART_ABORT_TIMEOUT: Duration = Duration::from_secs(30);
 
 type PartFuture<'a> = Pin<Box<dyn Future<Output = Result<UploadedPipelinePart>> + Send + 'a>>;
 
@@ -62,6 +63,66 @@ struct UploadedPipelinePart {
 struct UploadPipelineSummary {
     size_bytes: u64,
     sha256:     String,
+}
+
+/// Owns cancellation cleanup for one non-resumable multipart upload. Dropping
+/// the caller-facing owner closes the decision channel, which makes the
+/// bounded background task abort the upload without retaining object bytes.
+struct MultipartCleanupOwner {
+    decision: Option<tokio::sync::oneshot::Sender<CleanupDecision>>,
+    task:     Option<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy)]
+enum CleanupDecision {
+    Abort,
+    Disarm,
+}
+
+impl MultipartCleanupOwner {
+    fn new(client: Client, bucket: String, key: String, upload_id: String) -> Self {
+        Self::spawn(async move {
+            let _ = client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send()
+                .await;
+        })
+    }
+
+    fn spawn<F>(abort: F) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let (decision, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            if matches!(
+                receiver.await.unwrap_or(CleanupDecision::Abort),
+                CleanupDecision::Abort
+            ) {
+                let _ = tokio::time::timeout(MULTIPART_ABORT_TIMEOUT, abort).await;
+            }
+        });
+        Self {
+            decision: Some(decision),
+            task: Some(task),
+        }
+    }
+
+    async fn abort(mut self) { self.finish(CleanupDecision::Abort).await }
+
+    async fn disarm(mut self) { self.finish(CleanupDecision::Disarm).await }
+
+    async fn finish(&mut self, decision_value: CleanupDecision) {
+        if let Some(decision) = self.decision.take() {
+            let _ = decision.send(decision_value);
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
 }
 
 /// Reads and hashes parts in source order while polling a finite set of upload
@@ -357,6 +418,12 @@ impl S3ObjectStore {
             action:  "create_multipart_upload",
             message: "S3 response omitted upload_id".to_owned(),
         })?;
+        let cleanup = MultipartCleanupOwner::new(
+            self.client.clone(),
+            self.bucket.clone(),
+            key.to_owned(),
+            upload_id.to_owned(),
+        );
 
         let client = self.client.clone();
         let bucket = self.bucket.clone();
@@ -407,11 +474,11 @@ impl S3ObjectStore {
                 Ok(Some(part)) => parts.push(part.completed),
                 Ok(None) => break,
                 Err(error) => {
-                // Cancel every request still owned by the pipeline before the
-                // upload itself is aborted. Otherwise a late UploadPart may
-                // race the AbortMultipartUpload request.
+                    // Cancel every request still owned by the pipeline before
+                    // the upload itself is aborted. Otherwise a late
+                    // UploadPart may race the AbortMultipartUpload request.
                     drop(pipeline);
-                    self.abort(key, upload_id).await;
+                    cleanup.abort().await;
                     return Err(error);
                 }
             }
@@ -430,12 +497,13 @@ impl S3ObjectStore {
             .send()
             .await
         {
-            self.abort(key, upload_id).await;
+            cleanup.abort().await;
             return Err(ObjectError::S3 {
                 action:  "complete_multipart_upload",
                 message: error.to_string(),
             });
         }
+        cleanup.disarm().await;
         Ok((summary.size_bytes, summary.sha256))
     }
 
@@ -1076,7 +1144,8 @@ mod pipeline_tests {
     use tokio::sync::{Notify, Semaphore};
 
     use super::{
-        MAX_UPLOAD_CONCURRENCY, MULTIPART_PART_BYTES, PartUploadPipeline, S3ObjectStore, read_part,
+        MAX_UPLOAD_CONCURRENCY, MULTIPART_PART_BYTES, MultipartCleanupOwner, PartUploadPipeline,
+        S3ObjectStore, read_part,
     };
     use crate::{
         ObjectReader,
@@ -1125,6 +1194,43 @@ mod pipeline_tests {
                 .with_upload_concurrency(MAX_UPLOAD_CONCURRENCY + 1)
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn multipart_cleanup_owner_state_transitions() {
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let owner = {
+            let aborts = aborts.clone();
+            MultipartCleanupOwner::spawn(async move {
+                aborts.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        drop(owner);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while aborts.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drop starts cancellation cleanup");
+
+        let owner = {
+            let aborts = aborts.clone();
+            MultipartCleanupOwner::spawn(async move {
+                aborts.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        owner.disarm().await;
+        assert_eq!(aborts.load(Ordering::SeqCst), 1);
+
+        let owner = {
+            let aborts = aborts.clone();
+            MultipartCleanupOwner::spawn(async move {
+                aborts.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        owner.abort().await;
+        assert_eq!(aborts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

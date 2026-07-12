@@ -203,6 +203,11 @@ source order. That is an exact 20 MiB request-body bound per object at Lake's
 `with_upload_concurrency(1..=16)`; zero and larger values fail before S3 I/O.
 On restart, any remote responses ahead of the durable contiguous checkpoint
 are treated as untrusted and overwritten from the verified source.
+Cancelling an ordinary reader-backed upload also cancels its owned part
+requests and starts one bounded best-effort multipart abort. Because no client
+can run cleanup after a process or host failure, production buckets must also
+configure an `AbortIncompleteMultipartUpload` lifecycle rule as the final
+orphan-safety boundary.
 
 The same directory also makes the metadata append durable after every object
 has uploaded. Before its first append RPC, the SDK atomically fsyncs the exact
