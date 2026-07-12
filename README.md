@@ -310,6 +310,16 @@ catalog. S3 mode uses the dedicated `LAKE_ASYNC_DYNAMODB_TABLE` (default
 CAS-fenced leases, immutable Arrow IPC parts, and one atomic result manifest;
 polling never starts or embeds a metadata server.
 
+Each Query replica runs at most four async workers by default, with one running
+job per tenant and a 30-minute absolute execution deadline. Configure these
+with `LAKE_ASYNC_WORKER_CONCURRENCY`,
+`LAKE_ASYNC_WORKER_CONCURRENCY_PER_TENANT`, and
+`LAKE_ASYNC_EXECUTION_TIMEOUT_MS`. The scheduler scans bounded durable pages,
+selects eligible tenants round-robin without parking worker slots behind a
+saturated tenant, and cancels both execution and lease renewal at the deadline.
+These limits are process-local; CAS worker leases preserve single ownership but
+do not turn them into cluster-global tenant quotas.
+
 The wire surface is also exercised by Apache Arrow's official ADBC Flight SQL
 driver, independently of the Rust SDK. `mise run test-adbc` starts real
 loopback Query listeners and verifies a typed 20,000-row multi-batch result,

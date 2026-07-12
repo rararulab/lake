@@ -501,7 +501,10 @@ design-level ones:
   acquire a finite tenant gate and only then enter the global FIFO under one
   deadline; a bounded weak registry reclaims inactive gates without background
   work. This protects one replica without adding metadata traffic or exporting
-  identities. Cluster-global quotas, durable async fairness, and byte/resource
+  identities. Durable async workers separately use bounded page candidates,
+  per-tenant round-robin selection, a process-local tenant ceiling, and an
+  absolute execution deadline; saturated tenants never park a worker slot.
+  Cluster-global quotas, a durable tenant queue index, and byte/resource
   accounting remain production policy work.
 - Each Metasrv replica separately bounds concurrent FILE appends and reserves
   worst-case buffered control bytes before reading a request. A follower and
@@ -614,8 +617,9 @@ design-level ones:
   maintenance are wired. Structured process logging and authenticated gRPC
   health readiness, bounded Prometheus metrics, and distributed tracing are
   wired. Durable SDK append state and finite client-side schema caching are
-  wired. Per-replica tenant concurrency isolation is wired; remaining policy
-  work is distributed async fairness and tenant byte/resource accounting. A
+  wired. Per-replica foreground and async tenant concurrency isolation is
+  wired; remaining policy work is cluster-global async fairness and tenant
+  byte/resource accounting. A
   self-built engine slots in behind `TableEngine`
   if/when Lance's ceiling is hit.
 

@@ -37,6 +37,14 @@ pub(crate) fn describe() {
         "lake_query_ready",
         "Whether Query is ready to receive Flight traffic"
     );
+    metrics::describe_counter!(
+        "lake_query_async_scheduler_total",
+        "Durable async scheduler transitions by bounded outcome"
+    );
+    metrics::describe_gauge!(
+        "lake_query_async_active_workers",
+        "Durable async jobs currently owning process-local worker capacity"
+    );
 }
 
 pub(crate) fn admission(outcome: &'static str) {
@@ -65,6 +73,18 @@ pub(crate) fn catalog_refresh(phase: &'static str, outcome: &'static str) {
 }
 
 pub(crate) fn ready(ready: bool) { metrics::gauge!("lake_query_ready").set(f64::from(ready)); }
+
+pub(crate) fn async_scheduler(outcome: &'static str) {
+    metrics::counter!("lake_query_async_scheduler_total", "outcome" => outcome).increment(1);
+}
+
+pub(crate) fn async_active_increment() {
+    metrics::gauge!("lake_query_async_active_workers").increment(1.0);
+}
+
+pub(crate) fn async_active_decrement() {
+    metrics::gauge!("lake_query_async_active_workers").decrement(1.0);
+}
 
 #[cfg(test)]
 mod tests {
@@ -261,6 +281,44 @@ mod tests {
                 !rendered.contains(forbidden),
                 "forbidden label/value {forbidden}"
             );
+        }
+    }
+
+    #[test]
+    fn async_scheduler_metrics_are_bounded_and_identity_free() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        super::describe();
+        for outcome in [
+            "admitted",
+            "scope_saturated",
+            "completed",
+            "failed",
+            "deadline_exceeded",
+            "invalid_state",
+        ] {
+            super::async_scheduler(outcome);
+        }
+        super::async_active_increment();
+        super::async_active_decrement();
+
+        let rendered = handle.render();
+        for outcome in [
+            "admitted",
+            "scope_saturated",
+            "completed",
+            "failed",
+            "deadline_exceeded",
+            "invalid_state",
+        ] {
+            assert!(rendered.contains(&format!(
+                "lake_query_async_scheduler_total{{outcome=\"{outcome}\"}} 1"
+            )));
+        }
+        assert!(rendered.contains("lake_query_async_active_workers 0"));
+        for forbidden in ["secret-tenant", "query-id", "principal", "tenant"] {
+            assert!(!rendered.contains(forbidden));
         }
     }
 }

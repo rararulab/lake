@@ -25,6 +25,7 @@
 //! the Arrow Flight SQL wire (see `flight`).
 
 mod async_query;
+mod async_scheduler;
 mod flight;
 mod telemetry;
 mod ticket;
@@ -45,7 +46,6 @@ use datafusion::{
     execution::{memory_pool::FairSpillPool, runtime_env::RuntimeEnvBuilder},
     prelude::{SQLOptions, SessionConfig, SessionContext},
 };
-use futures::StreamExt;
 use lake_catalog::{
     CatalogGeneration, CatalogRefreshHealth, LakeCatalog, ProviderLoadError, TableSnapshot,
 };
@@ -59,7 +59,10 @@ pub use ticket::{QueryTicketError, QueryTicketKeyRing};
 use tokio_util::sync::CancellationToken;
 use tonic_health::{ServingStatus, server::health_reporter};
 
-use crate::flight::FlightSqlServiceImpl;
+use crate::{
+    async_scheduler::{AsyncCandidate, AsyncScheduler, AsyncSchedulerLimits},
+    flight::FlightSqlServiceImpl,
+};
 
 /// Maximum age of the in-memory catalog listing used on the query hot path.
 const CATALOG_MAX_AGE: Duration = Duration::from_secs(5);
@@ -387,13 +390,15 @@ impl Default for QueryResources {
 /// Complete network configuration for one stateless Query server.
 #[derive(Clone)]
 pub struct AsyncQueryConfig {
-    state:              MetaStoreRef,
-    results:            Arc<dyn ManagedObjectStore>,
-    job_lifetime:       Duration,
-    poll_ttl:           Duration,
-    worker_lease:       Duration,
-    scan_interval:      Duration,
+    state: MetaStoreRef,
+    results: Arc<dyn ManagedObjectStore>,
+    job_lifetime: Duration,
+    poll_ttl: Duration,
+    worker_lease: Duration,
+    scan_interval: Duration,
     worker_concurrency: usize,
+    worker_concurrency_per_tenant: usize,
+    execution_time: Duration,
 }
 
 impl AsyncQueryConfig {
@@ -407,6 +412,8 @@ impl AsyncQueryConfig {
             worker_lease: Duration::from_secs(30),
             scan_interval: Duration::from_secs(1),
             worker_concurrency: 4,
+            worker_concurrency_per_tenant: 1,
+            execution_time: Duration::from_mins(30),
         }
     }
 
@@ -439,6 +446,22 @@ impl AsyncQueryConfig {
         self.worker_concurrency = concurrency;
         self
     }
+
+    /// Set bounded process-local worker and tenant concurrency plus one
+    /// absolute execution deadline.
+    pub fn try_with_scheduler_limits(
+        mut self,
+        concurrency: usize,
+        concurrency_per_tenant: usize,
+        execution_time: Duration,
+    ) -> Result<Self> {
+        AsyncSchedulerLimits::try_new(concurrency, concurrency_per_tenant, execution_time)
+            .map_err(|_| QueryError::InvalidAsyncConfiguration)?;
+        self.worker_concurrency = concurrency;
+        self.worker_concurrency_per_tenant = concurrency_per_tenant;
+        self.execution_time = execution_time;
+        Ok(self)
+    }
 }
 
 impl std::fmt::Debug for AsyncQueryConfig {
@@ -452,6 +475,11 @@ impl std::fmt::Debug for AsyncQueryConfig {
             .field("worker_lease", &self.worker_lease)
             .field("scan_interval", &self.scan_interval)
             .field("worker_concurrency", &self.worker_concurrency)
+            .field(
+                "worker_concurrency_per_tenant",
+                &self.worker_concurrency_per_tenant,
+            )
+            .field("execution_time", &self.execution_time)
             .finish()
     }
 }
@@ -782,9 +810,12 @@ where
     .map_err(|_| QueryError::InvalidTicketConfiguration)?;
     let async_runtime = match config.async_queries.clone() {
         Some(async_config) => {
-            if async_config.scan_interval.is_zero()
-                || !(1..=64).contains(&async_config.worker_concurrency)
-            {
+            let scheduler_limits = AsyncSchedulerLimits::try_new(
+                async_config.worker_concurrency,
+                async_config.worker_concurrency_per_tenant,
+                async_config.execution_time,
+            );
+            if async_config.scan_interval.is_zero() || scheduler_limits.is_err() {
                 return Err(QueryError::InvalidAsyncConfiguration);
             }
             let coordinator = async_query::AsyncQueryCoordinator::try_new(
@@ -807,7 +838,7 @@ where
                 coordinator,
                 worker,
                 async_config.scan_interval,
-                async_config.worker_concurrency,
+                scheduler_limits.expect("validated above"),
             ))
         }
         None => None,
@@ -849,19 +880,19 @@ where
         discovery_limits: config.discovery_limits,
         ticket_codec,
     };
-    let traced =
-        if let Some((coordinator, worker, scan_interval, worker_concurrency)) = async_runtime {
-            background.async_worker = Some(tokio::spawn(run_async_query_loop(
-                coordinator.clone(),
-                worker,
-                scan_interval,
-                worker_concurrency,
-                cancellation.clone(),
-            )));
-            flight::TracedFlightSqlService::with_async_queries(inner, coordinator)
-        } else {
-            flight::TracedFlightSqlService::new(inner)
-        };
+    let traced = if let Some((coordinator, worker, scan_interval, scheduler_limits)) = async_runtime
+    {
+        background.async_worker = Some(tokio::spawn(run_async_query_loop(
+            coordinator.clone(),
+            worker,
+            scan_interval,
+            scheduler_limits,
+            cancellation.clone(),
+        )));
+        flight::TracedFlightSqlService::with_async_queries(inner, coordinator)
+    } else {
+        flight::TracedFlightSqlService::new(inner)
+    };
     let service = FlightServiceServer::new(traced);
 
     tracing::info!(%addr, "Flight SQL server ready");
@@ -968,20 +999,42 @@ async fn run_async_query_loop(
     coordinator: async_query::AsyncQueryCoordinator,
     worker: async_query::AsyncQueryWorker,
     scan_interval: Duration,
-    worker_concurrency: usize,
+    limits: AsyncSchedulerLimits,
     shutdown: CancellationToken,
 ) {
     let mut interval = tokio::time::interval(scan_interval);
     let mut scan_cursor = None;
+    let mut scheduler = AsyncScheduler::new(limits);
+    let mut tasks = tokio::task::JoinSet::new();
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval.tick().await;
     loop {
         tokio::select! {
-            () = shutdown.cancelled() => return,
+            () = shutdown.cancelled() => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                return;
+            },
+            joined = tasks.join_next(), if !tasks.is_empty() => {
+                if let Ok((candidate, result)) = joined.expect("guarded non-empty task set") {
+                    scheduler.finished(&candidate);
+                    telemetry::async_active_decrement();
+                    match result {
+                        Ok(()) => telemetry::async_scheduler("completed"),
+                        Err(async_query::AsyncQueryWorkerError::ExecutionDeadline) => {
+                            telemetry::async_scheduler("deadline_exceeded");
+                        }
+                        Err(_) => telemetry::async_scheduler("failed"),
+                    }
+                }
+            },
             _ = interval.tick() => {
-                let (query_ids, next_cursor) = match coordinator
+                if scheduler.available() == 0 {
+                    continue;
+                }
+                let (records, invalid, next_cursor) = match coordinator
                     .store()
-                    .list_query_ids_page(scan_cursor.as_deref())
+                    .list_records_page(scan_cursor.as_deref())
                     .await
                 {
                     Ok(page) => page,
@@ -992,34 +1045,39 @@ async fn run_async_query_loop(
                     }
                 };
                 scan_cursor = next_cursor;
-                futures::stream::iter(query_ids)
-                    .for_each_concurrent(worker_concurrency, |query_id| {
-                        let coordinator = coordinator.clone();
-                        let worker = worker.clone();
-                        let shutdown = shutdown.clone();
-                        async move {
-                            let now = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map_or(0, |duration| duration.as_secs());
-                            match coordinator.cleanup_if_expired(&query_id, now).await {
-                                Ok(true) => return,
-                                Ok(false) => {}
-                                Err(error) => {
-                                    tracing::warn!(query_id, error = %error, "async query cleanup failed");
-                                    return;
-                                }
-                            }
-                            let should_run = matches!(coordinator.store().load(&query_id).await,
-                                Ok(Some(record)) if record.is_pending());
-                            if should_run {
-                                tokio::select! {
-                                    () = shutdown.cancelled() => {}
-                                    _ = worker.run(&query_id) => {}
-                                }
-                            }
+                for _ in 0..invalid {
+                    telemetry::async_scheduler("invalid_state");
+                }
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_secs());
+                let mut candidates = Vec::new();
+                for record in records {
+                    if record.expires_at() <= now {
+                        if let Err(error) = coordinator.cleanup_if_expired(record.query_id(), now).await {
+                            tracing::warn!(error = %error, "async query cleanup failed");
                         }
-                    })
-                    .await;
+                    } else if record.is_pending() {
+                        candidates.push(AsyncCandidate::new(record.query_id(), record.tenant_id()));
+                    }
+                }
+                for candidate in &candidates {
+                    if scheduler.tenant_saturated(candidate.tenant()) {
+                        telemetry::async_scheduler("scope_saturated");
+                    }
+                }
+                for candidate in scheduler.select(candidates) {
+                    scheduler.started(&candidate);
+                    telemetry::async_scheduler("admitted");
+                    telemetry::async_active_increment();
+                    let worker = worker.clone();
+                    tasks.spawn(async move {
+                        let result = worker
+                            .run(candidate.query_id(), limits.execution_time())
+                            .await;
+                        (candidate, result)
+                    });
+                }
             }
         }
     }

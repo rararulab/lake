@@ -34,6 +34,9 @@ data:
   LAKE_ASYNC_QUERIES: "true"
   LAKE_ASYNC_DYNAMODB_TABLE: lake-async-queries
   LAKE_ASYNC_RESULT_PREFIX: async-query-results
+  LAKE_ASYNC_WORKER_CONCURRENCY: "4"
+  LAKE_ASYNC_WORKER_CONCURRENCY_PER_TENANT: "1"
+  LAKE_ASYNC_EXECUTION_TIMEOUT_MS: "1800000"
   # Async state uses lake-async-queries_prefix_v2, never the catalog tables.
 ---
 apiVersion: v1

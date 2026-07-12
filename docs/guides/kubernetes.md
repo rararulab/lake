@@ -62,6 +62,14 @@ from the registry tables. Result jobs, Arrow IPC parts, and manifests live
 under `LAKE_ASYNC_RESULT_PREFIX`; lifecycle cleanup requires List, Get, Put,
 and DeleteObject on that exact prefix.
 
+The reference ConfigMap also sets four total async workers, one worker per
+tenant, and a 30-minute execution deadline. Tune
+`LAKE_ASYNC_WORKER_CONCURRENCY`,
+`LAKE_ASYNC_WORKER_CONCURRENCY_PER_TENANT`, and
+`LAKE_ASYNC_EXECUTION_TIMEOUT_MS` together with pod CPU, memory, spill, and
+result-prefix capacity. Replica autoscaling multiplies aggregate worker
+capacity; these settings are not cluster-global quotas.
+
 A failed finalize leaves its durable barrier held. Keep admission paused,
 finish backfill, and rerun finalize. Do not delete the barrier as a routine
 rollback mechanism; doing so can re-admit stale dual writers during parity

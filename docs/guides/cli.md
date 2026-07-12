@@ -56,6 +56,15 @@ queue/tracker saturation or a response beyond the matching-row maximum returns
 gRPC `ResourceExhausted`. The policy is per Query replica and does not claim a
 cluster-global quota.
 
+Durable async execution has a separate bounded worker scheduler.
+`LAKE_ASYNC_WORKER_CONCURRENCY` defaults to `4` and must be within `1..=64`;
+`LAKE_ASYNC_WORKER_CONCURRENCY_PER_TENANT` defaults to `1` and cannot exceed
+the worker total. `LAKE_ASYNC_EXECUTION_TIMEOUT_MS` defaults to `1800000` and
+must be within `1..=86400000`. Eligible tenants are selected round-robin from
+each bounded state page, and saturated tenants do not occupy worker slots while
+waiting. Deadline expiry cancels execution and lease renewal and records a
+stable terminal failure. All three values are per Query replica.
+
 Metasrv FILE append admission uses `LAKE_APPEND_MAX_CONCURRENT` (default `8`),
 `LAKE_APPEND_QUEUE_TIMEOUT_MS` (default `100`),
 `LAKE_APPEND_MAX_STREAM_BYTES` (default `67108864`), and
