@@ -117,12 +117,25 @@ Core series are:
   `lake_metasrv_reserved_append_bytes`, `lake_metasrv_campaign_total`,
   `lake_metasrv_write_ready`, `lake_metasrv_maintenance_pages_total`, and
   `lake_metasrv_maintenance_items_total`.
+- `lake_dynamo_v2_authoritative`, `lake_dynamo_finalize_barrier_held`,
+  `lake_dynamo_prefix_requests_total`, and `lake_dynamo_prefix_items_total`
+  when Dynamo is the metastore.
 
 Labels are finite state-machine values such as `success`, `error`, `leader`,
 or `saturated`. SQL, tenant, namespace, table, operation ID, URI, and credential
 values are never metric labels. The listener and exporter upkeep future share
 the server future directly: normal shutdown joins it, while dropping the outer
 server future drops the listener without leaving detached work.
+
+After a v2 migration, alert until every runtime target reports
+`lake_dynamo_v2_authoritative == 1`, and require the rate of
+`lake_dynamo_prefix_requests_total{layout="v1"}` to fall to zero. Prefix-read
+amplification is the ratio of evaluated to returned
+`lake_dynamo_prefix_items_total` rates for the same `layout`/`api`; no prefix
+label is needed. A held finalization barrier together with a v1-authoritative
+pod means the post-finalize restart is incomplete and metadata write admission
+must remain paused. See the full bounded-label contract in
+[`dynamo-prefix-metrics.md`](../design/dynamo-prefix-metrics.md).
 
 ## OTLP distributed tracing
 

@@ -30,6 +30,7 @@ mod error;
 pub mod registry;
 mod rocks;
 mod store;
+mod telemetry;
 
 pub use dynamo::DynamoMeta;
 pub use dynamo_migration::{DynamoMigrationPage, DynamoMigrationVerification};

@@ -466,6 +466,9 @@ LAKE_METRICS_ADDR=127.0.0.1:9090 lake meta --addr 127.0.0.1:50052
 Lake rejects non-loopback metrics listeners and never places SQL, tenant,
 table, object URI, operation ID, or credentials in metric labels. See the
 [CLI guide](docs/guides/cli.md#prometheus-metrics) for the exported series.
+Dynamo-backed processes also expose their v1/v2 authority mode, finalization
+barrier, and physical prefix evaluated/returned counts, so operators can prove
+the prefix-layout rollout without exporting a logical key or prefix.
 
 Set `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to opt into OTLP/gRPC traces. Lake
 continues W3C context across SDK/Flight, Query-to-Metasrv, and follower-to-leader

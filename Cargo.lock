@@ -4265,6 +4265,8 @@ dependencies = [
  "aws-config",
  "aws-sdk-dynamodb",
  "lake-common",
+ "metrics",
+ "metrics-exporter-prometheus",
  "rocksdb",
  "serde",
  "serde_json",
