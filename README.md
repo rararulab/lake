@@ -310,6 +310,15 @@ catalog. S3 mode uses the dedicated `LAKE_ASYNC_DYNAMODB_TABLE` (default
 CAS-fenced leases, immutable Arrow IPC parts, and one atomic result manifest;
 polling never starts or embeds a metadata server.
 
+The wire surface is also exercised by Apache Arrow's official ADBC Flight SQL
+driver, independently of the Rust SDK. `mise run test-adbc` starts real
+loopback Query listeners and verifies a typed 20,000-row multi-batch result,
+stable read-only DML rejection, and bearer success/failure using pinned ADBC
+and PyArrow wheels from `interop/adbc/uv.lock`. Standard Rust Flight tests
+cover the lower-level `PollFlightInfo`, multi-endpoint `DoGet`, and
+`CancelFlightInfo` lifecycle. This matrix does not claim ADBC transactions,
+DML, prepared statements, bulk ingestion, or catalog metadata support.
+
 `open` is integrity-verified by default. It validates the stored SHA-256 shape
 before storage I/O, caps the stream at `DataLocation.size_bytes`, and computes
 SHA-256 incrementally with constant memory. A full read succeeds only after
