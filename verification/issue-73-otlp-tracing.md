@@ -43,4 +43,3 @@ and response spans ending before relayed streams. The candidate now addresses
 all four: all supported Query Flight operations are traced, SQL and append
 chains include the client trace, the outer process lifecycle is exercised, and
 the shared response wrapper owns span outcome through completion/error/drop.
-
