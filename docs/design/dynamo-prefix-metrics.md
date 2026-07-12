@@ -23,17 +23,31 @@ in errors returned to the trusted caller, never in metric names or labels.
 The one-shot migration CLI reports page and finalize outcomes in its JSON
 response; it does not start a long-lived scrape endpoint. Runtime metrics
 therefore expose only durable migration state (authority and barrier).
+Runtime nodes refresh the barrier strongly consistently at most once per 30
+seconds with a 100 ms telemetry-only timeout. Failure retains the last-known
+gauge and never changes startup or metastore error semantics.
 
 ## Rollout signals
 
 After finalization and the required runtime restart:
 
-- `max(lake_dynamo_v2_authoritative) by (service, instance)` must be `1` for
-  every Query and Metasrv target.
-- The rate of `lake_dynamo_prefix_requests_total{layout="v1"}` must fall to
+- `max by (service, instance) (lake_dynamo_v2_authoritative)` must be `1` for
+  every Query and Metasrv target; also alert on
+  `absent_over_time(lake_dynamo_v2_authoritative[5m])`.
+- `sum by (service, instance)
+  (rate(lake_dynamo_prefix_requests_total{layout="v1"}[5m]))` must fall to
   zero.
-- `rate(lake_dynamo_prefix_items_total{kind="evaluated"}) /
-  rate(lake_dynamo_prefix_items_total{kind="returned"})` exposes prefix-read
-  amplification without key-cardinality risk.
+- Filter amplification is:
+  `sum by (service, instance, layout, api)
+  (rate(lake_dynamo_prefix_items_total{kind="evaluated"}[5m])) /
+  sum by (service, instance, layout, api)
+  (rate(lake_dynamo_prefix_items_total{kind="returned"}[5m]))`.
+- Physical fan-out per returned item is:
+  `sum by (service, instance, layout, api)
+  (rate(lake_dynamo_prefix_requests_total{outcome="success"}[5m])) /
+  sum by (service, instance, layout, api)
+  (rate(lake_dynamo_prefix_items_total{kind="returned"}[5m]))`. A positive
+  request rate with zero returns intentionally becomes infinite and should
+  page sustained empty-shard traffic.
 - A held barrier with any v1-authoritative runtime is a rollout page: keep
   write admission paused and finish the v2 rollout.

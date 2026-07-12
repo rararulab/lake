@@ -131,8 +131,12 @@ After a v2 migration, alert until every runtime target reports
 `lake_dynamo_v2_authoritative == 1`, and require the rate of
 `lake_dynamo_prefix_requests_total{layout="v1"}` to fall to zero. Prefix-read
 amplification is the ratio of evaluated to returned
-`lake_dynamo_prefix_items_total` rates for the same `layout`/`api`; no prefix
-label is needed. A held finalization barrier together with a v1-authoritative
+`lake_dynamo_prefix_items_total` rates after `sum by (layout, api, service,
+instance)` removes the differing `kind` label. Physical Query fan-out uses the
+successful request rate divided by the returned-item rate; no prefix label is
+needed. Alert on `absent_over_time(lake_dynamo_v2_authoritative[5m])` so a pod
+with a missing series cannot silently pass rollout checks. A held finalization
+barrier together with a v1-authoritative
 pod means the post-finalize restart is incomplete and metadata write admission
 must remain paused. See the full bounded-label contract in
 [`dynamo-prefix-metrics.md`](../design/dynamo-prefix-metrics.md).

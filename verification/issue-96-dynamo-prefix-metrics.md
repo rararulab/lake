@@ -17,4 +17,13 @@
   v2 Query, authority, and barrier series.
 - `mise run gate` passed all workspace tests, e2e, hooks, and site checks.
 - `mise run doc` passed with rustdoc warnings denied.
-- Independent frozen-head review is pending.
+- Initial correctness review found that a telemetry-only barrier read could
+  change startup errors; the corrected implementation is best-effort, retains
+  last-known state, and has a hard 100 ms timeout with a 30-second refresh
+  interval.
+- Initial performance/release review found repeated metric descriptions and
+  invalid PromQL. Descriptions now register once after recorder installation,
+  hot calls only perform an atomic deadline check, and the documented queries
+  aggregate matching label sets over explicit ranges.
+- The corrected full gate and documentation check passed after these fixes.
+- Independent corrected-head review is pending.

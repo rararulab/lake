@@ -13,6 +13,7 @@ mode, and migration state without leaking any logical metadata identity.
 
 ### Allowed Changes
 crates/lake-meta/**
+crates/lake-cli/src/metrics.rs
 Cargo.lock
 README.md
 docs/design/dynamo-prefix-metrics.md

@@ -22,8 +22,8 @@
 
 use std::{
     collections::HashMap,
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -54,6 +54,8 @@ const V2_FINALIZE_BARRIER_KEY: &str = "__lake_internal/dynamo-prefix-v2-finalize
 const V2_FINALIZE_BARRIER_VALUE: &[u8] = b"locked-v1";
 const V2_BACKFILL_CURSOR_KEY: &str = "__lake_internal/dynamo-prefix-v2-backfill-cursor";
 const MIGRATION_PAGE_LIMIT_MAX: usize = 10_000;
+const METRICS_BARRIER_REFRESH_SECS: u64 = 30;
+const METRICS_BARRIER_REFRESH_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Wrap any AWS SDK error into a [`MetaError::Dynamo`] carrying `message`.
 fn dynamo_err<E>(message: impl Into<String>) -> impl FnOnce(E) -> MetaError
@@ -84,25 +86,24 @@ fn transaction_condition_mismatch(error: &TransactWriteItemsError) -> bool {
 }
 
 pub struct DynamoMeta {
-    client:           Client,
-    table:            String,
-    v2_table:         String,
-    v2_authoritative: AtomicBool,
-    finalize_barrier: AtomicBool,
+    client:             Client,
+    table:              String,
+    v2_table:           String,
+    v2_authoritative:   AtomicBool,
+    finalize_barrier:   AtomicBool,
+    metrics_refresh_at: AtomicU64,
 }
 
 impl DynamoMeta {
     pub fn new(client: Client, table: impl Into<String>) -> Self {
         let table = table.into();
-        telemetry::describe();
-        telemetry::authority(false);
-        telemetry::barrier(false);
         Self {
             client,
             v2_table: format!("{table}{V2_TABLE_SUFFIX}"),
             table,
             v2_authoritative: AtomicBool::new(false),
             finalize_barrier: AtomicBool::new(false),
+            metrics_refresh_at: AtomicU64::new(0),
         }
     }
 
@@ -249,8 +250,6 @@ impl DynamoMeta {
         if complete {
             self.v2_authoritative.store(true, Ordering::Release);
         }
-        let barrier = self.finalize_barrier_is_held().await?;
-        self.finalize_barrier.store(barrier, Ordering::Release);
         self.record_operational_state();
         Ok(())
     }
@@ -259,12 +258,37 @@ impl DynamoMeta {
     pub fn is_v2_authoritative(&self) -> bool { self.v2_authoritative.load(Ordering::Acquire) }
 
     fn record_operational_state(&self) {
-        // The CLI installs its process recorder after storage configuration is
-        // opened. Re-describe idempotently at the first real metastore call so
-        // HELP/TYPE metadata is registered with that recorder.
-        telemetry::describe();
         telemetry::authority(self.is_v2_authoritative());
         telemetry::barrier(self.finalize_barrier.load(Ordering::Acquire));
+    }
+
+    async fn refresh_operational_metrics(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let refresh_at = self.metrics_refresh_at.load(Ordering::Acquire);
+        if now >= refresh_at
+            && self
+                .metrics_refresh_at
+                .compare_exchange(
+                    refresh_at,
+                    now.saturating_add(METRICS_BARRIER_REFRESH_SECS),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            if let Ok(Ok(held)) = tokio::time::timeout(
+                METRICS_BARRIER_REFRESH_TIMEOUT,
+                self.finalize_barrier_is_held(),
+            )
+            .await
+            {
+                self.finalize_barrier.store(held, Ordering::Release);
+            }
+            self.record_operational_state();
+        }
     }
 
     async fn get_v2(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -937,7 +961,7 @@ impl DynamoMeta {
 #[async_trait]
 impl MetaStore for DynamoMeta {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        self.record_operational_state();
+        self.refresh_operational_metrics().await;
         if self.is_v2_authoritative() {
             return self.get_v2(key).await;
         }
@@ -958,7 +982,7 @@ impl MetaStore for DynamoMeta {
     }
 
     async fn cas(&self, key: &str, expected: Option<&[u8]>, new: &[u8]) -> Result<bool> {
-        self.record_operational_state();
+        self.refresh_operational_metrics().await;
         let result = self
             .client
             .transact_write_items()
@@ -981,7 +1005,7 @@ impl MetaStore for DynamoMeta {
     }
 
     async fn guarded_mutate(&self, mutation: GuardedMutation<'_>) -> Result<bool> {
-        self.record_operational_state();
+        self.refresh_operational_metrics().await;
         let mutation = mutation.validate()?;
         let target_key = mutation.target_key.to_owned();
         let result = self
@@ -1006,7 +1030,7 @@ impl MetaStore for DynamoMeta {
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
-        self.record_operational_state();
+        self.refresh_operational_metrics().await;
         if self.is_v2_authoritative() {
             return Ok(self
                 .scan_prefix_v2(prefix)
@@ -1072,7 +1096,7 @@ impl MetaStore for DynamoMeta {
     }
 
     async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        self.record_operational_state();
+        self.refresh_operational_metrics().await;
         if self.is_v2_authoritative() {
             return self.scan_prefix_v2(prefix).await;
         }
@@ -1141,7 +1165,7 @@ impl MetaStore for DynamoMeta {
         continuation: Option<&str>,
         limit: usize,
     ) -> Result<MetaScanPage> {
-        self.record_operational_state();
+        self.refresh_operational_metrics().await;
         if self.is_v2_authoritative() {
             return self.scan_prefix_page_v2(prefix, continuation, limit).await;
         }
@@ -1209,7 +1233,7 @@ impl MetaStore for DynamoMeta {
     }
 
     async fn delete(&self, key: &str, expected: &[u8]) -> Result<bool> {
-        self.record_operational_state();
+        self.refresh_operational_metrics().await;
         let physical = physical_key(key);
         let legacy = Delete::builder()
             .table_name(&self.table)
@@ -1487,9 +1511,24 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _recorder = metrics::set_default_local_recorder(&recorder);
+        crate::describe_dynamo_metrics();
         meta.record_operational_state();
         let rendered = handle.render();
         assert!(rendered.contains("# HELP lake_dynamo_v2_authoritative"));
         assert!(rendered.contains("lake_dynamo_v2_authoritative 0"));
+    }
+
+    #[tokio::test]
+    async fn dynamo_metrics_refresh_is_bounded_and_best_effort() {
+        let meta = test_meta();
+        tokio::time::timeout(Duration::from_secs(1), meta.refresh_operational_metrics())
+            .await
+            .expect("telemetry refresh has a hard timeout");
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            meta.refresh_operational_metrics(),
+        )
+        .await
+        .expect("rate-limited refresh performs no network call");
     }
 }
