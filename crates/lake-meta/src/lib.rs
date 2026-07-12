@@ -30,9 +30,16 @@ mod error;
 pub mod registry;
 mod rocks;
 mod store;
+mod telemetry;
 
 pub use dynamo::DynamoMeta;
 pub use dynamo_migration::{DynamoMigrationPage, DynamoMigrationVerification};
 pub use error::{MetaError, Result};
 pub use rocks::RocksMeta;
 pub use store::{GuardedMutation, MetaScanPage, MetaStore, MetaStoreRef};
+
+/// Register bounded Dynamo metric descriptions with the active recorder.
+///
+/// Process owners call this after installing their metrics recorder; emitting
+/// values remains internal to [`DynamoMeta`].
+pub fn describe_dynamo_metrics() { telemetry::describe(); }

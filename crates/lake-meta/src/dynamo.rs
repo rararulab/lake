@@ -22,8 +22,8 @@
 
 use std::{
     collections::HashMap,
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -44,6 +44,7 @@ use crate::{
     dynamo_migration::{DynamoMigrationPage, DynamoMigrationVerification},
     error::{DynamoSnafu, MetaError, Result},
     store::{GuardedMutation, GuardedTarget, MetaScanPage, MetaStore},
+    telemetry::{self, PrefixApi, PrefixLayout, RequestOutcome},
 };
 
 const V2_TABLE_SUFFIX: &str = "_prefix_v2";
@@ -53,6 +54,8 @@ const V2_FINALIZE_BARRIER_KEY: &str = "__lake_internal/dynamo-prefix-v2-finalize
 const V2_FINALIZE_BARRIER_VALUE: &[u8] = b"locked-v1";
 const V2_BACKFILL_CURSOR_KEY: &str = "__lake_internal/dynamo-prefix-v2-backfill-cursor";
 const MIGRATION_PAGE_LIMIT_MAX: usize = 10_000;
+const METRICS_BARRIER_REFRESH_SECS: u64 = 30;
+const METRICS_BARRIER_REFRESH_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Wrap any AWS SDK error into a [`MetaError::Dynamo`] carrying `message`.
 fn dynamo_err<E>(message: impl Into<String>) -> impl FnOnce(E) -> MetaError
@@ -83,10 +86,12 @@ fn transaction_condition_mismatch(error: &TransactWriteItemsError) -> bool {
 }
 
 pub struct DynamoMeta {
-    client:           Client,
-    table:            String,
-    v2_table:         String,
-    v2_authoritative: AtomicBool,
+    client:             Client,
+    table:              String,
+    v2_table:           String,
+    v2_authoritative:   AtomicBool,
+    finalize_barrier:   AtomicBool,
+    metrics_refresh_at: AtomicU64,
 }
 
 impl DynamoMeta {
@@ -97,6 +102,8 @@ impl DynamoMeta {
             v2_table: format!("{table}{V2_TABLE_SUFFIX}"),
             table,
             v2_authoritative: AtomicBool::new(false),
+            finalize_barrier: AtomicBool::new(false),
+            metrics_refresh_at: AtomicU64::new(0),
         }
     }
 
@@ -243,11 +250,46 @@ impl DynamoMeta {
         if complete {
             self.v2_authoritative.store(true, Ordering::Release);
         }
+        self.record_operational_state();
         Ok(())
     }
 
     #[must_use]
     pub fn is_v2_authoritative(&self) -> bool { self.v2_authoritative.load(Ordering::Acquire) }
+
+    fn record_operational_state(&self) {
+        telemetry::authority(self.is_v2_authoritative());
+        telemetry::barrier(self.finalize_barrier.load(Ordering::Acquire));
+    }
+
+    async fn refresh_operational_metrics(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let refresh_at = self.metrics_refresh_at.load(Ordering::Acquire);
+        if now >= refresh_at
+            && self
+                .metrics_refresh_at
+                .compare_exchange(
+                    refresh_at,
+                    now.saturating_add(METRICS_BARRIER_REFRESH_SECS),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            if let Ok(Ok(held)) = tokio::time::timeout(
+                METRICS_BARRIER_REFRESH_TIMEOUT,
+                self.finalize_barrier_is_held(),
+            )
+            .await
+            {
+                self.finalize_barrier.store(held, Ordering::Release);
+            }
+            self.record_operational_state();
+        }
+    }
 
     async fn get_v2(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let physical = physical_key(key);
@@ -301,8 +343,31 @@ impl DynamoMeta {
             .set_exclusive_start_key(start_key)
             .limit(i32::try_from(limit).unwrap_or(i32::MAX))
             .send()
-            .await
-            .map_err(dynamo_err(format!("v2 query page for prefix '{prefix}'")))?;
+            .await;
+        let response = match response {
+            Ok(response) => {
+                telemetry::prefix_request(
+                    PrefixLayout::V2,
+                    PrefixApi::Query,
+                    RequestOutcome::Success,
+                    response.scanned_count().max(0) as usize,
+                    response.items().len(),
+                );
+                response
+            }
+            Err(error) => {
+                telemetry::prefix_request(
+                    PrefixLayout::V2,
+                    PrefixApi::Query,
+                    RequestOutcome::Error,
+                    0,
+                    0,
+                );
+                return Err(dynamo_err(format!("v2 query page for prefix '{prefix}'"))(
+                    error,
+                ));
+            }
+        };
 
         let mut entries = Vec::with_capacity(response.items().len());
         for item in response.items() {
@@ -509,13 +574,14 @@ impl DynamoMeta {
                 .send()
                 .await;
         }
-        Ok(DynamoMigrationPage {
+        let page = DynamoMigrationPage {
             scanned: response.scanned_count().max(0) as usize,
             copied,
             already_live,
             complete: continuation.is_none(),
             continuation,
-        })
+        };
+        Ok(page)
     }
 
     async fn acquire_finalize_barrier(&self) -> Result<()> {
@@ -535,6 +601,8 @@ impl DynamoMeta {
             .send()
             .await
             .map_err(dynamo_err("acquire v2 finalization write barrier"))?;
+        telemetry::barrier(true);
+        self.finalize_barrier.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -679,7 +747,10 @@ impl DynamoMeta {
             .send()
             .await;
         match result {
-            Ok(_) => self.v2_authoritative.store(true, Ordering::Release),
+            Ok(_) => {
+                self.v2_authoritative.store(true, Ordering::Release);
+                telemetry::authority(true);
+            }
             Err(error)
                 if error
                     .as_service_error()
@@ -890,6 +961,7 @@ impl DynamoMeta {
 #[async_trait]
 impl MetaStore for DynamoMeta {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.refresh_operational_metrics().await;
         if self.is_v2_authoritative() {
             return self.get_v2(key).await;
         }
@@ -910,6 +982,7 @@ impl MetaStore for DynamoMeta {
     }
 
     async fn cas(&self, key: &str, expected: Option<&[u8]>, new: &[u8]) -> Result<bool> {
+        self.refresh_operational_metrics().await;
         let result = self
             .client
             .transact_write_items()
@@ -932,6 +1005,7 @@ impl MetaStore for DynamoMeta {
     }
 
     async fn guarded_mutate(&self, mutation: GuardedMutation<'_>) -> Result<bool> {
+        self.refresh_operational_metrics().await;
         let mutation = mutation.validate()?;
         let target_key = mutation.target_key.to_owned();
         let result = self
@@ -956,6 +1030,7 @@ impl MetaStore for DynamoMeta {
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        self.refresh_operational_metrics().await;
         if self.is_v2_authoritative() {
             return Ok(self
                 .scan_prefix_v2(prefix)
@@ -964,8 +1039,9 @@ impl MetaStore for DynamoMeta {
                 .map(|(key, _)| key)
                 .collect());
         }
-        // ponytail: a full Scan is fine at lake's ~10^4-key scale. The upgrade
-        // path is a GSI keyed to make prefixes a Query rather than a table scan.
+        // Legacy authority scans only during the bounded v1→v2 migration
+        // window. The verified marker permanently switches this path to the
+        // sharded strongly-consistent Query implementation above.
         let mut out = Vec::new();
         let mut start_key: Option<HashMap<String, AttributeValue>> = None;
         loop {
@@ -979,8 +1055,29 @@ impl MetaStore for DynamoMeta {
                 .expression_attribute_values(":prefix", AttributeValue::S(prefix.to_owned()))
                 .set_exclusive_start_key(start_key.take())
                 .send()
-                .await
-                .map_err(dynamo_err(format!("scan for prefix '{prefix}'")))?;
+                .await;
+            let resp = match resp {
+                Ok(resp) => {
+                    telemetry::prefix_request(
+                        PrefixLayout::V1,
+                        PrefixApi::Scan,
+                        RequestOutcome::Success,
+                        resp.scanned_count().max(0) as usize,
+                        resp.items().len(),
+                    );
+                    resp
+                }
+                Err(error) => {
+                    telemetry::prefix_request(
+                        PrefixLayout::V1,
+                        PrefixApi::Scan,
+                        RequestOutcome::Error,
+                        0,
+                        0,
+                    );
+                    return Err(dynamo_err(format!("scan for prefix '{prefix}'"))(error));
+                }
+            };
 
             for item in resp.items() {
                 if let Some(AttributeValue::S(pk)) = item.get("pk") {
@@ -999,6 +1096,7 @@ impl MetaStore for DynamoMeta {
     }
 
     async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        self.refresh_operational_metrics().await;
         if self.is_v2_authoritative() {
             return self.scan_prefix_v2(prefix).await;
         }
@@ -1015,8 +1113,31 @@ impl MetaStore for DynamoMeta {
                 .expression_attribute_values(":prefix", AttributeValue::S(prefix.to_owned()))
                 .set_exclusive_start_key(start_key.take())
                 .send()
-                .await
-                .map_err(dynamo_err(format!("scan entries for prefix '{prefix}'")))?;
+                .await;
+            let resp = match resp {
+                Ok(resp) => {
+                    telemetry::prefix_request(
+                        PrefixLayout::V1,
+                        PrefixApi::Scan,
+                        RequestOutcome::Success,
+                        resp.scanned_count().max(0) as usize,
+                        resp.items().len(),
+                    );
+                    resp
+                }
+                Err(error) => {
+                    telemetry::prefix_request(
+                        PrefixLayout::V1,
+                        PrefixApi::Scan,
+                        RequestOutcome::Error,
+                        0,
+                        0,
+                    );
+                    return Err(dynamo_err(format!("scan entries for prefix '{prefix}'"))(
+                        error,
+                    ));
+                }
+            };
 
             for item in resp.items() {
                 let (Some(AttributeValue::S(pk)), Some(AttributeValue::B(value))) =
@@ -1044,6 +1165,7 @@ impl MetaStore for DynamoMeta {
         continuation: Option<&str>,
         limit: usize,
     ) -> Result<MetaScanPage> {
+        self.refresh_operational_metrics().await;
         if self.is_v2_authoritative() {
             return self.scan_prefix_page_v2(prefix, continuation, limit).await;
         }
@@ -1063,8 +1185,31 @@ impl MetaStore for DynamoMeta {
             .set_exclusive_start_key(start_key)
             .limit(i32::try_from(limit).unwrap_or(i32::MAX))
             .send()
-            .await
-            .map_err(dynamo_err(format!("scan page for prefix '{prefix}'")))?;
+            .await;
+        let response = match response {
+            Ok(response) => {
+                telemetry::prefix_request(
+                    PrefixLayout::V1,
+                    PrefixApi::Scan,
+                    RequestOutcome::Success,
+                    response.scanned_count().max(0) as usize,
+                    response.items().len(),
+                );
+                response
+            }
+            Err(error) => {
+                telemetry::prefix_request(
+                    PrefixLayout::V1,
+                    PrefixApi::Scan,
+                    RequestOutcome::Error,
+                    0,
+                    0,
+                );
+                return Err(dynamo_err(format!("scan page for prefix '{prefix}'"))(
+                    error,
+                ));
+            }
+        };
         let mut entries = Vec::new();
         for item in response.items() {
             let (Some(AttributeValue::S(pk)), Some(AttributeValue::B(value))) =
@@ -1088,6 +1233,7 @@ impl MetaStore for DynamoMeta {
     }
 
     async fn delete(&self, key: &str, expected: &[u8]) -> Result<bool> {
+        self.refresh_operational_metrics().await;
         let physical = physical_key(key);
         let legacy = Delete::builder()
             .table_name(&self.table)
@@ -1149,6 +1295,7 @@ mod tests {
         config::Region,
         types::{CancellationReason, error::TransactionCanceledException},
     };
+    use metrics_exporter_prometheus::PrometheusBuilder;
 
     use super::*;
 
@@ -1356,5 +1503,32 @@ mod tests {
             .len(),
             4
         );
+    }
+
+    #[test]
+    fn dynamo_metrics_register_after_late_recorder_install() {
+        let meta = test_meta();
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        crate::describe_dynamo_metrics();
+        meta.record_operational_state();
+        let rendered = handle.render();
+        assert!(rendered.contains("# HELP lake_dynamo_v2_authoritative"));
+        assert!(rendered.contains("lake_dynamo_v2_authoritative 0"));
+    }
+
+    #[tokio::test]
+    async fn dynamo_metrics_refresh_is_bounded_and_best_effort() {
+        let meta = test_meta();
+        tokio::time::timeout(Duration::from_secs(1), meta.refresh_operational_metrics())
+            .await
+            .expect("telemetry refresh has a hard timeout");
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            meta.refresh_operational_metrics(),
+        )
+        .await
+        .expect("rate-limited refresh performs no network call");
     }
 }

@@ -28,6 +28,7 @@
 
 use aws_sdk_dynamodb::{primitives::Blob, types::AttributeValue};
 use lake_meta::{DynamoMeta, GuardedMutation, MetaStore};
+use metrics_exporter_prometheus::PrometheusBuilder;
 
 #[tokio::test]
 #[ignore = "requires localstack DynamoDB; set LAKE_DYNAMODB_ENDPOINT and run with --ignored"]
@@ -36,6 +37,9 @@ async fn dynamo_v1_dual_v2_migration_roundtrip() {
         // Skip when the localstack endpoint is not provisioned.
         return;
     };
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let metrics = recorder.handle();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
 
     // Unique per-run table name so parallel/repeat runs never collide.
     let table = format!(
@@ -233,4 +237,17 @@ async fn dynamo_v1_dual_v2_migration_roundtrip() {
             ("legacy".to_owned(), b"old".to_vec()),
         ]
     );
+
+    let rendered = metrics.render();
+    for expected in [
+        "lake_dynamo_v2_authoritative 1",
+        "lake_dynamo_finalize_barrier_held 1",
+        "lake_dynamo_prefix_requests_total{layout=\"v1\",api=\"scan\",outcome=\"success\"}",
+        "lake_dynamo_prefix_requests_total{layout=\"v2\",api=\"query\",outcome=\"success\"}",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}:\n{rendered}"
+        );
+    }
 }

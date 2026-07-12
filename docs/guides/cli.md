@@ -117,12 +117,32 @@ Core series are:
   `lake_metasrv_reserved_append_bytes`, `lake_metasrv_campaign_total`,
   `lake_metasrv_write_ready`, `lake_metasrv_maintenance_pages_total`, and
   `lake_metasrv_maintenance_items_total`.
+- `lake_dynamo_v2_authoritative`, `lake_dynamo_finalize_barrier_held`,
+  `lake_dynamo_prefix_requests_total`, and `lake_dynamo_prefix_items_total`
+  when Dynamo is the metastore.
 
 Labels are finite state-machine values such as `success`, `error`, `leader`,
 or `saturated`. SQL, tenant, namespace, table, operation ID, URI, and credential
 values are never metric labels. The listener and exporter upkeep future share
 the server future directly: normal shutdown joins it, while dropping the outer
 server future drops the listener without leaving detached work.
+
+After a v2 migration, alert on runtime targets selected by
+`max by (service, instance) (lake_dynamo_v2_authoritative) == 0`, and require the rate of
+`lake_dynamo_prefix_requests_total{layout="v1"}` to fall to zero. Prefix-read
+amplification is the ratio of evaluated to returned
+`lake_dynamo_prefix_items_total` rates after `sum by (layout, api, service,
+instance)` removes the differing `kind` label. Physical Query fan-out uses the
+successful request rate divided by the returned-item rate; no prefix label is
+needed. Detect a missing series per pod by reconciling scrape inventory:
+`max by (service, instance) (up{job=~"lake-query|lake-metasrv"}) unless on
+(service, instance) max by (service, instance)
+(lake_dynamo_v2_authoritative)`. The scrape configuration must relabel `up`
+with the same `service` and `instance` identity, and the alert rule should use
+`for: 5m`. A held finalization barrier together with a v1-authoritative
+pod means the post-finalize restart is incomplete and metadata write admission
+must remain paused. See the full bounded-label contract in
+[`dynamo-prefix-metrics.md`](../design/dynamo-prefix-metrics.md).
 
 ## OTLP distributed tracing
 

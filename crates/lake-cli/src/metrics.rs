@@ -130,6 +130,7 @@ impl MetricsRuntime {
             .install_recorder()
             .context("install Prometheus recorder")?;
         describe_process_metrics();
+        lake_meta::describe_dynamo_metrics();
         metrics::gauge!("lake_process_info").set(1.0);
         tracing::info!(%addr, service, "Prometheus metrics listener ready");
         Ok(Some(Self { listener, handle }))

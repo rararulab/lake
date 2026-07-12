@@ -13,16 +13,18 @@ async-trait = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-dynamodb = { workspace = true }
 lake-common = { workspace = true }
+metrics = { workspace = true }
 rocksdb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 snafu = { workspace = true }
+tokio = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+metrics-exporter-prometheus = { workspace = true }
 tempfile = "3"
-tokio = { workspace = true }
 
 [lints]
 workspace = true
