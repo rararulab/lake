@@ -73,6 +73,7 @@ tonic-health = "^0.14"
 tracing = "^0.1"
 tracing-opentelemetry = "^0.33"
 tracing-subscriber = { version = "^0.3", features = ["env-filter", "fmt", "json"] }
+tower = "^0.5"
 subtle = "^2.6"
 url = "^2.5"
 uuid = { version = "^1.23", features = ["v7"] }

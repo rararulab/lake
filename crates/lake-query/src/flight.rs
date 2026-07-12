@@ -64,6 +64,7 @@ use tokio::{
     time::{Instant, Sleep},
 };
 use tonic::{Request, Response, Status, Streaming};
+use tower::{Layer, Service};
 use tracing::{Instrument as _, Span, field};
 
 use crate::{DiscoveryLimits, QueryEngine, QueryLimits, telemetry};
@@ -612,6 +613,63 @@ fn query_server_span<T>(request: &Request<T>, method: &'static str) -> Span {
     );
     let _ = set_span_parent_from_request(&span, request);
     span
+}
+
+/// Arrow Flight SQL's blanket service handles `ListActions` without exposing
+/// its request to `FlightSqlService`. This narrow HTTP layer closes that one
+/// hook gap while typed handlers remain responsible for every other RPC.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ListActionsTraceLayer;
+
+impl<S> Layer<S> for ListActionsTraceLayer {
+    type Service = ListActionsTraceService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service { ListActionsTraceService { inner } }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ListActionsTraceService<S> {
+    inner: S,
+}
+
+impl<S, B> Service<tonic::codegen::http::Request<B>> for ListActionsTraceService<S>
+where
+    S: Service<tonic::codegen::http::Request<B>> + Send,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+{
+    type Error = S::Error;
+    type Future = Pin<
+        Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send + 'static>,
+    >;
+    type Response = S::Response;
+
+    fn poll_ready(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(context)
+    }
+
+    fn call(&mut self, request: tonic::codegen::http::Request<B>) -> Self::Future {
+        if !request
+            .uri()
+            .path()
+            .ends_with("/arrow.flight.protocol.FlightService/ListActions")
+        {
+            return Box::pin(self.inner.call(request));
+        }
+
+        let metadata = tonic::metadata::MetadataMap::from_headers(request.headers().clone());
+        let trace_request = Request::from_parts(metadata, tonic::Extensions::new(), ());
+        let span = query_server_span(&trace_request, "list_actions");
+        let future = self.inner.call(request);
+        Box::pin(async move {
+            let result = future.instrument(span.clone()).await;
+            span.record("rpc.outcome", if result.is_ok() { "ok" } else { "error" });
+            result
+        })
+    }
 }
 
 type BoxStatusStream<T> =

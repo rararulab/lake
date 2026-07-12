@@ -568,6 +568,7 @@ where
     tracing::info!(%addr, "Flight SQL server ready");
     let server_shutdown = cancellation.clone();
     let server = server
+        .layer(flight::ListActionsTraceLayer)
         .layer(tonic::service::InterceptorLayer::new(
             config.server_security.interceptor(),
         ))
