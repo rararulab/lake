@@ -16,8 +16,13 @@
 
 use std::{future::Future, sync::Arc};
 
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::config::Region;
+use lake_common::ManagedStageBackend;
+use lake_meta::{DynamoMeta, MetaStoreRef, RocksMeta};
 use lake_metasrv::MetasrvServerConfig;
-use lake_query::{QueryEngine, QueryServerConfig};
+use lake_objects::{LocalObjectStore, ManagedObjectStore, S3ObjectStore};
+use lake_query::{AsyncQueryConfig, QueryEngine, QueryServerConfig};
 
 use super::{
     Context,
@@ -63,6 +68,9 @@ where
     if let Some(keys) = query_ticket_keys_from_env()? {
         config = config.with_ticket_keys(keys);
     }
+    if async_queries_enabled_from_env()? {
+        config = config.with_async_queries(async_query_config(ctx).await?);
+    }
     metrics::run_with_metrics("query", shutdown, |cancellation| async move {
         lake_query::serve_with_config_and_shutdown(
             engine,
@@ -74,6 +82,67 @@ where
         Ok(())
     })
     .await
+}
+
+fn async_queries_enabled_from_env() -> anyhow::Result<bool> {
+    match std::env::var("LAKE_ASYNC_QUERIES") {
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(error) => Err(error.into()),
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => anyhow::bail!("LAKE_ASYNC_QUERIES must be a boolean"),
+        },
+    }
+}
+
+async fn async_query_config(ctx: &Context) -> anyhow::Result<AsyncQueryConfig> {
+    let (state, results): (MetaStoreRef, Arc<dyn ManagedObjectStore>) =
+        match ctx.managed_stage().backend() {
+            ManagedStageBackend::Local { root } => {
+                let data_root = std::path::Path::new(root)
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("managed stage has no data root"))?;
+                let state: MetaStoreRef =
+                    Arc::new(RocksMeta::open(data_root.join("async-query-state"))?);
+                let results: Arc<dyn ManagedObjectStore> =
+                    Arc::new(LocalObjectStore::open(data_root.join("async-query-results")).await?);
+                (state, results)
+            }
+            ManagedStageBackend::S3 {
+                bucket,
+                region,
+                endpoint,
+                force_path_style,
+                ..
+            } => {
+                let table = std::env::var("LAKE_ASYNC_DYNAMODB_TABLE")
+                    .unwrap_or_else(|_| "lake_async_queries".to_owned());
+                let dynamo_endpoint = std::env::var("LAKE_DYNAMODB_ENDPOINT").ok();
+                let dynamo = DynamoMeta::connect(dynamo_endpoint.as_deref(), &table).await?;
+                dynamo.open_tables().await?;
+                let state: MetaStoreRef = Arc::new(dynamo);
+                let mut loader = aws_config::defaults(BehaviorVersion::latest());
+                if let Some(region) = region {
+                    loader = loader.region(Region::new(region.clone()));
+                }
+                let shared = loader.load().await;
+                let mut config =
+                    aws_sdk_s3::config::Builder::from(&shared).force_path_style(*force_path_style);
+                if let Some(endpoint) = endpoint {
+                    config = config.endpoint_url(endpoint);
+                }
+                let prefix = std::env::var("LAKE_ASYNC_RESULT_PREFIX")
+                    .unwrap_or_else(|_| "async-query-results".to_owned());
+                let results: Arc<dyn ManagedObjectStore> = Arc::new(S3ObjectStore::new(
+                    aws_sdk_s3::Client::from_conf(config.build()),
+                    bucket,
+                    prefix,
+                )?);
+                (state, results)
+            }
+        };
+    Ok(AsyncQueryConfig::new(state, results))
 }
 
 pub async fn meta(ctx: &Context, addr: &str) -> anyhow::Result<()> {

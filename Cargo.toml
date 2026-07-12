@@ -43,6 +43,7 @@ axum = { version = "^0.8", default-features = false, features = ["http1", "tokio
 aws-config = "^1.5"
 aws-sdk-dynamodb = "^1.60"
 bon = "^3.9"
+bytes = "^1.12"
 aws-sdk-s3 = "^1.60"
 datafusion = "^53.0"
 futures = "^0.3"

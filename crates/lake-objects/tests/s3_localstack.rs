@@ -27,11 +27,13 @@ use aws_sdk_s3::{
 };
 use lake_objects::{
     GcPlanApplier, GcPlanWriter, GcPlanner, InventoryRequest, ManagedObjectInventory,
-    ManagedObjectStore, ObjectCandidate, ObjectError, S3ObjectStore,
+    ManagedObjectScope, ManagedObjectStore, ObjectCandidate, ObjectError, S3ObjectStore,
 };
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
-use tokio::sync::oneshot;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, ReadBuf},
+    sync::oneshot,
+};
 
 const PART_BYTES: usize = 5 * 1024 * 1024;
 
@@ -218,6 +220,41 @@ async fn s3_multipart_roundtrip_localstack() {
     let mut downloaded = Vec::new();
     reader.read_to_end(&mut downloaded).await.unwrap();
     assert_eq!(downloaded, bytes);
+}
+
+#[tokio::test]
+#[ignore = "requires LocalStack S3; set LAKE_S3_ENDPOINT and run with --ignored"]
+async fn async_result_s3_upload_is_tenant_and_query_scoped_localstack() {
+    let Some((_client, store, bucket)) = stage().await else {
+        return;
+    };
+    let scope =
+        ManagedObjectScope::try_new("tenant-a", "0198f73b-12b0-7d20-b8ab-8195ce8bfe73").unwrap();
+    let bytes = b"bounded arrow result part".to_vec();
+    let location = store
+        .put_scoped_reader(
+            &scope,
+            "part",
+            Box::pin(std::io::Cursor::new(bytes.clone())),
+            "application/vnd.apache.arrow.stream".to_owned(),
+        )
+        .await
+        .expect("scoped S3 result upload");
+
+    assert!(location.uri.starts_with(&format!(
+        "s3://{bucket}/managed/objects/tenant-a/0198f73b-12b0-7d20-b8ab-8195ce8bfe73/part/"
+    )));
+    let mut reader = store.open_reader(&location).await.unwrap();
+    let mut downloaded = Vec::new();
+    reader.read_to_end(&mut downloaded).await.unwrap();
+    assert_eq!(downloaded, bytes);
+}
+
+#[test]
+fn async_result_s3_scope_localstack_is_wired() {
+    let integration = include_str!("../../../scripts/test-integration.ts");
+    assert!(integration.contains("lake-objects"));
+    assert!(integration.contains("--run-ignored"));
 }
 
 #[tokio::test]

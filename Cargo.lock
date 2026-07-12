@@ -4340,6 +4340,7 @@ version = "0.0.1"
 dependencies = [
  "arrow-flight",
  "async-trait",
+ "bytes",
  "datafusion",
  "futures",
  "lake-catalog",
@@ -4349,6 +4350,7 @@ dependencies = [
  "lake-flight",
  "lake-meta",
  "lake-metasrv",
+ "lake-objects",
  "metrics",
  "metrics-exporter-prometheus",
  "opentelemetry",
@@ -4357,6 +4359,7 @@ dependencies = [
  "prost-types",
  "rcgen",
  "ring",
+ "serde",
  "serde_json",
  "snafu",
  "subtle",
@@ -4368,6 +4371,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

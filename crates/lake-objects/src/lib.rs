@@ -134,6 +134,18 @@ pub enum ObjectError {
     #[snafu(display("managed object store returned an invalid presigned capability lifetime"))]
     InvalidPresignedCapabilityLifetime,
 
+    #[snafu(display("managed object scope is invalid"))]
+    InvalidManagedObjectScope,
+
+    #[snafu(display("this managed object store does not support scoped writes"))]
+    ScopedWriteUnsupported,
+
+    #[snafu(display("this managed object store does not support scoped deletion"))]
+    ScopedDeleteUnsupported,
+
+    #[snafu(display("managed object scope contains too many objects to delete safely"))]
+    ScopedDeleteTooLarge,
+
     #[snafu(display("DataLocation has an invalid integrity identity"))]
     Integrity { source: ObjectIntegrityError },
 
@@ -289,6 +301,24 @@ pub trait ManagedObjectStore: Send + Sync {
     /// Upload one stream and return its stable immutable identity.
     async fn put_reader(&self, input: ObjectReader, content_type: String) -> Result<DataLocation>;
 
+    /// Upload an immutable object below an exact tenant/query/class prefix.
+    /// Async result stores override this; the default fails closed rather
+    /// than flattening data into an unscoped stage.
+    async fn put_scoped_reader(
+        &self,
+        _scope: &ManagedObjectScope,
+        _class: &str,
+        _input: ObjectReader,
+        _content_type: String,
+    ) -> Result<DataLocation> {
+        Err(ObjectError::ScopedWriteUnsupported)
+    }
+
+    /// Delete every service-owned object below an exact tenant/query scope.
+    async fn delete_scope(&self, _scope: &ManagedObjectScope) -> Result<()> {
+        Err(ObjectError::ScopedDeleteUnsupported)
+    }
+
     /// Upload a seekable local path. Stores that support restart checkpoints
     /// override this method; the default keeps bounded streaming behavior.
     async fn put_path(
@@ -331,6 +361,45 @@ pub trait ManagedObjectStore: Send + Sync {
         validate_presign_expiration(expires_in)?;
         Err(ObjectError::PresignUnsupported)
     }
+}
+
+/// Validated hierarchy for service-owned async query objects.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedObjectScope {
+    tenant: String,
+    query:  String,
+}
+
+impl ManagedObjectScope {
+    pub fn try_new(tenant: impl Into<String>, query: impl Into<String>) -> Result<Self> {
+        let tenant = tenant.into();
+        let query = query.into();
+        if !valid_scope_segment(&tenant, 64) || !valid_scope_segment(&query, 64) {
+            return Err(ObjectError::InvalidManagedObjectScope);
+        }
+        Ok(Self { tenant, query })
+    }
+
+    fn relative_prefix(&self, class: &str) -> Result<String> {
+        if !valid_scope_segment(class, 32) {
+            return Err(ObjectError::InvalidManagedObjectScope);
+        }
+        Ok(format!("{}/{}/{class}", self.tenant, self.query))
+    }
+
+    pub(crate) fn relative_scope_prefix(&self) -> String {
+        format!("{}/{}", self.tenant, self.query)
+    }
+}
+
+fn valid_scope_segment(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && value != "."
+        && value != ".."
 }
 
 /// Validate Lake's bounded lifetime policy for delegated read capabilities.
@@ -445,9 +514,10 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     use crate::{
-        InventoryRequest, LocalObjectStore, ManagedObjectInventory, ManagedObjectStore,
-        ObjectError, ObjectIntegrityError, ObjectReader, Result as ObjectResult, S3ObjectStore,
-        data_location_array, data_location_from_array, open_verified,
+        InventoryRequest, LocalObjectStore, ManagedObjectInventory, ManagedObjectScope,
+        ManagedObjectStore, ObjectError, ObjectIntegrityError, ObjectReader,
+        Result as ObjectResult, S3ObjectStore, data_location_array, data_location_from_array,
+        open_verified,
     };
 
     struct StaticReadStore {
@@ -637,6 +707,37 @@ mod tests {
         assert!(location.uri.starts_with("file://"));
         let path = location.uri.strip_prefix("file://").unwrap();
         assert_eq!(tokio::fs::read(path).await.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn async_result_store_scopes_objects_by_tenant_and_query() {
+        let destination_dir = tempdir().unwrap();
+        let store = LocalObjectStore::open(destination_dir.path())
+            .await
+            .unwrap();
+        let scope = ManagedObjectScope::try_new("tenant-a", "0198f73b-12b0-7d20-b8ab-8195ce8bfe73")
+            .expect("safe tenant/query scope");
+
+        let location = ManagedObjectStore::put_scoped_reader(
+            &store,
+            &scope,
+            "job",
+            Box::pin(std::io::Cursor::new(b"encrypted-job".to_vec())),
+            "application/vnd.lake.async-job".to_owned(),
+        )
+        .await
+        .expect("scoped immutable object");
+
+        assert!(location.uri.contains("/tenant-a/"));
+        assert!(
+            location
+                .uri
+                .contains("/0198f73b-12b0-7d20-b8ab-8195ce8bfe73/job/")
+        );
+        assert!(matches!(
+            ManagedObjectScope::try_new("../escape", "query"),
+            Err(ObjectError::InvalidManagedObjectScope)
+        ));
     }
 
     #[tokio::test]

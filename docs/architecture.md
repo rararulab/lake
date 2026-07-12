@@ -354,10 +354,13 @@ the post-ack lookup generation. The same SDK Flight connection
 therefore observes its own write immediately; independent query nodes retain
 the normal bounded-staleness window until their cache refreshes.
 
-Interactive results stream over `DoGet`. The planned large-result tier
-materializes Arrow/Parquet parts to a service-owned S3 prefix and publishes
-short-lived HTTPS locations through `PollFlightInfo`. The complete API and
-security boundary are in
+Interactive results stream over `DoGet`. The durable result tier accepts
+standard `PollFlightInfo`, persists encrypted snapshot-pinned jobs in a
+dedicated CAS store, materializes bounded Arrow IPC parts below a
+tenant/query-scoped result prefix, and publishes only an immutable manifest.
+Completed part capabilities are redeemed through `DoGet`; the SDK hides
+polling and endpoint fan-in behind `query_async`. The complete API and security
+boundary are in
 [`docs/design/sql-api-over-s3.md`](design/sql-api-over-s3.md).
 
 ## Crate map
@@ -445,8 +448,9 @@ design-level ones:
   FILE append streams.
   `lake-metasrv::serve` runs deadline-aware lease election, forwards follower
   writes to the observed leader, serializes mutations per table, and gates
-  maintenance on the same lease. Ceiling: there is no durable query scheduler
-  or asynchronous large-result service yet.
+  maintenance on the same lease. Durable asynchronous queries deliberately use
+  a separate injected state store rather than this catalog/control-plane
+  authority.
 - Every production Flight hop shares `lake-flight`: a server interceptor
   authenticates every RPC, TLS configuration is verified by the client, and
   non-loopback plaintext/anonymous listeners fail closed. This covers

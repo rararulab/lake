@@ -21,6 +21,7 @@ use std::{
     fmt,
     ops::Range,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -32,12 +33,15 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_flight::{
-    Action, FlightClient, FlightData, FlightDescriptor, PutResult, decode::FlightRecordBatchStream,
-    encode::FlightDataEncoderBuilder, sql::client::FlightSqlServiceClient,
+    Action, FlightClient, FlightData, FlightDescriptor, PutResult,
+    decode::FlightRecordBatchStream,
+    encode::FlightDataEncoderBuilder,
+    error::FlightError,
+    sql::{CommandStatementQuery, ProstMessageExt, client::FlightSqlServiceClient},
 };
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
-use futures::TryStreamExt;
+use futures::{Stream, StreamExt, TryStreamExt};
 use lake_common::{
     AppendOperationId, DataLocation, FILE_APPEND_TYPE_URL, FileAppendRequest,
     MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageBackend, ManagedStageDescriptor, TableRef, Version,
@@ -275,6 +279,9 @@ pub enum SdkError {
 
     #[snafu(display("query returned a Flight endpoint without a ticket"))]
     MissingQueryTicket,
+
+    #[snafu(display("asynchronous query did not complete within {timeout:?}"))]
+    AsyncQueryTimeout { timeout: Duration },
 
     #[snafu(display("query result column '{column}' is missing"))]
     MissingResultColumn { column: String },
@@ -657,6 +664,10 @@ pub struct LakeClient {
     upload_checkpoint_dir: Option<PathBuf>,
 }
 
+/// Ordered Arrow batches materialized by one durable asynchronous SQL query.
+pub type AsyncQueryResultStream =
+    Pin<Box<dyn Stream<Item = std::result::Result<RecordBatch, FlightError>> + Send>>;
+
 /// Builder for authenticated and TLS-verified SDK connections.
 #[derive(Clone, Debug)]
 pub struct LakeClientBuilder {
@@ -986,6 +997,72 @@ impl LakeClient {
             .context(MissingQueryEndpointSnafu)?;
         let ticket = endpoint.ticket.context(MissingQueryTicketSnafu)?;
         client.do_get(ticket).await.context(FlightSnafu)
+    }
+
+    /// Submit read-only SQL through standard Flight `PollFlightInfo`, wait for
+    /// durable completion, then stream every ordered result endpoint.
+    pub async fn query_async(&self, sql: &str) -> Result<AsyncQueryResultStream> {
+        self.query_async_with_timeout(sql, Duration::from_hours(24))
+            .await
+    }
+
+    /// As [`Self::query_async`], with a client-side bound on polling time.
+    pub async fn query_async_with_timeout(
+        &self,
+        sql: &str,
+        timeout: Duration,
+    ) -> Result<AsyncQueryResultStream> {
+        if timeout.is_zero() {
+            return Err(SdkError::AsyncQueryTimeout { timeout });
+        }
+        let command = CommandStatementQuery {
+            query:          sql.to_owned(),
+            transaction_id: None,
+        };
+        let mut descriptor = FlightDescriptor::new_cmd(command.as_any().encode_to_vec());
+        let mut client = FlightClient::new(self.query.clone());
+        self.security
+            .apply_to_flight_client(&mut client)
+            .context(SecuritySnafu)?;
+        let poll = tokio::time::timeout(timeout, async {
+            let mut backoff = Duration::from_millis(100);
+            loop {
+                let poll = client
+                    .poll_flight_info(descriptor)
+                    .await
+                    .context(FlightSnafu)?;
+                if poll.flight_descriptor.is_none() {
+                    return Ok::<_, SdkError>(poll);
+                }
+                descriptor = poll
+                    .flight_descriptor
+                    .expect("checked PollFlightInfo retry descriptor");
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2).min(Duration::from_secs(2));
+            }
+        })
+        .await
+        .map_err(|_| SdkError::AsyncQueryTimeout { timeout })??;
+        let info = poll.info.context(MissingQueryEndpointSnafu)?;
+        if info.endpoint.is_empty() {
+            return Err(SdkError::MissingQueryEndpoint);
+        }
+        let tickets = info
+            .endpoint
+            .into_iter()
+            .map(|endpoint| endpoint.ticket.context(MissingQueryTicketSnafu))
+            .collect::<Result<Vec<_>>>()?;
+        let mut requests = Vec::with_capacity(tickets.len());
+        for ticket in tickets {
+            let mut client = FlightClient::new(self.query.clone());
+            self.security
+                .apply_to_flight_client(&mut client)
+                .context(SecuritySnafu)?;
+            requests.push((client, ticket));
+        }
+        let streams = futures::stream::iter(requests)
+            .then(|(mut client, ticket)| async move { client.do_get(ticket).await });
+        Ok(Box::pin(streams.try_flatten()))
     }
 
     /// Open a direct storage reader that verifies size and SHA-256 at EOF.
@@ -1411,7 +1488,7 @@ mod tests {
         LocalObjectStore, ManagedObjectStore, ObjectReader, Result as ObjectResult, S3ObjectStore,
         data_location_field, data_location_from_array,
     };
-    use lake_query::{QueryEngine, QueryServerConfig};
+    use lake_query::{AsyncQueryConfig, QueryEngine, QueryServerConfig};
     use prost::Message;
     use rcgen::generate_simple_self_signed;
     use sha2::{Digest, Sha256};
@@ -3277,6 +3354,57 @@ mod tests {
             .await
             .unwrap();
         assert!(objects.next_entry().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sdk_async_query_roundtrip_uses_poll_flight_info() {
+        let root = tempdir().unwrap();
+        let catalog: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("catalog")).unwrap());
+        let state: MetaStoreRef =
+            Arc::new(RocksMeta::open(root.path().join("async-state")).unwrap());
+        let results = Arc::new(
+            LocalObjectStore::open(root.path().join("async-results"))
+                .await
+                .unwrap(),
+        );
+        let engine = Arc::new(QueryEngine::new(catalog, Arc::new(LanceEngine::new())));
+        let address = free_addr();
+        let server = tokio::spawn({
+            let address = address.clone();
+            async move {
+                lake_query::serve_with_config(
+                    engine,
+                    &address,
+                    QueryServerConfig::new().with_async_queries(
+                        AsyncQueryConfig::new(state, results)
+                            .with_scan_interval(Duration::from_millis(10)),
+                    ),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stage = LocalObjectStore::open(root.path().join("client-stage"))
+            .await
+            .unwrap();
+        let client = LakeClient::connect_with_store(format!("http://{address}"), stage)
+            .await
+            .unwrap();
+        let batches = client
+            .query_async("SELECT CAST(42 AS BIGINT) AS answer")
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let values = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 42);
+        server.abort();
     }
 
     fn free_addr() -> String {

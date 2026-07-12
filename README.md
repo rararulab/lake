@@ -81,6 +81,9 @@ in application code:
 ```bash
 LAKE_S3_BUCKET=embodied-data \
 LAKE_MANAGED_OBJECT_PREFIX=lake/managed-files \
+LAKE_ASYNC_QUERIES=true \
+LAKE_ASYNC_DYNAMODB_TABLE=lake_async_queries \
+LAKE_ASYNC_RESULT_PREFIX=lake/async-query-results \
 AWS_REGION=us-east-1 \
 LAKE_AUTH_PRINCIPALS_FILE=/run/secrets/query-principals.json \
 LAKE_TLS_CERT_FILE=/run/tls/query.crt \
@@ -266,6 +269,28 @@ let mut reader = client.open(&location).await?;
 let mut destination = tokio::fs::File::create("episode.mp4").await?;
 tokio::io::copy(&mut reader, &mut destination).await?; // drain to verified EOF
 ```
+
+For queries whose result generation should survive one client connection or
+Query replica, use the same client with standard Flight `PollFlightInfo`:
+
+```rust
+use futures::TryStreamExt;
+
+let mut results = client
+    .query_async("SELECT * FROM lake.robots.training_samples")
+    .await?;
+while let Some(batch) = results.try_next().await? {
+    consume(batch).await?;
+}
+```
+
+Enable it on `lake query` with `LAKE_ASYNC_QUERIES=true`. Local mode creates
+separate `async-query-state` and `async-query-results` directories beside the
+catalog. S3 mode uses the dedicated `LAKE_ASYNC_DYNAMODB_TABLE` (default
+`lake_async_queries`) and `LAKE_ASYNC_RESULT_PREFIX` (default
+`async-query-results`). Query replicas share encrypted, identity-bound jobs,
+CAS-fenced leases, immutable Arrow IPC parts, and one atomic result manifest;
+polling never starts or embeds a metadata server.
 
 `open` is integrity-verified by default. It validates the stored SHA-256 shape
 before storage I/O, caps the stream at `DataLocation.size_bytes`, and computes

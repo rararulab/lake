@@ -34,6 +34,7 @@ const MIN_SECRET_BYTES: usize = 32;
 const MAX_SECRET_BYTES: usize = 4096;
 const FUTURE_SKEW: Duration = Duration::from_secs(30);
 const MAX_TICKET_TTL: Duration = Duration::from_hours(1);
+pub(crate) const MAX_DURABLE_JOB_TTL: Duration = Duration::from_hours(24);
 
 /// Redacted statement-ticket validation or key-configuration failure.
 #[derive(Debug, Eq, PartialEq, Snafu)]
@@ -174,6 +175,7 @@ pub(crate) struct StatementTicket {
 pub(crate) struct StatementTicketCodec {
     keys:          QueryTicketKeyRing,
     ttl:           Duration,
+    max_ttl:       Duration,
     audience:      Arc<str>,
     nonce_prefix:  [u8; NONCE_PREFIX_BYTES],
     nonce_counter: Arc<AtomicU32>,
@@ -185,8 +187,25 @@ impl StatementTicketCodec {
         ttl: Duration,
         audience: impl Into<Arc<str>>,
     ) -> Result<Self, QueryTicketError> {
+        Self::try_new_with_max_ttl(keys, ttl, audience, MAX_TICKET_TTL)
+    }
+
+    pub(crate) fn try_new_durable_job(
+        keys: QueryTicketKeyRing,
+        ttl: Duration,
+        audience: impl Into<Arc<str>>,
+    ) -> Result<Self, QueryTicketError> {
+        Self::try_new_with_max_ttl(keys, ttl, audience, MAX_DURABLE_JOB_TTL)
+    }
+
+    fn try_new_with_max_ttl(
+        keys: QueryTicketKeyRing,
+        ttl: Duration,
+        audience: impl Into<Arc<str>>,
+        max_ttl: Duration,
+    ) -> Result<Self, QueryTicketError> {
         let audience = audience.into();
-        if ttl.is_zero() || ttl > MAX_TICKET_TTL || audience.is_empty() {
+        if ttl.is_zero() || ttl > max_ttl || audience.is_empty() {
             return Err(QueryTicketError::InvalidConfiguration);
         }
         let mut nonce_prefix = [0_u8; NONCE_PREFIX_BYTES];
@@ -196,6 +215,7 @@ impl StatementTicketCodec {
         Ok(Self {
             keys,
             ttl,
+            max_ttl,
             audience,
             nonce_prefix,
             nonce_counter: Arc::new(AtomicU32::new(0)),
@@ -352,7 +372,7 @@ impl StatementTicketCodec {
         if payload.issued_at_secs > latest_issued
             || payload.expires_at_secs <= now_secs
             || payload.expires_at_secs < payload.issued_at_secs
-            || payload.expires_at_secs - payload.issued_at_secs > MAX_TICKET_TTL.as_secs()
+            || payload.expires_at_secs - payload.issued_at_secs > self.max_ttl.as_secs()
             || payload
                 .principal_id
                 .as_bytes()

@@ -25,6 +25,7 @@
 use std::{
     collections::BTreeSet,
     future::Future,
+    io::Cursor,
     ops::Bound::{Excluded, Unbounded},
     pin::Pin,
     sync::Arc,
@@ -32,21 +33,22 @@ use std::{
 };
 
 use arrow_flight::{
-    Action, ActionType, Criteria, Empty, FlightClient, FlightData, FlightDescriptor,
-    FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, PollInfo,
-    Result as FlightResult, SchemaResult, Ticket,
+    Action, ActionType, CancelFlightInfoRequest, CancelFlightInfoResult, CancelStatus, Criteria,
+    Empty, FlightClient, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
+    HandshakeRequest, HandshakeResponse, PollInfo, Result as FlightResult, SchemaResult, Ticket,
     encode::FlightDataEncoderBuilder,
     error::FlightError,
     flight_service_server::FlightService,
     sql::{
-        Any, CommandGetDbSchemas, CommandGetTables, CommandStatementQuery, ProstMessageExt,
-        SqlInfo, TicketStatementQuery,
+        Any, Command, CommandGetDbSchemas, CommandGetTables, CommandStatementQuery,
+        ProstMessageExt, SqlInfo, TicketStatementQuery,
         server::{FlightSqlService, PeekableFlightDataStream},
     },
 };
 use datafusion::{
     arrow::{
         datatypes::{Schema, SchemaRef},
+        ipc::reader::StreamReader as IpcStreamReader,
         record_batch::RecordBatch,
     },
     common::{TableReference, config::Dialect},
@@ -63,6 +65,7 @@ use lake_flight::{
 };
 use prost::Message;
 use tokio::{
+    io::AsyncReadExt,
     sync::{OwnedSemaphorePermit, Semaphore},
     time::{Instant, Sleep},
 };
@@ -70,7 +73,9 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{Instrument as _, Span, field};
 
 use crate::{
-    DiscoveryLimits, QueryEngine, QueryError, QueryLimits, telemetry,
+    DiscoveryLimits, QueryEngine, QueryError, QueryLimits,
+    async_query::AsyncQueryCoordinator,
+    telemetry,
     ticket::{MAX_TABLE_SNAPSHOTS, StatementTableSnapshot, StatementTicket, StatementTicketCodec},
 };
 
@@ -723,11 +728,292 @@ fn finish_stream_rpc<T: Send + 'static>(
 /// Delegates Arrow Flight SQL dispatch while overriding `ListActions`, the one
 /// successful RPC whose request is not exposed by `FlightSqlService` hooks.
 pub(crate) struct TracedFlightSqlService {
-    inner: FlightSqlServiceImpl,
+    inner:         FlightSqlServiceImpl,
+    async_queries: Option<AsyncQueryCoordinator>,
 }
 
 impl TracedFlightSqlService {
-    pub(crate) fn new(inner: FlightSqlServiceImpl) -> Self { Self { inner } }
+    pub(crate) fn new(inner: FlightSqlServiceImpl) -> Self {
+        Self {
+            inner,
+            async_queries: None,
+        }
+    }
+
+    pub(crate) fn with_async_queries(
+        inner: FlightSqlServiceImpl,
+        async_queries: AsyncQueryCoordinator,
+    ) -> Self {
+        Self {
+            inner,
+            async_queries: Some(async_queries),
+        }
+    }
+
+    async fn poll_async_query(
+        &self,
+        request: Request<FlightDescriptor>,
+    ) -> std::result::Result<Response<PollInfo>, Status> {
+        let coordinator = self
+            .async_queries
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("asynchronous queries are not configured"))?;
+        let principal = self.inner.principal(&request)?;
+        let descriptor = request.into_inner();
+        if AsyncQueryCoordinator::is_poll_handle(&descriptor.cmd) {
+            let query_id = coordinator
+                .open_poll_handle(&descriptor.cmd, &principal)
+                .map_err(|_| Status::unauthenticated("invalid async query handle"))?;
+            let record = coordinator
+                .store()
+                .load(&query_id)
+                .await
+                .map_err(|_| Status::unavailable("async query state is unavailable"))?
+                .ok_or_else(|| Status::unauthenticated("invalid async query handle"))?;
+            if !record.belongs_to(&principal) {
+                return Err(Status::unauthenticated("invalid async query handle"));
+            }
+            if record.is_completed() {
+                let manifest = coordinator
+                    .load_manifest(&record)
+                    .await
+                    .map_err(|_| Status::unavailable("async query result is unavailable"))?;
+                let cancel_handle = coordinator
+                    .refresh_poll_handle(&query_id, &principal)
+                    .map_err(|_| Status::internal("could not issue async cancel handle"))?;
+                let mut info = FlightInfo::new().with_app_metadata(cancel_handle);
+                info.schema = manifest.schema_ipc().to_vec().into();
+                for part in 0..manifest.part_count() {
+                    let handle = coordinator
+                        .seal_result_handle(&query_id, part, &principal)
+                        .map_err(|_| Status::internal("could not issue async result handle"))?;
+                    info = info.with_endpoint(
+                        FlightEndpoint::new()
+                            .with_ticket(Ticket::new(handle))
+                            .with_expiration_time(poll_expiration(
+                                coordinator
+                                    .capability_expires_at()
+                                    .map_err(|_| Status::internal("invalid capability expiry"))?,
+                            )?),
+                    );
+                }
+                let poll = PollInfo::new()
+                    .with_info(info)
+                    .try_with_progress(1.0)
+                    .map_err(|_| Status::internal("could not encode async query progress"))?;
+                return Ok(Response::new(poll));
+            }
+            if record.is_failed() {
+                return Err(Status::internal("asynchronous query execution failed"));
+            }
+            if record.is_cancelled() {
+                return Err(Status::cancelled("asynchronous query was cancelled"));
+            }
+            if record.is_expired() {
+                return Err(Status::deadline_exceeded("asynchronous query expired"));
+            }
+            if !record.is_pending() {
+                return Err(Status::failed_precondition(
+                    "async query is terminal but has no published result",
+                ));
+            }
+            let handle = coordinator
+                .refresh_poll_handle(&query_id, &principal)
+                .map_err(|_| Status::internal("could not refresh async query handle"))?;
+            let expiration = poll_expiration(
+                coordinator
+                    .capability_expires_at()
+                    .map_err(|_| Status::internal("invalid capability expiry"))?,
+            )?;
+            let poll = PollInfo::new()
+                .with_descriptor(FlightDescriptor::new_cmd(handle))
+                .try_with_progress(0.0)
+                .map_err(|_| Status::internal("could not encode async query progress"))?
+                .with_expiration_time(expiration);
+            return Ok(Response::new(poll));
+        }
+
+        self.inner.admission.validate_sql_size(&descriptor.cmd)?;
+        let any = Any::decode(&*descriptor.cmd)
+            .map_err(|_| Status::invalid_argument("invalid Flight SQL poll descriptor"))?;
+        let Command::CommandStatementQuery(query) = Command::try_from(any)
+            .map_err(|_| Status::invalid_argument("invalid Flight SQL poll descriptor"))?
+        else {
+            return Err(Status::invalid_argument(
+                "PollFlightInfo requires a statement query",
+            ));
+        };
+        self.inner
+            .admission
+            .validate_sql_size(query.query.as_bytes())?;
+        let references = self
+            .inner
+            .authorized_table_references(&principal, &query.query)?;
+        let _permit = self.inner.admission.acquire().await?;
+        let deadline = self.inner.admission.execution_deadline();
+        let (snapshots, schema) = tokio::time::timeout_at(deadline, async {
+            let snapshots = self
+                .inner
+                .engine
+                .resolve_snapshots(&references)
+                .await
+                .map_err(query_status)?;
+            let schema = self.inner.plan_schema(&query.query, &snapshots).await?;
+            Ok::<_, Status>((snapshots, schema))
+        })
+        .await
+        .map_err(|_| Status::deadline_exceeded("query planning deadline exceeded"))??;
+        let statement = StatementTicket {
+            sql:       query.query,
+            snapshots: snapshots.iter().map(ticket_snapshot).collect(),
+        };
+        let submission = coordinator
+            .submit_statement(&statement, &principal)
+            .await
+            .map_err(|_| Status::internal("could not persist async query"))?;
+        let info = FlightInfo::new()
+            .try_with_schema(&schema)
+            .map_err(|_| Status::internal("could not encode async query schema"))?
+            .with_descriptor(descriptor)
+            .with_app_metadata(submission.poll_handle().to_vec());
+        let poll = PollInfo::new()
+            .with_info(info)
+            .with_descriptor(FlightDescriptor::new_cmd(submission.poll_handle().to_vec()))
+            .try_with_progress(0.0)
+            .map_err(|_| Status::internal("could not encode async query progress"))?
+            .with_expiration_time(poll_expiration(
+                coordinator
+                    .capability_expires_at()
+                    .map_err(|_| Status::internal("invalid capability expiry"))?,
+            )?);
+        Ok(Response::new(poll))
+    }
+
+    async fn do_get_async_result(
+        &self,
+        request: Request<Ticket>,
+    ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let coordinator = self
+            .async_queries
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("asynchronous queries are not configured"))?;
+        let principal = self.inner.principal(&request)?;
+        let (query_id, part) = coordinator
+            .open_result_handle(&request.get_ref().ticket, &principal)
+            .map_err(|_| Status::unauthenticated("invalid async result handle"))?;
+        let record = coordinator
+            .store()
+            .load(&query_id)
+            .await
+            .map_err(|_| Status::unavailable("async query state is unavailable"))?
+            .ok_or_else(|| Status::unauthenticated("invalid async result handle"))?;
+        if !record.belongs_to(&principal) || !record.is_completed() {
+            return Err(Status::unauthenticated("invalid async result handle"));
+        }
+        let permit = self.inner.admission.acquire().await?;
+        let deadline = self.inner.admission.execution_deadline();
+        let manifest = coordinator
+            .load_manifest(&record)
+            .await
+            .map_err(|_| Status::unavailable("async query result is unavailable"))?;
+        let location = manifest
+            .part(part)
+            .ok_or_else(|| Status::unauthenticated("invalid async result handle"))?;
+        let capacity = usize::try_from(location.size_bytes)
+            .map_err(|_| Status::resource_exhausted("async query result part is too large"))?;
+        let reader = coordinator
+            .open_result_part(&manifest, part)
+            .await
+            .map_err(|_| Status::unavailable("async query result is unavailable"))?;
+        let mut encoded = Vec::with_capacity(capacity);
+        tokio::time::timeout_at(
+            deadline,
+            reader
+                .take(location.size_bytes.saturating_add(1))
+                .read_to_end(&mut encoded),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("async result read deadline exceeded"))?
+        .map_err(|_| Status::unavailable("async query result is unavailable"))?;
+        if encoded.len() != capacity {
+            return Err(Status::unavailable("async query result is unavailable"));
+        }
+        let (schema, batches) = tokio::time::timeout_at(
+            deadline,
+            tokio::task::spawn_blocking(move || {
+                let reader = IpcStreamReader::try_new(Cursor::new(encoded), None)
+                    .map_err(|_| Status::internal("async query result is invalid"))?;
+                let schema = reader.schema();
+                let batches = reader
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|_| Status::internal("async query result is invalid"))?;
+                Ok::<_, Status>((schema, batches))
+            }),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("async result decode deadline exceeded"))?
+        .map_err(|_| Status::internal("async query result decoding failed"))??;
+        let batches = futures::stream::iter(batches.into_iter().map(Ok));
+        let stream: <FlightSqlServiceImpl as FlightService>::DoGetStream = Box::pin(
+            FlightDataEncoderBuilder::new()
+                .with_schema(schema)
+                .build(batches)
+                .map_err(Status::from),
+        );
+        Ok(Response::new(Box::pin(AdmittedFlightStream::new(
+            stream, deadline, permit,
+        ))))
+    }
+
+    async fn cancel_async_query(
+        &self,
+        request: Request<Action>,
+    ) -> std::result::Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        let coordinator = self
+            .async_queries
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("asynchronous queries are not configured"))?;
+        let principal = self.inner.principal(&request)?;
+        let cancel = CancelFlightInfoRequest::decode(&*request.into_inner().body)
+            .map_err(|_| Status::invalid_argument("invalid CancelFlightInfo request"))?;
+        let info = cancel
+            .info
+            .ok_or_else(|| Status::invalid_argument("CancelFlightInfo is missing FlightInfo"))?;
+        let query_id = coordinator
+            .open_poll_handle(&info.app_metadata, &principal)
+            .map_err(|_| Status::unauthenticated("invalid async cancel handle"))?;
+        let record = coordinator
+            .store()
+            .load(&query_id)
+            .await
+            .map_err(|_| Status::unavailable("async query state is unavailable"))?
+            .ok_or_else(|| Status::not_found("asynchronous query does not exist"))?;
+        if !record.belongs_to(&principal) {
+            return Err(Status::unauthenticated("invalid async cancel handle"));
+        }
+        let status = if record.is_pending() {
+            coordinator
+                .cancel(&query_id)
+                .await
+                .map_err(|_| Status::aborted("asynchronous query changed concurrently"))?;
+            CancelStatus::Cancelled
+        } else if record.is_cancelled() {
+            CancelStatus::Cancelled
+        } else {
+            CancelStatus::NotCancellable
+        };
+        let body = CancelFlightInfoResult::new(status).encode_to_vec();
+        let stream = futures::stream::once(async move { Ok(FlightResult { body: body.into() }) });
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+fn poll_expiration(seconds: u64) -> std::result::Result<prost_types::Timestamp, Status> {
+    Ok(prost_types::Timestamp {
+        seconds: i64::try_from(seconds)
+            .map_err(|_| Status::internal("async query expiration is invalid"))?,
+        nanos:   0,
+    })
 }
 
 #[tonic::async_trait]
@@ -765,7 +1051,7 @@ impl FlightService for TracedFlightSqlService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> std::result::Result<Response<PollInfo>, Status> {
-        <FlightSqlServiceImpl as FlightService>::poll_flight_info(&self.inner, request).await
+        self.poll_async_query(request).await
     }
 
     async fn get_schema(
@@ -779,6 +1065,9 @@ impl FlightService for TracedFlightSqlService {
         &self,
         request: Request<Ticket>,
     ) -> std::result::Result<Response<Self::DoGetStream>, Status> {
+        if AsyncQueryCoordinator::is_result_handle(&request.get_ref().ticket) {
+            return self.do_get_async_result(request).await;
+        }
         <FlightSqlServiceImpl as FlightService>::do_get(&self.inner, request).await
     }
 
@@ -793,6 +1082,9 @@ impl FlightService for TracedFlightSqlService {
         &self,
         request: Request<Action>,
     ) -> std::result::Result<Response<Self::DoActionStream>, Status> {
+        if request.get_ref().r#type == "CancelFlightInfo" {
+            return self.cancel_async_query(request).await;
+        }
         <FlightSqlServiceImpl as FlightService>::do_action(&self.inner, request).await
     }
 
@@ -803,7 +1095,19 @@ impl FlightService for TracedFlightSqlService {
         let span = query_server_span(&request, "list_actions");
         let result = <FlightSqlServiceImpl as FlightService>::list_actions(&self.inner, request)
             .instrument(span.clone())
-            .await;
+            .await
+            .map(|response| {
+                if self.async_queries.is_none() {
+                    return response;
+                }
+                let stream = response.into_inner().chain(futures::stream::once(async {
+                    Ok(ActionType {
+                        r#type:      "CancelFlightInfo".to_owned(),
+                        description: "Cancel a durable asynchronous query".to_owned(),
+                    })
+                }));
+                Response::new(Box::pin(stream) as Self::ListActionsStream)
+            });
         finish_stream_rpc(&span, result)
     }
 
@@ -1201,10 +1505,14 @@ mod tests {
     };
     use lake_engine_lance::LanceEngine;
     use lake_meta::{MetaStore, MetaStoreRef, RocksMeta, registry, registry::TableRegistration};
+    use lake_objects::LocalObjectStore;
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::ticket::{QueryTicketKeyRing, StatementTicketCodec};
+    use crate::{
+        async_query::{AsyncQueryCoordinator, AsyncQueryWorker, WorkerIdentity},
+        ticket::{QueryTicketKeyRing, StatementTicketCodec},
+    };
 
     #[test]
     fn flight_sql_patterns_follow_percent_and_underscore_semantics() {
@@ -1542,17 +1850,14 @@ mod tests {
         .map_err(Status::from)
     }
 
+    fn test_ticket_keys() -> QueryTicketKeyRing {
+        QueryTicketKeyRing::try_new(b"query-test-ticket-key-material-000001", std::iter::empty())
+            .unwrap()
+    }
+
     fn test_ticket_codec() -> StatementTicketCodec {
-        StatementTicketCodec::try_new(
-            QueryTicketKeyRing::try_new(
-                b"query-test-ticket-key-material-000001",
-                std::iter::empty(),
-            )
-            .unwrap(),
-            Duration::from_mins(5),
-            "lake-query",
-        )
-        .unwrap()
+        StatementTicketCodec::try_new(test_ticket_keys(), Duration::from_mins(5), "lake-query")
+            .unwrap()
     }
 
     async fn discovery_service(
@@ -1855,6 +2160,244 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(values.values(), &[1]);
+    }
+
+    #[tokio::test]
+    async fn poll_flight_info_submits_identity_bound_pinned_job() {
+        let catalog_directory = tempfile::tempdir().unwrap();
+        let catalog_meta = Arc::new(RocksMeta::open(catalog_directory.path()).unwrap());
+        let table = TableRef::new("robots", "episodes");
+        let location = TableLocation::new("mem://robots/episodes/async-incarnation");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let registration = snapshot_registration(&location, Version(7), &schema);
+        registry::register(catalog_meta.as_ref(), &table, &registration)
+            .await
+            .unwrap();
+        let engine = VersionedTestEngine::default();
+        engine.insert(&location, Version(7), int_provider(schema, vec![7]));
+        let issuer = snapshot_service(catalog_meta, Arc::new(engine), test_ticket_codec());
+        let worker_engine = issuer.engine.clone();
+        let state_directory = tempfile::tempdir().unwrap();
+        let state: MetaStoreRef = Arc::new(RocksMeta::open(state_directory.path()).unwrap());
+        let object_directory = tempfile::tempdir().unwrap();
+        let objects = Arc::new(
+            LocalObjectStore::open(object_directory.path())
+                .await
+                .unwrap(),
+        );
+        let coordinator = AsyncQueryCoordinator::try_new(
+            state,
+            objects.clone(),
+            test_ticket_keys(),
+            Duration::from_hours(6),
+            Duration::from_mins(5),
+        )
+        .unwrap();
+        let service = TracedFlightSqlService::with_async_queries(issuer, coordinator.clone());
+        let principal = robots_reader();
+        let query = CommandStatementQuery {
+            query:          "SELECT value FROM lake.robots.episodes".to_owned(),
+            transaction_id: None,
+        };
+        let mut request = Request::new(FlightDescriptor::new_cmd(query.as_any().encode_to_vec()));
+        request.extensions_mut().insert(principal.clone());
+
+        let poll = FlightService::poll_flight_info(&service, request)
+            .await
+            .expect("submit async query")
+            .into_inner();
+
+        assert_eq!(poll.progress, Some(0.0));
+        let next = poll.flight_descriptor.expect("retry descriptor");
+        let query_id = coordinator
+            .open_poll_handle(&next.cmd, &principal)
+            .expect("identity-bound poll handle");
+        let record = coordinator
+            .store()
+            .load(&query_id)
+            .await
+            .unwrap()
+            .expect("durable queued query");
+        let statement = coordinator
+            .open_job(&record)
+            .await
+            .expect("encrypted pinned job specification");
+        assert_eq!(statement.sql, query.query);
+        assert_eq!(statement.snapshots.len(), 1);
+        assert_eq!(statement.snapshots[0].version, 7);
+
+        let replica = snapshot_service(
+            Arc::new(EmptyMeta),
+            Arc::new(LanceEngine::new()),
+            test_ticket_codec(),
+        );
+        let replica = TracedFlightSqlService::with_async_queries(replica, coordinator.clone());
+        let mut follow_up = Request::new(next.clone());
+        follow_up.extensions_mut().insert(principal.clone());
+        assert!(
+            FlightService::poll_flight_info(&replica, follow_up)
+                .await
+                .is_ok(),
+            "another replica polls without catalog resolution"
+        );
+        let mut replay = Request::new(next.clone());
+        replay.extensions_mut().insert(
+            Principal::try_new(
+                PrincipalId::try_new("other-reader").unwrap(),
+                TenantId::try_new("robots-tenant").unwrap(),
+                PrincipalRole::User,
+                ["robots"],
+            )
+            .unwrap(),
+        );
+        let error = FlightService::poll_flight_info(&replica, replay)
+            .await
+            .expect_err("another principal cannot poll the capability");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+
+        AsyncQueryWorker::try_new(
+            coordinator,
+            worker_engine,
+            WorkerIdentity::new([9; 16]),
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .run(&query_id)
+        .await
+        .expect("worker materializes the pinned query");
+        let mut completed = Request::new(next);
+        completed.extensions_mut().insert(principal.clone());
+        let completed = FlightService::poll_flight_info(&replica, completed)
+            .await
+            .expect("completed poll returns result endpoints")
+            .into_inner();
+        assert_eq!(completed.progress, Some(1.0));
+        assert!(completed.flight_descriptor.is_none());
+        let endpoint = &completed.info.expect("completed FlightInfo").endpoint[0];
+        let mut result_request = Request::new(endpoint.ticket.clone().expect("result ticket"));
+        result_request.extensions_mut().insert(principal);
+        let batches = FlightRecordBatchStream::new_from_flight_data(
+            FlightService::do_get(&replica, result_request)
+                .await
+                .expect("redeem async result")
+                .into_inner()
+                .map_err(arrow_flight::error::FlightError::from),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        let values = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.values(), &[7]);
+    }
+
+    #[tokio::test]
+    async fn cancel_flight_info_fences_execution_and_reaps_partial_results() {
+        let catalog_directory = tempfile::tempdir().unwrap();
+        let catalog: MetaStoreRef = Arc::new(RocksMeta::open(catalog_directory.path()).unwrap());
+        let service = snapshot_service(catalog, Arc::new(LanceEngine::new()), test_ticket_codec());
+        let state_directory = tempfile::tempdir().unwrap();
+        let state: MetaStoreRef = Arc::new(RocksMeta::open(state_directory.path()).unwrap());
+        let object_directory = tempfile::tempdir().unwrap();
+        let objects = Arc::new(
+            LocalObjectStore::open(object_directory.path())
+                .await
+                .unwrap(),
+        );
+        let coordinator = AsyncQueryCoordinator::try_new(
+            state,
+            objects,
+            test_ticket_keys(),
+            Duration::from_hours(1),
+            Duration::from_mins(5),
+        )
+        .unwrap();
+        let service = TracedFlightSqlService::with_async_queries(service, coordinator.clone());
+        let principal = robots_reader();
+        let query = CommandStatementQuery {
+            query:          "SELECT 1".to_owned(),
+            transaction_id: None,
+        };
+        let mut submit = Request::new(FlightDescriptor::new_cmd(query.as_any().encode_to_vec()));
+        submit.extensions_mut().insert(principal.clone());
+        let poll = FlightService::poll_flight_info(&service, submit)
+            .await
+            .unwrap()
+            .into_inner();
+        let retry = poll.flight_descriptor.clone().unwrap();
+        let query_id = coordinator
+            .open_poll_handle(&retry.cmd, &principal)
+            .unwrap();
+        let cancel = CancelFlightInfoRequest::new(poll.info.unwrap());
+        let cancel_body = cancel.encode_to_vec();
+        let mut cancel_request = Request::new(Action::new("CancelFlightInfo", cancel_body.clone()));
+        cancel_request.extensions_mut().insert(principal.clone());
+        let result = FlightService::do_action(&service, cancel_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let cancelled = CancelFlightInfoResult::decode(&*result[0].body).unwrap();
+        assert_eq!(cancelled.status(), CancelStatus::Cancelled);
+        let mut repeated = Request::new(Action::new("CancelFlightInfo", cancel_body));
+        repeated.extensions_mut().insert(principal.clone());
+        let repeated = FlightService::do_action(&service, repeated)
+            .await
+            .unwrap()
+            .into_inner()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            CancelFlightInfoResult::decode(&*repeated[0].body)
+                .unwrap()
+                .status(),
+            CancelStatus::Cancelled
+        );
+        assert!(
+            coordinator
+                .store()
+                .load(&query_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_cancelled()
+        );
+        let mut follow_up = Request::new(retry);
+        follow_up.extensions_mut().insert(principal);
+        let error = FlightService::poll_flight_info(&service, follow_up)
+            .await
+            .expect_err("cancelled job cannot be polled as pending");
+        assert_eq!(error.code(), tonic::Code::Cancelled);
+        let expires_at = coordinator
+            .store()
+            .load(&query_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .expires_at();
+        assert!(
+            !coordinator
+                .cleanup_if_expired(&query_id, expires_at)
+                .await
+                .unwrap()
+        );
+        assert!(
+            coordinator
+                .cleanup_if_expired(&query_id, expires_at + 300)
+                .await
+                .unwrap()
+        );
+        assert!(coordinator.store().load(&query_id).await.unwrap().is_none());
     }
 
     #[tokio::test]

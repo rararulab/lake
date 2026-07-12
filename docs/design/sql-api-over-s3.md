@@ -55,24 +55,25 @@ This avoids an intermediate result copy and starts returning rows before the
 query finishes. It is the default for schema discovery, sampling, filters, and
 other results that fit the query service's streaming limits.
 
-### Tier 2: asynchronous S3 results (proposed)
+### Tier 2: durable asynchronous results
 
 Large scans should not pin one gRPC connection for their full lifetime:
 
 1. Submit the statement with `PollFlightInfo`.
-2. Execute asynchronously and materialize partitioned Arrow IPC stream files
+2. Execute asynchronously under a CAS-fenced worker lease and materialize
+   tenant/query-scoped Arrow IPC stream parts
    (default) or Parquet under a service-owned result prefix.
-3. Return completed partitions as `FlightEndpoint`s with short-lived presigned
-   HTTPS locations.
-4. Let clients download available partitions in parallel while later
-   partitions continue to materialize.
+3. Publish one immutable manifest only after every bounded part succeeds.
+4. Return short-lived identity-bound `FlightEndpoint` tickets; each `DoGet`
+   redeems one exact local or S3 part on any Query replica.
 
 Flight explicitly supports long-running queries through `PollFlightInfo` and
-extended HTTP/HTTPS endpoint locations for cloud object storage. A presigned
-URL carries external-download authorization; its endpoint ticket is ignored
+multiple result endpoints. Lake keeps those endpoints inside standard Flight:
+the ticket is authenticated and a location, when present, names a Flight
+service rather than a raw object URL
 ([Flight RPC specification](https://arrow.apache.org/docs/format/Flight.html)).
-This is compatible with the established warehouse pattern of materializing
-query results to an S3 result location
+The server-side materialization remains compatible with the established
+warehouse pattern of writing query results to S3
 ([Athena result files](https://docs.aws.amazon.com/athena/latest/ug/querying-finding-output-files.html)).
 
 Use this result layout:
@@ -110,10 +111,10 @@ policy and resource controls below:
   principal, tenant, audience, issued-at, and expiry, with a bounded shared key
   ring for stateless replica rotation. Raw SQL, storage locations, incarnation
   ids, and credentials are not ticket plaintext. Exact table snapshots are
-  bound across `GetFlightInfo`/`DoGet`; async result mode still needs its own
-  capability envelope.
-- Presigned result URLs with the shortest practical expiry, `GET` only, and a
-  result prefix unique to the tenant and query.
+  bound across `GetFlightInfo`/`DoGet`; async mode uses a separate encrypted
+  durable job capability and exact snapshot-set envelope.
+- Short-lived result tickets bound to principal, tenant, query, and exact part;
+  storage stays below a result prefix unique to the tenant and query.
 - Per-replica concurrency, queue wait, execution duration, SQL/ticket size,
   DataFusion memory, and local spill are now bounded. Add per-tenant limits for
   scanned bytes, result bytes, memory, spill, and egress plus fair queuing.
@@ -132,8 +133,7 @@ that principal. AWS documents the same property for Athena result buckets
 Keep the server standards-first:
 
 - Arrow Flight SQL for statements, metadata, tickets, and streaming results.
-- Arrow IPC stream as the default result format; Parquet only when the HTTPS
-  response advertises its media type.
+- Arrow IPC stream as the durable result format.
 - ADBC Flight SQL for general client access. The Arrow project ships stable Go
   and beta Java/C# Flight SQL drivers, with language reuse through driver
   managers where available
@@ -149,9 +149,11 @@ schema encoding, streaming, error mapping, and result-location semantics.
    authorization, per-replica limits, encrypted expiring statement tickets,
    and staged ticket-key rotation are wired; next pin exact table snapshots,
    finish cancellation coverage, and add load tests.
-2. Add an async query state store and `PollFlightInfo`.
-3. Add bounded result materialization, manifest publication, presigned HTTPS
-   endpoints, and result garbage collection.
+2. Add an async query state store and `PollFlightInfo`. **Implemented:** the
+   Rust SDK exposes `query_async`, while Query uses an injected dedicated CAS
+   store and result object store.
+3. Bounded result materialization, atomic manifest publication, exact DoGet
+   endpoints, and expiry cleanup are implemented.
 4. Add ADBC compatibility tests for streaming, polling, endpoint downloads,
    errors, and cancellation.
 

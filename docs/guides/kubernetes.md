@@ -33,6 +33,8 @@ contain static AWS credentials. Annotate the separate `lake-query` and
 `lake-metasrv` ServiceAccounts for the cluster's workload-identity mechanism:
 
 - Query receives read/list access to the registry and table/object prefixes.
+- Query receives conditional read/write access to the separate async-query
+  tables and read/write/delete access to `LAKE_ASYNC_RESULT_PREFIX`.
 - Metasrv receives registry conditional-write and table/object read/write
   access.
 
@@ -51,6 +53,14 @@ they observe v2 authority before resuming writes. Runtime identities need
 `DescribeTable` plus their normal data-plane permissions, not `CreateTable`.
 Keep both table ARNs in the runtime IAM policy and retain v1 for at least one
 append-operation retention horizon.
+
+When `LAKE_ASYNC_QUERIES=true`, also provision
+`$LAKE_ASYNC_DYNAMODB_TABLE` and
+`$LAKE_ASYNC_DYNAMODB_TABLE_prefix_v2` with the same key schemas. These tables
+hold only bounded async coordination records and are deliberately separate
+from the registry tables. Result jobs, Arrow IPC parts, and manifests live
+under `LAKE_ASYNC_RESULT_PREFIX`; lifecycle cleanup requires List, Get, Put,
+and DeleteObject on that exact prefix.
 
 A failed finalize leaves its durable barrier held. Keep admission paused,
 finish backfill, and rerun finalize. Do not delete the barrier as a routine
