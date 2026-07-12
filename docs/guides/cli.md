@@ -72,6 +72,19 @@ invalid or zero values fail before the Metasrv listener binds. Dataset cleanup
 uses the immutable `LAKE_LANCE_RETAIN_VERSIONS` policy captured at process
 startup, then reconciles external manifest history only after cleanup succeeds.
 
+Append-operation cleanup uses `LAKE_APPEND_OPERATION_GC_PAGE_SIZE` (default
+`128`) per physical metadata page and
+`LAKE_MAINTENANCE_OPERATION_GC_MAX_PAGES` (default `16`, maximum `10000`) per
+tick. A tick follows its process-local cursor until it reaches end-of-scan or
+the page budget; it never wraps and rereads the beginning in the same tick.
+The defaults raise the scan ceiling from 128 to 2048 records per minute
+(roughly 34 records/second before reconciliation cost) while keeping drop and
+table maintenance schedulable. Size the product of page size and page budget
+above the sustained append rate times the maintenance interval. A sustained
+positive rate of `lake_metasrv_maintenance_items_total{stage="append_operations",outcome="budget_exhausted"}`
+means the configured budget is continuously consumed; compare the `deleted`
+rate with append throughput before raising either bound.
+
 ## gRPC health checks
 
 Query and Metasrv register the standard `grpc.health.v1.Health` service on the

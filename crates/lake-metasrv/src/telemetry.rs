@@ -68,8 +68,9 @@ pub(crate) fn write_ready(ready: bool) {
     metrics::gauge!("lake_metasrv_write_ready").set(f64::from(ready));
 }
 
-pub(crate) fn maintenance_page(stage: &'static str) {
-    metrics::counter!("lake_metasrv_maintenance_pages_total", "stage" => stage).increment(1);
+pub(crate) fn maintenance_pages(stage: &'static str, count: usize) {
+    metrics::counter!("lake_metasrv_maintenance_pages_total", "stage" => stage)
+        .increment(count as u64);
 }
 
 pub(crate) fn maintenance_items(stage: &'static str, outcome: &'static str, count: usize) {
@@ -164,6 +165,9 @@ mod tests {
             "lake_metasrv_reserved_append_bytes 0",
             "lake_metasrv_campaign_total{outcome=\"leader\"} 1",
             "lake_metasrv_write_ready 0",
+            "lake_metasrv_maintenance_pages_total{stage=\"append_operations\"} 1",
+            "lake_metasrv_maintenance_items_total{stage=\"append_operations\",outcome=\"\
+             budget_exhausted\"} 0",
             "lake_metasrv_maintenance_pages_total{stage=\"tables\"}",
             "lake_metasrv_maintenance_items_total{stage=\"tables\",outcome=\"maintained\"} 0",
         ] {

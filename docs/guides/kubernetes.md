@@ -131,6 +131,14 @@ spill `emptyDir` is capped at 16 GiB and is disposable. Tune its memory/spill
 budgets and pod limits together: the configured 6 GiB query pool sits below
 the 8 GiB container limit.
 
+Metasrv append-operation cleanup defaults to 16 metadata pages of 128 records
+per one-minute maintenance tick. Monitor the finite-label
+`append_operations/budget_exhausted` maintenance counter and the deleted-item
+rate. If the budget stays exhausted and deletion trails sustained append
+throughput, raise `LAKE_MAINTENANCE_OPERATION_GC_MAX_PAGES` or
+`LAKE_APPEND_OPERATION_GC_PAGE_SIZE` while keeping the product within the
+node's Dynamo request and shutdown budgets.
+
 ## Availability model
 
 - Query is a three-replica Deployment with zero-unavailable rolling updates,

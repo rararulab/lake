@@ -63,12 +63,18 @@ pub(crate) fn append_limits_from_env() -> anyhow::Result<AppendLimits> {
 pub(crate) fn maintenance_limits_from_env() -> anyhow::Result<MaintenanceLimits> {
     let interval_secs = env_value("LAKE_MAINTENANCE_INTERVAL_SECS")?;
     let table_page_size = env_value("LAKE_MAINTENANCE_TABLE_PAGE_SIZE")?;
-    maintenance_limits_from_values(interval_secs.as_deref(), table_page_size.as_deref())
+    let operation_gc_max_pages = env_value("LAKE_MAINTENANCE_OPERATION_GC_MAX_PAGES")?;
+    maintenance_limits_from_values(
+        interval_secs.as_deref(),
+        table_page_size.as_deref(),
+        operation_gc_max_pages.as_deref(),
+    )
 }
 
 fn maintenance_limits_from_values(
     interval_secs: Option<&str>,
     table_page_size: Option<&str>,
+    operation_gc_max_pages: Option<&str>,
 ) -> anyhow::Result<MaintenanceLimits> {
     let defaults = MaintenanceLimits::default();
     let interval_secs = parse_or(
@@ -81,8 +87,17 @@ fn maintenance_limits_from_values(
         table_page_size,
         defaults.table_page_size(),
     )?;
-    MaintenanceLimits::try_new(Duration::from_secs(interval_secs), table_page_size)
-        .context("invalid Metasrv maintenance limits")
+    let operation_gc_max_pages = parse_or(
+        "LAKE_MAINTENANCE_OPERATION_GC_MAX_PAGES",
+        operation_gc_max_pages,
+        defaults.operation_gc_max_pages(),
+    )?;
+    MaintenanceLimits::try_new(
+        Duration::from_secs(interval_secs),
+        table_page_size,
+        operation_gc_max_pages,
+    )
+    .context("invalid Metasrv maintenance limits")
 }
 
 fn append_limits_from_values(
@@ -339,14 +354,21 @@ mod tests {
 
     #[test]
     fn maintenance_limit_values_are_validated_before_serving() {
-        assert!(maintenance_limits_from_values(Some("0"), None).is_err());
-        assert!(maintenance_limits_from_values(Some("often"), None).is_err());
-        assert!(maintenance_limits_from_values(None, Some("0")).is_err());
-        assert!(maintenance_limits_from_values(None, Some("10001")).is_err());
+        assert!(maintenance_limits_from_values(Some("0"), None, None).is_err());
+        assert!(maintenance_limits_from_values(Some("often"), None, None).is_err());
+        assert!(maintenance_limits_from_values(None, Some("0"), None).is_err());
+        assert!(maintenance_limits_from_values(None, Some("10001"), None).is_err());
+        assert!(maintenance_limits_from_values(None, None, Some("0")).is_err());
+        assert!(maintenance_limits_from_values(None, None, Some("10001")).is_err());
+        assert!(maintenance_limits_from_values(None, None, Some("many")).is_err());
 
-        let limits = maintenance_limits_from_values(Some("15"), Some("512")).expect("valid limits");
+        let defaults = maintenance_limits_from_values(None, None, None).expect("default limits");
+        assert_eq!(defaults.operation_gc_max_pages(), 16);
+        let limits = maintenance_limits_from_values(Some("15"), Some("512"), Some("32"))
+            .expect("valid limits");
         assert_eq!(limits.interval(), Duration::from_secs(15));
         assert_eq!(limits.table_page_size(), 512);
+        assert_eq!(limits.operation_gc_max_pages(), 32);
     }
 
     #[test]
