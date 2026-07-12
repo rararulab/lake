@@ -14,7 +14,7 @@
 
 //! Process-owned structured logging configuration.
 
-use std::{env, time::Duration};
+use std::{env, future::Future, time::Duration};
 
 use anyhow::{Context as _, anyhow, bail};
 use opentelemetry::trace::TracerProvider as _;
@@ -228,6 +228,23 @@ pub(crate) fn init_from_env() -> anyhow::Result<TelemetryGuard> {
         .map_err(|error| anyhow!("initialize process observability: {error}"))
 }
 
+/// Own process telemetry around the complete command future. Constructing an
+/// async command is inert, so initialization failure occurs before command
+/// parsing, storage setup, or listener binding. Cancellation drops the guard.
+pub(crate) async fn run_process<F>(
+    initialize: impl FnOnce() -> anyhow::Result<TelemetryGuard>,
+    command: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    let telemetry = initialize()?;
+    tracing::info!(target: "lake", version = env!("CARGO_PKG_VERSION"), "lake process starting");
+    let result = command.await;
+    telemetry.shutdown();
+    result
+}
+
 fn log_format_from_env() -> anyhow::Result<LogFormat> {
     match env::var("LAKE_LOG_FORMAT") {
         Ok(value) if value == "json" => Ok(LogFormat::Json),
@@ -365,16 +382,79 @@ mod tests {
         assert_eq!(config.max_export_batch_size, 256);
 
         let recorder = RecordingExporter::default();
-        let guard = TelemetryGuard::from_exporter(config.clone(), recorder.clone());
-        finish_test_span(&guard);
-        guard.shutdown();
+        let command_started = Arc::new(AtomicBool::new(false));
+        let started = command_started.clone();
+        run_process(
+            || {
+                let guard = TelemetryGuard::from_exporter(config.clone(), recorder.clone());
+                finish_test_span(&guard);
+                Ok(guard)
+            },
+            async move {
+                started.store(true, Ordering::Release);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(())
+            },
+        )
+        .await
+        .expect("collector state does not stop command");
+        assert!(command_started.load(Ordering::Acquire));
         assert_eq!(recorder.exported.load(Ordering::Relaxed), 1);
         assert!(recorder.shutdown.load(Ordering::Relaxed));
 
-        let guard = TelemetryGuard::from_config(config).expect("provider construction is lazy");
-        finish_test_span(&guard);
+        let command_polled = Arc::new(AtomicBool::new(false));
+        let polled = command_polled.clone();
+        let error = run_process(
+            || Err(anyhow!("malformed OTLP configuration")),
+            async move {
+                polled.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("initialization failure wins");
+        assert!(error.to_string().contains("malformed OTLP"));
+        assert!(!command_polled.load(Ordering::Acquire));
+
         let started = Instant::now();
-        guard.shutdown();
+        run_process(|| TelemetryGuard::from_config(config), async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(())
+        })
+        .await
+        .expect("unavailable collector is not fatal");
         assert!(started.elapsed() < Duration::from_secs(1));
+
+        let cancelled = RecordingExporter::default();
+        let entered = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn({
+            let cancelled = cancelled.clone();
+            let entered = entered.clone();
+            let config = OtlpConfig {
+                endpoint: "http://127.0.0.1:9".to_owned(),
+                ..OtlpConfig::from_lookup(|name| match name {
+                    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" => Some("http://127.0.0.1:9".to_owned()),
+                    _ => None,
+                })
+                .expect("configuration")
+                .expect("enabled")
+            };
+            async move {
+                run_process(
+                    || Ok(TelemetryGuard::from_exporter(config, cancelled)),
+                    async move {
+                        entered.store(true, Ordering::Release);
+                        std::future::pending().await
+                    },
+                )
+                .await
+            }
+        });
+        while !entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        let _ = task.await;
+        assert!(cancelled.shutdown.load(Ordering::Acquire));
     }
 }

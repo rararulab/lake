@@ -17,7 +17,10 @@ use std::{
     time::Duration,
 };
 
-use arrow_flight::{FlightClient, FlightDescriptor, encode::FlightDataEncoderBuilder};
+use arrow_flight::{
+    FlightClient, FlightDescriptor, encode::FlightDataEncoderBuilder,
+    sql::client::FlightSqlServiceClient,
+};
 use datafusion::arrow::{
     array::StringArray,
     datatypes::{DataType, Field, Schema},
@@ -214,6 +217,32 @@ async fn query_trace_context_reaches_metasrv_without_data_attributes() {
     let beta_version = send("beta-token", messages.clone()).await;
     let alpha_replay = send("alpha-token", messages).await;
 
+    let mut sql_client = FlightSqlServiceClient::new(channel.clone());
+    let sql_span = tracing::info_span!("test.client.sql");
+    async {
+        ClientSecurity::new()
+            .with_bearer_token("alpha-token")
+            .unwrap()
+            .apply_to_sql_client(&mut sql_client);
+        let info = sql_client
+            .execute(
+                "SELECT episode_id FROM lake.robots.episodes".to_owned(),
+                None,
+            )
+            .await
+            .expect("plan SQL");
+        let ticket = info.endpoint[0].ticket.clone().expect("query ticket");
+        sql_client
+            .do_get(ticket)
+            .await
+            .expect("execute SQL")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect SQL response");
+    }
+    .instrument(sql_span.clone())
+    .await;
+
     assert_eq!(alpha_version, Version(2));
     assert_eq!(beta_version, Version(3));
     assert_eq!(alpha_replay, alpha_version);
@@ -228,21 +257,44 @@ async fn query_trace_context_reaches_metasrv_without_data_attributes() {
     );
 
     drop(client_span);
+    drop(sql_span);
     provider.force_flush().expect("flush test spans");
     let spans = exporter.0.lock().expect("span recorder lock");
+    let client_trace = spans
+        .iter()
+        .find(|span| span.name == "test.client")
+        .expect("client span")
+        .span_context
+        .trace_id();
     let query_span = spans
         .iter()
-        .find(|span| span_attribute(span, "rpc.service") == Some("lake.query"))
+        .find(|span| {
+            span.span_context.trace_id() == client_trace
+                && span_attribute(span, "rpc.service") == Some("lake.query")
+        })
         .expect("Query server span");
     let metasrv_span = spans
         .iter()
-        .find(|span| span_attribute(span, "rpc.service") == Some("lake.metasrv"))
+        .find(|span| {
+            span.span_context.trace_id() == client_trace
+                && span_attribute(span, "rpc.service") == Some("lake.metasrv")
+        })
         .expect("Metasrv server span");
-    assert_eq!(
-        query_span.span_context.trace_id(),
-        metasrv_span.span_context.trace_id()
-    );
-    for span in [query_span, metasrv_span] {
+    assert_eq!(query_span.span_context.trace_id(), client_trace);
+    assert_eq!(metasrv_span.span_context.trace_id(), client_trace);
+    let sql_trace = spans
+        .iter()
+        .find(|span| span.name == "test.client.sql")
+        .expect("SQL client span")
+        .span_context
+        .trace_id();
+    let sql_methods = spans
+        .iter()
+        .filter(|span| span.span_context.trace_id() == sql_trace)
+        .filter_map(|span| span_attribute(span, "rpc.method"))
+        .collect::<Vec<_>>();
+    assert_eq!(sql_methods, ["get_flight_info", "do_get"]);
+    for span in spans.iter().filter(|span| span.name == "flight.server") {
         let keys = span
             .attributes
             .iter()

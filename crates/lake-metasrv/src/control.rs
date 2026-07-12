@@ -49,7 +49,7 @@ use lake_common::{
     TableRef, TenantId, Version,
 };
 use lake_flight::{
-    ClientSecurity, DELEGATED_NAMESPACE_HEADER, DELEGATED_TENANT_HEADER,
+    ClientSecurity, DELEGATED_NAMESPACE_HEADER, DELEGATED_TENANT_HEADER, TracedFlightStream,
     append_flight_payload_digest, set_span_parent_from_request,
 };
 use lake_objects::data_location_field;
@@ -64,10 +64,6 @@ use crate::{AppendLimits, Metasrv, TablePlacement, leadership::Leadership, telem
 
 /// The [`Status`] message returned by every unsupported Flight method.
 const UNSUPPORTED: &str = "metasrv control plane only serves actions and FILE append do_put";
-
-fn record_rpc_outcome<T>(span: &Span, result: &Result<T, Status>) {
-    span.record("rpc.outcome", if result.is_ok() { "ok" } else { "error" });
-}
 
 #[derive(Clone, Debug)]
 pub(crate) struct AppendAdmission {
@@ -141,6 +137,23 @@ const RESOURCE_UNAVAILABLE: &str = "resource is not available";
 
 /// A boxed server stream of `T`, the shape every Flight response stream takes.
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+
+fn finish_stream_rpc<T: Send + 'static>(
+    span: &Span,
+    result: Result<Response<BoxStream<T>>, Status>,
+) -> Result<Response<BoxStream<T>>, Status> {
+    match result {
+        Ok(response) => {
+            let stream: BoxStream<T> =
+                Box::pin(TracedFlightStream::new(response.into_inner(), span.clone()));
+            Ok(Response::new(stream))
+        }
+        Err(error) => {
+            span.record("rpc.outcome", "error");
+            Err(error)
+        }
+    }
+}
 
 /// The `DoAction` response stream: a (usually one-shot) stream of Flight
 /// results carrying JSON bodies.
@@ -731,8 +744,7 @@ impl FlightService for MetasrvFlightService {
         }
         .instrument(span.clone())
         .await;
-        record_rpc_outcome(&span, &result);
-        result
+        finish_stream_rpc(&span, result)
     }
 
     async fn do_exchange(
@@ -793,8 +805,7 @@ impl FlightService for MetasrvFlightService {
         }
         .instrument(span.clone())
         .await;
-        record_rpc_outcome(&span, &result);
-        result
+        finish_stream_rpc(&span, result)
     }
 
     /// Advertise the four control-plane actions and their descriptions.

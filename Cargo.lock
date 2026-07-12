@@ -4241,6 +4241,7 @@ name = "lake-flight"
 version = "0.0.1"
 dependencies = [
  "arrow-flight",
+ "futures",
  "lake-common",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -4252,6 +4253,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-opentelemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]

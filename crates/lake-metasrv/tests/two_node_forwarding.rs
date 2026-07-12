@@ -1035,6 +1035,7 @@ async fn follower_forwarding_preserves_trace_context() {
         .collect::<Vec<_>>();
     assert_eq!(forwarded.len(), 2, "follower and leader server spans");
     for span in forwarded {
+        assert_eq!(span_attribute(span, "rpc.outcome"), Some("ok"));
         let keys = span
             .attributes
             .iter()

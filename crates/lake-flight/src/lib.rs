@@ -14,9 +14,16 @@
 
 //! Shared Flight transport-security contracts.
 
-use std::{fmt, net::SocketAddr, sync::Arc};
+use std::{
+    fmt,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context as TaskContext, Poll},
+};
 
 use arrow_flight::{FlightClient, FlightData, sql::client::FlightSqlServiceClient};
+use futures::Stream;
 use lake_common::AppendPayloadDigest;
 pub use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
 use opentelemetry::{
@@ -109,6 +116,59 @@ pub fn set_span_parent_from_request<T>(
     request: &Request<T>,
 ) -> std::result::Result<(), tracing_opentelemetry::SetParentError> {
     span.set_parent(extract_trace_context(request.metadata()))
+}
+
+/// Keep a server span alive for the complete lifetime of a Flight response
+/// stream, including downstream errors and cancellation by the caller.
+pub struct TracedFlightStream<T> {
+    inner:    Pin<Box<dyn Stream<Item = std::result::Result<T, Status>> + Send>>,
+    span:     Span,
+    finished: bool,
+}
+
+impl<T> TracedFlightStream<T> {
+    pub fn new(
+        inner: impl Stream<Item = std::result::Result<T, Status>> + Send + 'static,
+        span: Span,
+    ) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            span,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, outcome: &'static str) {
+        if !self.finished {
+            self.span.record("rpc.outcome", outcome);
+            self.finished = true;
+        }
+    }
+}
+
+impl<T> Stream for TracedFlightStream<T> {
+    type Item = std::result::Result<T, Status>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let polled = {
+            let span = self.span.clone();
+            let _entered = span.enter();
+            self.inner.as_mut().poll_next(context)
+        };
+        match &polled {
+            Poll::Ready(Some(Err(_))) => self.finish("error"),
+            Poll::Ready(None) => self.finish("ok"),
+            Poll::Pending | Poll::Ready(Some(Ok(_))) => {}
+        }
+        polled
+    }
+}
+
+impl<T> Drop for TracedFlightStream<T> {
+    fn drop(&mut self) { self.finish("cancelled"); }
 }
 
 /// Incrementally hashes the ordered Arrow Flight metadata messages in one
@@ -587,20 +647,52 @@ fn ensure_crypto_provider() { let _ = rustls::crypto::ring::default_provider().i
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::{
+        net::SocketAddr,
+        sync::{Arc, Mutex},
+    };
 
     use arrow_flight::{FlightClient, sql::client::FlightSqlServiceClient};
+    use futures::StreamExt as _;
     use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
     use opentelemetry::{
-        Context, TraceFlags, TraceId,
+        Context, TraceFlags, TraceId, Value,
         trace::{SpanContext, SpanId, TraceContextExt as _, TraceState},
     };
-    use tonic::{Request, service::Interceptor};
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
+    use tonic::{Request, Status, service::Interceptor};
+    use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::{
         BearerAuthenticator, BearerPrincipalBinding, ClientSecurity, DELEGATED_TENANT_HEADER,
-        ServerSecurity, append_flight_payload_digest, extract_trace_context, inject_trace_context,
+        ServerSecurity, TracedFlightStream, append_flight_payload_digest, extract_trace_context,
+        inject_trace_context,
     };
+
+    #[derive(Clone, Debug, Default)]
+    struct RecordingExporter(Arc<Mutex<Vec<SpanData>>>);
+
+    impl SpanExporter for RecordingExporter {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().expect("span recorder lock").extend(batch);
+            Ok(())
+        }
+    }
+
+    fn span_outcome(span: &SpanData) -> Option<&str> {
+        span.attributes.iter().find_map(|attribute| {
+            if attribute.key.as_str() != "rpc.outcome" {
+                return None;
+            }
+            match &attribute.value {
+                Value::String(value) => Some(value.as_str()),
+                _ => None,
+            }
+        })
+    }
 
     fn request_with_authorization(value: &str) -> Request<()> {
         let mut request = Request::new(());
@@ -656,6 +748,49 @@ mod tests {
         assert_eq!(trace_keys, ["traceparent", "tracestate"]);
         assert!(!format!("{extracted:?}").contains("must-stay-redacted"));
         assert!(!format!("{extracted:?}").contains("sensitive-tenant"));
+    }
+
+    #[test]
+    fn traced_flight_stream_records_late_error_and_cancellation() {
+        use opentelemetry::trace::TracerProvider as _;
+
+        let exporter = RecordingExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer()
+                .with_tracer(provider.tracer("stream-test"))
+                .with_location(false)
+                .with_threads(false)
+                .with_target(false)
+                .with_tracked_inactivity(false),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            let error_span =
+                tracing::info_span!("flight.server", rpc.outcome = tracing::field::Empty);
+            let mut error_stream = TracedFlightStream::new(
+                futures::stream::iter([Err::<(), _>(Status::unavailable("late failure"))]),
+                error_span,
+            );
+            let error = futures::executor::block_on(error_stream.next())
+                .expect("one item")
+                .expect_err("late stream error");
+            assert_eq!(error.code(), tonic::Code::Unavailable);
+
+            let cancelled_span =
+                tracing::info_span!("flight.server", rpc.outcome = tracing::field::Empty);
+            drop(TracedFlightStream::<()>::new(
+                futures::stream::pending(),
+                cancelled_span,
+            ));
+        });
+        provider.force_flush().expect("flush spans");
+        let spans = exporter.0.lock().expect("span recorder lock");
+        let mut outcomes = spans.iter().filter_map(span_outcome).collect::<Vec<_>>();
+        outcomes.sort_unstable();
+        assert_eq!(outcomes, ["cancelled", "error"]);
     }
 
     #[test]
