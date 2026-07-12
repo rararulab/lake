@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use arrow_flight::{FlightClient, FlightDescriptor, encode::FlightDataEncoderBuilder};
 use datafusion::arrow::{
@@ -33,9 +36,38 @@ use lake_flight::{
 use lake_meta::{MetaStoreRef, RocksMeta};
 use lake_metasrv::{Metasrv, MetasrvServerConfig};
 use lake_query::{QueryEngine, QueryServerConfig};
+use opentelemetry::{Value, trace::TracerProvider as _};
+use opentelemetry_sdk::{
+    error::OTelSdkResult,
+    trace::{SdkTracerProvider, SpanData, SpanExporter},
+};
 use prost::Message;
 use prost_types::Any;
 use tonic::transport::Channel;
+use tracing::Instrument as _;
+use tracing_subscriber::layer::SubscriberExt as _;
+
+#[derive(Clone, Debug, Default)]
+struct RecordingExporter(Arc<Mutex<Vec<SpanData>>>);
+
+impl SpanExporter for RecordingExporter {
+    async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+        self.0.lock().expect("span recorder lock").extend(batch);
+        Ok(())
+    }
+}
+
+fn span_attribute<'a>(span: &'a SpanData, key: &str) -> Option<&'a str> {
+    span.attributes.iter().find_map(|attribute| {
+        if attribute.key.as_str() != key {
+            return None;
+        }
+        match &attribute.value {
+            Value::String(value) => Some(value.as_str()),
+            _ => None,
+        }
+    })
+}
 
 fn free_addr() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -43,7 +75,21 @@ fn free_addr() -> String {
 }
 
 #[tokio::test]
-async fn query_forwards_authenticated_append_operation_scope() {
+async fn query_trace_context_reaches_metasrv_without_data_attributes() {
+    let exporter = RecordingExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("lake-query-test"))
+            .with_location(false)
+            .with_threads(false)
+            .with_target(false)
+            .with_tracked_inactivity(false),
+    );
+    tracing::subscriber::set_global_default(subscriber).expect("install tracing subscriber");
+
     let root = tempfile::tempdir().unwrap();
     let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
     let engine: TableEngineRef = Arc::new(LanceEngine::new());
@@ -161,7 +207,10 @@ async fn query_forwards_authenticated_append_operation_scope() {
         }
     };
 
-    let alpha_version = send("alpha-token", messages.clone()).await;
+    let client_span = tracing::info_span!("test.client");
+    let alpha_version = send("alpha-token", messages.clone())
+        .instrument(client_span.clone())
+        .await;
     let beta_version = send("beta-token", messages.clone()).await;
     let alpha_replay = send("alpha-token", messages).await;
 
@@ -177,4 +226,31 @@ async fn query_forwards_authenticated_append_operation_scope() {
             .current_version,
         beta_version
     );
+
+    drop(client_span);
+    provider.force_flush().expect("flush test spans");
+    let spans = exporter.0.lock().expect("span recorder lock");
+    let query_span = spans
+        .iter()
+        .find(|span| span_attribute(span, "rpc.service") == Some("lake.query"))
+        .expect("Query server span");
+    let metasrv_span = spans
+        .iter()
+        .find(|span| span_attribute(span, "rpc.service") == Some("lake.metasrv"))
+        .expect("Metasrv server span");
+    assert_eq!(
+        query_span.span_context.trace_id(),
+        metasrv_span.span_context.trace_id()
+    );
+    for span in [query_span, metasrv_span] {
+        let keys = span
+            .attributes
+            .iter()
+            .map(|attribute| attribute.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            ["rpc.system", "rpc.service", "rpc.method", "rpc.outcome"]
+        );
+    }
 }

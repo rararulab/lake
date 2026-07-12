@@ -115,6 +115,32 @@ values are never metric labels. The listener and exporter upkeep future share
 the server future directly: normal shutdown joins it, while dropping the outer
 server future drops the listener without leaving detached work.
 
+## OTLP distributed tracing
+
+Trace export is disabled unless `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (preferred)
+or `OTEL_EXPORTER_OTLP_ENDPOINT` is set to an HTTP(S) collector origin:
+
+```bash
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4317 \
+OTEL_SERVICE_NAME=lake-query \
+lake query --addr 127.0.0.1:50051 \
+  --metadata-addr http://127.0.0.1:50052
+```
+
+The endpoint must not contain credentials, a path, query, or fragment. Lake
+uses OTLP/gRPC, a fixed 2,048-span queue and 256-span export batch. Set
+`LAKE_OTLP_SHUTDOWN_TIMEOUT_MS` to `1..=30000` milliseconds (default `5000`)
+to bound the final export, exporter shutdown, and worker join. Collector
+unavailability drops telemetry within those bounds; it does not fail a running
+Query or Metasrv command.
+
+Flight calls propagate only W3C `traceparent` and `tracestate`. Server spans
+use fixed RPC names and the bounded fields `rpc.system`, `rpc.service`,
+`rpc.method`, and `rpc.outcome`. SQL, tenant, principal, namespace, table,
+object URI/path, credentials, media type, action bodies, and operation IDs are
+neither span attributes nor propagated baggage. Existing JSON/pretty logs stay
+enabled when OTLP is active.
+
 ## Process logging
 
 The binary installs its tracing subscriber before command parsing, storage

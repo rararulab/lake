@@ -100,6 +100,14 @@ Prometheus listens at `127.0.0.1:9090` and no Service exposes that port. Run a
 collector as a sidecar or node agent that can scrape pod loopback; do not
 change Lake's listener to a wildcard address.
 
+OTLP tracing remains opt-in. The reference assigns distinct
+`OTEL_SERVICE_NAME` values and a five-second owned shutdown bound, but does not
+guess a collector. To enable export, add an in-cluster collector origin such as
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4317` to the
+`lake-runtime` ConfigMap. Use a NetworkPolicy to restrict that egress. The
+collector is not part of Lake's availability path: an unavailable collector
+cannot stop either service, and shutdown remains bounded.
+
 Lake drains for at most 30 seconds after SIGTERM. Kubernetes grants 45 seconds,
 leaving time for probe withdrawal and process/container cleanup. The Query
 spill `emptyDir` is capped at 16 GiB and is disposable. Tune its memory/spill

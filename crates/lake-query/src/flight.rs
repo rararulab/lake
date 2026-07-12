@@ -54,13 +54,17 @@ use lake_common::{
     FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION,
     ManagedStageDescriptor, Namespace, Principal, PrincipalRole, TableName,
 };
-use lake_flight::{ClientSecurity, DELEGATED_NAMESPACE_HEADER, DELEGATED_TENANT_HEADER};
+use lake_flight::{
+    ClientSecurity, DELEGATED_NAMESPACE_HEADER, DELEGATED_TENANT_HEADER,
+    set_span_parent_from_request,
+};
 use prost::Message;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::{Instant, Sleep},
 };
 use tonic::{Request, Response, Status, Streaming};
+use tracing::{Instrument as _, Span, field};
 
 use crate::{DiscoveryLimits, QueryEngine, QueryLimits, telemetry};
 
@@ -593,6 +597,10 @@ impl FlightSqlServiceImpl {
 /// Collapse any displayable error into an internal [`Status`].
 fn to_status<E: std::fmt::Display>(err: E) -> Status { Status::internal(err.to_string()) }
 
+fn record_rpc_outcome<T>(span: &Span, result: &std::result::Result<T, Status>) {
+    span.record("rpc.outcome", if result.is_ok() { "ok" } else { "error" });
+}
+
 #[tonic::async_trait]
 impl FlightSqlService for FlightSqlServiceImpl {
     type FlightService = Self;
@@ -753,44 +761,61 @@ impl FlightSqlService for FlightSqlServiceImpl {
         request: Request<PeekableFlightDataStream>,
         message: Any,
     ) -> std::result::Result<Response<<Self as FlightService>::DoPutStream>, Status> {
-        if message.type_url != FILE_APPEND_TYPE_URL {
-            return Err(Status::invalid_argument("invalid FILE append command"));
+        let span = tracing::info_span!(
+            target: "lake_query",
+            "flight.server",
+            rpc.system = "grpc",
+            rpc.service = "lake.query",
+            rpc.method = "do_put",
+            rpc.outcome = field::Empty,
+        );
+        let _ = set_span_parent_from_request(&span, &request);
+        let result = async move {
+            if message.type_url != FILE_APPEND_TYPE_URL {
+                return Err(Status::invalid_argument("invalid FILE append command"));
+            }
+            let append = FileAppendRequest::from_command_payload(&message.value)
+                .ok_or_else(|| Status::invalid_argument("invalid FILE append command"))?;
+            let principal = self.principal(&request)?;
+            self.authorize_namespace(&principal, &append.table().namespace.0)?;
+            let addr = self
+                .metadata_addr
+                .as_ref()
+                .ok_or_else(|| Status::failed_precondition("FILE writes are not configured"))?;
+            let channel = self
+                .metadata_security
+                .connect(addr.clone())
+                .await
+                .map_err(|error| Status::unavailable(error.to_string()))?;
+            let mut client = FlightClient::new(channel);
+            self.metadata_security
+                .apply_to_flight_client(&mut client)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            apply_delegated_append_scope(
+                client.metadata_mut(),
+                &principal,
+                &append.table().namespace.0,
+            )?;
+            let results = client
+                .do_put(request.into_inner().map(|item| {
+                    item.map_err(|error| {
+                        arrow_flight::error::FlightError::protocol(error.to_string())
+                    })
+                }))
+                .await
+                .map_err(|error| Status::unavailable(error.to_string()))?
+                .map_err(|error| Status::internal(error.to_string()))
+                .try_collect::<Vec<_>>()
+                .await?;
+            self.engine.invalidate_registration(append.table()).await;
+            let stream: <Self as FlightService>::DoPutStream =
+                Box::pin(futures::stream::iter(results.into_iter().map(Ok)));
+            Ok(Response::new(stream))
         }
-        let append = FileAppendRequest::from_command_payload(&message.value)
-            .ok_or_else(|| Status::invalid_argument("invalid FILE append command"))?;
-        let principal = self.principal(&request)?;
-        self.authorize_namespace(&principal, &append.table().namespace.0)?;
-        let addr = self
-            .metadata_addr
-            .as_ref()
-            .ok_or_else(|| Status::failed_precondition("FILE writes are not configured"))?;
-        let channel = self
-            .metadata_security
-            .connect(addr.clone())
-            .await
-            .map_err(|error| Status::unavailable(error.to_string()))?;
-        let mut client = FlightClient::new(channel);
-        self.metadata_security
-            .apply_to_flight_client(&mut client)
-            .map_err(|error| Status::internal(error.to_string()))?;
-        apply_delegated_append_scope(
-            client.metadata_mut(),
-            &principal,
-            &append.table().namespace.0,
-        )?;
-        let results = client
-            .do_put(request.into_inner().map(|item| {
-                item.map_err(|error| arrow_flight::error::FlightError::protocol(error.to_string()))
-            }))
-            .await
-            .map_err(|error| Status::unavailable(error.to_string()))?
-            .map_err(|error| Status::internal(error.to_string()))
-            .try_collect::<Vec<_>>()
-            .await?;
-        self.engine.invalidate_registration(append.table()).await;
-        Ok(Response::new(Box::pin(futures::stream::iter(
-            results.into_iter().map(Ok),
-        ))))
+        .instrument(span.clone())
+        .await;
+        record_rpc_outcome(&span, &result);
+        result
     }
 
     async fn do_action_fallback(

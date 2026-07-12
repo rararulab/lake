@@ -196,10 +196,14 @@ pub(crate) fn init_from_env() -> anyhow::Result<TelemetryGuard> {
         Some(config) => TelemetryGuard::from_config(config)?,
         None => TelemetryGuard::disabled(),
     };
-    let telemetry = guard
-        .provider
-        .as_ref()
-        .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer("lake")));
+    let telemetry = guard.provider.as_ref().map(|provider| {
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("lake"))
+            .with_location(false)
+            .with_threads(false)
+            .with_target(false)
+            .with_tracked_inactivity(false)
+    });
     let subscriber = tracing_subscriber::registry().with(filter).with(telemetry);
     let result = match format {
         LogFormat::Json => subscriber

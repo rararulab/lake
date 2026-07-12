@@ -50,7 +50,7 @@ use lake_common::{
 };
 use lake_flight::{
     ClientSecurity, DELEGATED_NAMESPACE_HEADER, DELEGATED_TENANT_HEADER,
-    append_flight_payload_digest,
+    append_flight_payload_digest, set_span_parent_from_request,
 };
 use lake_objects::data_location_field;
 use prost::Message;
@@ -58,11 +58,16 @@ use prost_types::Any;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status, Streaming};
+use tracing::{Instrument as _, Span, field};
 
 use crate::{AppendLimits, Metasrv, TablePlacement, leadership::Leadership, telemetry};
 
 /// The [`Status`] message returned by every unsupported Flight method.
 const UNSUPPORTED: &str = "metasrv control plane only serves actions and FILE append do_put";
+
+fn record_rpc_outcome<T>(span: &Span, result: &Result<T, Status>) {
+    span.record("rpc.outcome", if result.is_ok() { "ok" } else { "error" });
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct AppendAdmission {
@@ -664,54 +669,70 @@ impl FlightService for MetasrvFlightService {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        let principal = principal(&request)?;
-        let delegated = delegated_namespace(&request)?;
-        let tenant = operation_tenant(&principal, delegated_tenant(&request)?)?;
-        let permit = self.append_admission.acquire().await?;
-        let mut input = request.into_inner();
-        let first = input
-            .next()
-            .await
-            .ok_or_else(|| Status::invalid_argument("FILE append stream is empty"))??;
-        let append = append_request(&first)?;
-        let namespace = &append.table().namespace.0;
-        authorize_namespace(&principal, delegated.as_deref(), namespace)?;
-        let input = Box::pin(futures::stream::once(async move { Ok(first) }).chain(input));
-        if !self.leadership.is_leader() {
-            match self.leadership.leader() {
-                Some(addr) if addr != self.own_addr => {
-                    let response = self.forward_put(&addr, namespace, &tenant, input).await;
-                    drop(permit);
-                    return response;
+        let span = tracing::info_span!(
+            target: "lake_metasrv",
+            "flight.server",
+            rpc.system = "grpc",
+            rpc.service = "lake.metasrv",
+            rpc.method = "do_put",
+            rpc.outcome = field::Empty,
+        );
+        let _ = set_span_parent_from_request(&span, &request);
+        let result = async move {
+            let principal = principal(&request)?;
+            let delegated = delegated_namespace(&request)?;
+            let tenant = operation_tenant(&principal, delegated_tenant(&request)?)?;
+            let permit = self.append_admission.acquire().await?;
+            let mut input = request.into_inner();
+            let first = input
+                .next()
+                .await
+                .ok_or_else(|| Status::invalid_argument("FILE append stream is empty"))??;
+            let append = append_request(&first)?;
+            let namespace = &append.table().namespace.0;
+            authorize_namespace(&principal, delegated.as_deref(), namespace)?;
+            let input = Box::pin(futures::stream::once(async move { Ok(first) }).chain(input));
+            if !self.leadership.is_leader() {
+                match self.leadership.leader() {
+                    Some(addr) if addr != self.own_addr => {
+                        let response = self.forward_put(&addr, namespace, &tenant, input).await;
+                        drop(permit);
+                        return response;
+                    }
+                    Some(_) => {}
+                    None => return Err(Status::unavailable("no leader elected")),
                 }
-                Some(_) => {}
-                None => return Err(Status::unavailable("no leader elected")),
             }
+            let version = append_file_stream_with_limits(
+                &self.metasrv,
+                tenant,
+                input,
+                self.append_admission.limits,
+            )
+            .await?;
+            #[cfg(feature = "test")]
+            if let Some(gate) = &self.append_result_gate
+                && gate.block_first().await
+            {
+                return Err(Status::unavailable(
+                    "injected post-commit append response loss",
+                ));
+            }
+            let result = PutResult {
+                app_metadata: serde_json::to_vec(&version)
+                    .map_err(|error| Status::internal(error.to_string()))?
+                    .into(),
+            };
+            let stream: Self::DoPutStream =
+                Box::pin(futures::stream::once(async move { Ok(result) }));
+            let response = Response::new(stream);
+            drop(permit);
+            Ok(response)
         }
-        let version = append_file_stream_with_limits(
-            &self.metasrv,
-            tenant,
-            input,
-            self.append_admission.limits,
-        )
-        .await?;
-        #[cfg(feature = "test")]
-        if let Some(gate) = &self.append_result_gate
-            && gate.block_first().await
-        {
-            return Err(Status::unavailable(
-                "injected post-commit append response loss",
-            ));
-        }
-        let result = PutResult {
-            app_metadata: serde_json::to_vec(&version)
-                .map_err(|error| Status::internal(error.to_string()))?
-                .into(),
-        };
-        let stream: Self::DoPutStream = Box::pin(futures::stream::once(async move { Ok(result) }));
-        let response = Response::new(stream);
-        drop(permit);
-        Ok(response)
+        .instrument(span.clone())
+        .await;
+        record_rpc_outcome(&span, &result);
+        result
     }
 
     async fn do_exchange(
@@ -727,38 +748,53 @@ impl FlightService for MetasrvFlightService {
         &self,
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        let principal = principal(&request)?;
-        let delegated = delegated_namespace(&request)?;
-        let action = request.into_inner();
-        match action.r#type.as_str() {
-            "create_table" => {
-                let req: CreateTableReq = parse_body(&action.body)?;
-                authorize_namespace(&principal, delegated.as_deref(), &req.namespace)?;
-                self.action_create_table(action).await
+        let span = tracing::info_span!(
+            target: "lake_metasrv",
+            "flight.server",
+            rpc.system = "grpc",
+            rpc.service = "lake.metasrv",
+            rpc.method = "do_action",
+            rpc.outcome = field::Empty,
+        );
+        let _ = set_span_parent_from_request(&span, &request);
+        let result = async move {
+            let principal = principal(&request)?;
+            let delegated = delegated_namespace(&request)?;
+            let action = request.into_inner();
+            match action.r#type.as_str() {
+                "create_table" => {
+                    let req: CreateTableReq = parse_body(&action.body)?;
+                    authorize_namespace(&principal, delegated.as_deref(), &req.namespace)?;
+                    self.action_create_table(action).await
+                }
+                "drop_table" => {
+                    let req: TableIdent = parse_body(&action.body)?;
+                    authorize_namespace(&principal, delegated.as_deref(), &req.namespace)?;
+                    self.action_drop_table(action).await
+                }
+                "resolve" => {
+                    let req: TableIdent = parse_body(&action.body)?;
+                    authorize_namespace(&principal, delegated.as_deref(), &req.namespace)?;
+                    self.action_resolve(&action.body).await
+                }
+                "list_tables" => {
+                    let req: NamespaceIdent = parse_body(&action.body)?;
+                    authorize_namespace(&principal, delegated.as_deref(), &req.namespace)?;
+                    self.action_list_tables(&action.body).await
+                }
+                "list_namespaces" => {
+                    self.action_list_namespaces(&principal, delegated.as_deref())
+                        .await
+                }
+                other => Err(Status::unimplemented(format!(
+                    "unknown action type '{other}'"
+                ))),
             }
-            "drop_table" => {
-                let req: TableIdent = parse_body(&action.body)?;
-                authorize_namespace(&principal, delegated.as_deref(), &req.namespace)?;
-                self.action_drop_table(action).await
-            }
-            "resolve" => {
-                let req: TableIdent = parse_body(&action.body)?;
-                authorize_namespace(&principal, delegated.as_deref(), &req.namespace)?;
-                self.action_resolve(&action.body).await
-            }
-            "list_tables" => {
-                let req: NamespaceIdent = parse_body(&action.body)?;
-                authorize_namespace(&principal, delegated.as_deref(), &req.namespace)?;
-                self.action_list_tables(&action.body).await
-            }
-            "list_namespaces" => {
-                self.action_list_namespaces(&principal, delegated.as_deref())
-                    .await
-            }
-            other => Err(Status::unimplemented(format!(
-                "unknown action type '{other}'"
-            ))),
         }
+        .instrument(span.clone())
+        .await;
+        record_rpc_outcome(&span, &result);
+        result
     }
 
     /// Advertise the four control-plane actions and their descriptions.

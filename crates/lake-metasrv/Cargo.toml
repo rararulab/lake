@@ -41,8 +41,12 @@ uuid = { workspace = true }
 # lake-meta, …) is already a normal dependency and thus available to tests.
 lake-engine-lance = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 rcgen = "^0.13"
 tempfile = "3"
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

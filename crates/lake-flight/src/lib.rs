@@ -536,6 +536,7 @@ impl ClientSecurity {
 
     /// Apply the same bearer credential to all high-level Flight operations.
     pub fn apply_to_flight_client(&self, client: &mut FlightClient) -> Result<()> {
+        inject_trace_context(&Span::current().context(), client.metadata_mut());
         if let Some(bearer) = &self.bearer {
             client
                 .metadata_mut()
@@ -546,6 +547,13 @@ impl ClientSecurity {
 
     /// Apply the same bearer credential to Flight SQL and its DoGet clients.
     pub fn apply_to_sql_client(&self, client: &mut FlightSqlServiceClient<Channel>) {
+        let mut metadata = MetadataMap::new();
+        inject_trace_context(&Span::current().context(), &mut metadata);
+        for key in [TRACEPARENT_HEADER, TRACESTATE_HEADER] {
+            if let Some(value) = metadata.get(key).and_then(|value| value.to_str().ok()) {
+                client.set_header(key, value);
+            }
+        }
         if let Some(bearer) = &self.bearer {
             client.set_token(bearer.value.to_string());
         }

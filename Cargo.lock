@@ -4288,6 +4288,8 @@ dependencies = [
  "lake-objects",
  "metrics",
  "metrics-exporter-prometheus",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "prost",
  "prost-types",
  "rcgen",
@@ -4300,6 +4302,8 @@ dependencies = [
  "tonic",
  "tonic-health",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -4339,6 +4343,8 @@ dependencies = [
  "lake-metasrv",
  "metrics",
  "metrics-exporter-prometheus",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "prost",
  "prost-types",
  "rcgen",
@@ -4350,6 +4356,8 @@ dependencies = [
  "tonic",
  "tonic-health",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]

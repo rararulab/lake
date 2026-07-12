@@ -28,7 +28,7 @@
 
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -64,12 +64,41 @@ use lake_metasrv::{
     election::{LEASE_KEY, LeaseElection, LeaseStatus, LeaseValue},
     serve_with_config, serve_with_config_and_shutdown,
 };
+use opentelemetry::{Value, trace::TracerProvider as _};
+use opentelemetry_sdk::{
+    error::OTelSdkResult,
+    trace::{SdkTracerProvider, SpanData, SpanExporter},
+};
 use prost::Message;
 use prost_types::Any;
 use rcgen::generate_simple_self_signed;
 use serde_json::json;
 use tokio::sync::{Notify, oneshot};
 use tonic::{Code, Request, Status, transport::Channel};
+use tracing::Instrument as _;
+use tracing_subscriber::layer::SubscriberExt as _;
+
+#[derive(Clone, Debug, Default)]
+struct RecordingExporter(Arc<Mutex<Vec<SpanData>>>);
+
+impl SpanExporter for RecordingExporter {
+    async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+        self.0.lock().expect("span recorder lock").extend(batch);
+        Ok(())
+    }
+}
+
+fn span_attribute<'a>(span: &'a SpanData, key: &str) -> Option<&'a str> {
+    span.attributes.iter().find_map(|attribute| {
+        if attribute.key.as_str() != key {
+            return None;
+        }
+        match &attribute.value {
+            Value::String(value) => Some(value.as_str()),
+            _ => None,
+        }
+    })
+}
 
 /// Grab a currently-free loopback address by binding an ephemeral port and
 /// immediately releasing it; `serve` re-binds it a moment later.
@@ -912,7 +941,21 @@ async fn wait_secure_serving(addr: &str, security: &ClientSecurity) {
 }
 
 #[tokio::test]
-async fn secured_follower_forwards_with_peer_identity() {
+async fn follower_forwarding_preserves_trace_context() {
+    let exporter = RecordingExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("lake-metasrv-test"))
+            .with_location(false)
+            .with_threads(false)
+            .with_target(false)
+            .with_tracked_inactivity(false),
+    );
+    tracing::subscriber::set_global_default(subscriber).expect("install tracing subscriber");
+
     let credential = "metasrv-peer-credential";
     let certified =
         generate_simple_self_signed(vec!["localhost".to_owned()]).expect("test identity");
@@ -962,7 +1005,9 @@ async fn secured_follower_forwards_with_peer_identity() {
         "columns": ["ts:i64", "reward:f64"],
     });
 
+    let client_span = tracing::info_span!("test.client.forwarding");
     secure_do_action(follower, &client_security, "create_table", body)
+        .instrument(client_span.clone())
         .await
         .expect("secured follower forwards to leader");
     assert!(
@@ -971,4 +1016,33 @@ async fn secured_follower_forwards_with_peer_identity() {
             .expect("registry")
             .is_some()
     );
+
+    drop(client_span);
+    provider.force_flush().expect("flush test spans");
+    let spans = exporter.0.lock().expect("span recorder lock");
+    let client_trace = spans
+        .iter()
+        .find(|span| span.name == "test.client.forwarding")
+        .expect("client span")
+        .span_context
+        .trace_id();
+    let forwarded = spans
+        .iter()
+        .filter(|span| {
+            span.span_context.trace_id() == client_trace
+                && span_attribute(span, "rpc.service") == Some("lake.metasrv")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(forwarded.len(), 2, "follower and leader server spans");
+    for span in forwarded {
+        let keys = span
+            .attributes
+            .iter()
+            .map(|attribute| attribute.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            ["rpc.system", "rpc.service", "rpc.method", "rpc.outcome"]
+        );
+    }
 }

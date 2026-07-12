@@ -485,8 +485,10 @@ design-level ones:
   owned by the server lifecycle, and labels never contain workload or object
   identities. A hardened container and Kubernetes reference now preserve the
   tier split, authenticated health, private metrics, finite shutdown, and
-  bounded resources in a scheduler. Distributed tracing remains production
-  work.
+  bounded resources in a scheduler. Opt-in OTLP/gRPC tracing uses a bounded,
+  process-owned exporter and W3C context across public Flight,
+  Query-to-Metasrv, and follower-forwarding hops. Server span attributes are a
+  fixed RPC allowlist and exclude workload, identity, and object data.
 
 ## Phasing
 
@@ -499,9 +501,9 @@ design-level ones:
 - **v2 (metadata HA + ops)** — lease-election, follower forwarding,
   leadership-gated writes, per-table serialization, and leader-only
   maintenance are wired. Structured process logging and authenticated gRPC
-  health readiness and bounded Prometheus metrics are wired. Remaining:
-  durable operation state, distributed tracing, and
-  client-side SDK caching. A self-built engine slots in behind `TableEngine`
+  health readiness, bounded Prometheus metrics, and distributed tracing are
+  wired. Remaining: durable operation state and client-side SDK caching. A
+  self-built engine slots in behind `TableEngine`
   if/when Lance's ceiling is hit.
 
 Invariant across all phases: fleet reads go through the stateless query
