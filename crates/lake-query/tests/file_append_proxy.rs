@@ -46,7 +46,7 @@ use opentelemetry_sdk::{
 };
 use prost::Message;
 use prost_types::Any;
-use tonic::{Request, transport::Channel};
+use tonic::{Code, Request, transport::Channel};
 use tracing::Instrument as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -261,6 +261,18 @@ async fn query_trace_context_reaches_metasrv_without_data_attributes() {
     .instrument(actions_span.clone())
     .await;
 
+    let anonymous_actions_span = tracing::info_span!("test.client.actions.anonymous");
+    async {
+        let mut client = FlightServiceClient::new(channel.clone());
+        let error = client
+            .list_actions(ClientSecurity::new().authorize_request(Request::new(Empty {})))
+            .await
+            .expect_err("anonymous ListActions rejected");
+        assert_eq!(error.code(), Code::Unauthenticated);
+    }
+    .instrument(anonymous_actions_span.clone())
+    .await;
+
     assert_eq!(alpha_version, Version(2));
     assert_eq!(beta_version, Version(3));
     assert_eq!(alpha_replay, alpha_version);
@@ -277,6 +289,7 @@ async fn query_trace_context_reaches_metasrv_without_data_attributes() {
     drop(client_span);
     drop(sql_span);
     drop(actions_span);
+    drop(anonymous_actions_span);
     provider.force_flush().expect("flush test spans");
     let spans = exporter.0.lock().expect("span recorder lock");
     let client_trace = spans
@@ -321,6 +334,16 @@ async fn query_trace_context_reaches_metasrv_without_data_attributes() {
         .trace_id();
     assert!(spans.iter().any(|span| {
         span.span_context.trace_id() == actions_trace
+            && span_attribute(span, "rpc.method") == Some("list_actions")
+    }));
+    let anonymous_actions_trace = spans
+        .iter()
+        .find(|span| span.name == "test.client.actions.anonymous")
+        .expect("anonymous ListActions client span")
+        .span_context
+        .trace_id();
+    assert!(!spans.iter().any(|span| {
+        span.span_context.trace_id() == anonymous_actions_trace
             && span_attribute(span, "rpc.method") == Some("list_actions")
     }));
     for span in spans.iter().filter(|span| span.name == "flight.server") {

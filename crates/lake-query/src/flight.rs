@@ -30,8 +30,9 @@ use std::{
 };
 
 use arrow_flight::{
-    Action, ActionType, FlightClient, FlightDescriptor, FlightEndpoint, FlightInfo,
-    HandshakeRequest, HandshakeResponse, Result as FlightResult, Ticket,
+    Action, ActionType, Criteria, Empty, FlightClient, FlightData, FlightDescriptor,
+    FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, PollInfo,
+    Result as FlightResult, SchemaResult, Ticket,
     encode::FlightDataEncoderBuilder,
     error::FlightError,
     flight_service_server::FlightService,
@@ -64,7 +65,6 @@ use tokio::{
     time::{Instant, Sleep},
 };
 use tonic::{Request, Response, Status, Streaming};
-use tower::{Layer, Service};
 use tracing::{Instrument as _, Span, field};
 
 use crate::{DiscoveryLimits, QueryEngine, QueryLimits, telemetry};
@@ -615,63 +615,6 @@ fn query_server_span<T>(request: &Request<T>, method: &'static str) -> Span {
     span
 }
 
-/// Arrow Flight SQL's blanket service handles `ListActions` without exposing
-/// its request to `FlightSqlService`. This narrow HTTP layer closes that one
-/// hook gap while typed handlers remain responsible for every other RPC.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ListActionsTraceLayer;
-
-impl<S> Layer<S> for ListActionsTraceLayer {
-    type Service = ListActionsTraceService<S>;
-
-    fn layer(&self, inner: S) -> Self::Service { ListActionsTraceService { inner } }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ListActionsTraceService<S> {
-    inner: S,
-}
-
-impl<S, B> Service<tonic::codegen::http::Request<B>> for ListActionsTraceService<S>
-where
-    S: Service<tonic::codegen::http::Request<B>> + Send,
-    S::Future: Send + 'static,
-    B: Send + 'static,
-{
-    type Error = S::Error;
-    type Future = Pin<
-        Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send + 'static>,
-    >;
-    type Response = S::Response;
-
-    fn poll_ready(
-        &mut self,
-        context: &mut Context<'_>,
-    ) -> Poll<std::result::Result<(), Self::Error>> {
-        self.inner.poll_ready(context)
-    }
-
-    fn call(&mut self, request: tonic::codegen::http::Request<B>) -> Self::Future {
-        if !request
-            .uri()
-            .path()
-            .ends_with("/arrow.flight.protocol.FlightService/ListActions")
-        {
-            return Box::pin(self.inner.call(request));
-        }
-
-        let metadata = tonic::metadata::MetadataMap::from_headers(request.headers().clone());
-        let trace_request = Request::from_parts(metadata, tonic::Extensions::new(), ());
-        let span = query_server_span(&trace_request, "list_actions");
-        let future = self.inner.call(request);
-        Box::pin(async move {
-            let result = future.instrument(span.clone()).await;
-            span.record("rpc.outcome", if result.is_ok() { "ok" } else { "error" });
-            result
-        })
-    }
-}
-
 type BoxStatusStream<T> =
     Pin<Box<dyn Stream<Item = std::result::Result<T, Status>> + Send + 'static>>;
 
@@ -689,6 +632,101 @@ fn finish_stream_rpc<T: Send + 'static>(
             span.record("rpc.outcome", "error");
             Err(error)
         }
+    }
+}
+
+/// Delegates Arrow Flight SQL dispatch while overriding `ListActions`, the one
+/// successful RPC whose request is not exposed by `FlightSqlService` hooks.
+pub(crate) struct TracedFlightSqlService {
+    inner: FlightSqlServiceImpl,
+}
+
+impl TracedFlightSqlService {
+    pub(crate) fn new(inner: FlightSqlServiceImpl) -> Self { Self { inner } }
+}
+
+#[tonic::async_trait]
+impl FlightService for TracedFlightSqlService {
+    type DoActionStream = <FlightSqlServiceImpl as FlightService>::DoActionStream;
+    type DoExchangeStream = <FlightSqlServiceImpl as FlightService>::DoExchangeStream;
+    type DoGetStream = <FlightSqlServiceImpl as FlightService>::DoGetStream;
+    type DoPutStream = <FlightSqlServiceImpl as FlightService>::DoPutStream;
+    type HandshakeStream = <FlightSqlServiceImpl as FlightService>::HandshakeStream;
+    type ListActionsStream = <FlightSqlServiceImpl as FlightService>::ListActionsStream;
+    type ListFlightsStream = <FlightSqlServiceImpl as FlightService>::ListFlightsStream;
+
+    async fn handshake(
+        &self,
+        request: Request<Streaming<HandshakeRequest>>,
+    ) -> std::result::Result<Response<Self::HandshakeStream>, Status> {
+        <FlightSqlServiceImpl as FlightService>::handshake(&self.inner, request).await
+    }
+
+    async fn list_flights(
+        &self,
+        request: Request<Criteria>,
+    ) -> std::result::Result<Response<Self::ListFlightsStream>, Status> {
+        <FlightSqlServiceImpl as FlightService>::list_flights(&self.inner, request).await
+    }
+
+    async fn get_flight_info(
+        &self,
+        request: Request<FlightDescriptor>,
+    ) -> std::result::Result<Response<FlightInfo>, Status> {
+        <FlightSqlServiceImpl as FlightService>::get_flight_info(&self.inner, request).await
+    }
+
+    async fn poll_flight_info(
+        &self,
+        request: Request<FlightDescriptor>,
+    ) -> std::result::Result<Response<PollInfo>, Status> {
+        <FlightSqlServiceImpl as FlightService>::poll_flight_info(&self.inner, request).await
+    }
+
+    async fn get_schema(
+        &self,
+        request: Request<FlightDescriptor>,
+    ) -> std::result::Result<Response<SchemaResult>, Status> {
+        <FlightSqlServiceImpl as FlightService>::get_schema(&self.inner, request).await
+    }
+
+    async fn do_get(
+        &self,
+        request: Request<Ticket>,
+    ) -> std::result::Result<Response<Self::DoGetStream>, Status> {
+        <FlightSqlServiceImpl as FlightService>::do_get(&self.inner, request).await
+    }
+
+    async fn do_put(
+        &self,
+        request: Request<Streaming<FlightData>>,
+    ) -> std::result::Result<Response<Self::DoPutStream>, Status> {
+        <FlightSqlServiceImpl as FlightService>::do_put(&self.inner, request).await
+    }
+
+    async fn do_action(
+        &self,
+        request: Request<Action>,
+    ) -> std::result::Result<Response<Self::DoActionStream>, Status> {
+        <FlightSqlServiceImpl as FlightService>::do_action(&self.inner, request).await
+    }
+
+    async fn list_actions(
+        &self,
+        request: Request<Empty>,
+    ) -> std::result::Result<Response<Self::ListActionsStream>, Status> {
+        let span = query_server_span(&request, "list_actions");
+        let result = <FlightSqlServiceImpl as FlightService>::list_actions(&self.inner, request)
+            .instrument(span.clone())
+            .await;
+        finish_stream_rpc(&span, result)
+    }
+
+    async fn do_exchange(
+        &self,
+        request: Request<Streaming<FlightData>>,
+    ) -> std::result::Result<Response<Self::DoExchangeStream>, Status> {
+        <FlightSqlServiceImpl as FlightService>::do_exchange(&self.inner, request).await
     }
 }
 
