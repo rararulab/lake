@@ -38,8 +38,6 @@ use crate::{
     telemetry,
 };
 
-const DEFAULT_TABLE_MAINTENANCE_PAGE_SIZE: usize = 128;
-
 /// Drive periodic maintenance forever, running a sweep only while `is_leader`.
 ///
 /// Sleeps for the configured interval between rounds. A round is skipped
@@ -70,7 +68,7 @@ pub(crate) async fn run_maintenance_loop_until(
         if !leadership.is_leader() {
             continue;
         }
-        sweep_until_with_page_size(&metasrv, &shutdown, limits.table_page_size()).await;
+        sweep_until_with_limits(&metasrv, &shutdown, limits).await;
     }
 }
 
@@ -83,13 +81,14 @@ pub(crate) async fn sweep(metasrv: &Metasrv) {
 }
 
 async fn sweep_until(metasrv: &Metasrv, shutdown: &CancellationToken) {
-    sweep_until_with_page_size(metasrv, shutdown, DEFAULT_TABLE_MAINTENANCE_PAGE_SIZE).await;
+    let limits = MaintenanceLimits::default();
+    sweep_until_with_limits(metasrv, shutdown, limits).await;
 }
 
-async fn sweep_until_with_page_size(
+async fn sweep_until_with_limits(
     metasrv: &Metasrv,
     shutdown: &CancellationToken,
-    table_page_size: usize,
+    limits: MaintenanceLimits,
 ) {
     if shutdown.is_cancelled() {
         return;
@@ -104,25 +103,45 @@ async fn sweep_until_with_page_size(
         completed = drop_gc.completed,
         "drop tombstone maintenance page complete"
     );
-    telemetry::maintenance_page("drop_tombstones");
+    telemetry::maintenance_pages("drop_tombstones", 1);
     telemetry::maintenance_items("drop_tombstones", "scanned", drop_gc.scanned);
     telemetry::maintenance_items("drop_tombstones", "completed", drop_gc.completed);
     if shutdown.is_cancelled() {
         return;
     }
-    let operation_gc = sweep_operations_at_until(metasrv, now, shutdown).await;
+    let operation_gc = sweep_operation_pages_at_until(
+        metasrv,
+        now,
+        shutdown,
+        limits.operation_gc_max_pages(),
+        limits.operation_gc_max_duration(),
+    )
+    .await;
     tracing::debug!(
+        pages = operation_gc.pages,
         scanned = operation_gc.scanned,
         deleted = operation_gc.deleted,
+        budget_exhausted = operation_gc.budget_exhausted,
+        time_exhausted = operation_gc.time_exhausted,
         "append operation maintenance page complete"
     );
-    telemetry::maintenance_page("append_operations");
+    telemetry::maintenance_pages("append_operations", operation_gc.pages);
     telemetry::maintenance_items("append_operations", "scanned", operation_gc.scanned);
     telemetry::maintenance_items("append_operations", "deleted", operation_gc.deleted);
+    telemetry::maintenance_items(
+        "append_operations",
+        "budget_exhausted",
+        usize::from(operation_gc.budget_exhausted),
+    );
+    telemetry::maintenance_items(
+        "append_operations",
+        "time_exhausted",
+        usize::from(operation_gc.time_exhausted),
+    );
     if shutdown.is_cancelled() {
         return;
     }
-    let tables = sweep_table_page(metasrv, shutdown, table_page_size).await;
+    let tables = sweep_table_page(metasrv, shutdown, limits.table_page_size()).await;
     tracing::debug!(
         scanned = tables.scanned,
         attempted = tables.attempted,
@@ -131,7 +150,7 @@ async fn sweep_until_with_page_size(
         failed = tables.failed,
         "table maintenance page complete"
     );
-    telemetry::maintenance_page("tables");
+    telemetry::maintenance_pages("tables", 1);
     telemetry::maintenance_items("tables", "scanned", tables.scanned);
     telemetry::maintenance_items("tables", "attempted", tables.attempted);
     telemetry::maintenance_items("tables", "maintained", tables.maintained);
@@ -310,8 +329,11 @@ async fn sweep_drop_tombstones_until(
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct OperationGcStats {
-    pub(crate) scanned: usize,
-    pub(crate) deleted: usize,
+    pub(crate) pages:            usize,
+    pub(crate) scanned:          usize,
+    pub(crate) deleted:          usize,
+    pub(crate) budget_exhausted: bool,
+    pub(crate) time_exhausted:   bool,
 }
 
 pub(crate) async fn sweep_operations_at(metasrv: &Metasrv, now: u64) -> OperationGcStats {
@@ -323,51 +345,92 @@ async fn sweep_operations_at_until(
     now: u64,
     shutdown: &CancellationToken,
 ) -> OperationGcStats {
-    let cursor = metasrv.inner.operation_gc_cursor.lock().await.clone();
-    let page = match metasrv
-        .meta()
-        .scan_prefix_page(
-            OPERATION_PREFIX,
-            cursor.as_deref(),
-            metasrv.inner.operation_gc_page_size,
-        )
-        .await
-    {
-        Ok(page) => page,
-        Err(error) => {
-            tracing::warn!(%error, "append operation GC page scan failed");
-            return OperationGcStats::default();
-        }
-    };
-    let (entries, continuation) = page.into_parts();
-    *metasrv.inner.operation_gc_cursor.lock().await = continuation;
-    let mut stats = OperationGcStats {
-        scanned: entries.len(),
-        deleted: 0,
-    };
-    for (stripped, bytes) in entries {
+    sweep_operation_pages_at_until(
+        metasrv,
+        now,
+        shutdown,
+        1,
+        MaintenanceLimits::default().operation_gc_max_duration(),
+    )
+    .await
+}
+
+async fn sweep_operation_pages_at_until(
+    metasrv: &Metasrv,
+    now: u64,
+    shutdown: &CancellationToken,
+    max_pages: usize,
+    max_duration: std::time::Duration,
+) -> OperationGcStats {
+    let mut stats = OperationGcStats::default();
+    let deadline = tokio::time::Instant::now() + max_duration;
+    for _ in 0..max_pages {
         if shutdown.is_cancelled() {
             break;
         }
-        let key = format!("{OPERATION_PREFIX}{stripped}");
-        let record = match AppendRecord::decode(&stripped, &bytes) {
-            Ok(record) => record,
+        let cursor = metasrv.inner.operation_gc_cursor.lock().await.clone();
+        let page = match tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return stats,
+            () = tokio::time::sleep_until(deadline) => {
+                stats.time_exhausted = true;
+                return stats;
+            }
+            result = metasrv.meta().scan_prefix_page(
+                OPERATION_PREFIX,
+                cursor.as_deref(),
+                metasrv.inner.operation_gc_page_size,
+            ) => result,
+        } {
+            Ok(page) => page,
             Err(error) => {
-                tracing::warn!(%error, key, "append operation GC found corrupt state");
-                continue;
+                tracing::warn!(%error, "append operation GC page scan failed");
+                return stats;
             }
         };
-        if now.saturating_sub(record.updated_at) <= metasrv.inner.operation_retention.as_secs() {
-            continue;
-        }
-        match reconcile_and_delete_expired(metasrv, &key, &bytes, record, shutdown).await {
-            Ok(true) => stats.deleted += 1,
-            Ok(false) => {}
-            Err(error) => {
-                tracing::warn!(%error, key, "append operation GC reconciliation failed");
+        let (entries, continuation) = page.into_parts();
+        let has_more = continuation.is_some();
+        stats.pages += 1;
+        stats.scanned += entries.len();
+        for (stripped, bytes) in entries {
+            if shutdown.is_cancelled() {
+                return stats;
+            }
+            let key = format!("{OPERATION_PREFIX}{stripped}");
+            let record = match AppendRecord::decode(&stripped, &bytes) {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::warn!(%error, key, "append operation GC found corrupt state");
+                    continue;
+                }
+            };
+            if now.saturating_sub(record.updated_at) <= metasrv.inner.operation_retention.as_secs()
+            {
+                continue;
+            }
+            let reconciliation = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return stats,
+                () = tokio::time::sleep_until(deadline) => {
+                    stats.time_exhausted = true;
+                    return stats;
+                }
+                result = reconcile_and_delete_expired(metasrv, &key, &bytes, record, shutdown) => result,
+            };
+            match reconciliation {
+                Ok(true) => stats.deleted += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, key, "append operation GC reconciliation failed");
+                }
             }
         }
+        *metasrv.inner.operation_gc_cursor.lock().await = continuation;
+        if !has_more {
+            return stats;
+        }
     }
+    stats.budget_exhausted = !shutdown.is_cancelled();
     stats
 }
 
@@ -585,6 +648,16 @@ mod tests {
         page_scanned: Option<Arc<tokio::sync::Notify>>,
     }
 
+    struct CancelAfterPageMeta {
+        inner:      MetaStoreRef,
+        page_calls: AtomicUsize,
+        shutdown:   CancellationToken,
+    }
+
+    struct BlockingGetMeta {
+        inner: MetaStoreRef,
+    }
+
     #[async_trait]
     impl MetaStore for RecordingScanMeta {
         async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
@@ -625,6 +698,111 @@ mod tests {
 
         async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
             self.inner.delete(key, expected).await
+        }
+    }
+
+    #[async_trait]
+    impl MetaStore for CancelAfterPageMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn scan_prefix_page(
+            &self,
+            prefix: &str,
+            continuation: Option<&str>,
+            limit: usize,
+        ) -> lake_meta::Result<MetaScanPage> {
+            let page = self
+                .inner
+                .scan_prefix_page(prefix, continuation, limit)
+                .await?;
+            if self.page_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.shutdown.cancel();
+            }
+            Ok(page)
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
+        }
+    }
+
+    #[async_trait]
+    impl MetaStore for BlockingGetMeta {
+        async fn get(&self, _key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            std::future::pending().await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn scan_prefix_page(
+            &self,
+            prefix: &str,
+            continuation: Option<&str>,
+            limit: usize,
+        ) -> lake_meta::Result<MetaScanPage> {
+            self.inner
+                .scan_prefix_page(prefix, continuation, limit)
+                .await
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
+        }
+    }
+
+    async fn seed_committed_operations(meta: &dyn MetaStore, count: usize) {
+        let tenant = TenantId::try_new("tenant-a").unwrap();
+        let table = TableRef::new("robots", "episodes");
+        for index in 0..count {
+            let operation = AppendOperation::builder()
+                .tenant(tenant.clone())
+                .operation_id(
+                    AppendOperationId::parse(format!("0197f0f4-7b2a-7000-8000-{index:012x}"))
+                        .unwrap(),
+                )
+                .payload_digest(
+                    AppendPayloadDigest::parse(
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    )
+                    .unwrap(),
+                )
+                .build();
+            let mut record =
+                AppendRecord::reserved(&operation, &table, "incarnation-a", Version(1), 1);
+            record.state = AppendState::Committed;
+            record.result_version = Some(Version(2));
+            let key = operation_key(&operation, &table);
+            assert!(
+                meta.cas(&key, None, &record.encode().unwrap())
+                    .await
+                    .unwrap()
+            );
         }
     }
 
@@ -1180,6 +1358,147 @@ mod tests {
             metasrv.append(&table, expired, stream).await,
             Err(crate::MetasrvError::OperationExpired { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn operation_gc_drains_multiple_pages_within_budget() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        seed_committed_operations(meta.as_ref(), 3).await;
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv =
+            Metasrv::with_operation_policy(meta.clone(), engine, Duration::from_secs(1), 1);
+
+        let stats = sweep_operation_pages_at_until(
+            &metasrv,
+            u64::MAX / 2,
+            &CancellationToken::new(),
+            3,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(stats.pages, 3);
+        assert_eq!(stats.scanned, 3);
+        assert_eq!(stats.deleted, 3);
+        assert!(!stats.budget_exhausted);
+        assert!(meta.scan_prefix(OPERATION_PREFIX).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn operation_gc_stops_at_page_budget_and_resumes() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        seed_committed_operations(meta.as_ref(), 3).await;
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv =
+            Metasrv::with_operation_policy(meta.clone(), engine, Duration::from_secs(1), 1);
+        let shutdown = CancellationToken::new();
+
+        let first = sweep_operation_pages_at_until(
+            &metasrv,
+            u64::MAX / 2,
+            &shutdown,
+            2,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(first.pages, 2);
+        assert_eq!(first.deleted, 2);
+        assert!(first.budget_exhausted);
+        assert_eq!(meta.scan_prefix(OPERATION_PREFIX).await.unwrap().len(), 1);
+
+        let second = sweep_operation_pages_at_until(
+            &metasrv,
+            u64::MAX / 2,
+            &shutdown,
+            2,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(second.pages, 1);
+        assert_eq!(second.deleted, 1);
+        assert!(!second.budget_exhausted);
+        assert!(meta.scan_prefix(OPERATION_PREFIX).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn operation_gc_shutdown_stops_between_pages() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let inner: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        seed_committed_operations(inner.as_ref(), 3).await;
+        let shutdown = CancellationToken::new();
+        let recording = Arc::new(CancelAfterPageMeta {
+            inner:      inner.clone(),
+            page_calls: AtomicUsize::new(0),
+            shutdown:   shutdown.clone(),
+        });
+        let meta: MetaStoreRef = recording.clone();
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::with_operation_policy(meta, engine, Duration::from_secs(1), 1);
+
+        let stats = sweep_operation_pages_at_until(
+            &metasrv,
+            u64::MAX / 2,
+            &shutdown,
+            10,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(stats.pages, 1);
+        assert_eq!(recording.page_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stats.deleted, 0,
+            "cancelled page performs no reconciliation"
+        );
+
+        let resumed = sweep_operation_pages_at_until(
+            &metasrv,
+            u64::MAX / 2,
+            &CancellationToken::new(),
+            10,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(resumed.deleted, 3, "partial page cursor was not published");
+        assert!(
+            inner
+                .scan_prefix(OPERATION_PREFIX)
+                .await
+                .expect("scan resumed operation prefix")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_gc_time_budget_bounds_blocked_reconciliation() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let inner: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        seed_committed_operations(inner.as_ref(), 1).await;
+        let blocking: MetaStoreRef = Arc::new(BlockingGetMeta {
+            inner: inner.clone(),
+        });
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::with_operation_policy(blocking, engine, Duration::from_secs(1), 1);
+
+        let stats = tokio::time::timeout(
+            Duration::from_secs(1),
+            sweep_operation_pages_at_until(
+                &metasrv,
+                u64::MAX / 2,
+                &CancellationToken::new(),
+                16,
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("operation GC obeys its wall-clock budget");
+
+        assert!(stats.time_exhausted);
+        assert_eq!(stats.pages, 1);
+        assert_eq!(stats.deleted, 0);
+        assert_eq!(inner.scan_prefix(OPERATION_PREFIX).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -289,9 +289,12 @@ deployments drain writers, upgrade every Query/Metasrv node that may append,
 then resume, matching the external-manifest pointer upgrade boundary above.
 
 Terminal coordination records have a configurable retention horizon (seven
-days by default). Leader-only cleanup scans bounded metastore pages; pending
-records are reconciled before deletion. IDs older than retention fail closed,
-and timestamps more than five minutes in the future are rejected. A FILE
+days by default). Leader-only cleanup drains consecutive metastore pages under
+finite per-tick page and wall-clock budgets, advances its cursor only after a
+complete page, stops at end-of-scan without wrapping, and resumes its
+process-local cursor on the next tick. Pending records are
+reconciled before deletion. IDs older than retention fail closed, and
+timestamps more than five minutes in the future are rejected. A FILE
 Flight control stream is capped at 64 MiB because multi-GB video/model bytes
 belong in object storage, not in Query or Metasrv memory.
 
@@ -463,6 +466,10 @@ design-level ones:
   rather than listing every namespace and table. Its process-local opaque
   cursor wraps after the final page; every candidate is point-read again under
   its table lock so drop/recreate cannot expose a stale scanned generation.
+- The same tick drains multiple append-operation pages under independent page
+  and wall-clock budgets. It remains serial and cancellation-aware so
+  increasing cleanup throughput cannot bypass per-table locks, exact-stage
+  cleanup, or indefinitely starve the later table-maintenance page.
 - Query's DataFusion runtime is also process-bounded: all concurrent operators
   share one fair execution-memory pool and one aggregate size-limited spill
   manager under an operator-owned local directory. Spill is ephemeral replica
