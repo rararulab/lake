@@ -30,7 +30,7 @@ use lake_meta::{DynamoMeta, GuardedMutation, MetaStore};
 
 #[tokio::test]
 #[ignore = "requires localstack DynamoDB; set LAKE_DYNAMODB_ENDPOINT and run with --ignored"]
-async fn dynamo_meta_roundtrip() {
+async fn dynamo_v1_dual_v2_migration_roundtrip() {
     let Ok(endpoint) = std::env::var("LAKE_DYNAMODB_ENDPOINT") else {
         // Skip when the localstack endpoint is not provisioned.
         return;
@@ -145,5 +145,42 @@ async fn dynamo_meta_roundtrip() {
         ))
         .await
         .unwrap()
+    );
+
+    loop {
+        let page = meta.migrate_v2_page(2).await.unwrap();
+        assert!(page.scanned <= 2, "legacy migration page is bounded");
+        if page.complete {
+            break;
+        }
+    }
+    let verification = meta.verify_and_finalize_v2(2).await.unwrap();
+    assert!(verification.finalized);
+    assert_eq!(verification.legacy_items, verification.v2_items);
+    assert!(meta.is_v2_authoritative());
+    assert_eq!(meta.get("k").await.unwrap().as_deref(), Some(&b"2"[..]));
+
+    let mut continuation = None;
+    let mut v2_paged = Vec::new();
+    loop {
+        let page = meta
+            .scan_prefix_page("ptr/", continuation.as_deref(), 1)
+            .await
+            .unwrap();
+        assert!(page.entries().len() <= 1, "v2 query page is bounded");
+        let (entries, next) = page.into_parts();
+        v2_paged.extend(entries);
+        continuation = next;
+        if continuation.is_none() {
+            break;
+        }
+    }
+    v2_paged.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(
+        v2_paged,
+        vec![
+            ("a".to_owned(), b"v".to_vec()),
+            ("b".to_owned(), b"v".to_vec()),
+        ]
     );
 }

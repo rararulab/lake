@@ -30,6 +30,7 @@ data:
   LAKE_TABLE_PREFIX: tables
   LAKE_MANAGED_OBJECT_PREFIX: managed-objects
   LAKE_DYNAMODB_TABLE: lake-registry
+  # Lake derives the prefix-query companion as lake-registry_prefix_v2.
 ---
 apiVersion: v1
 kind: Service

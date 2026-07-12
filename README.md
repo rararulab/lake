@@ -338,6 +338,30 @@ start Query or Metasrv. On a versioned S3 bucket, `DeleteObject` creates a
 delete marker rather than reclaiming old versions, so configure an S3
 noncurrent-version lifecycle policy when physical byte reclamation is required.
 
+### DynamoDB prefix-layout migration
+
+Cloud deployments use a companion table named
+`$LAKE_DYNAMODB_TABLE_prefix_v2`. Its `(family#shard, full-key)` primary key
+lets catalog and maintenance prefix reads use strongly consistent `Query`
+requests instead of evaluating unrelated append-operation and manifest keys.
+Every current binary dual-writes the legacy and prefix tables atomically.
+
+After upgrading every commit-capable metadata node, run bounded backfill pages
+until `complete` is true, then finalize with an explicit rollout acknowledgement:
+
+```bash
+lake dynamo-migrate --page-size 500 --json
+lake dynamo-migrate --page-size 500 \
+  --finalize --acknowledge-dual-rollout --json
+```
+
+The cursor is durable, so rerunning after a crash resumes safely. Finalization
+checks exact key/value parity in both directions and rejects concurrent writes
+by checking a monotonic dual-write generation. Once finalized, reads use v2
+and never fall back to a legacy table scan. Retain the legacy table for at
+least `LAKE_APPEND_OPERATION_RETENTION_SECS` before removing it; rollback after
+finalization requires a dual-capable binary.
+
 For a local deployment, start metadata and query separately. The query process
 is told where metadata lives; clients are not:
 

@@ -54,6 +54,15 @@ pub enum MetaError {
 
     #[snafu(display("registry scan limit must be greater than zero"))]
     InvalidScanLimit,
+
+    #[snafu(display("invalid DynamoDB prefix cursor: {message}"))]
+    InvalidScanCursor { message: String },
+
+    #[snafu(display("invalid DynamoDB migration page size: {limit}"))]
+    InvalidMigrationPageSize { limit: usize },
+
+    #[snafu(display("DynamoDB prefix migration did not converge: {message}"))]
+    MigrationConflict { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, MetaError>;

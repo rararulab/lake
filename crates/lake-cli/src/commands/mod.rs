@@ -24,6 +24,7 @@
 //!   `LAKE_S3_ENDPOINT` and the standard `AWS_*` variables.
 
 pub mod client;
+pub mod dynamo_migrate;
 pub mod gc;
 pub mod ingest;
 mod limits;

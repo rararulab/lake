@@ -39,6 +39,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Backfill and optionally finalize DynamoDB's prefix-isolated layout.
+    DynamoMigrate(commands::dynamo_migrate::DynamoMigrateCmd),
     /// Run the end-to-end self-check: create → ingest → SQL query.
     Selftest,
     /// Execute a SQL statement against the catalog.
@@ -89,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
             // A pure network client: it holds no local storage, so it must not
             // build a Context (which would require a data-dir or S3 config).
             Command::Client { addr, command } => commands::client::run(&addr, command).await,
+            Command::DynamoMigrate(command) => commands::dynamo_migrate::run(command).await,
             command => run_with_context(&data_dir, command).await,
         }
     })
@@ -104,6 +107,9 @@ async fn run_with_context(data_dir: &str, command: Command) -> anyhow::Result<()
         Command::Ingest { table, file } => commands::ingest::run(&ctx, &table, &file).await,
         Command::Table(cmd) => commands::table::run(&ctx, cmd).await,
         Command::Gc(cmd) => commands::gc::run(&ctx, cmd).await,
+        Command::DynamoMigrate(_) => {
+            unreachable!("DynamoMigrate is dispatched before Context::open")
+        }
         Command::Query {
             addr,
             metadata_addr,
@@ -219,6 +225,27 @@ mod tests {
         assert!(
             Cli::try_parse_from(["lake", "gc", "--plan", "gc-plan", "--safety-age-secs", "0",])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn dynamo_v2_finalize_requires_exact_verified_backfill() {
+        let command =
+            Cli::try_parse_from(["lake", "dynamo-migrate", "--page-size", "128", "--json"])
+                .unwrap();
+        let Command::DynamoMigrate(command) = command.command else {
+            panic!("expected dynamo-migrate command");
+        };
+        assert_eq!(command.page_size, 128);
+        assert!(!command.finalize);
+        assert!(command.json);
+
+        assert!(
+            Cli::try_parse_from(["lake", "dynamo-migrate", "--finalize", "--json"]).is_err(),
+            "finalization must require an explicit dual-rollout acknowledgement"
+        );
+        assert!(
+            Cli::try_parse_from(["lake", "dynamo-migrate", "--page-size", "0", "--json",]).is_err()
         );
     }
 }

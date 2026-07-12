@@ -373,7 +373,14 @@ surfaced through `lake-catalog`.
   write batch; DynamoDB uses one `TransactWriteItems` request. Backends without
   a native atomic implementation fail closed.
 - **Metastore**: DynamoDB is multi-AZ HA by construction; RocksDB is
-  single-node, dev only.
+  single-node, dev only. Dynamo's legacy table remains the authority until a
+  verified migration marker exists. Current nodes atomically dual-write a
+  companion `(family#shard, full-key)` table; after finalization, point reads
+  use strongly consistent `GetItem` and prefix reads drain bounded,
+  strongly-consistent `Query` pages across 64 shards. The migration marker is
+  published only when bidirectional parity was verified under an unchanged
+  monotonic write generation. See
+  [`dynamo-prefix-layout.md`](design/dynamo-prefix-layout.md).
 
 No self-built consensus: read HA comes from stateless replicas, write HA
 from lease-election over an already-HA KV.

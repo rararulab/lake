@@ -40,6 +40,14 @@ The exact IAM resources are deployment-specific and are intentionally not
 created by this repository. Query and Metasrv both use DynamoDB/S3; neither
 StatefulSet identity nor an `emptyDir` is authoritative data.
 
+Provision both `$LAKE_DYNAMODB_TABLE` (HASH key `pk`) and its companion
+`$LAKE_DYNAMODB_TABLE_prefix_v2` (HASH `bucket`, RANGE `pk`) with on-demand
+billing, or grant the one-shot migration identity `CreateTable`. Roll all
+Query and Metasrv pods to a dual-capable image before running
+`lake dynamo-migrate`. Do not set `--acknowledge-dual-rollout` while an old
+v1-only writer exists. After finalization, keep both table ARNs in the runtime
+IAM policy and retain v1 for at least one append-operation retention horizon.
+
 ## Create required secrets
 
 Create two Secrets rather than editing credentials into the manifest. Secret
