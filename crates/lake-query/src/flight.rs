@@ -52,6 +52,7 @@ use datafusion::{
         record_batch::RecordBatch,
     },
     common::{TableReference, config::Dialect},
+    sql::{parser::Statement, sqlparser::ast::Statement as SqlStatement},
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use lake_catalog::{CatalogGeneration, TableSnapshot};
@@ -617,6 +618,23 @@ impl FlightSqlServiceImpl {
         let statement = state
             .sql_to_statement(sql, &Dialect::Generic)
             .map_err(|_| Status::invalid_argument("invalid SQL statement"))?;
+        if matches!(
+            &statement,
+            Statement::Statement(statement)
+                if matches!(
+                    statement.as_ref(),
+                    SqlStatement::Insert(_)
+                        | SqlStatement::Update(_)
+                        | SqlStatement::Delete(_)
+                        | SqlStatement::Merge(_)
+                        | SqlStatement::Directory { .. }
+                        | SqlStatement::Copy { .. }
+                        | SqlStatement::CopyIntoSnowflake { .. }
+                )
+        ) || matches!(statement, Statement::CopyTo(_))
+        {
+            return Err(Status::invalid_argument("DML not supported"));
+        }
         let references = state
             .resolve_table_references(&statement)
             .map_err(|_| Status::invalid_argument("invalid SQL statement"))?;
@@ -2121,6 +2139,37 @@ mod tests {
             meta.scans.load(Ordering::Relaxed),
             0,
             "authorization must not consult the metastore"
+        );
+    }
+
+    #[test]
+    fn flight_dml_is_rejected_before_snapshot_resolution() {
+        let meta = Arc::new(PlanningMeta::default());
+        let meta_ref: MetaStoreRef = meta.clone();
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let service = FlightSqlServiceImpl {
+            engine:            Arc::new(QueryEngine::new(meta_ref, storage)),
+            metadata_addr:     None,
+            metadata_security: ClientSecurity::new(),
+            managed_stage:     None,
+            admission:         QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:  DiscoveryLimits::default(),
+            ticket_codec:      test_ticket_codec(),
+        };
+
+        let error = service
+            .authorized_table_references(
+                &Principal::deployment_admin(),
+                "INSERT INTO lake.interop.missing VALUES (1)",
+            )
+            .expect_err("DML must fail before resolving the target table");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.message(), "DML not supported");
+        assert_eq!(
+            meta.scans.load(Ordering::Relaxed),
+            0,
+            "read-only rejection must not consult the catalog authority"
         );
     }
 

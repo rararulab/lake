@@ -81,6 +81,15 @@ run = "prek run --all-files"
 description = "run workspace tests"
 run = "cargo test --workspace --all-targets"
 
+[tasks.adbc-install]
+description = "install the frozen upstream ADBC interoperability environment"
+run = "uv sync --project interop/adbc --frozen"
+
+[tasks.test-adbc]
+description = "run pinned upstream ADBC Flight SQL interoperability checks"
+depends = ["adbc-install"]
+run = "cargo test -p lake-query --test adbc_interop -- --ignored"
+
 [tasks.e2e]
 description = "end-to-end self-check: create -> ingest -> SQL query"
 run = "cargo run -p lake-cli -- selftest"
@@ -119,7 +128,7 @@ run = "kubeconform -strict -summary -kubernetes-version 1.32.0 deploy/kubernetes
 # via `mise run ci`.
 [tasks.gate]
 description = "fast local quality gate: hooks + Rust tests + e2e + marketing site"
-depends = ["hooks", "test", "e2e", "site-check"]
+depends = ["hooks", "test", "test-adbc", "e2e", "site-check"]
 
 [tasks.doc]
 description = "cargo doc with -D warnings (slow; CI and on demand)"

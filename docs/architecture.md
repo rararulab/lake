@@ -365,6 +365,12 @@ Query-replica restarts. Initial retries carry one 128-bit submission id and
 converge through the same state-record CAS. The complete API and security boundary are in
 [`docs/design/sql-api-over-s3.md`](design/sql-api-over-s3.md).
 
+Protocol conformance is intentionally not circular: a pinned official ADBC
+Flight SQL client black-box tests interactive typed streaming, bearer metadata,
+and read-only errors against a real listener. Rust's upstream Arrow Flight
+types separately exercise polling, endpoint redemption, and cancellation,
+which are below the ordinary ADBC DB-API surface.
+
 ## Crate map
 
 | Crate | Owns | Tier |

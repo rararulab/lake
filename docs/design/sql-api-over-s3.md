@@ -155,8 +155,11 @@ schema encoding, streaming, error mapping, and result-location semantics.
    identity-bound submission ids make lost initial responses idempotent.
 3. Bounded result materialization, atomic manifest publication, exact DoGet
    endpoints, and expiry cleanup are implemented.
-4. Add ADBC compatibility tests for streaming, polling, endpoint downloads,
-   errors, and cancellation.
+4. **Implemented:** a pinned official ADBC Flight SQL client verifies typed
+   interactive streaming, bearer propagation, and read-only errors against a
+   real Query listener. Standard Arrow Flight tests cover `PollFlightInfo`,
+   exact endpoint downloads, and `CancelFlightInfo`; those RPCs are not
+   misrepresented as ordinary ADBC DB-API operations.
 
 The first step exposes the SQL API over S3-backed tables. The later steps
 change how large *results* are delivered; they are not required for direct
