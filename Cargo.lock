@@ -4380,6 +4380,7 @@ dependencies = [
  "lake-metasrv",
  "lake-objects",
  "lake-query",
+ "moka",
  "prost",
  "prost-types",
  "rcgen",

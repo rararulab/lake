@@ -20,6 +20,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use arrow::{
@@ -44,6 +45,7 @@ use lake_objects::{
     LocalObjectStore, ManagedObjectStore, ObjectReader, S3ObjectStore, data_location_array,
     data_location_field, data_location_from_array,
 };
+use moka::future::Cache;
 use prost::Message;
 use prost_types::Any;
 use sha2::{Digest, Sha256};
@@ -54,6 +56,10 @@ use tonic::transport::Channel;
 const APPEND_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 const APPEND_RETRY_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 const APPEND_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+const DEFAULT_SCHEMA_CACHE_CAPACITY: u64 = 1_024;
+const DEFAULT_SCHEMA_CACHE_TTL: Duration = Duration::from_mins(1);
+const MAX_SCHEMA_CACHE_CAPACITY: u64 = 65_536;
+const MAX_SCHEMA_CACHE_TTL: Duration = Duration::from_hours(1);
 
 fn ambiguous_append_error(error: &SdkError) -> bool {
     match error {
@@ -112,6 +118,12 @@ where
 pub enum SdkError {
     #[snafu(display("unsupported INSERT SQL: {message}"))]
     InvalidSql { message: String },
+
+    #[snafu(display("invalid SDK schema cache configuration: {message}"))]
+    InvalidSchemaCacheConfig { message: String },
+
+    #[snafu(display("table schema lookup failed: {message}"))]
+    SchemaLookup { message: String },
 
     #[snafu(display(
         "ambiguous FILE append did not converge within {window:?}; resume the returned pending \
@@ -290,12 +302,81 @@ pub enum InsertValue {
     File(FileUpload),
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SchemaCacheConfig {
+    capacity: u64,
+    ttl:      Duration,
+}
+
+impl Default for SchemaCacheConfig {
+    fn default() -> Self {
+        Self {
+            capacity: DEFAULT_SCHEMA_CACHE_CAPACITY,
+            ttl:      DEFAULT_SCHEMA_CACHE_TTL,
+        }
+    }
+}
+
+impl SchemaCacheConfig {
+    fn validate(capacity: u64, ttl: Duration) -> Result<Self> {
+        if capacity == 0 || capacity > MAX_SCHEMA_CACHE_CAPACITY {
+            return Err(SdkError::InvalidSchemaCacheConfig {
+                message: format!("capacity must be in 1..={MAX_SCHEMA_CACHE_CAPACITY}"),
+            });
+        }
+        if ttl.is_zero() || ttl > MAX_SCHEMA_CACHE_TTL {
+            return Err(SdkError::InvalidSchemaCacheConfig {
+                message: format!("TTL must be in 1ns..={MAX_SCHEMA_CACHE_TTL:?}"),
+            });
+        }
+        Ok(Self { capacity, ttl })
+    }
+}
+
+#[derive(Clone)]
+struct SchemaCache {
+    entries: Cache<TableRef, SchemaRef>,
+}
+
+impl SchemaCache {
+    fn new(config: SchemaCacheConfig) -> Self {
+        Self {
+            entries: Cache::builder()
+                .max_capacity(config.capacity)
+                .time_to_live(config.ttl)
+                .build(),
+        }
+    }
+
+    async fn resolve<F, Fut>(&self, table: TableRef, load: F) -> Result<SchemaRef>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<SchemaRef>>,
+    {
+        self.entries
+            .try_get_with(table, async {
+                load().await.map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|message| SdkError::SchemaLookup {
+                message: message.to_string(),
+            })
+    }
+
+    async fn invalidate(&self, table: &TableRef) { self.entries.invalidate(table).await; }
+
+    fn clear(&self) { self.entries.invalidate_all(); }
+
+    fn entry_count(&self) -> u64 { self.entries.entry_count() }
+}
+
 /// A Rust SDK client connected to the stateless query endpoint.
 #[derive(Clone)]
 pub struct LakeClient {
     query:                 Channel,
     objects:               Arc<dyn ManagedObjectStore>,
     security:              ClientSecurity,
+    schema_cache:          SchemaCache,
     upload_checkpoint_dir: Option<PathBuf>,
 }
 
@@ -304,10 +385,17 @@ pub struct LakeClient {
 pub struct LakeClientBuilder {
     query_endpoint:        String,
     security:              ClientSecurity,
+    schema_cache:          SchemaCacheConfig,
     upload_checkpoint_dir: Option<PathBuf>,
 }
 
 impl LakeClientBuilder {
+    /// Configure the finite client-local table schema cache.
+    pub fn with_schema_cache(mut self, capacity: u64, ttl: Duration) -> Result<Self> {
+        self.schema_cache = SchemaCacheConfig::validate(capacity, ttl)?;
+        Ok(self)
+    }
+
     /// Persist resumable path-upload checkpoints in this local directory.
     #[must_use]
     pub fn with_upload_checkpoint_dir(mut self, directory: impl Into<PathBuf>) -> Self {
@@ -359,6 +447,7 @@ impl LakeClientBuilder {
             query,
             objects,
             security: self.security,
+            schema_cache: SchemaCache::new(self.schema_cache),
             upload_checkpoint_dir: self.upload_checkpoint_dir,
         })
     }
@@ -378,6 +467,7 @@ impl LakeClientBuilder {
             query,
             objects: Arc::new(objects),
             security: self.security,
+            schema_cache: SchemaCache::new(self.schema_cache),
             upload_checkpoint_dir: self.upload_checkpoint_dir,
         })
     }
@@ -389,6 +479,7 @@ impl LakeClient {
         LakeClientBuilder {
             query_endpoint:        query_endpoint.into(),
             security:              ClientSecurity::new(),
+            schema_cache:          SchemaCacheConfig::default(),
             upload_checkpoint_dir: None,
         }
     }
@@ -410,6 +501,14 @@ impl LakeClient {
             .connect_with_store(objects)
             .await
     }
+
+    /// Expire one cached table schema immediately.
+    pub async fn invalidate_table_schema(&self, table: &TableRef) {
+        self.schema_cache.invalidate(table).await;
+    }
+
+    /// Expire every cached table schema immediately.
+    pub fn clear_schema_cache(&self) { self.schema_cache.clear(); }
 
     /// Execute a parameterized, single-row INSERT with typed scalar/`FILE`
     /// values.
@@ -555,6 +654,12 @@ impl LakeClient {
     }
 
     async fn table_schema(&self, table: &TableRef) -> Result<SchemaRef> {
+        self.schema_cache
+            .resolve(table.clone(), || self.fetch_table_schema(table))
+            .await
+    }
+
+    async fn fetch_table_schema(&self, table: &TableRef) -> Result<SchemaRef> {
         let mut client = FlightSqlServiceClient::new(self.query.clone());
         self.security.apply_to_sql_client(&mut client);
         let info = client
@@ -868,7 +973,8 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
     use crate::{
-        APPEND_RETRY_WINDOW, FileUpload, InsertValue, LakeClient, SdkError, data_location,
+        APPEND_RETRY_WINDOW, FileUpload, InsertValue, LakeClient, MAX_SCHEMA_CACHE_CAPACITY,
+        MAX_SCHEMA_CACHE_TTL, SchemaCache, SchemaCacheConfig, SdkError, data_location,
         retry_ambiguous_append_with_window,
     };
 
@@ -969,6 +1075,7 @@ mod tests {
                 .connect_lazy(),
             objects:               client.objects.clone(),
             security:              client.security.clone(),
+            schema_cache:          client.schema_cache.clone(),
             upload_checkpoint_dir: client.upload_checkpoint_dir.clone(),
         };
 
@@ -1158,6 +1265,147 @@ mod tests {
             crash_a_tx.take().unwrap().send(()).unwrap();
             server_a.take().unwrap().await.unwrap().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn schema_cache_coalesces_concurrent_lookups_across_clones() {
+        let root = tempdir().expect("tempdir");
+        let client = LakeClient {
+            query:                 tonic::transport::Endpoint::from_static("http://127.0.0.1:9")
+                .connect_lazy(),
+            objects:               Arc::new(
+                LocalObjectStore::open(root.path().join("objects"))
+                    .await
+                    .expect("object store"),
+            ),
+            security:              ClientSecurity::new(),
+            schema_cache:          SchemaCache::new(SchemaCacheConfig {
+                capacity: 16,
+                ttl:      Duration::from_secs(1),
+            }),
+            upload_checkpoint_dir: None,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        let table = TableRef::new("robots", "episodes");
+
+        let resolved = futures::future::join_all((0..16).map(|_| {
+            let client = client.clone();
+            let calls = calls.clone();
+            let schema = schema.clone();
+            let table = table.clone();
+            async move {
+                client
+                    .schema_cache
+                    .resolve(table, || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Ok(schema)
+                    })
+                    .await
+                    .expect("schema lookup")
+            }
+        }))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(resolved.iter().all(|item| Arc::ptr_eq(item, &schema)));
+        assert!(client.schema_cache.entry_count() <= 16);
+    }
+
+    #[tokio::test]
+    async fn schema_cache_expiry_and_invalidation_refetch_without_caching_failures() {
+        let cache = SchemaCache::new(SchemaCacheConfig {
+            capacity: 2,
+            ttl:      Duration::from_millis(25),
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let schema = Arc::new(Schema::empty());
+        let table = TableRef::new("robots", "episodes");
+
+        let failures = futures::future::join_all((0..8).map(|_| {
+            let cache = cache.clone();
+            let table = table.clone();
+            let calls = calls.clone();
+            async move {
+                cache
+                    .resolve(table, || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        Err(SdkError::InvalidSql {
+                            message: "injected schema failure".to_owned(),
+                        })
+                    })
+                    .await
+            }
+        }))
+        .await;
+        assert!(failures.iter().all(|result| {
+            result
+                .as_ref()
+                .expect_err("first lookup fails")
+                .to_string()
+                .contains("injected schema failure")
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let load = || {
+            let calls = calls.clone();
+            let schema = schema.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(schema)
+            }
+        };
+        cache.resolve(table.clone(), load).await.expect("retry");
+        cache
+            .resolve(table.clone(), || async {
+                panic!("cache hit must not load")
+            })
+            .await
+            .expect("cache hit");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        cache.invalidate(&table).await;
+        cache
+            .resolve(table.clone(), load)
+            .await
+            .expect("invalidated");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        cache.resolve(table.clone(), load).await.expect("expired");
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        cache.clear();
+        cache.resolve(table, load).await.expect("cleared");
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn schema_cache_rejects_unbounded_configuration() {
+        assert!(
+            LakeClient::builder("http://127.0.0.1:9")
+                .with_schema_cache(0, Duration::from_secs(1))
+                .is_err()
+        );
+        assert!(
+            LakeClient::builder("http://127.0.0.1:9")
+                .with_schema_cache(MAX_SCHEMA_CACHE_CAPACITY + 1, Duration::from_secs(1))
+                .is_err()
+        );
+        assert!(
+            LakeClient::builder("http://127.0.0.1:9")
+                .with_schema_cache(1, MAX_SCHEMA_CACHE_TTL + Duration::from_secs(1))
+                .is_err()
+        );
+        let defaults = SchemaCacheConfig::default();
+        assert_eq!(defaults.capacity, 1_024);
+        assert_eq!(defaults.ttl, Duration::from_mins(1));
     }
 
     async fn object_count(path: &std::path::Path) -> usize {
