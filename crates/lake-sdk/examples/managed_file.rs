@@ -55,9 +55,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .await?;
 
-    let expected = b"streamed directly into the Lake-managed stage";
-    let source = root.path().join("episode.mp4");
-    tokio::fs::write(&source, expected).await?;
+    let expected = [
+        b"first object streamed directly into the Lake-managed stage".as_slice(),
+        b"second object streamed directly into the Lake-managed stage".as_slice(),
+    ];
+    let sources = [
+        root.path().join("episode-1.mp4"),
+        root.path().join("episode-2.mp4"),
+    ];
+    tokio::fs::write(&sources[0], expected[0]).await?;
+    tokio::fs::write(&sources[1], expected[1]).await?;
     let metadata_addr = free_addr()?;
     let query_addr = free_addr()?;
     let managed_stage = ManagedStageDescriptor::local(
@@ -85,17 +92,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .connect()
         .await?;
     client
-        .insert(
+        .insert_many(
             "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
             vec![
-                InsertValue::Utf8("episode-42".to_owned()),
-                InsertValue::File(FileUpload::from_path(&source, "video/mp4")),
+                vec![
+                    InsertValue::Utf8("episode-1".to_owned()),
+                    InsertValue::File(FileUpload::from_path(&sources[0], "video/mp4")),
+                ],
+                vec![
+                    InsertValue::Utf8("episode-2".to_owned()),
+                    InsertValue::File(FileUpload::from_path(&sources[1], "video/mp4")),
+                ],
             ],
         )
         .await?;
 
     let mut results = client
-        .query("SELECT episode_id, video FROM lake.robots.episodes")
+        .query("SELECT episode_id, video FROM lake.robots.episodes ORDER BY episode_id")
         .await?;
     let batch = results.try_next().await?.ok_or("query returned no rows")?;
     let episode_ids = batch
@@ -103,14 +116,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or("episode_id is not UTF-8")?;
-    assert_eq!(episode_ids.value(0), "episode-42");
-    let location = data_location(&batch, "video", 0)?;
+    assert_eq!(episode_ids.value(0), "episode-1");
+    assert_eq!(episode_ids.value(1), "episode-2");
     assert!(results.try_next().await?.is_none());
 
-    let mut reader = client.open(&location).await?;
-    let mut actual = Vec::new();
-    reader.read_to_end(&mut actual).await?;
-    assert_eq!(actual, expected);
-    eprintln!("FILE upload and direct read succeeded: {}", location.uri);
+    for (row, expected) in expected.into_iter().enumerate() {
+        let location = data_location(&batch, "video", row)?;
+        let mut reader = client.open(&location).await?;
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).await?;
+        assert_eq!(actual, expected);
+        eprintln!("FILE upload and direct read succeeded: {}", location.uri);
+    }
     Ok(())
 }

@@ -42,6 +42,25 @@ embed, or connect directly to `lake-metasrv`:
 let client = LakeClient::connect("http://127.0.0.1:50051").await?;
 ```
 
+Batch multiple episode rows into one bounded Arrow append and one table
+version. Each `FILE` still streams directly to managed storage; only its
+`DataLocation` enters the batch. Batches contain 1..=10,000 rows, cap caller
+metadata and accumulated returned locations at 16 MiB each, use the exact
+protobuf size for the 64 MiB Flight limit, and validate every row before the
+first upload:
+
+```rust
+let version = client
+    .insert_many(
+        "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+        vec![
+            vec![InsertValue::Utf8("ep-1".into()), InsertValue::File(video_1)],
+            vec![InsertValue::Utf8("ep-2".into()), InsertValue::File(video_2)],
+        ],
+    )
+    .await?;
+```
+
 At connection time the SDK asks query for a versioned, credential-free managed
 stage descriptor. Query derives `tenants/<tenant-id>` below the configured local
 root or S3 prefix and returns only that child stage's location hints. The SDK
@@ -204,8 +223,8 @@ let reader = client
 Empty, reversed, and out-of-bounds ranges return a typed SDK object error
 before storage I/O.
 
-The example performs insert, query, `DataLocation` decoding, and direct open
-through `LakeClient`. Local development discovers a `file://` stage; production
+The example performs a multi-row insert, query, `DataLocation` decoding, and
+direct open through `LakeClient`. Local development discovers a `file://` stage; production
 discovers an `s3://` stage. Non-empty S3 objects stream through
 bounded 5 MiB multipart parts, with incremental SHA-256 and abort-on-error.
 The query service forwards only the Arrow row to the metadata leader;

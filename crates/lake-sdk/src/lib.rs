@@ -60,6 +60,10 @@ const DEFAULT_SCHEMA_CACHE_CAPACITY: u64 = 1_024;
 const DEFAULT_SCHEMA_CACHE_TTL: Duration = Duration::from_mins(1);
 const MAX_SCHEMA_CACHE_CAPACITY: u64 = 65_536;
 const MAX_SCHEMA_CACHE_TTL: Duration = Duration::from_hours(1);
+const MAX_INSERT_BATCH_ROWS: usize = 10_000;
+const MAX_INSERT_INPUT_METADATA_BYTES: usize = 16 * 1024 * 1024;
+const MAX_INSERT_OUTPUT_METADATA_BYTES: usize = 16 * 1024 * 1024;
+const MAX_INSERT_FLIGHT_BYTES: usize = 64 * 1024 * 1024;
 
 fn ambiguous_append_error(error: &SdkError) -> bool {
     match error {
@@ -133,6 +137,12 @@ pub enum SdkError {
 
     #[snafu(display("INSERT binds {actual} values but SQL declares {expected} placeholders"))]
     ParameterCount { expected: usize, actual: usize },
+
+    #[snafu(display("INSERT batch row count {actual} is outside 1..={maximum}"))]
+    BatchRowCount { actual: usize, maximum: usize },
+
+    #[snafu(display("INSERT batch metadata is {actual} bytes, above the {maximum}-byte limit"))]
+    BatchMetadataSize { actual: usize, maximum: usize },
 
     #[snafu(display("INSERT column '{column}' is missing from table schema"))]
     UnknownColumn { column: String },
@@ -679,7 +689,12 @@ impl LakeClient {
     /// Execute a parameterized, single-row INSERT with typed scalar/`FILE`
     /// values.
     pub async fn insert(&self, sql: &str, values: Vec<InsertValue>) -> Result<Version> {
-        let pending = self.prepare_insert(sql, values).await?;
+        self.insert_many(sql, vec![values]).await
+    }
+
+    /// Execute one bounded multi-row INSERT with typed scalar/`FILE` values.
+    pub async fn insert_many(&self, sql: &str, rows: Vec<Vec<InsertValue>>) -> Result<Version> {
+        let pending = self.prepare_insert_many(sql, rows).await?;
         self.resume_append(pending).await
     }
 
@@ -711,29 +726,70 @@ impl LakeClient {
     }
 
     async fn prepare_insert(&self, sql: &str, values: Vec<InsertValue>) -> Result<PendingAppend> {
-        let insert = parse_insert(sql)?;
-        if insert.columns.len() != values.len() {
-            return Err(SdkError::ParameterCount {
-                expected: insert.columns.len(),
-                actual:   values.len(),
+        self.prepare_insert_many(sql, vec![values]).await
+    }
+
+    async fn prepare_insert_many(
+        &self,
+        sql: &str,
+        rows: Vec<Vec<InsertValue>>,
+    ) -> Result<PendingAppend> {
+        if rows.is_empty() || rows.len() > MAX_INSERT_BATCH_ROWS {
+            return Err(SdkError::BatchRowCount {
+                actual:  rows.len(),
+                maximum: MAX_INSERT_BATCH_ROWS,
             });
         }
+        let input_bytes = batch_input_metadata_bytes(sql, &rows);
+        if input_bytes > MAX_INSERT_INPUT_METADATA_BYTES {
+            return Err(SdkError::BatchMetadataSize {
+                actual:  input_bytes,
+                maximum: MAX_INSERT_INPUT_METADATA_BYTES,
+            });
+        }
+        let insert = parse_insert(sql)?;
+        for values in &rows {
+            if insert.columns.len() != values.len() {
+                return Err(SdkError::ParameterCount {
+                    expected: insert.columns.len(),
+                    actual:   values.len(),
+                });
+            }
+        }
         let schema = self.table_schema(&insert.table).await?;
-        validate_bindings(&schema, &insert.columns, &values)?;
+        for values in &rows {
+            validate_bindings(&schema, &insert.columns, values)?;
+        }
 
-        let mut bindings = insert
-            .columns
-            .into_iter()
-            .zip(values)
-            .collect::<BTreeMap<_, _>>();
+        let mut column_values = (0..schema.fields().len())
+            .map(|_| Vec::with_capacity(rows.len()))
+            .collect::<Vec<_>>();
+        for values in rows {
+            let mut bindings = insert
+                .columns
+                .iter()
+                .cloned()
+                .zip(values)
+                .collect::<BTreeMap<_, _>>();
+            for (index, field) in schema.fields().iter().enumerate() {
+                column_values[index].push(bindings.remove(field.name()).ok_or_else(|| {
+                    SdkError::MissingColumn {
+                        column: field.name().to_owned(),
+                    }
+                })?);
+            }
+        }
         let mut arrays = Vec::<ArrayRef>::with_capacity(schema.fields().len());
-        for field in schema.fields() {
-            let value = bindings
-                .remove(field.name())
-                .ok_or_else(|| SdkError::MissingColumn {
-                    column: field.name().to_owned(),
-                })?;
-            arrays.push(self.upload_and_encode(field.data_type(), value).await?);
+        let mut output_metadata_bytes = 0usize;
+        for (field, values) in schema.fields().iter().zip(column_values) {
+            arrays.push(
+                self.upload_and_encode_column(
+                    field.data_type(),
+                    values,
+                    &mut output_metadata_bytes,
+                )
+                .await?,
+            );
         }
         let batch = RecordBatch::try_new(schema, arrays).context(ArrowSnafu)?;
         let mut messages = FlightDataEncoderBuilder::new()
@@ -759,6 +815,7 @@ impl LakeClient {
             .first_mut()
             .expect("Flight encoder emits a schema message")
             .flight_descriptor = Some(descriptor);
+        validate_flight_payload_size(&messages, MAX_INSERT_FLIGHT_BYTES)?;
         Ok(PendingAppend {
             operation_id,
             messages,
@@ -838,18 +895,32 @@ impl LakeClient {
         Ok(Arc::new(schema))
     }
 
-    async fn upload_and_encode(
+    async fn upload_and_encode_column(
         &self,
         data_type: &DataType,
-        value: InsertValue,
+        values: Vec<InsertValue>,
+        output_metadata_bytes: &mut usize,
     ) -> Result<ArrayRef> {
-        match (data_type, value) {
-            (DataType::Utf8, InsertValue::Utf8(value)) => {
-                Ok(Arc::new(StringArray::from(vec![value])))
-            }
-            (data_type, InsertValue::File(file))
-                if data_type == data_location_field("ignored", false).data_type() =>
-            {
+        if data_type == &DataType::Utf8 {
+            let values = values
+                .into_iter()
+                .map(|value| match value {
+                    InsertValue::Utf8(value) => Ok(value),
+                    InsertValue::File(_) => Err(SdkError::TypeMismatch {
+                        column: "bound value".to_owned(),
+                    }),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Arc::new(StringArray::from(values)));
+        }
+        if data_type == data_location_field("ignored", false).data_type() {
+            let mut locations = Vec::with_capacity(values.len());
+            for value in values {
+                let InsertValue::File(file) = value else {
+                    return Err(SdkError::TypeMismatch {
+                        column: "bound value".to_owned(),
+                    });
+                };
                 let location = match file.source {
                     ObjectSource::Path(path) => {
                         let checkpoint = self.checkpoint_path(&path).await?;
@@ -864,12 +935,21 @@ impl LakeClient {
                     }
                 };
                 let location = location.context(ObjectSnafu)?;
-                Ok(Arc::new(data_location_array(&[location])))
+                *output_metadata_bytes =
+                    output_metadata_bytes.saturating_add(data_location_metadata_bytes(&location));
+                if *output_metadata_bytes > MAX_INSERT_OUTPUT_METADATA_BYTES {
+                    return Err(SdkError::BatchMetadataSize {
+                        actual:  *output_metadata_bytes,
+                        maximum: MAX_INSERT_OUTPUT_METADATA_BYTES,
+                    });
+                }
+                locations.push(location);
             }
-            (..) => Err(SdkError::TypeMismatch {
-                column: "bound value".to_owned(),
-            }),
+            return Ok(Arc::new(data_location_array(&locations)));
         }
+        Err(SdkError::TypeMismatch {
+            column: "bound value".to_owned(),
+        })
     }
 
     async fn checkpoint_path(&self, source: &Path) -> Result<Option<PathBuf>> {
@@ -1097,6 +1177,41 @@ fn duplicate(values: &[String]) -> bool {
         .any(|(index, value)| values[..index].iter().any(|prior| prior == value))
 }
 
+fn batch_input_metadata_bytes(sql: &str, rows: &[Vec<InsertValue>]) -> usize {
+    rows.iter().flatten().fold(sql.len(), |total, value| {
+        let bytes = match value {
+            InsertValue::Utf8(value) => value.len(),
+            InsertValue::File(file) => {
+                let source = match &file.source {
+                    ObjectSource::Path(path) => path.as_os_str().as_encoded_bytes().len(),
+                    ObjectSource::Reader(_) => 0,
+                };
+                source.saturating_add(file.content_type.len())
+            }
+        };
+        total.saturating_add(bytes)
+    })
+}
+
+fn data_location_metadata_bytes(location: &DataLocation) -> usize {
+    location
+        .uri
+        .len()
+        .saturating_add(location.content_type.len())
+        .saturating_add(location.sha256.len())
+        .saturating_add(std::mem::size_of::<u64>())
+}
+
+fn validate_flight_payload_size(messages: &[FlightData], maximum: usize) -> Result<()> {
+    let actual = messages.iter().fold(0usize, |total, message| {
+        total.saturating_add(message.encoded_len())
+    });
+    if actual > maximum {
+        return Err(SdkError::BatchMetadataSize { actual, maximum });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1116,7 +1231,7 @@ mod tests {
         datatypes::{DataType, Field, Schema},
     };
     use arrow_flight::{
-        FlightDescriptor, FlightInfo,
+        FlightData, FlightDescriptor, FlightInfo,
         flight_service_server::FlightServiceServer,
         sql::{CommandStatementQuery, SqlInfo, server::FlightSqlService},
     };
@@ -1140,6 +1255,7 @@ mod tests {
         data_location_field, data_location_from_array,
     };
     use lake_query::{QueryEngine, QueryServerConfig};
+    use prost::Message;
     use rcgen::generate_simple_self_signed;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
@@ -1150,9 +1266,10 @@ mod tests {
     use tonic::{Request, Response, Status};
 
     use crate::{
-        APPEND_RETRY_WINDOW, FileUpload, InsertValue, LakeClient, MAX_SCHEMA_CACHE_CAPACITY,
-        MAX_SCHEMA_CACHE_TTL, SchemaCache, SchemaCacheConfig, SdkError, data_location,
-        retry_ambiguous_append_with_window,
+        APPEND_RETRY_WINDOW, FileUpload, InsertValue, LakeClient, MAX_INSERT_BATCH_ROWS,
+        MAX_INSERT_INPUT_METADATA_BYTES, MAX_SCHEMA_CACHE_CAPACITY, MAX_SCHEMA_CACHE_TTL,
+        SchemaCache, SchemaCacheConfig, SdkError, data_location,
+        retry_ambiguous_append_with_window, validate_flight_payload_size,
     };
 
     #[derive(Clone)]
@@ -2358,6 +2475,158 @@ mod tests {
         assert!(example.contains(".query("));
         assert!(example.contains("data_location("));
         assert!(!example.contains(".execute_sql("));
+    }
+
+    #[tokio::test]
+    async fn sdk_batch_insert_commits_multiple_files_as_one_version() {
+        let root = tempdir().unwrap();
+        let (client, metasrv, table, _meta, _engine) = setup_client(root.path()).await;
+        let first = root.path().join("first.mp4");
+        let second = root.path().join("second.mp4");
+        tokio::fs::write(&first, b"first video bytes")
+            .await
+            .unwrap();
+        tokio::fs::write(&second, b"second video bytes")
+            .await
+            .unwrap();
+
+        let version = client
+            .insert_many(
+                "INSERT INTO robots.episodes (video, episode_id) VALUES (?, ?)",
+                vec![
+                    vec![
+                        InsertValue::File(FileUpload::from_path(&first, "video/mp4")),
+                        InsertValue::Utf8("episode-batch-1".to_owned()),
+                    ],
+                    vec![
+                        InsertValue::File(FileUpload::from_path(&second, "video/mp4")),
+                        InsertValue::Utf8("episode-batch-2".to_owned()),
+                    ],
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(version, Version(2));
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(2)
+        );
+        let mut results = client
+            .query("SELECT episode_id, video FROM lake.robots.episodes ORDER BY episode_id")
+            .await
+            .unwrap();
+        let batch = results.try_next().await.unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let expected = [
+            b"first video bytes".as_slice(),
+            b"second video bytes".as_slice(),
+        ];
+        for (row, bytes) in expected.into_iter().enumerate() {
+            let location = data_location(&batch, "video", row).unwrap();
+            let mut reader = client.open(&location).await.unwrap();
+            let mut actual = Vec::new();
+            reader.read_to_end(&mut actual).await.unwrap();
+            assert_eq!(actual, bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_batch_insert_validates_every_row_before_upload() {
+        let root = tempdir().unwrap();
+        let (client, metasrv, table, _meta, _engine) = setup_client(root.path()).await;
+        let source = root.path().join("must-not-upload.mp4");
+        tokio::fs::write(&source, b"must not upload").await.unwrap();
+
+        let error = client
+            .insert_many(
+                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                vec![
+                    vec![
+                        InsertValue::Utf8("valid-first-row".to_owned()),
+                        InsertValue::File(FileUpload::from_path(&source, "video/mp4")),
+                    ],
+                    vec![
+                        InsertValue::Utf8("invalid-second-row".to_owned()),
+                        InsertValue::Utf8("not a FILE".to_owned()),
+                    ],
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SdkError::TypeMismatch { .. }));
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(1)
+        );
+        assert_eq!(object_count(&root.path().join("objects")).await, 0);
+    }
+
+    #[tokio::test]
+    async fn sdk_batch_insert_rejects_empty_and_excessive_batches() {
+        let root = tempdir().unwrap();
+        let client = LakeClient {
+            query:                 tonic::transport::Endpoint::from_static("http://127.0.0.1:9")
+                .connect_lazy(),
+            objects:               Arc::new(
+                LocalObjectStore::open(root.path().join("objects"))
+                    .await
+                    .unwrap(),
+            ),
+            security:              ClientSecurity::new(),
+            schema_cache:          SchemaCache::new(SchemaCacheConfig::default()),
+            upload_checkpoint_dir: None,
+        };
+        let sql = "INSERT INTO robots.episodes (episode_id) VALUES (?)";
+
+        assert!(matches!(
+            client.insert_many(sql, Vec::new()).await,
+            Err(SdkError::BatchRowCount { actual: 0, .. })
+        ));
+        let excessive = (0..=MAX_INSERT_BATCH_ROWS).map(|_| Vec::new()).collect();
+        assert!(matches!(
+            client.insert_many(sql, excessive).await,
+            Err(SdkError::BatchRowCount { actual, .. }) if actual == MAX_INSERT_BATCH_ROWS + 1
+        ));
+        let oversized = vec![vec![InsertValue::Utf8(
+            "x".repeat(MAX_INSERT_INPUT_METADATA_BYTES + 1),
+        )]];
+        assert!(matches!(
+            client.insert_many(sql, oversized).await,
+            Err(SdkError::BatchMetadataSize { .. })
+        ));
+        assert_eq!(object_count(&root.path().join("objects")).await, 0);
+    }
+
+    #[test]
+    fn sdk_batch_insert_flight_bound_uses_protobuf_size() {
+        let within = FlightData {
+            data_body: vec![0; 28].into(),
+            ..FlightData::default()
+        };
+        let maximum = within.encoded_len();
+        validate_flight_payload_size(std::slice::from_ref(&within), maximum).unwrap();
+
+        let over = FlightData {
+            data_body: vec![0; 29].into(),
+            ..FlightData::default()
+        };
+        assert!(over.encoded_len() > maximum);
+        assert!(matches!(
+            validate_flight_payload_size(&[over], maximum),
+            Err(SdkError::BatchMetadataSize { actual, maximum: limit })
+                if actual > limit
+        ));
     }
 
     #[tokio::test]
