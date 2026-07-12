@@ -23,6 +23,103 @@ use crate::error::{MetaError, Result};
 
 pub type MetaStoreRef = Arc<dyn MetaStore>;
 
+/// One conditional target transition plus an unconditional opaque signal.
+///
+/// Backends apply both writes atomically. The signal lets readers cheaply
+/// detect a successful mutation without encoding target identity in it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignaledMutation<'a> {
+    pub(crate) target_key:   &'a str,
+    pub(crate) target:       GuardedTarget<'a>,
+    pub(crate) signal_key:   &'a str,
+    pub(crate) signal_value: &'a [u8],
+}
+
+impl<'a> SignaledMutation<'a> {
+    /// Borrow the conditional target key for decorator instrumentation.
+    #[must_use]
+    pub const fn target_key(&self) -> &str { self.target_key }
+
+    #[must_use]
+    pub const fn create(
+        target_key: &'a str,
+        value: &'a [u8],
+        signal_key: &'a str,
+        signal_value: &'a [u8],
+    ) -> Self {
+        Self {
+            target_key,
+            target: GuardedTarget::Put {
+                expected: None,
+                value,
+            },
+            signal_key,
+            signal_value,
+        }
+    }
+
+    #[must_use]
+    pub const fn update(
+        target_key: &'a str,
+        expected: &'a [u8],
+        value: &'a [u8],
+        signal_key: &'a str,
+        signal_value: &'a [u8],
+    ) -> Self {
+        Self {
+            target_key,
+            target: GuardedTarget::Put {
+                expected: Some(expected),
+                value,
+            },
+            signal_key,
+            signal_value,
+        }
+    }
+
+    #[must_use]
+    pub const fn delete(
+        target_key: &'a str,
+        expected: &'a [u8],
+        signal_key: &'a str,
+        signal_value: &'a [u8],
+    ) -> Self {
+        Self {
+            target_key,
+            target: GuardedTarget::Delete { expected },
+            signal_key,
+            signal_value,
+        }
+    }
+
+    pub(crate) fn validate(self) -> Result<Self> {
+        if self.target_key == self.signal_key {
+            return Err(MetaError::InvalidSignaledMutation);
+        }
+        Ok(self)
+    }
+
+    /// Add an independent exact-value guard while preserving the atomic
+    /// target transition and signal replacement.
+    #[must_use]
+    pub const fn guarded_by(
+        self,
+        guard_key: &'a str,
+        guard_expected: &'a [u8],
+    ) -> GuardedMutation<'a> {
+        GuardedMutation {
+            guard_key,
+            guard_expected,
+            target_key: self.target_key,
+            target: self.target,
+            signal: Some(MutationSignal {
+                key:   self.signal_key,
+                value: self.signal_value,
+            }),
+        }
+    }
+}
+
 /// One exact target transition protected by an exact guard value.
 ///
 /// Constructors enforce that create, update, and delete always carry the
@@ -34,6 +131,13 @@ pub struct GuardedMutation<'a> {
     pub(crate) guard_expected: &'a [u8],
     pub(crate) target_key:     &'a str,
     pub(crate) target:         GuardedTarget<'a>,
+    pub(crate) signal:         Option<MutationSignal<'a>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MutationSignal<'a> {
+    pub(crate) key:   &'a str,
+    pub(crate) value: &'a [u8],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +168,7 @@ impl<'a> GuardedMutation<'a> {
                 expected: None,
                 value,
             },
+            signal: None,
         }
     }
 
@@ -84,6 +189,7 @@ impl<'a> GuardedMutation<'a> {
                 expected: Some(target_expected),
                 value,
             },
+            signal: None,
         }
     }
 
@@ -102,11 +208,23 @@ impl<'a> GuardedMutation<'a> {
             target: GuardedTarget::Delete {
                 expected: target_expected,
             },
+            signal: None,
         }
     }
 
+    /// Atomically replace an opaque signal when the guarded target succeeds.
+    #[must_use]
+    pub const fn with_signal(mut self, key: &'a str, value: &'a [u8]) -> Self {
+        self.signal = Some(MutationSignal { key, value });
+        self
+    }
+
     pub(crate) fn validate(self) -> Result<Self> {
-        if self.guard_key == self.target_key {
+        if self.guard_key == self.target_key
+            || self
+                .signal
+                .is_some_and(|signal| signal.key == self.guard_key || signal.key == self.target_key)
+        {
             return Err(MetaError::InvalidGuardedMutation);
         }
         Ok(self)
@@ -153,6 +271,14 @@ pub trait MetaStore: Send + Sync {
     /// Atomic compare-and-set. `expected = None` means "key must not exist".
     /// Returns false if the current value didn't match.
     async fn cas(&self, key: &str, expected: Option<&[u8]>, new: &[u8]) -> Result<bool>;
+
+    /// Atomically apply a conditional target mutation and replace an opaque
+    /// signal. The default fails closed because sequential writes cannot meet
+    /// this contract.
+    async fn signaled_mutate(&self, mutation: SignaledMutation<'_>) -> Result<bool> {
+        mutation.validate()?;
+        Err(MetaError::SignaledMutationUnsupported)
+    }
 
     /// Apply a target transition only when both its expected state and an
     /// independent guard value match. Both checks and the write are atomic.

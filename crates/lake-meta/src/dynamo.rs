@@ -43,7 +43,7 @@ use crate::{
     dynamo_layout::{PrefixCursor, bucket_for_prefix, physical_key},
     dynamo_migration::{DynamoMigrationPage, DynamoMigrationVerification},
     error::{DynamoSnafu, MetaError, Result},
-    store::{GuardedMutation, GuardedTarget, MetaScanPage, MetaStore},
+    store::{GuardedMutation, GuardedTarget, MetaScanPage, MetaStore, SignaledMutation},
     telemetry::{self, PrefixApi, PrefixLayout, RequestOutcome},
 };
 
@@ -691,6 +691,9 @@ impl DynamoMeta {
                         message: "malformed item in v2 table".to_owned(),
                     });
                 };
+                if key.starts_with("__lake_internal/") {
+                    continue;
+                }
                 v2_items += 1;
                 if self.get_legacy_raw(key).await?.as_deref() != Some(value.as_ref()) {
                     return Err(MetaError::MigrationConflict {
@@ -885,6 +888,116 @@ impl DynamoMeta {
             legacy_target.build(),
             v2_target.build(),
         ];
+        if let Some(signal) = mutation.signal {
+            items.extend(self.signal_transaction_items(signal.key, signal.value));
+        }
+        if !self.is_v2_authoritative() {
+            items.push(self.finalize_barrier_condition());
+        }
+        items
+    }
+
+    fn signal_transaction_items(&self, key: &str, value: &[u8]) -> Vec<TransactWriteItem> {
+        let physical = physical_key(key);
+        let legacy = Put::builder()
+            .table_name(&self.table)
+            .item("pk", AttributeValue::S(key.to_owned()))
+            .item("val", AttributeValue::B(Blob::new(value.to_vec())))
+            .build()
+            .expect("legacy signal put is complete");
+        let v2 = Put::builder()
+            .table_name(&self.v2_table)
+            .item("bucket", AttributeValue::S(physical.bucket))
+            .item("pk", AttributeValue::S(physical.logical_key))
+            .item("val", AttributeValue::B(Blob::new(value.to_vec())))
+            .build()
+            .expect("v2 signal put is complete");
+        vec![
+            TransactWriteItem::builder().put(legacy).build(),
+            TransactWriteItem::builder().put(v2).build(),
+        ]
+    }
+
+    fn signaled_transaction_items(&self, mutation: SignaledMutation<'_>) -> Vec<TransactWriteItem> {
+        let physical = physical_key(mutation.target_key);
+        let (legacy_target, v2_target) = match mutation.target {
+            GuardedTarget::Put { expected, value } => {
+                let mut legacy = Put::builder()
+                    .table_name(&self.table)
+                    .item("pk", AttributeValue::S(mutation.target_key.to_owned()))
+                    .item("val", AttributeValue::B(Blob::new(value.to_vec())));
+                let mut v2 = Put::builder()
+                    .table_name(&self.v2_table)
+                    .item("bucket", AttributeValue::S(physical.bucket))
+                    .item("pk", AttributeValue::S(physical.logical_key))
+                    .item("val", AttributeValue::B(Blob::new(value.to_vec())));
+                match expected {
+                    None => {
+                        legacy = legacy.condition_expression("attribute_not_exists(pk)");
+                        v2 = v2.condition_expression("attribute_not_exists(pk)");
+                    }
+                    Some(expected) => {
+                        legacy = legacy
+                            .condition_expression("val = :target")
+                            .expression_attribute_values(
+                                ":target",
+                                AttributeValue::B(Blob::new(expected.to_vec())),
+                            );
+                        v2 = v2
+                            .condition_expression(if self.is_v2_authoritative() {
+                                "val = :target"
+                            } else {
+                                "attribute_not_exists(pk) OR val = :target"
+                            })
+                            .expression_attribute_values(
+                                ":target",
+                                AttributeValue::B(Blob::new(expected.to_vec())),
+                            );
+                    }
+                }
+                (
+                    TransactWriteItem::builder()
+                        .put(legacy.build().expect("signaled legacy put is complete"))
+                        .build(),
+                    TransactWriteItem::builder()
+                        .put(v2.build().expect("signaled v2 put is complete"))
+                        .build(),
+                )
+            }
+            GuardedTarget::Delete { expected } => {
+                let legacy = Delete::builder()
+                    .table_name(&self.table)
+                    .key("pk", AttributeValue::S(mutation.target_key.to_owned()))
+                    .condition_expression("val = :target")
+                    .expression_attribute_values(
+                        ":target",
+                        AttributeValue::B(Blob::new(expected.to_vec())),
+                    )
+                    .build()
+                    .expect("signaled legacy delete is complete");
+                let v2 = Delete::builder()
+                    .table_name(&self.v2_table)
+                    .key("bucket", AttributeValue::S(physical.bucket))
+                    .key("pk", AttributeValue::S(physical.logical_key))
+                    .condition_expression(if self.is_v2_authoritative() {
+                        "val = :target"
+                    } else {
+                        "attribute_not_exists(pk) OR val = :target"
+                    })
+                    .expression_attribute_values(
+                        ":target",
+                        AttributeValue::B(Blob::new(expected.to_vec())),
+                    )
+                    .build()
+                    .expect("signaled v2 delete is complete");
+                (
+                    TransactWriteItem::builder().delete(legacy).build(),
+                    TransactWriteItem::builder().delete(v2).build(),
+                )
+            }
+        };
+        let mut items = vec![legacy_target, v2_target];
+        items.extend(self.signal_transaction_items(mutation.signal_key, mutation.signal_value));
         if !self.is_v2_authoritative() {
             items.push(self.finalize_barrier_condition());
         }
@@ -1001,6 +1114,31 @@ impl MetaStore for DynamoMeta {
             Err(error) => Err(dynamo_err(format!("dual CAS transaction on '{key}'"))(
                 error,
             )),
+        }
+    }
+
+    async fn signaled_mutate(&self, mutation: SignaledMutation<'_>) -> Result<bool> {
+        self.refresh_operational_metrics().await;
+        let mutation = mutation.validate()?;
+        let target_key = mutation.target_key.to_owned();
+        let result = self
+            .client
+            .transact_write_items()
+            .set_transact_items(Some(self.signaled_transaction_items(mutation)))
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(true),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(transaction_condition_mismatch) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(dynamo_err(format!(
+                "signaled transaction on '{target_key}'"
+            ))(error)),
         }
     }
 

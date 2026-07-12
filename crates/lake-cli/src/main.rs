@@ -39,6 +39,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Activate generation-based catalog refresh after a quiescent rollout.
+    CatalogFinalize(commands::catalog_finalize::CatalogFinalizeCmd),
     /// Backfill and optionally finalize DynamoDB's prefix-isolated layout.
     DynamoMigrate(commands::dynamo_migrate::DynamoMigrateCmd),
     /// Run the end-to-end self-check: create → ingest → SQL query.
@@ -107,6 +109,7 @@ async fn run_with_context(data_dir: &str, command: Command) -> anyhow::Result<()
         Command::Ingest { table, file } => commands::ingest::run(&ctx, &table, &file).await,
         Command::Table(cmd) => commands::table::run(&ctx, cmd).await,
         Command::Gc(cmd) => commands::gc::run(&ctx, cmd).await,
+        Command::CatalogFinalize(command) => commands::catalog_finalize::run(&ctx, command).await,
         Command::DynamoMigrate(_) => {
             unreachable!("DynamoMigrate is dispatched before Context::open")
         }
@@ -269,5 +272,32 @@ mod tests {
         assert!(
             Cli::try_parse_from(["lake", "dynamo-migrate", "--page-size", "0", "--json",]).is_err()
         );
+    }
+
+    #[test]
+    fn catalog_generation_finalize_requires_rollout_acknowledgements() {
+        assert!(Cli::try_parse_from(["lake", "catalog-finalize"]).is_err());
+        assert!(
+            Cli::try_parse_from(["lake", "catalog-finalize", "--acknowledge-writer-rollout",])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["lake", "catalog-finalize", "--acknowledge-write-quiescence",])
+                .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "lake",
+            "catalog-finalize",
+            "--acknowledge-writer-rollout",
+            "--acknowledge-write-quiescence",
+            "--json",
+        ])
+        .unwrap();
+        let Command::CatalogFinalize(command) = cli.command else {
+            panic!("expected catalog-finalize command");
+        };
+        assert!(command.acknowledge_writer_rollout);
+        assert!(command.acknowledge_write_quiescence);
+        assert!(command.json);
     }
 }

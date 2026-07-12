@@ -18,7 +18,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lake_meta::{GuardedMutation, MetaError, MetaScanPage, MetaStore, MetaStoreRef, Result};
+use lake_meta::{
+    GuardedMutation, MetaError, MetaScanPage, MetaStore, MetaStoreRef, Result, SignaledMutation,
+};
 
 use crate::leadership::Leadership;
 
@@ -53,6 +55,14 @@ impl MetaStore for FencedMetaStore {
             }
         };
         self.inner.guarded_mutate(mutation).await
+    }
+
+    async fn signaled_mutate(&self, mutation: SignaledMutation<'_>) -> Result<bool> {
+        let _publication = self.leadership.begin_publication().await;
+        let guard = self.guard()?;
+        self.inner
+            .guarded_mutate(mutation.guarded_by(crate::election::LEASE_KEY, guard.bytes()))
+            .await
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
@@ -92,7 +102,7 @@ impl MetaStore for FencedMetaStore {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use lake_meta::{MetaError, MetaStore, MetaStoreRef, RocksMeta};
+    use lake_meta::{MetaError, MetaStore, MetaStoreRef, RocksMeta, SignaledMutation};
 
     use super::FencedMetaStore;
     use crate::{
@@ -125,6 +135,39 @@ mod tests {
         assert_eq!(
             raw.get("target").await.unwrap().as_deref(),
             Some(&b"old"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_leader_cannot_publish_directory_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw: MetaStoreRef = Arc::new(RocksMeta::open(dir.path()).unwrap());
+        let a = LeaseElection::new(raw.clone(), "a", Duration::from_millis(10));
+        let b = LeaseElection::new(raw.clone(), "b", Duration::from_millis(10));
+        let stale = leader_guard(a.campaign_at(0).await.unwrap());
+        let leadership = Arc::new(Leadership::new());
+        leadership.assume_guarded_leader("a", stale, Duration::from_mins(1));
+        let fenced = FencedMetaStore::new(raw.clone(), leadership);
+
+        let takeover = leader_guard(b.campaign_at(20).await.unwrap());
+        assert_eq!(takeover.epoch(), 2);
+        let published = fenced
+            .signaled_mutate(SignaledMutation::create(
+                "tbl/robots/episodes",
+                b"registration",
+                "__lake_internal/catalog-directory-generation",
+                b"generation",
+            ))
+            .await
+            .unwrap();
+
+        assert!(!published);
+        assert_eq!(raw.get("tbl/robots/episodes").await.unwrap(), None);
+        assert_eq!(
+            raw.get("__lake_internal/catalog-directory-generation")
+                .await
+                .unwrap(),
+            None
         );
     }
 

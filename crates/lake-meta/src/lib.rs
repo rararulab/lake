@@ -36,7 +36,7 @@ pub use dynamo::DynamoMeta;
 pub use dynamo_migration::{DynamoMigrationPage, DynamoMigrationVerification};
 pub use error::{MetaError, Result};
 pub use rocks::RocksMeta;
-pub use store::{GuardedMutation, MetaScanPage, MetaStore, MetaStoreRef};
+pub use store::{GuardedMutation, MetaScanPage, MetaStore, MetaStoreRef, SignaledMutation};
 
 /// Register bounded Dynamo metric descriptions with the active recorder.
 ///

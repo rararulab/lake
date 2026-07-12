@@ -28,8 +28,94 @@ use crate::{
     error::{
         AlreadyRegisteredSnafu, ConflictSnafu, CorruptEntrySnafu, InvalidScanLimitSnafu, Result,
     },
-    store::MetaStore,
+    store::{MetaStore, SignaledMutation},
 };
+
+const DIRECTORY_GENERATION_KEY: &str = "__lake_internal/catalog-directory-generation";
+const DIRECTORY_AUTHORITY_KEY: &str = "__lake_internal/catalog-directory-authoritative";
+const DIRECTORY_AUTHORITY_VALUE: &[u8] = b"v1";
+
+/// Durable optimization state for catalog directory refresh.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryState {
+    authoritative: bool,
+    generation:    Option<Vec<u8>>,
+}
+
+impl DirectoryState {
+    #[must_use]
+    pub const fn authoritative(&self) -> bool { self.authoritative }
+
+    #[must_use]
+    pub fn generation(&self) -> Option<&[u8]> { self.generation.as_deref() }
+}
+
+fn new_directory_generation() -> Vec<u8> { uuid::Uuid::now_v7().to_string().into_bytes() }
+
+/// Read the monotonic directory-authority marker and current opaque generation.
+pub async fn directory_state(meta: &dyn MetaStore) -> Result<DirectoryState> {
+    let authority = meta.get(DIRECTORY_AUTHORITY_KEY).await?;
+    let authoritative = match authority.as_deref() {
+        None => false,
+        Some(DIRECTORY_AUTHORITY_VALUE) => true,
+        Some(_) => {
+            return Err(crate::MetaError::InvalidDirectoryGeneration {
+                message: "authority marker contains an unexpected value".to_owned(),
+            });
+        }
+    };
+    let generation = meta.get(DIRECTORY_GENERATION_KEY).await?;
+    if authoritative && generation.is_none() {
+        return Err(crate::MetaError::InvalidDirectoryGeneration {
+            message: "authoritative marker has no generation".to_owned(),
+        });
+    }
+    Ok(DirectoryState {
+        authoritative,
+        generation,
+    })
+}
+
+/// Point-read the current opaque generation after authority is established.
+pub async fn directory_generation(meta: &dyn MetaStore) -> Result<Vec<u8>> {
+    meta.get(DIRECTORY_GENERATION_KEY).await?.ok_or_else(|| {
+        crate::MetaError::InvalidDirectoryGeneration {
+            message: "authoritative marker has no generation".to_owned(),
+        }
+    })
+}
+
+/// Monotonically enable generation-based refresh after every writer is ready.
+/// Returns true only for the invocation that publishes authority.
+pub async fn finalize_directory_generation(meta: &dyn MetaStore) -> Result<bool> {
+    match meta.get(DIRECTORY_AUTHORITY_KEY).await?.as_deref() {
+        Some(DIRECTORY_AUTHORITY_VALUE) => return Ok(false),
+        Some(_) => {
+            return Err(crate::MetaError::InvalidDirectoryGeneration {
+                message: "authority marker contains an unexpected value".to_owned(),
+            });
+        }
+        None => {}
+    }
+    let generation = new_directory_generation();
+    let published = meta
+        .signaled_mutate(SignaledMutation::create(
+            DIRECTORY_AUTHORITY_KEY,
+            DIRECTORY_AUTHORITY_VALUE,
+            DIRECTORY_GENERATION_KEY,
+            &generation,
+        ))
+        .await?;
+    if published {
+        return Ok(true);
+    }
+    match meta.get(DIRECTORY_AUTHORITY_KEY).await?.as_deref() {
+        Some(DIRECTORY_AUTHORITY_VALUE) => Ok(false),
+        _ => Err(crate::MetaError::InvalidDirectoryGeneration {
+            message: "authority finalization did not converge".to_owned(),
+        }),
+    }
+}
 
 /// One registry entry: everything needed to route a table name to its data.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,7 +170,15 @@ pub async fn register(
 ) -> Result<()> {
     let k = key(table);
     let bytes = serde_json::to_vec(reg).context(CorruptEntrySnafu { key: &k })?;
-    let created = meta.cas(&k, None, &bytes).await?;
+    let generation = new_directory_generation();
+    let created = meta
+        .signaled_mutate(SignaledMutation::create(
+            &k,
+            &bytes,
+            DIRECTORY_GENERATION_KEY,
+            &generation,
+        ))
+        .await?;
     ensure!(
         created,
         AlreadyRegisteredSnafu {
@@ -104,7 +198,15 @@ pub async fn delete(
 ) -> Result<()> {
     let k = key(table);
     let expected_bytes = serde_json::to_vec(expected).context(CorruptEntrySnafu { key: &k })?;
-    let deleted = meta.delete(&k, &expected_bytes).await?;
+    let generation = new_directory_generation();
+    let deleted = meta
+        .signaled_mutate(SignaledMutation::delete(
+            &k,
+            &expected_bytes,
+            DIRECTORY_GENERATION_KEY,
+            &generation,
+        ))
+        .await?;
     ensure!(
         deleted,
         ConflictSnafu {
@@ -326,6 +428,43 @@ mod tests {
 
         assert_eq!(page_count, 3);
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn signaled_registry_mutations_are_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = RocksMeta::open(dir.path()).unwrap();
+        let table = TableRef::new("robots", "episodes");
+
+        assert!(finalize_directory_generation(&meta).await.unwrap());
+        let initial = directory_state(&meta).await.unwrap();
+        assert!(initial.authoritative());
+        let initial_generation = initial.generation().unwrap().to_vec();
+
+        let first = reg(1);
+        register(&meta, &table, &first).await.unwrap();
+        let after_register = directory_state(&meta).await.unwrap();
+        assert_ne!(after_register.generation().unwrap(), initial_generation);
+
+        set_version(&meta, &table, &first, Version(2))
+            .await
+            .unwrap();
+        let after_version = directory_state(&meta).await.unwrap();
+        assert_eq!(
+            after_version.generation(),
+            after_register.generation(),
+            "append-only version churn is not directory DDL"
+        );
+
+        assert!(register(&meta, &table, &reg(3)).await.is_err());
+        let after_conflict = directory_state(&meta).await.unwrap();
+        assert_eq!(after_conflict.generation(), after_register.generation());
+
+        let current = get(&meta, &table).await.unwrap().unwrap();
+        delete(&meta, &table, &current).await.unwrap();
+        let after_delete = directory_state(&meta).await.unwrap();
+        assert_ne!(after_delete.generation(), after_register.generation());
+        assert_eq!(get(&meta, &table).await.unwrap(), None);
     }
 
     #[tokio::test]
