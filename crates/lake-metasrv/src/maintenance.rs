@@ -389,13 +389,29 @@ async fn reconcile_and_delete_expired(
     }
     if record.state != AppendState::Committed {
         let Some(registration) = metasrv.resolve(&table).await? else {
-            return delete_operation_record(metasrv, key, encoded, &table, &operation).await;
+            return delete_operation_record(
+                metasrv,
+                key,
+                encoded,
+                &table,
+                &operation,
+                &record.table_incarnation,
+            )
+            .await;
         };
         if registration.incarnation_id() != Some(record.table_incarnation.as_str()) {
             // The expired operation cannot legally target this replacement,
             // and the server rejects its UUID before record creation. Removing
             // its exact record/fence is therefore both safe and leak-free.
-            return delete_operation_record(metasrv, key, encoded, &table, &operation).await;
+            return delete_operation_record(
+                metasrv,
+                key,
+                encoded,
+                &table,
+                &operation,
+                &record.table_incarnation,
+            )
+            .await;
         }
         let handle = metasrv
             .engine()
@@ -413,8 +429,15 @@ async fn reconcile_and_delete_expired(
             {
                 Some(version) => version,
                 None if registration.current_version == record.base_version => {
-                    return delete_operation_record(metasrv, key, encoded, &table, &operation)
-                        .await;
+                    return delete_operation_record(
+                        metasrv,
+                        key,
+                        encoded,
+                        &table,
+                        &operation,
+                        &record.table_incarnation,
+                    )
+                    .await;
                 }
                 None => {
                     return Err(MetasrvError::OperationRecoveryConflict {
@@ -454,7 +477,15 @@ async fn reconcile_and_delete_expired(
             });
         }
     }
-    delete_operation_record(metasrv, key, encoded, &table, &operation).await
+    delete_operation_record(
+        metasrv,
+        key,
+        encoded,
+        &table,
+        &operation,
+        &record.table_incarnation,
+    )
+    .await
 }
 
 async fn delete_operation_record(
@@ -463,7 +494,24 @@ async fn delete_operation_record(
     encoded: &[u8],
     table: &TableRef,
     operation: &lake_common::AppendOperation,
+    table_incarnation: &str,
 ) -> crate::Result<bool> {
+    // The operation record is the durable lifetime fence for engine-private
+    // staging. Reclaim the exact stage before deleting that record so a crash
+    // retries cleanup instead of orphaning invisible objects forever.
+    if let Some(registration) = metasrv.resolve(table).await?
+        && registration.incarnation_id() == Some(table_incarnation)
+        && let Some(handle) = metasrv
+            .engine()
+            .open(&registration.location)
+            .await
+            .map_err(|source| MetasrvError::Engine { source })?
+    {
+        handle
+            .expire_append(operation)
+            .await
+            .map_err(|source| MetasrvError::Engine { source })?;
+    }
     let active = active_key(operation, table);
     let _ = metasrv
         .meta()
@@ -1132,5 +1180,94 @@ mod tests {
             metasrv.append(&table, expired, stream).await,
             Err(crate::MetasrvError::OperationExpired { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn operation_gc_reclaims_exact_lance_stage_before_record() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv =
+            Metasrv::with_operation_policy(meta.clone(), engine, Duration::from_secs(1), 8);
+        let table = TableRef::new("robots", "episodes");
+        let location = TableLocation::new(meta_dir.path().join("episodes.lance").to_string_lossy());
+        metasrv
+            .create_table(&table, location.clone(), batch().schema())
+            .await
+            .unwrap();
+        let operation = operation();
+        let value = batch();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            value.schema(),
+            futures::stream::iter(vec![Ok::<_, DataFusionError>(value)]),
+        ));
+        metasrv.append(&table, &operation, stream).await.unwrap();
+
+        let stage_header = std::path::PathBuf::from(location.as_str())
+            .join("_lake")
+            .join("object_refs_staging")
+            .join(format!(
+                "{}--{}",
+                operation.tenant().as_str(),
+                operation.operation_id().as_str()
+            ))
+            .join("0.json");
+        assert!(
+            stage_header.exists(),
+            "committed operation retains its replay stage"
+        );
+        let key = operation_key(&operation, &table);
+        assert!(meta.get(&key).await.unwrap().is_some());
+
+        let stats = sweep_operations_at(&metasrv, u64::MAX).await;
+
+        assert_eq!(stats.deleted, 1);
+        assert!(
+            !stage_header.exists(),
+            "stage is reclaimed before operation expiry completes"
+        );
+        assert!(meta.get(&key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn operation_gc_retains_record_when_stage_cleanup_fails() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv =
+            Metasrv::with_operation_policy(meta.clone(), engine, Duration::from_secs(1), 8);
+        let table = TableRef::new("robots", "episodes");
+        let location = TableLocation::new(meta_dir.path().join("episodes.lance").to_string_lossy());
+        metasrv
+            .create_table(&table, location.clone(), batch().schema())
+            .await
+            .unwrap();
+        let operation = operation();
+        let value = batch();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            value.schema(),
+            futures::stream::iter(vec![Ok::<_, DataFusionError>(value)]),
+        ));
+        metasrv.append(&table, &operation, stream).await.unwrap();
+        let stage_header = std::path::PathBuf::from(location.as_str())
+            .join("_lake")
+            .join("object_refs_staging")
+            .join(format!(
+                "{}--{}",
+                operation.tenant().as_str(),
+                operation.operation_id().as_str()
+            ))
+            .join("0.json");
+        std::fs::write(&stage_header, br#"{"format_version":1,"chunk_index":0}"#).unwrap();
+        let key = operation_key(&operation, &table);
+
+        let stats = sweep_operations_at(&metasrv, u64::MAX).await;
+
+        assert_eq!(stats.deleted, 0);
+        assert!(stage_header.exists(), "malformed stage remains fail-closed");
+        assert!(
+            meta.get(&key).await.unwrap().is_some(),
+            "cleanup failure keeps durable identity for a later retry"
+        );
     }
 }

@@ -265,16 +265,26 @@ digest of its ordered Flight control payload:
    version; a changed digest conflicts; corrupt or missing recovery evidence
    fails closed.
 
-Reference staging is an operation-derived, durable recovery journal and is
-deleted immediately after final sidecars are complete. Cleanup does not take a
-distributed lock, so an exact-operation contender can observe a staging chunk
-just before the terminal actor removes it. That disappearance is not itself a
-success signal: a pre-commit contender re-runs tenant/operation/digest-exact
-transaction reconciliation, while a concurrent finalizer rechecks the complete
-final sidecar set for the committed version. Only those durable authorities
-permit convergence; missing staging without a matching transaction and full
-lineage remains an error. This keeps cleanup immediate and bounded without
-serializing healthy appends or adding timing retries.
+Reference staging is an operation-derived, durable recovery journal. It remains
+for the full lifetime of the coordinator's append-operation record, even after
+final sidecars are complete, so every legally admitted exact replay can finish
+reconciliation without racing terminal deletion. The leader's bounded
+operation GC holds the same table lock used by append, asks the engine to expire
+the exact stage, and only then deletes the operation record. Cleanup failure
+therefore leaves durable identity for a later retry instead of creating an
+untraceable orphan. Missing or recreated tables skip exact-stage cleanup because
+their old dataset is governed by the durable drop lifecycle.
+Within the stage itself, chunk zero is both the only chunk-count header and the
+publication marker. Persisters materialize non-header chunks first and publish
+chunk zero last. Expiry cleanup withdraws chunk zero first, then streams a
+bounded drain of the operation-dedicated prefix; a missing or lazily vanished
+header uses the same drain rather than assuming no chunks remain. The table lock
+prevents a legally admitted persister from recreating chunks during expiry.
+
+This changes the staging publication protocol. Commit-capable binaries using
+the old header-first publisher must not run concurrently with the new cleanup:
+deployments drain writers, upgrade every Query/Metasrv node that may append,
+then resume, matching the external-manifest pointer upgrade boundary above.
 
 Terminal coordination records have a configurable retention horizon (seven
 days by default). Leader-only cleanup scans bounded metastore pages; pending
