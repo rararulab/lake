@@ -265,6 +265,17 @@ digest of its ordered Flight control payload:
    version; a changed digest conflicts; corrupt or missing recovery evidence
    fails closed.
 
+Reference staging is an operation-derived, durable recovery journal and is
+deleted immediately after final sidecars are complete. Cleanup does not take a
+distributed lock, so an exact-operation contender can observe a staging chunk
+just before the terminal actor removes it. That disappearance is not itself a
+success signal: a pre-commit contender re-runs tenant/operation/digest-exact
+transaction reconciliation, while a concurrent finalizer rechecks the complete
+final sidecar set for the committed version. Only those durable authorities
+permit convergence; missing staging without a matching transaction and full
+lineage remains an error. This keeps cleanup immediate and bounded without
+serializing healthy appends or adding timing retries.
+
 Terminal coordination records have a configurable retention horizon (seven
 days by default). Leader-only cleanup scans bounded metastore pages; pending
 records are reconciled before deletion. IDs older than retention fail closed,
