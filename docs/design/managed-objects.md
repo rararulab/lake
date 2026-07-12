@@ -149,11 +149,15 @@ SDK process and never cross the discovery protocol. No raw object bytes travel
 over Flight SQL or the metasrv control plane.
 
 Range reads use the same containment check and process credentials
-as sequential reads. They do not introduce a query endpoint, signed URL, or
-arbitrary URI escape hatch.
+as sequential reads. A credentialed SDK process may explicitly mint a bounded
+S3 GET capability after that same containment check. The capability URL and
+required headers are redacted by default, live for at most one hour, and may
+be used with an additional HTTP Range header. Stable `DataLocation` rows never
+contain this expiring credential.
 
 Tenant authorization derives one exact managed-stage child prefix per validated
 tenant and the SDK refuses locations outside it. The current slice does not
-provide browser presigning, object deduplication, cross-host upload-checkpoint
-sharing, or row-level DELETE. Those additions must keep the same visibility rule: a SQL-visible
+provide server-issued signing for credentialless SDK processes, object
+deduplication, cross-host upload-checkpoint sharing, or row-level DELETE.
+Those additions must keep the same visibility rule: a SQL-visible
 `DataLocation` always identifies a complete, immutable object.

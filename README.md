@@ -223,14 +223,31 @@ let reader = client
 Empty, reversed, and out-of-bounds ranges return a typed SDK object error
 before storage I/O.
 
+A credentialed Rust process can delegate one S3 read without handing its AWS
+credentials to the consumer. The capability is valid for 1 second through 1
+hour, is scoped to the already validated tenant child-prefix, and performs no
+object GET while being minted:
+
+```rust
+let capability = client
+    .presign_read(&location, std::time::Duration::from_secs(300))
+    .await?;
+let url = capability.url();       // sensitive: do not log
+let headers = capability.headers(); // send these with the HTTP GET
+```
+
+`Debug` redacts the URL and header values. HTTP clients may add a `Range`
+header for video/model seeking while also sending `capability.headers()`.
+Local stages and custom stores without signing support return a typed error.
+
 The example performs a multi-row insert, query, `DataLocation` decoding, and
-direct open through `LakeClient`. Local development discovers a `file://` stage; production
-discovers an `s3://` stage. Non-empty S3 objects stream through
+direct open through `LakeClient`. Local development discovers a `file://`
+stage; production discovers an `s3://` stage. Non-empty S3 objects stream through
 bounded 5 MiB multipart parts, with incremental SHA-256 and abort-on-error.
 The query service forwards only the Arrow row to the metadata leader;
 video/model bytes travel directly between the SDK and the managed stage.
 Tenant child-prefix authorization is enforced by Query, Metasrv, and the SDK;
-presigned browser access remains outside this Rust API.
+presigned capabilities retain that same SDK-side boundary.
 
 ## Managed-object garbage collection
 
