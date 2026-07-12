@@ -37,11 +37,11 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use lake_common::{ManagedStageDescriptor, TableLocation, TableRef};
 use lake_engine::TableEngineRef;
-use lake_engine_lance::LanceEngine;
+use lake_engine_lance::{LanceEngine, LanceMaintenancePolicy};
 use lake_meta::{DynamoMeta, MetaStoreRef, RocksMeta};
 use lake_metasrv::{Metasrv, TablePlacement};
 
-use self::limits::operation_policy_from_env;
+use self::limits::{lance_maintenance_policy_from_env, operation_policy_from_env};
 
 /// Shared, process-wide handles. Built from `--data-dir` (local) or the
 /// `LAKE_S3_BUCKET`/`LAKE_DYNAMODB_*`/`AWS_*` environment (cloud).
@@ -55,19 +55,24 @@ pub struct Context {
 
 impl Context {
     pub async fn open(data_dir: &str) -> anyhow::Result<Self> {
+        let maintenance_policy = lance_maintenance_policy_from_env()?;
         match std::env::var("LAKE_S3_BUCKET") {
-            Ok(bucket) => Self::open_cloud(bucket).await,
-            Err(_) => Self::open_local(data_dir),
+            Ok(bucket) => Self::open_cloud(bucket, maintenance_policy).await,
+            Err(_) => Self::open_local(data_dir, maintenance_policy),
         }
     }
 
     /// Dev path: RocksDB + local-filesystem Lance datasets.
-    fn open_local(data_dir: &str) -> anyhow::Result<Self> {
+    fn open_local(
+        data_dir: &str,
+        maintenance_policy: LanceMaintenancePolicy,
+    ) -> anyhow::Result<Self> {
         let root = PathBuf::from(data_dir);
         std::fs::create_dir_all(&root)?;
         let root = std::fs::canonicalize(root)?;
         let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.join("meta"))?);
-        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let engine: TableEngineRef =
+            Arc::new(LanceEngine::new().with_maintenance_policy(maintenance_policy));
         let managed_stage = local_managed_stage_descriptor(&root);
         Self::wire(
             meta,
@@ -78,16 +83,19 @@ impl Context {
     }
 
     /// Prod path: DynamoDB registry + Lance datasets on S3.
-    async fn open_cloud(bucket: String) -> anyhow::Result<Self> {
+    async fn open_cloud(
+        bucket: String,
+        maintenance_policy: LanceMaintenancePolicy,
+    ) -> anyhow::Result<Self> {
         let endpoint = std::env::var("LAKE_DYNAMODB_ENDPOINT").ok();
         let table = std::env::var("LAKE_DYNAMODB_TABLE").unwrap_or_else(|_| "lake_registry".into());
         let dynamo = DynamoMeta::connect(endpoint.as_deref(), &table).await?;
         dynamo.ensure_table().await?;
         let meta: MetaStoreRef = Arc::new(dynamo);
-        let engine: TableEngineRef = Arc::new(LanceEngine::for_object_store(
-            meta.clone(),
-            s3_storage_options(),
-        ));
+        let engine: TableEngineRef = Arc::new(
+            LanceEngine::for_object_store(meta.clone(), s3_storage_options())
+                .with_maintenance_policy(maintenance_policy),
+        );
         let table_prefix = std::env::var("LAKE_TABLE_PREFIX").unwrap_or_default();
         let managed_prefix = std::env::var("LAKE_MANAGED_OBJECT_PREFIX")
             .unwrap_or_else(|_| "managed-objects".to_owned());

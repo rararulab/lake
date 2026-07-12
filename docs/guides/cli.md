@@ -36,6 +36,13 @@ not just the e2e self-check binary.
   `--catalog-url`, or `--endpoint`; avoid ambiguous positional arguments for
   operational commands.
 
+`LAKE_LANCE_RETAIN_VERSIONS` controls the recent untagged dataset versions
+preserved by engine maintenance. It defaults to `10` and must be within
+`1..=10000`. Configuration is parsed before local or cloud storage opens;
+malformed, zero, and larger values make startup exit non-zero. Lance tags and
+referenced branches remain retained independently of this recent-version
+window.
+
 Query Flight SQL discovery is bounded by
 `LAKE_QUERY_MAX_DISCOVERY_ROWS` (default `10000`) and
 `LAKE_QUERY_DISCOVERY_BATCH_ROWS` (default `256`). Both must be positive and
@@ -61,7 +68,9 @@ process returns a typed error instead of waiting indefinitely.
 Leader table maintenance uses `LAKE_MAINTENANCE_INTERVAL_SECS` (default `60`)
 and `LAKE_MAINTENANCE_TABLE_PAGE_SIZE` (default `128`, maximum `10000`). Each
 tick reads at most one registry page and resumes from a process-local cursor;
-invalid or zero values fail before the Metasrv listener binds.
+invalid or zero values fail before the Metasrv listener binds. Dataset cleanup
+uses the immutable `LAKE_LANCE_RETAIN_VERSIONS` policy captured at process
+startup, then reconciles external manifest history only after cleanup succeeds.
 
 ## gRPC health checks
 

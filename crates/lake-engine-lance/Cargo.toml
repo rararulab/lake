@@ -20,6 +20,7 @@ lance-table = { workspace = true }
 object_store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+snafu = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 
