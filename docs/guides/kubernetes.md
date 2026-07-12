@@ -57,6 +57,21 @@ finish backfill, and rerun finalize. Do not delete the barrier as a routine
 rollback mechanism; doing so can re-admit stale dual writers during parity
 verification.
 
+After the Dynamo v2 migration and writer rollout are complete, keep metadata
+write admission paused and activate catalog directory generations once:
+
+```bash
+lake catalog-finalize \
+  --acknowledge-writer-rollout \
+  --acknowledge-write-quiescence \
+  --json
+```
+
+Repeat execution is safe and reports `finalized: false` once authority already
+exists. Resume writes only after the command succeeds. Do not roll any registry
+writer back to an older image afterward; old Query replicas are compatible,
+but old writers do not publish the required atomic generation signal.
+
 ## Create required secrets
 
 Create two Secrets rather than editing credentials into the manifest. Secret

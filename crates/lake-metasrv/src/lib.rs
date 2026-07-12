@@ -1216,7 +1216,9 @@ mod tests {
         TableEngineRef, TableHandleRef,
     };
     use lake_engine_lance::LanceEngine;
-    use lake_meta::{DynamoMeta, GuardedMutation, MetaScanPage, MetaStore, RocksMeta};
+    use lake_meta::{
+        DynamoMeta, GuardedMutation, MetaScanPage, MetaStore, RocksMeta, SignaledMutation,
+    };
     use rcgen::generate_simple_self_signed;
     use tokio::sync::{Notify, oneshot};
     use tonic::Request;
@@ -1258,6 +1260,28 @@ mod tests {
             self.inner.cas(key, expected, new).await
         }
 
+        async fn signaled_mutate(&self, mutation: SignaledMutation<'_>) -> lake_meta::Result<bool> {
+            if mutation.target_key().starts_with("tbl/") {
+                let tombstone_key =
+                    format!("drop/{}/{}", self.table.namespace.0, self.table.name.0);
+                assert!(
+                    self.inner.get(&tombstone_key).await?.is_some(),
+                    "tombstone must be durable before registry deletion"
+                );
+                self.tombstone_seen.fetch_add(1, Ordering::SeqCst);
+                if self.race_version {
+                    registry::set_version(
+                        self.inner.as_ref(),
+                        &self.table,
+                        &self.expected,
+                        Version(2),
+                    )
+                    .await?;
+                }
+            }
+            self.inner.signaled_mutate(mutation).await
+        }
+
         async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
             self.inner.list_prefix(prefix).await
         }
@@ -1278,24 +1302,6 @@ mod tests {
         }
 
         async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
-            if key.starts_with("tbl/") {
-                let tombstone_key =
-                    format!("drop/{}/{}", self.table.namespace.0, self.table.name.0);
-                assert!(
-                    self.inner.get(&tombstone_key).await?.is_some(),
-                    "tombstone must be durable before registry deletion"
-                );
-                self.tombstone_seen.fetch_add(1, Ordering::SeqCst);
-                if self.race_version {
-                    registry::set_version(
-                        self.inner.as_ref(),
-                        &self.table,
-                        &self.expected,
-                        Version(2),
-                    )
-                    .await?;
-                }
-            }
             self.inner.delete(key, expected).await
         }
     }

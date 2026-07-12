@@ -45,6 +45,9 @@ const REGISTRATION_CACHE_TTL: Duration = Duration::from_secs(5);
 /// One provider per catalog table at the target deployment scale.
 const PROVIDER_CACHE_CAPACITY: u64 = 100_000;
 
+/// Bound authority scans when DDL keeps moving the directory under refresh.
+const DIRECTORY_REFRESH_ATTEMPTS: usize = 3;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RegistrationCacheKey {
     table: TableRef,
@@ -126,6 +129,10 @@ pub struct CatalogState {
     providers:            Cache<ProviderGeneration, Arc<dyn TableProvider>>,
     /// Serializes authority scans without blocking snapshot readers.
     refresh_lock:         Mutex<()>,
+    /// Monotonic local observation of the rollout authority marker.
+    directory_authority:  AtomicBool,
+    /// Generation represented by the published snapshot.
+    directory_generation: RwLock<Option<Vec<u8>>>,
     /// Last complete generation publication. A missing value means startup
     /// warm has not succeeded and callers must fail closed.
     refreshed_at:         RwLock<Option<Instant>>,
@@ -244,6 +251,8 @@ impl LakeCatalog {
                     .max_capacity(provider_cache_capacity)
                     .build(),
                 refresh_lock: Mutex::new(()),
+                directory_authority: AtomicBool::new(false),
+                directory_generation: RwLock::new(None),
                 refreshed_at: RwLock::new(None),
                 refresh_in_flight: AtomicBool::new(false),
                 refresh_failures: AtomicU64::new(0),
@@ -418,17 +427,57 @@ impl LakeCatalog {
             return Ok(());
         }
 
-        let registrations = match registry::scan_tables(self.state.meta.as_ref()).await {
-            Ok(registrations) => registrations,
+        let mut generation = match self.observe_directory_generation().await {
+            Ok(generation) => generation,
             Err(error) => {
-                self.state.refresh_failures.fetch_add(1, Ordering::AcqRel);
-                *self
-                    .state
-                    .last_refresh_failure
-                    .write()
-                    .expect("refresh failure lock poisoned") = Some(Instant::now());
+                self.record_refresh_failure();
                 return Err(error);
             }
+        };
+        if generation.as_deref()
+            == self
+                .state
+                .directory_generation
+                .read()
+                .expect("directory generation lock poisoned")
+                .as_deref()
+            && refreshed_at.is_some()
+            && generation.is_some()
+        {
+            self.record_refresh_success();
+            return Ok(());
+        }
+
+        let registrations = 'attempts: {
+            for attempt in 0..DIRECTORY_REFRESH_ATTEMPTS {
+                let registrations = match registry::scan_tables(self.state.meta.as_ref()).await {
+                    Ok(registrations) => registrations,
+                    Err(error) => {
+                        self.record_refresh_failure();
+                        return Err(error);
+                    }
+                };
+                if let Some(before) = generation.as_deref() {
+                    let after = match registry::directory_generation(self.state.meta.as_ref()).await
+                    {
+                        Ok(after) => after,
+                        Err(error) => {
+                            self.record_refresh_failure();
+                            return Err(error);
+                        }
+                    };
+                    if after != before {
+                        generation = Some(after);
+                        if attempt + 1 == DIRECTORY_REFRESH_ATTEMPTS {
+                            self.record_refresh_failure();
+                            return Err(lake_meta::MetaError::DirectoryGenerationChanged);
+                        }
+                        continue;
+                    }
+                }
+                break 'attempts registrations;
+            }
+            unreachable!("directory refresh attempts are non-zero")
         };
         let mut snapshot = CatalogGeneration::default();
         for (table, registration) in registrations {
@@ -446,6 +495,37 @@ impl LakeCatalog {
         *self.state.snapshot.write().expect("snapshot lock poisoned") = Arc::new(snapshot);
         *self
             .state
+            .directory_generation
+            .write()
+            .expect("directory generation lock poisoned") = generation;
+        self.record_refresh_success();
+        Ok(())
+    }
+
+    async fn observe_directory_generation(&self) -> lake_meta::Result<Option<Vec<u8>>> {
+        if self.state.directory_authority.load(Ordering::Acquire) {
+            return registry::directory_generation(self.state.meta.as_ref())
+                .await
+                .map(Some);
+        }
+        let directory = registry::directory_state(self.state.meta.as_ref()).await?;
+        if !directory.authoritative() {
+            return Ok(None);
+        }
+        self.state
+            .directory_authority
+            .store(true, Ordering::Release);
+        Ok(Some(
+            directory
+                .generation()
+                .expect("authoritative directory state has a generation")
+                .to_vec(),
+        ))
+    }
+
+    fn record_refresh_success(&self) {
+        *self
+            .state
             .refreshed_at
             .write()
             .expect("refresh timestamp lock poisoned") = Some(Instant::now());
@@ -455,7 +535,15 @@ impl LakeCatalog {
             .last_refresh_failure
             .write()
             .expect("refresh failure lock poisoned") = None;
-        Ok(())
+    }
+
+    fn record_refresh_failure(&self) {
+        self.state.refresh_failures.fetch_add(1, Ordering::AcqRel);
+        *self
+            .state
+            .last_refresh_failure
+            .write()
+            .expect("refresh failure lock poisoned") = Some(Instant::now());
     }
 }
 
@@ -486,7 +574,7 @@ impl CatalogProvider for LakeCatalog {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool as StdAtomicBool, AtomicU8, AtomicUsize, Ordering};
 
     use arrow_flight::{IpcMessage, SchemaAsIpc};
     use async_trait::async_trait;
@@ -501,6 +589,69 @@ mod tests {
     use super::*;
 
     struct FailingGetMeta;
+
+    struct CountingMeta {
+        inner:              Arc<RocksMeta>,
+        scans:              AtomicUsize,
+        inject_during_scan: StdAtomicBool,
+        injected:           AtomicUsize,
+    }
+
+    impl CountingMeta {
+        fn new(inner: Arc<RocksMeta>) -> Self {
+            Self {
+                inner,
+                scans: AtomicUsize::new(0),
+                inject_during_scan: StdAtomicBool::new(false),
+                injected: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MetaStore for CountingMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn scan_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<(String, Vec<u8>)>> {
+            self.scans.fetch_add(1, Ordering::SeqCst);
+            let entries = self.inner.scan_prefix(prefix).await?;
+            if self.inject_during_scan.load(Ordering::SeqCst) {
+                let index = self.injected.fetch_add(1, Ordering::SeqCst);
+                let table = TableRef::new("robots", format!("concurrent-{index}"));
+                registry::register(
+                    self.inner.as_ref(),
+                    &table,
+                    &TableRegistration::new(
+                        TableLocation::new("mem://concurrent"),
+                        "lance",
+                        lake_common::Version(1),
+                        Vec::new(),
+                    ),
+                )
+                .await?;
+            }
+            Ok(entries)
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
+        }
+    }
 
     const SCAN_READY: u8 = 0;
     const SCAN_PAUSED: u8 = 1;
@@ -605,6 +756,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generation_point_read_failure_updates_refresh_health() {
+        let meta: MetaStoreRef = Arc::new(FailingGetMeta);
+        let catalog = LakeCatalog::new(meta, Arc::new(LanceEngine::new()));
+
+        catalog.refresh().await.unwrap_err();
+
+        let health = catalog.refresh_health();
+        assert_eq!(health.consecutive_failures(), 1);
+        assert!(health.last_failure_age().is_some());
+        assert!(!health.warmed());
+    }
+
+    #[tokio::test]
     async fn catalog_refresh_caches_registration_schemas() {
         let root = tempfile::tempdir().unwrap();
         let meta = Arc::new(RocksMeta::open(root.path()).unwrap());
@@ -640,6 +804,137 @@ mod tests {
             generation.listings(),
             &BTreeMap::from([(table.namespace.clone(), vec![table.name.clone()])])
         );
+    }
+
+    #[tokio::test]
+    async fn catalog_generation_skips_unchanged_registry_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let inner = Arc::new(RocksMeta::open(root.path()).unwrap());
+        let table = TableRef::new("robots", "episodes");
+        registry::register(
+            inner.as_ref(),
+            &table,
+            &TableRegistration::new(
+                TableLocation::new("mem://episodes"),
+                "lance",
+                lake_common::Version(1),
+                Vec::new(),
+            ),
+        )
+        .await
+        .unwrap();
+        registry::finalize_directory_generation(inner.as_ref())
+            .await
+            .unwrap();
+        let meta = Arc::new(CountingMeta::new(inner));
+        let catalog = LakeCatalog::new(meta.clone(), Arc::new(LanceEngine::new()));
+
+        catalog.refresh().await.unwrap();
+        catalog.refresh().await.unwrap();
+
+        assert_eq!(meta.scans.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn append_version_churn_does_not_invalidate_directory_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let inner = Arc::new(RocksMeta::open(root.path()).unwrap());
+        let table = TableRef::new("robots", "episodes");
+        let mut registration = TableRegistration::new(
+            TableLocation::new("mem://episodes"),
+            "lance",
+            lake_common::Version(1),
+            Vec::new(),
+        );
+        registry::register(inner.as_ref(), &table, &registration)
+            .await
+            .unwrap();
+        registry::finalize_directory_generation(inner.as_ref())
+            .await
+            .unwrap();
+        let meta = Arc::new(CountingMeta::new(inner.clone()));
+        let catalog = LakeCatalog::new(meta.clone(), Arc::new(LanceEngine::new()));
+        catalog.refresh().await.unwrap();
+
+        for version in 2..=4 {
+            registry::set_version(
+                inner.as_ref(),
+                &table,
+                &registration,
+                lake_common::Version(version),
+            )
+            .await
+            .unwrap();
+            registration.current_version = lake_common::Version(version);
+            catalog.refresh().await.unwrap();
+        }
+
+        assert_eq!(meta.scans.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_writer_mode_keeps_full_catalog_revalidation() {
+        let root = tempfile::tempdir().unwrap();
+        let inner = Arc::new(RocksMeta::open(root.path()).unwrap());
+        let meta = Arc::new(CountingMeta::new(inner.clone()));
+        let catalog = LakeCatalog::new(meta.clone(), Arc::new(LanceEngine::new()));
+        catalog.refresh().await.unwrap();
+        let table = TableRef::new("robots", "legacy");
+        let registration = TableRegistration::new(
+            TableLocation::new("mem://legacy"),
+            "lance",
+            lake_common::Version(1),
+            Vec::new(),
+        );
+        assert!(
+            inner
+                .cas(
+                    "tbl/robots/legacy",
+                    None,
+                    &serde_json::to_vec(&registration).unwrap(),
+                )
+                .await
+                .unwrap()
+        );
+
+        catalog.refresh().await.unwrap();
+
+        assert_eq!(meta.scans.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            catalog.cached_generation().listings(),
+            &BTreeMap::from([(table.namespace, vec![table.name])])
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_generation_change_during_scan_preserves_last_good() {
+        let root = tempfile::tempdir().unwrap();
+        let inner = Arc::new(RocksMeta::open(root.path()).unwrap());
+        registry::finalize_directory_generation(inner.as_ref())
+            .await
+            .unwrap();
+        let meta = Arc::new(CountingMeta::new(inner));
+        let catalog = LakeCatalog::new(meta.clone(), Arc::new(LanceEngine::new()));
+        catalog.refresh().await.unwrap();
+        let last_good = catalog.cached_generation();
+        meta.inject_during_scan.store(true, Ordering::SeqCst);
+        // Force the next refresh down the scan path with a real directory move.
+        registry::register(
+            meta.inner.as_ref(),
+            &TableRef::new("robots", "before-scan"),
+            &TableRegistration::new(
+                TableLocation::new("mem://before-scan"),
+                "lance",
+                lake_common::Version(1),
+                Vec::new(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        catalog.refresh().await.unwrap_err();
+
+        assert!(Arc::ptr_eq(&last_good, &catalog.cached_generation()));
     }
 
     #[tokio::test]

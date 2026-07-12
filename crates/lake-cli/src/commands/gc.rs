@@ -453,7 +453,7 @@ mod tests {
 
     use async_trait::async_trait;
     use lake_common::{TableLocation, Version};
-    use lake_meta::{MetaStore, MetaStoreRef, RocksMeta};
+    use lake_meta::{MetaStore, MetaStoreRef, RocksMeta, SignaledMutation};
 
     use super::*;
 
@@ -484,6 +484,10 @@ mod tests {
             new: &[u8],
         ) -> lake_meta::Result<bool> {
             self.inner.cas(key, expected, new).await
+        }
+
+        async fn signaled_mutate(&self, mutation: SignaledMutation<'_>) -> lake_meta::Result<bool> {
+            self.inner.signaled_mutate(mutation).await
         }
 
         async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {

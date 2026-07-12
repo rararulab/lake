@@ -871,7 +871,9 @@ mod file_append_tests {
     use lake_engine::TableEngineRef;
     use lake_engine_lance::LanceEngine;
     use lake_flight::append_flight_payload_digest;
-    use lake_meta::{GuardedMutation, MetaError, MetaStore, MetaStoreRef, RocksMeta};
+    use lake_meta::{
+        GuardedMutation, MetaError, MetaStore, MetaStoreRef, RocksMeta, SignaledMutation,
+    };
     use prost::Message;
     use prost_types::Any;
 
@@ -912,6 +914,10 @@ mod file_append_tests {
             new: &[u8],
         ) -> lake_meta::Result<bool> {
             self.inner.cas(key, expected, new).await
+        }
+
+        async fn signaled_mutate(&self, mutation: SignaledMutation<'_>) -> lake_meta::Result<bool> {
+            self.inner.signaled_mutate(mutation).await
         }
 
         async fn guarded_mutate(&self, mutation: GuardedMutation<'_>) -> lake_meta::Result<bool> {
@@ -964,6 +970,10 @@ mod file_append_tests {
             self.inner.cas(key, expected, new).await
         }
 
+        async fn signaled_mutate(&self, mutation: SignaledMutation<'_>) -> lake_meta::Result<bool> {
+            self.inner.signaled_mutate(mutation).await
+        }
+
         async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
             self.inner.list_prefix(prefix).await
         }
@@ -1001,6 +1011,10 @@ mod file_append_tests {
                 });
             }
             self.inner.cas(key, expected, new).await
+        }
+
+        async fn signaled_mutate(&self, mutation: SignaledMutation<'_>) -> lake_meta::Result<bool> {
+            self.inner.signaled_mutate(mutation).await
         }
 
         async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {

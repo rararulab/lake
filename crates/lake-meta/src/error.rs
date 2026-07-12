@@ -46,14 +46,26 @@ pub enum MetaError {
     #[snafu(display("invalid guarded mutation: guard and target keys must differ"))]
     InvalidGuardedMutation,
 
+    #[snafu(display("invalid signaled mutation: target and signal keys must differ"))]
+    InvalidSignaledMutation,
+
     #[snafu(display("metastore backend does not support atomic guarded mutations"))]
     GuardedMutationUnsupported,
+
+    #[snafu(display("metastore backend does not support atomic signaled mutations"))]
+    SignaledMutationUnsupported,
 
     #[snafu(display("metadata mutation requires a live lease guard"))]
     MutationGuardUnavailable,
 
     #[snafu(display("registry scan limit must be greater than zero"))]
     InvalidScanLimit,
+
+    #[snafu(display("catalog directory generation state is invalid: {message}"))]
+    InvalidDirectoryGeneration { message: String },
+
+    #[snafu(display("catalog directory changed while its snapshot was loading"))]
+    DirectoryGenerationChanged,
 
     #[snafu(display("invalid DynamoDB prefix cursor: {message}"))]
     InvalidScanCursor { message: String },

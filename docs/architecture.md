@@ -66,6 +66,15 @@ directly by the server cancellation token. All fallible address/security/TLS
 setup precedes task creation; a drop guard also cancels and aborts both refresh
 paths if the serve future itself is cancelled.
 
+Steady refresh is generation-gated after an explicit mixed-writer rollout
+finalization. Registry create/delete atomically move an opaque directory
+generation; append version changes do not. An unchanged generation costs one
+point read and skips the `tbl/` scan. A changed generation is read again after
+the scan, and a moving candidate is discarded with bounded retry while the
+last-good snapshot remains published. Before the monotonic authority marker
+exists, replicas retain full-scan compatibility for legacy writers. See
+[Catalog directory generations](design/catalog-directory-generation.md).
+
 The published listing is an immutable `Arc<CatalogGeneration>` containing both
 namespace/table names and their registry schemas. DataFusion sync listing and
 each Flight discovery request clone only that Arc, then read names and schemas
@@ -216,9 +225,11 @@ There are three distinct pieces of metadata, owned by different layers:
    manifest; lake does not reimplement it.
 
 The registry is key/value prefix-scannable with pagination. Metasrv can list a
-single `tbl/<namespace>/…` prefix, while each Query replica refreshes its whole
-table/name/schema snapshot with one `tbl/` scan. Discovery reads that immutable
-process-local generation and performs no request-path authority lookup.
+single `tbl/<namespace>/…` prefix. Each Query replica scans the whole `tbl/`
+family on initial warm and directory DDL, while stable refreshes use the opaque
+directory-generation point read after rollout finalization. Discovery reads
+the immutable process-local generation and performs no request-path authority
+lookup.
 
 ### Server-authoritative table placement
 

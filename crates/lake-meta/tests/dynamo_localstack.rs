@@ -27,7 +27,11 @@
 //! so it is safe to invoke via `--run-ignored all` without the env present.
 
 use aws_sdk_dynamodb::{primitives::Blob, types::AttributeValue};
-use lake_meta::{DynamoMeta, GuardedMutation, MetaStore};
+use lake_common::{TableLocation, TableRef, Version};
+use lake_meta::{
+    DynamoMeta, GuardedMutation, MetaStore,
+    registry::{self, TableRegistration},
+};
 use metrics_exporter_prometheus::PrometheusBuilder;
 
 async fn consume_and_delete_pages(meta: &DynamoMeta, prefix: &str) {
@@ -68,6 +72,49 @@ async fn consume_and_delete_pages(meta: &DynamoMeta, prefix: &str) {
             .expect("verify consumed prefix")
             .is_empty()
     );
+}
+
+async fn exercise_atomic_directory_signal(meta: &DynamoMeta, suffix: &str) {
+    let before = registry::directory_state(meta)
+        .await
+        .expect("read initial directory state")
+        .generation()
+        .expect("finalized directory has generation")
+        .to_vec();
+    let table = TableRef::new("directory", suffix);
+    let registration = TableRegistration::new(
+        TableLocation::new(format!("mem://{suffix}")),
+        "lance",
+        Version(1),
+        vec![1, 2, 3],
+    );
+    registry::register(meta, &table, &registration)
+        .await
+        .expect("atomically register and signal");
+    let after_register = registry::directory_state(meta)
+        .await
+        .expect("read post-register directory state");
+    assert_ne!(after_register.generation().expect("generation"), before);
+
+    registry::set_version(meta, &table, &registration, Version(2))
+        .await
+        .expect("advance version without directory invalidation");
+    let after_version = registry::directory_state(meta)
+        .await
+        .expect("read post-version directory state");
+    assert_eq!(after_version.generation(), after_register.generation());
+
+    let current = registry::get(meta, &table)
+        .await
+        .expect("read current registration")
+        .expect("registration exists");
+    registry::delete(meta, &table, &current)
+        .await
+        .expect("atomically delete and signal");
+    let after_delete = registry::directory_state(meta)
+        .await
+        .expect("read post-delete directory state");
+    assert_ne!(after_delete.generation(), after_register.generation());
 }
 
 #[tokio::test]
@@ -122,6 +169,13 @@ async fn dynamo_v1_dual_v2_migration_roundtrip() {
         .open_tables()
         .await
         .expect("open pre-provisioned layouts without creating them");
+
+    assert!(
+        registry::finalize_directory_generation(&meta)
+            .await
+            .expect("finalize directory authority")
+    );
+    exercise_atomic_directory_signal(&meta, "v1").await;
 
     // Same assertions as the RocksMeta unit tests.
 
@@ -253,6 +307,7 @@ async fn dynamo_v1_dual_v2_migration_roundtrip() {
             .await
             .unwrap()
     );
+    exercise_atomic_directory_signal(&meta, "v2").await;
 
     let mut continuation = None;
     let mut v2_paged = Vec::new();
@@ -299,4 +354,11 @@ fn dynamo_delete_while_paging_localstack_is_wired() {
     let source = include_str!("dynamo_localstack.rs");
     assert!(source.contains("consume_and_delete_pages(&meta, \"delete-while-paging-v1/\")"));
     assert!(source.contains("consume_and_delete_pages(&meta, \"delete-while-paging-v2/\")"));
+}
+
+#[test]
+fn dynamo_catalog_generation_atomicity_localstack_is_wired() {
+    let source = include_str!("dynamo_localstack.rs");
+    assert!(source.contains("exercise_atomic_directory_signal(&meta, \"v1\")"));
+    assert!(source.contains("exercise_atomic_directory_signal(&meta, \"v2\")"));
 }

@@ -65,6 +65,13 @@ connection drain plus maintenance, leadership-campaign, and health-readiness
 cleanup; unfinished owned background tasks are aborted at the deadline and the
 process returns a typed error instead of waiting indefinitely.
 
+`lake catalog-finalize --acknowledge-writer-rollout
+--acknowledge-write-quiescence` monotonically enables generation-gated Query
+catalog refresh. Run it only after every registry writer is on compatible code
+and metadata write admission is paused. The command is idempotent and supports
+`--json`; there is no routine unfinalize command. Old Query processes remain
+safe, but an old writer must never run after this acknowledgement.
+
 Leader table maintenance uses `LAKE_MAINTENANCE_INTERVAL_SECS` (default `60`)
 and `LAKE_MAINTENANCE_TABLE_PAGE_SIZE` (default `128`, maximum `10000`). Each
 tick reads at most one registry page and resumes from a process-local cursor;

@@ -617,7 +617,8 @@ mod tests {
     };
     use lake_engine_lance::LanceEngine;
     use lake_meta::{
-        MetaScanPage, MetaStore, MetaStoreRef, RocksMeta, registry::TableRegistration,
+        MetaScanPage, MetaStore, MetaStoreRef, RocksMeta, SignaledMutation,
+        registry::TableRegistration,
     };
 
     use super::*;
@@ -674,6 +675,10 @@ mod tests {
             self.inner.cas(key, expected, new).await
         }
 
+        async fn signaled_mutate(&self, mutation: SignaledMutation<'_>) -> lake_meta::Result<bool> {
+            self.inner.signaled_mutate(mutation).await
+        }
+
         async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
             self.list_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.list_prefix(prefix).await
@@ -716,6 +721,10 @@ mod tests {
             self.inner.cas(key, expected, new).await
         }
 
+        async fn signaled_mutate(&self, mutation: SignaledMutation<'_>) -> lake_meta::Result<bool> {
+            self.inner.signaled_mutate(mutation).await
+        }
+
         async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
             self.inner.list_prefix(prefix).await
         }
@@ -754,6 +763,10 @@ mod tests {
             new: &[u8],
         ) -> lake_meta::Result<bool> {
             self.inner.cas(key, expected, new).await
+        }
+
+        async fn signaled_mutate(&self, mutation: SignaledMutation<'_>) -> lake_meta::Result<bool> {
+            self.inner.signaled_mutate(mutation).await
         }
 
         async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {

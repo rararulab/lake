@@ -25,7 +25,7 @@ use snafu::ResultExt;
 
 use crate::{
     error::{BackendSnafu, Result},
-    store::{GuardedMutation, GuardedTarget, MetaScanPage, MetaStore},
+    store::{GuardedMutation, GuardedTarget, MetaScanPage, MetaStore, SignaledMutation},
 };
 
 pub struct RocksMeta {
@@ -70,6 +70,31 @@ impl MetaStore for RocksMeta {
         Ok(true)
     }
 
+    async fn signaled_mutate(&self, mutation: SignaledMutation<'_>) -> Result<bool> {
+        let mutation = mutation.validate()?;
+        let _guard = self.lock();
+        let current = self.db.get(mutation.target_key).context(BackendSnafu {
+            key: mutation.target_key,
+        })?;
+        let matches = match mutation.target {
+            GuardedTarget::Put { expected, .. } => current.as_deref() == expected,
+            GuardedTarget::Delete { expected } => current.as_deref() == Some(expected),
+        };
+        if !matches {
+            return Ok(false);
+        }
+        let mut batch = WriteBatch::default();
+        match mutation.target {
+            GuardedTarget::Put { value, .. } => batch.put(mutation.target_key, value),
+            GuardedTarget::Delete { .. } => batch.delete(mutation.target_key),
+        }
+        batch.put(mutation.signal_key, mutation.signal_value);
+        self.db.write(batch).context(BackendSnafu {
+            key: mutation.target_key,
+        })?;
+        Ok(true)
+    }
+
     async fn guarded_mutate(&self, mutation: GuardedMutation<'_>) -> Result<bool> {
         let mutation = mutation.validate()?;
         let _guard = self.lock();
@@ -95,6 +120,9 @@ impl MetaStore for RocksMeta {
         match mutation.target {
             GuardedTarget::Put { value, .. } => batch.put(mutation.target_key, value),
             GuardedTarget::Delete { .. } => batch.delete(mutation.target_key),
+        }
+        if let Some(signal) = mutation.signal {
+            batch.put(signal.key, signal.value);
         }
         self.db.write(batch).context(BackendSnafu {
             key: mutation.target_key,
