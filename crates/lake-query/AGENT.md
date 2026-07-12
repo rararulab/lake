@@ -34,6 +34,10 @@ The query layer: stateless SQL compute. `QueryEngine` wires a DataFusion
 - `QueryLimits` bounds concurrency, queue wait, execution duration, and SQL
   bytes per replica. A DoGet permit lives until its stream completes, expires,
   or is dropped; admission never calls the metadata tier.
+- Statement tickets keep the standard Flight SQL outer type but encrypt SQL in
+  a versioned AEAD envelope bound to exact principal, tenant, audience, and
+  expiry. Non-loopback replicas require one shared bounded rotation key ring;
+  validation happens before admission or planning and never logs key material.
 - `QueryResources` gives the replica one shared DataFusion `FairSpillPool` and
   one size-limited local spill manager. Every constructor is bounded; the CLI
   validates deployment overrides before binding Flight.

@@ -19,9 +19,11 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
 use lake_flight::{BearerPrincipalBinding, ClientSecurity, ServerSecurity};
+use lake_query::QueryTicketKeyRing;
 use serde::Deserialize;
 
 const MAX_PRINCIPAL_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_TICKET_KEY_FILE_BYTES: u64 = 64 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,6 +39,13 @@ struct PrincipalBindingFile {
     tenant_id:    String,
     role:         PrincipalRoleFile,
     namespaces:   Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueryTicketKeyFile {
+    active:       String,
+    verification: Vec<String>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -109,6 +118,30 @@ pub(crate) fn server_security_from_principal_file(path: &Path) -> anyhow::Result
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     ServerSecurity::with_bearer_principals(bindings).map_err(Into::into)
+}
+
+pub(crate) fn query_ticket_keys_from_file(path: &Path) -> anyhow::Result<QueryTicketKeyRing> {
+    validate_protected_file(path)?;
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("cannot inspect Query ticket key file {}", path.display()))?;
+    if metadata.len() > MAX_TICKET_KEY_FILE_BYTES {
+        anyhow::bail!("Query ticket key file {} exceeds 64 KiB", path.display());
+    }
+    let wire = std::fs::read(path)
+        .with_context(|| format!("cannot read Query ticket key file {}", path.display()))?;
+    let file: QueryTicketKeyFile = serde_json::from_slice(&wire)
+        .with_context(|| format!("invalid Query ticket key file {}", path.display()))?;
+    QueryTicketKeyRing::try_new(
+        file.active.as_bytes(),
+        file.verification.iter().map(String::as_bytes),
+    )
+    .map_err(|_| anyhow::anyhow!("invalid Query ticket key configuration"))
+}
+
+pub(crate) fn query_ticket_keys_from_env() -> anyhow::Result<Option<QueryTicketKeyRing>> {
+    env_path("LAKE_QUERY_TICKET_KEYS_FILE")
+        .map(|path| query_ticket_keys_from_file(&path))
+        .transpose()
 }
 
 pub(crate) fn client_security_from_files(
@@ -224,7 +257,8 @@ mod tests {
     use tonic::{Request, service::Interceptor};
 
     use super::{
-        client_security_from_files, server_security_from_files, server_security_from_principal_file,
+        client_security_from_files, query_ticket_keys_from_file, server_security_from_files,
+        server_security_from_principal_file,
     };
 
     #[test]
@@ -281,5 +315,56 @@ mod tests {
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(server_security_from_principal_file(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn query_ticket_key_ring_requires_protected_bounded_unique_secrets() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().unwrap();
+        let path = root.path().join("ticket-keys.json");
+        let active = "active-query-ticket-secret-material-0001";
+        let old = "previous-query-ticket-secret-material-01";
+        fs::write(
+            &path,
+            format!(r#"{{"active":"{active}","verification":["{old}"]}}"#),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let keys = query_ticket_keys_from_file(&path).unwrap();
+
+        let debug = format!("{keys:?}");
+        assert!(!debug.contains(active));
+        assert!(!debug.contains(old));
+
+        fs::write(
+            &path,
+            format!(r#"{{"active":"{active}","verification":["{active}"]}}"#),
+        )
+        .unwrap();
+        let duplicate = query_ticket_keys_from_file(&path).unwrap_err();
+        assert!(!duplicate.to_string().contains(active));
+
+        fs::write(
+            &path,
+            r#"{"active":"active-query-ticket-secret-material-0001","verification":["old-query-ticket-secret-material-000001","old-query-ticket-secret-material-000002","old-query-ticket-secret-material-000003","old-query-ticket-secret-material-000004"]}"#,
+        )
+        .unwrap();
+        assert!(query_ticket_keys_from_file(&path).is_err());
+
+        fs::write(&path, r#"{"active":"too-short","verification":[]}"#).unwrap();
+        assert!(query_ticket_keys_from_file(&path).is_err());
+
+        fs::write(
+            &path,
+            format!(r#"{{"active":"{active}","verification":[],"extra":true}}"#),
+        )
+        .unwrap();
+        assert!(query_ticket_keys_from_file(&path).is_err());
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(query_ticket_keys_from_file(&path).is_err());
     }
 }

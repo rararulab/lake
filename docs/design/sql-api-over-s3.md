@@ -97,9 +97,12 @@ policy and resource controls below:
 - Read-only SQL validation in the server. Never trust clients to omit DDL/DML.
 - Source bucket and prefix allowlists owned by deployment configuration. SQL
   text can never introduce a source URI or object-store credential.
-- Opaque, signed, expiring query tickets bound to tenant, statement digest,
-  snapshot versions, result mode, and audience. Do not put raw SQL or S3
-  credentials in a production ticket.
+- Statement tickets are now opaque authenticated ciphertext bound to exact
+  principal, tenant, audience, issued-at, and expiry, with a bounded shared key
+  ring for stateless replica rotation. Raw SQL and credentials are not ticket
+  plaintext. Still bind exact table snapshot versions before claiming
+  `GetFlightInfo`/`DoGet` snapshot continuity; async result mode needs its own
+  capability envelope.
 - Presigned result URLs with the shortest practical expiry, `GET` only, and a
   result prefix unique to the tenant and query.
 - Per-replica concurrency, queue wait, execution duration, SQL/ticket size,
@@ -134,8 +137,9 @@ schema encoding, streaming, error mapping, and result-location semantics.
 ## Delivery sequence
 
 1. Productionize Tier 1: TLS, immutable tenant principal maps, pre-planning
-   authorization, and per-replica limits are wired; next add signed opaque
-   tickets, cancellation, online credential rotation, and load tests.
+   authorization, per-replica limits, encrypted expiring statement tickets,
+   and staged ticket-key rotation are wired; next pin exact table snapshots,
+   finish cancellation coverage, and add load tests.
 2. Add an async query state store and `PollFlightInfo`.
 3. Add bounded result materialization, manifest publication, presigned HTTPS
    endpoints, and result garbage collection.

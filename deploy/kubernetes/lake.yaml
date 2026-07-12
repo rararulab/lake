@@ -201,6 +201,10 @@ spec:
               value: "30000"
             - name: LAKE_QUERY_MAX_CONCURRENT
               value: "64"
+            - name: LAKE_QUERY_TICKET_KEYS_FILE
+              value: /var/run/lake-secrets/ticket-keys.json
+            - name: LAKE_QUERY_TICKET_TTL_SECS
+              value: "300"
             - name: LAKE_QUERY_MEMORY_BYTES
               value: "6442450944"
             - name: LAKE_QUERY_SPILL_BYTES

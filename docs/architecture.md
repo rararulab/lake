@@ -447,6 +447,14 @@ design-level ones:
   preserve an exact authorized namespace across internal hops. Loopback
   development installs an explicit development principal rather than treating a
   missing identity as authority.
+- Flight SQL statement handles remain standards-compatible outer
+  `TicketStatementQuery` messages, but their payload is a versioned
+  AES-256-GCM envelope rather than raw SQL. It binds principal, tenant,
+  audience, issued-at, and expiry and is opened before authorization,
+  admission, catalog refresh, or planning. Every production Query replica
+  shares a bounded active/verification key ring; loopback-only development may
+  generate an ephemeral key. Exact table-version snapshot pinning between
+  `GetFlightInfo` and `DoGet` remains a separate protocol invariant to add.
 - Managed-stage discovery derives `tenants/<tenant-id>` below the configured
   local root or S3 prefix. The SDK opens that child stage directly and rejects a
   `DataLocation` outside it. Production workload IAM must independently restrict

@@ -405,6 +405,16 @@ authentication remains mandatory. Metasrv nodes use
 `LAKE_PEER_AUTH_TOKEN_FILE`, `LAKE_PEER_CA_FILE`, and
 `LAKE_PEER_SERVER_NAME` for follower-to-leader forwarding.
 
+Every non-loopback Query also requires `LAKE_QUERY_TICKET_KEYS_FILE`, a
+mode-`0600` JSON key ring shared by all replicas behind the Flight endpoint.
+Statement handles are versioned AES-256-GCM ciphertext bound to their exact
+principal, tenant, audience, issue time, and expiry; SQL is not present as
+ticket plaintext. The active key seals new tickets and up to three verification
+keys keep in-flight tickets valid during staged rotation. Loopback development
+uses an ephemeral process-local key. `LAKE_QUERY_TICKET_TTL_SECS` defaults to
+300 and is restricted to `1..=3600`; see the Kubernetes runbook for the
+preload/activate/retire procedure.
+
 Each Query replica also enforces finite admission limits. Defaults are 64
 concurrent queries, 100 ms queue wait, 30 minutes execution time, and 1 MiB of
 SQL/ticket text. Override them at process startup:
@@ -414,6 +424,8 @@ LAKE_QUERY_MAX_CONCURRENT=32 \
 LAKE_QUERY_QUEUE_TIMEOUT_MS=250 \
 LAKE_QUERY_EXECUTION_TIMEOUT_MS=900000 \
 LAKE_QUERY_MAX_SQL_BYTES=262144 \
+LAKE_QUERY_TICKET_KEYS_FILE=/run/secrets/ticket-keys.json \
+LAKE_QUERY_TICKET_TTL_SECS=300 \
 lake query ...
 ```
 
