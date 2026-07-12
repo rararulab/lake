@@ -68,11 +68,11 @@ Scenario: Invalid rows fail before uploads or commits
   When insert_many validates the batch
   Then no object upload starts and no table version is published
 
-Scenario: Batch cardinality is finite before I/O
+Scenario: Batch cardinality and metadata are finite before I/O
   Test:
     Package: lake-sdk
     Filter: sdk_batch_insert_rejects_empty_and_excessive_batches
-  Given an empty batch or more than 10,000 rows
+  Given an empty batch, more than 10,000 rows, or over 16 MiB of caller metadata
   When insert_many is called
   Then a typed SDK error is returned before schema, storage, or Flight I/O
 
