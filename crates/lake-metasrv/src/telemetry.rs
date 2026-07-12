@@ -168,6 +168,8 @@ mod tests {
             "lake_metasrv_maintenance_pages_total{stage=\"append_operations\"} 1",
             "lake_metasrv_maintenance_items_total{stage=\"append_operations\",outcome=\"\
              budget_exhausted\"} 0",
+            "lake_metasrv_maintenance_items_total{stage=\"append_operations\",outcome=\"\
+             time_exhausted\"} 0",
             "lake_metasrv_maintenance_pages_total{stage=\"tables\"}",
             "lake_metasrv_maintenance_items_total{stage=\"tables\",outcome=\"maintained\"} 0",
         ] {

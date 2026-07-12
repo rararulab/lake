@@ -64,10 +64,12 @@ pub(crate) fn maintenance_limits_from_env() -> anyhow::Result<MaintenanceLimits>
     let interval_secs = env_value("LAKE_MAINTENANCE_INTERVAL_SECS")?;
     let table_page_size = env_value("LAKE_MAINTENANCE_TABLE_PAGE_SIZE")?;
     let operation_gc_max_pages = env_value("LAKE_MAINTENANCE_OPERATION_GC_MAX_PAGES")?;
+    let operation_gc_max_ms = env_value("LAKE_MAINTENANCE_OPERATION_GC_MAX_MS")?;
     maintenance_limits_from_values(
         interval_secs.as_deref(),
         table_page_size.as_deref(),
         operation_gc_max_pages.as_deref(),
+        operation_gc_max_ms.as_deref(),
     )
 }
 
@@ -75,6 +77,7 @@ fn maintenance_limits_from_values(
     interval_secs: Option<&str>,
     table_page_size: Option<&str>,
     operation_gc_max_pages: Option<&str>,
+    operation_gc_max_ms: Option<&str>,
 ) -> anyhow::Result<MaintenanceLimits> {
     let defaults = MaintenanceLimits::default();
     let interval_secs = parse_or(
@@ -92,10 +95,17 @@ fn maintenance_limits_from_values(
         operation_gc_max_pages,
         defaults.operation_gc_max_pages(),
     )?;
+    let operation_gc_max_ms = parse_or(
+        "LAKE_MAINTENANCE_OPERATION_GC_MAX_MS",
+        operation_gc_max_ms,
+        u64::try_from(defaults.operation_gc_max_duration().as_millis())
+            .expect("default operation GC duration fits u64"),
+    )?;
     MaintenanceLimits::try_new(
         Duration::from_secs(interval_secs),
         table_page_size,
         operation_gc_max_pages,
+        Duration::from_millis(operation_gc_max_ms),
     )
     .context("invalid Metasrv maintenance limits")
 }
@@ -354,21 +364,34 @@ mod tests {
 
     #[test]
     fn maintenance_limit_values_are_validated_before_serving() {
-        assert!(maintenance_limits_from_values(Some("0"), None, None).is_err());
-        assert!(maintenance_limits_from_values(Some("often"), None, None).is_err());
-        assert!(maintenance_limits_from_values(None, Some("0"), None).is_err());
-        assert!(maintenance_limits_from_values(None, Some("10001"), None).is_err());
-        assert!(maintenance_limits_from_values(None, None, Some("0")).is_err());
-        assert!(maintenance_limits_from_values(None, None, Some("10001")).is_err());
-        assert!(maintenance_limits_from_values(None, None, Some("many")).is_err());
+        assert!(maintenance_limits_from_values(Some("0"), None, None, None).is_err());
+        assert!(maintenance_limits_from_values(Some("often"), None, None, None).is_err());
+        assert!(maintenance_limits_from_values(None, Some("0"), None, None).is_err());
+        assert!(maintenance_limits_from_values(None, Some("10001"), None, None).is_err());
+        assert!(maintenance_limits_from_values(None, None, Some("0"), None).is_err());
+        assert!(maintenance_limits_from_values(None, None, Some("10001"), None).is_err());
+        assert!(maintenance_limits_from_values(None, None, Some("many"), None).is_err());
+        assert!(maintenance_limits_from_values(None, None, None, Some("0")).is_err());
+        assert!(maintenance_limits_from_values(None, None, None, Some("60001")).is_err());
+        assert!(maintenance_limits_from_values(None, None, None, Some("long")).is_err());
 
-        let defaults = maintenance_limits_from_values(None, None, None).expect("default limits");
+        let defaults =
+            maintenance_limits_from_values(None, None, None, None).expect("default limits");
         assert_eq!(defaults.operation_gc_max_pages(), 16);
-        let limits = maintenance_limits_from_values(Some("15"), Some("512"), Some("32"))
-            .expect("valid limits");
+        assert_eq!(
+            defaults.operation_gc_max_duration(),
+            Duration::from_secs(10)
+        );
+        let limits =
+            maintenance_limits_from_values(Some("15"), Some("512"), Some("32"), Some("2500"))
+                .expect("valid limits");
         assert_eq!(limits.interval(), Duration::from_secs(15));
         assert_eq!(limits.table_page_size(), 512);
         assert_eq!(limits.operation_gc_max_pages(), 32);
+        assert_eq!(
+            limits.operation_gc_max_duration(),
+            Duration::from_millis(2500)
+        );
     }
 
     #[test]

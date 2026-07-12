@@ -133,11 +133,13 @@ the 8 GiB container limit.
 
 Metasrv append-operation cleanup defaults to 16 metadata pages of 128 records
 per one-minute maintenance tick. Monitor the finite-label
-`append_operations/budget_exhausted` maintenance counter and the deleted-item
-rate. If the budget stays exhausted and deletion trails sustained append
-throughput, raise `LAKE_MAINTENANCE_OPERATION_GC_MAX_PAGES` or
-`LAKE_APPEND_OPERATION_GC_PAGE_SIZE` while keeping the product within the
-node's Dynamo request and shutdown budgets.
+`append_operations/budget_exhausted` and `append_operations/time_exhausted`
+maintenance counters and the deleted-item rate. If either ceiling stays
+exhausted and deletion trails sustained append throughput, raise
+`LAKE_MAINTENANCE_OPERATION_GC_MAX_PAGES`,
+`LAKE_MAINTENANCE_OPERATION_GC_MAX_MS`, or
+`LAKE_APPEND_OPERATION_GC_PAGE_SIZE` while keeping the product and duration
+within the node's Dynamo request, table-maintenance, and shutdown budgets.
 
 ## Availability model
 

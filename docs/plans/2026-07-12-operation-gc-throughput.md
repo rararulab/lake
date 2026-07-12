@@ -8,16 +8,18 @@ stage cleanup and replay safety.
 
 ## Architecture
 
-`MaintenanceLimits` owns a finite operation-page budget because this is a
-per-tick fairness bound, while the existing operation policy continues to own
-retention and page size. The leader follows the opaque process-local cursor
-for at most that many physical pages, stops at end-of-scan without wrapping in
-the same tick, and reports page/item/budget progress using bounded labels.
+`MaintenanceLimits` owns finite operation page and wall-clock budgets because
+these are per-tick fairness bounds, while the existing operation policy
+continues to own retention and page size. The leader follows the opaque
+process-local cursor within both ceilings, advances it only after a whole page
+is processed, stops at end-of-scan without wrapping in the same tick, and
+reports page/item/budget progress using bounded labels.
 
 ## Tasks
 
 1. Add RED tests for multi-page drain, budget/resume, shutdown at a page
-   boundary, configuration validation, and metric output.
+   boundary, wall-clock cancellation, Dynamo delete-while-paging,
+   configuration validation, and metric output.
 2. Extend immutable maintenance configuration and CLI environment parsing with
    a bounded maximum operation-page count per tick.
 3. Refactor operation GC so one stage drains consecutive pages under that

@@ -36,9 +36,10 @@ write path — create tables, resolve/list, and the append commit protocol.
 - Leader table maintenance reads one bounded registry page per configured tick,
   resumes from an opaque process-local cursor, and re-resolves each candidate
   under its table lock before touching the engine.
-- Append-operation GC drains consecutive metadata pages under a finite
-  per-tick page budget. It stops without wrapping at end-of-scan and preserves
-  cancellation, per-table serialization, exact-stage cleanup, and fencing.
+- Append-operation GC drains consecutive metadata pages under finite per-tick
+  page and wall-clock budgets. It advances the cursor only after a whole page,
+  stops without wrapping at end-of-scan, and preserves cancellation, per-table
+  serialization, exact-stage cleanup, and fencing.
 
 ## Layout
 

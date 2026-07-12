@@ -30,6 +30,46 @@ use aws_sdk_dynamodb::{primitives::Blob, types::AttributeValue};
 use lake_meta::{DynamoMeta, GuardedMutation, MetaStore};
 use metrics_exporter_prometheus::PrometheusBuilder;
 
+async fn consume_and_delete_pages(meta: &DynamoMeta, prefix: &str) {
+    let expected = ["a", "b", "c"];
+    for suffix in expected {
+        assert!(
+            meta.cas(&format!("{prefix}{suffix}"), None, suffix.as_bytes())
+                .await
+                .expect("seed delete-while-paging key")
+        );
+    }
+    let mut continuation = None;
+    let mut consumed = Vec::new();
+    loop {
+        let page = meta
+            .scan_prefix_page(prefix, continuation.as_deref(), 1)
+            .await
+            .expect("scan delete-while-paging page");
+        let (entries, next) = page.into_parts();
+        for (suffix, value) in entries {
+            assert!(
+                meta.delete(&format!("{prefix}{suffix}"), &value)
+                    .await
+                    .expect("delete consumed page entry")
+            );
+            consumed.push(suffix);
+        }
+        continuation = next;
+        if continuation.is_none() {
+            break;
+        }
+    }
+    consumed.sort_unstable();
+    assert_eq!(consumed, expected);
+    assert!(
+        meta.scan_prefix(prefix)
+            .await
+            .expect("verify consumed prefix")
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires localstack DynamoDB; set LAKE_DYNAMODB_ENDPOINT and run with --ignored"]
 async fn dynamo_v1_dual_v2_migration_roundtrip() {
@@ -144,6 +184,7 @@ async fn dynamo_v1_dual_v2_migration_roundtrip() {
             ("legacy".to_owned(), b"old".to_vec()),
         ]
     );
+    consume_and_delete_pages(&meta, "delete-while-paging-v1/").await;
 
     assert!(meta.cas("lease", None, b"epoch-1").await.unwrap());
     assert!(
@@ -237,6 +278,7 @@ async fn dynamo_v1_dual_v2_migration_roundtrip() {
             ("legacy".to_owned(), b"old".to_vec()),
         ]
     );
+    consume_and_delete_pages(&meta, "delete-while-paging-v2/").await;
 
     let rendered = metrics.render();
     for expected in [
@@ -250,4 +292,11 @@ async fn dynamo_v1_dual_v2_migration_roundtrip() {
             "missing {expected}:\n{rendered}"
         );
     }
+}
+
+#[test]
+fn dynamo_delete_while_paging_localstack_is_wired() {
+    let source = include_str!("dynamo_localstack.rs");
+    assert!(source.contains("consume_and_delete_pages(&meta, \"delete-while-paging-v1/\")"));
+    assert!(source.contains("consume_and_delete_pages(&meta, \"delete-while-paging-v2/\")"));
 }

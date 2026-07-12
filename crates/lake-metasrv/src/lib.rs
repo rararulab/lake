@@ -238,9 +238,10 @@ impl Default for AppendLimits {
 /// Immutable cadence and per-tick table-work bound for leader maintenance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaintenanceLimits {
-    interval:               Duration,
-    table_page_size:        usize,
-    operation_gc_max_pages: usize,
+    interval:                  Duration,
+    table_page_size:           usize,
+    operation_gc_max_pages:    usize,
+    operation_gc_max_duration: Duration,
 }
 
 impl MaintenanceLimits {
@@ -249,6 +250,7 @@ impl MaintenanceLimits {
         interval: Duration,
         table_page_size: usize,
         operation_gc_max_pages: usize,
+        operation_gc_max_duration: Duration,
     ) -> Result<Self> {
         if interval.is_zero() {
             return Err(MetasrvError::InvalidMaintenanceLimits {
@@ -265,10 +267,17 @@ impl MaintenanceLimits {
                 message: "operation_gc_max_pages must be within 1..=10000".to_owned(),
             });
         }
+        if operation_gc_max_duration.is_zero() || operation_gc_max_duration > Duration::from_mins(1)
+        {
+            return Err(MetasrvError::InvalidMaintenanceLimits {
+                message: "operation_gc_max_duration must be within 1ms..=60s".to_owned(),
+            });
+        }
         Ok(Self {
             interval,
             table_page_size,
             operation_gc_max_pages,
+            operation_gc_max_duration,
         })
     }
 
@@ -283,14 +292,19 @@ impl MaintenanceLimits {
     /// Maximum append-operation pages consumed by one tick.
     #[must_use]
     pub const fn operation_gc_max_pages(&self) -> usize { self.operation_gc_max_pages }
+
+    /// Maximum wall-clock time consumed by append-operation GC in one tick.
+    #[must_use]
+    pub const fn operation_gc_max_duration(&self) -> Duration { self.operation_gc_max_duration }
 }
 
 impl Default for MaintenanceLimits {
     fn default() -> Self {
         Self {
-            interval:               Duration::from_mins(1),
-            table_page_size:        128,
-            operation_gc_max_pages: 16,
+            interval:                  Duration::from_mins(1),
+            table_page_size:           128,
+            operation_gc_max_pages:    16,
+            operation_gc_max_duration: Duration::from_secs(10),
         }
     }
 }

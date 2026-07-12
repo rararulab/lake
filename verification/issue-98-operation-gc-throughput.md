@@ -21,4 +21,16 @@
   denied.
 - Full gate passed all workspace tests, e2e, hooks, and site checks.
 - Workspace rustdoc passed with warnings denied.
-- Independent frozen-head review is pending.
+- Initial performance review found that a page-only budget could still delay
+  table maintenance for minutes. The corrected stage has a startup-validated
+  10-second default wall-clock deadline, cancels blocked scan/reconciliation
+  futures safely against durable state, and emits `time_exhausted`.
+- Initial correctness review required production-backend cursor evidence. The
+  LocalStack lifecycle now deletes every limit-one page before resuming its
+  opaque cursor in both v1 Scan and v2 Query modes; the integration passed.
+- Cursor publication now occurs only after a whole page is processed, so
+  deadline or shutdown cancellation retries a partial page instead of skipping
+  its unprocessed entries.
+- Corrected lane-1 lifecycle passed 7/7, strict Clippy passed across the three
+  affected crates, and the corrected full gate and rustdoc passed.
+- Independent corrected-head re-review is pending.

@@ -109,14 +109,20 @@ async fn sweep_until_with_limits(
     if shutdown.is_cancelled() {
         return;
     }
-    let operation_gc =
-        sweep_operation_pages_at_until(metasrv, now, shutdown, limits.operation_gc_max_pages())
-            .await;
+    let operation_gc = sweep_operation_pages_at_until(
+        metasrv,
+        now,
+        shutdown,
+        limits.operation_gc_max_pages(),
+        limits.operation_gc_max_duration(),
+    )
+    .await;
     tracing::debug!(
         pages = operation_gc.pages,
         scanned = operation_gc.scanned,
         deleted = operation_gc.deleted,
         budget_exhausted = operation_gc.budget_exhausted,
+        time_exhausted = operation_gc.time_exhausted,
         "append operation maintenance page complete"
     );
     telemetry::maintenance_pages("append_operations", operation_gc.pages);
@@ -126,6 +132,11 @@ async fn sweep_until_with_limits(
         "append_operations",
         "budget_exhausted",
         usize::from(operation_gc.budget_exhausted),
+    );
+    telemetry::maintenance_items(
+        "append_operations",
+        "time_exhausted",
+        usize::from(operation_gc.time_exhausted),
     );
     if shutdown.is_cancelled() {
         return;
@@ -322,6 +333,7 @@ pub(crate) struct OperationGcStats {
     pub(crate) scanned:          usize,
     pub(crate) deleted:          usize,
     pub(crate) budget_exhausted: bool,
+    pub(crate) time_exhausted:   bool,
 }
 
 pub(crate) async fn sweep_operations_at(metasrv: &Metasrv, now: u64) -> OperationGcStats {
@@ -333,7 +345,14 @@ async fn sweep_operations_at_until(
     now: u64,
     shutdown: &CancellationToken,
 ) -> OperationGcStats {
-    sweep_operation_pages_at_until(metasrv, now, shutdown, 1).await
+    sweep_operation_pages_at_until(
+        metasrv,
+        now,
+        shutdown,
+        1,
+        MaintenanceLimits::default().operation_gc_max_duration(),
+    )
+    .await
 }
 
 async fn sweep_operation_pages_at_until(
@@ -341,22 +360,28 @@ async fn sweep_operation_pages_at_until(
     now: u64,
     shutdown: &CancellationToken,
     max_pages: usize,
+    max_duration: std::time::Duration,
 ) -> OperationGcStats {
     let mut stats = OperationGcStats::default();
+    let deadline = tokio::time::Instant::now() + max_duration;
     for _ in 0..max_pages {
         if shutdown.is_cancelled() {
             break;
         }
         let cursor = metasrv.inner.operation_gc_cursor.lock().await.clone();
-        let page = match metasrv
-            .meta()
-            .scan_prefix_page(
+        let page = match tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return stats,
+            () = tokio::time::sleep_until(deadline) => {
+                stats.time_exhausted = true;
+                return stats;
+            }
+            result = metasrv.meta().scan_prefix_page(
                 OPERATION_PREFIX,
                 cursor.as_deref(),
                 metasrv.inner.operation_gc_page_size,
-            )
-            .await
-        {
+            ) => result,
+        } {
             Ok(page) => page,
             Err(error) => {
                 tracing::warn!(%error, "append operation GC page scan failed");
@@ -365,7 +390,6 @@ async fn sweep_operation_pages_at_until(
         };
         let (entries, continuation) = page.into_parts();
         let has_more = continuation.is_some();
-        *metasrv.inner.operation_gc_cursor.lock().await = continuation;
         stats.pages += 1;
         stats.scanned += entries.len();
         for (stripped, bytes) in entries {
@@ -384,7 +408,16 @@ async fn sweep_operation_pages_at_until(
             {
                 continue;
             }
-            match reconcile_and_delete_expired(metasrv, &key, &bytes, record, shutdown).await {
+            let reconciliation = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return stats,
+                () = tokio::time::sleep_until(deadline) => {
+                    stats.time_exhausted = true;
+                    return stats;
+                }
+                result = reconcile_and_delete_expired(metasrv, &key, &bytes, record, shutdown) => result,
+            };
+            match reconciliation {
                 Ok(true) => stats.deleted += 1,
                 Ok(false) => {}
                 Err(error) => {
@@ -392,7 +425,8 @@ async fn sweep_operation_pages_at_until(
                 }
             }
         }
-        if shutdown.is_cancelled() || !has_more {
+        *metasrv.inner.operation_gc_cursor.lock().await = continuation;
+        if !has_more {
             return stats;
         }
     }
@@ -620,6 +654,10 @@ mod tests {
         shutdown:   CancellationToken,
     }
 
+    struct BlockingGetMeta {
+        inner: MetaStoreRef,
+    }
+
     #[async_trait]
     impl MetaStore for RecordingScanMeta {
         async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
@@ -696,6 +734,41 @@ mod tests {
                 self.shutdown.cancel();
             }
             Ok(page)
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
+        }
+    }
+
+    #[async_trait]
+    impl MetaStore for BlockingGetMeta {
+        async fn get(&self, _key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            std::future::pending().await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn scan_prefix_page(
+            &self,
+            prefix: &str,
+            continuation: Option<&str>,
+            limit: usize,
+        ) -> lake_meta::Result<MetaScanPage> {
+            self.inner
+                .scan_prefix_page(prefix, continuation, limit)
+                .await
         }
 
         async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
@@ -1296,9 +1369,14 @@ mod tests {
         let metasrv =
             Metasrv::with_operation_policy(meta.clone(), engine, Duration::from_secs(1), 1);
 
-        let stats =
-            sweep_operation_pages_at_until(&metasrv, u64::MAX / 2, &CancellationToken::new(), 3)
-                .await;
+        let stats = sweep_operation_pages_at_until(
+            &metasrv,
+            u64::MAX / 2,
+            &CancellationToken::new(),
+            3,
+            Duration::from_secs(1),
+        )
+        .await;
 
         assert_eq!(stats.pages, 3);
         assert_eq!(stats.scanned, 3);
@@ -1317,13 +1395,27 @@ mod tests {
             Metasrv::with_operation_policy(meta.clone(), engine, Duration::from_secs(1), 1);
         let shutdown = CancellationToken::new();
 
-        let first = sweep_operation_pages_at_until(&metasrv, u64::MAX / 2, &shutdown, 2).await;
+        let first = sweep_operation_pages_at_until(
+            &metasrv,
+            u64::MAX / 2,
+            &shutdown,
+            2,
+            Duration::from_secs(1),
+        )
+        .await;
         assert_eq!(first.pages, 2);
         assert_eq!(first.deleted, 2);
         assert!(first.budget_exhausted);
         assert_eq!(meta.scan_prefix(OPERATION_PREFIX).await.unwrap().len(), 1);
 
-        let second = sweep_operation_pages_at_until(&metasrv, u64::MAX / 2, &shutdown, 2).await;
+        let second = sweep_operation_pages_at_until(
+            &metasrv,
+            u64::MAX / 2,
+            &shutdown,
+            2,
+            Duration::from_secs(1),
+        )
+        .await;
         assert_eq!(second.pages, 1);
         assert_eq!(second.deleted, 1);
         assert!(!second.budget_exhausted);
@@ -1345,7 +1437,14 @@ mod tests {
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
         let metasrv = Metasrv::with_operation_policy(meta, engine, Duration::from_secs(1), 1);
 
-        let stats = sweep_operation_pages_at_until(&metasrv, u64::MAX / 2, &shutdown, 10).await;
+        let stats = sweep_operation_pages_at_until(
+            &metasrv,
+            u64::MAX / 2,
+            &shutdown,
+            10,
+            Duration::from_secs(1),
+        )
+        .await;
 
         assert_eq!(stats.pages, 1);
         assert_eq!(recording.page_calls.load(Ordering::SeqCst), 1);
@@ -1353,6 +1452,36 @@ mod tests {
             stats.deleted, 0,
             "cancelled page performs no reconciliation"
         );
+    }
+
+    #[tokio::test]
+    async fn operation_gc_time_budget_bounds_blocked_reconciliation() {
+        let meta_dir = tempfile::tempdir().unwrap();
+        let inner: MetaStoreRef = Arc::new(RocksMeta::open(meta_dir.path()).unwrap());
+        seed_committed_operations(inner.as_ref(), 1).await;
+        let blocking: MetaStoreRef = Arc::new(BlockingGetMeta {
+            inner: inner.clone(),
+        });
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::with_operation_policy(blocking, engine, Duration::from_secs(1), 1);
+
+        let stats = tokio::time::timeout(
+            Duration::from_secs(1),
+            sweep_operation_pages_at_until(
+                &metasrv,
+                u64::MAX / 2,
+                &CancellationToken::new(),
+                16,
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("operation GC obeys its wall-clock budget");
+
+        assert!(stats.time_exhausted);
+        assert_eq!(stats.pages, 1);
+        assert_eq!(stats.deleted, 0);
+        assert_eq!(inner.scan_prefix(OPERATION_PREFIX).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

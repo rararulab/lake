@@ -22,6 +22,9 @@ transactions, or introduce a storage-node tier.
 - Add a validated maximum append-operation page count to the immutable
   maintenance limits. The default is finite and materially raises throughput;
   zero and oversized values fail before serving.
+- Add a validated wall-clock deadline for the complete operation-GC stage.
+  Scan and reconciliation futures are cancellable against that deadline; the
+  durable record remains the retry authority after cancellation.
 - Within a tick, scan consecutive operation pages until the cursor reaches the
   end, the page budget is exhausted, an error occurs, or shutdown is
   requested. Do not wrap and rescan from the beginning in the same tick.
@@ -38,6 +41,7 @@ transactions, or introduce a storage-node tier.
 ### Allowed Changes
 crates/lake-metasrv/**
 crates/lake-cli/**
+crates/lake-meta/tests/dynamo_localstack.rs
 docs/architecture.md
 docs/guides/cli.md
 docs/guides/kubernetes.md
@@ -46,7 +50,7 @@ specs/issue-98-operation-gc-throughput.spec.md
 verification/issue-98-operation-gc-throughput.md
 
 ### Forbidden
-crates/lake-meta/**
+crates/lake-meta/src/**
 crates/lake-engine*/**
 crates/lake-query/**
 crates/lake-sdk/**
@@ -80,6 +84,22 @@ Scenario: Operation GC yields promptly to shutdown
   Given a multi-page operation sweep whose cancellation fires after page one
   When the GC stage reaches the next page boundary
   Then it performs no further page scan or record reconciliation
+
+Scenario: Operation GC wall-clock budget bounds blocked reconciliation
+  Test:
+    Package: lake-metasrv
+    Filter: operation_gc_time_budget_bounds_blocked_reconciliation
+  Given one expired operation whose reconciliation does not return
+  When the stage reaches its wall-clock deadline
+  Then it cancels the attempt, retains the durable record, and returns control
+
+Scenario: Dynamo cursors survive deleting consumed pages
+  Test:
+    Package: lake-meta
+    Filter: dynamo_delete_while_paging_localstack_is_wired
+  Given v1 Scan and v2 Query pages with a limit of one
+  When every consumed entry is deleted before its opaque cursor is resumed
+  Then LocalStack integration consumes every target exactly once in both layouts
 
 Scenario: Invalid operation page budgets fail before serving
   Test:
