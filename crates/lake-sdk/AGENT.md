@@ -24,7 +24,7 @@ The Rust SDK's typed write and direct-read surface.
 - `LakeClientBuilder` applies one redacted TLS/bearer configuration to every
   Query Flight client; credentials never enter stage discovery or SQL data.
 - `query` streams Flight RecordBatches; `data_location` decodes a logical
-  `FILE`, and `open` reads its bytes directly from the managed stage.
+  `FILE`, and `open` reads directly while verifying size/SHA-256 at EOF.
 - `open_range` delegates one validated half-open interval directly to the
   configured stage; query and metasrv never proxy range bytes.
 - `presign_read` delegates a bounded S3 GET capability only after the same

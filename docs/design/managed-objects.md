@@ -42,6 +42,15 @@ The administrative schema DSL exposes the same logical type as
 `lake_sdk::data_location(&batch, "video", row)` and pass the result to
 `LakeClient::open` for direct object I/O.
 
+Full opens are integrity-verified by default. Before touching storage the SDK
+requires the DataLocation SHA-256 to be exactly 64 hexadecimal characters. It
+then caps the backend stream at the declared size, hashes only bytes delivered
+to the caller, and privately probes one byte beyond the cap. EOF succeeds only
+when the object is neither short nor long and the incremental SHA-256 matches.
+The wrapper retains constant memory regardless of object size. Verification is
+an EOF property: dropping the reader early makes no success claim. Terminal
+integrity failures are `InvalidData` I/O errors with a public typed source.
+
 For random-access consumers, `LakeClient::open_range(&location, start..end)`
 uses Rust half-open byte ranges. The managed stage rejects empty, reversed, or
 out-of-bounds intervals against `DataLocation.size_bytes` before opening the
@@ -49,6 +58,11 @@ object. Local storage seeks once and limits the returned stream to
 `end - start`; S3 sends one `Range: bytes=start-(end-1)` request. The returned
 type is still a streaming `AsyncRead`, so callers can feed a decoder without
 allocating the interval or downloading the object prefix.
+
+Range and presigned reads do not claim the full-object SHA-256. A partial
+interval cannot establish the identity of bytes it did not read; per-range
+checksums require a future chunk/Merkle identity format rather than pretending
+the whole-file digest was verified.
 
 The SDK validates the SQL subset, placeholders, column names, and Arrow types
 before opening any file upload. It then streams each `FileUpload` into the
