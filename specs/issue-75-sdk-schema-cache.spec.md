@@ -77,6 +77,14 @@ Scenario: Schema cache configuration is finite and validated before connect
   When zero or values above the documented production ceilings are supplied
   Then client construction fails before network or storage setup and valid defaults remain finite
 
+Scenario: Invalidation fences stale in-flight schema loads
+  Test:
+    Package: lake-sdk
+    Filter: schema_cache_invalidation_fences_in_flight_loader
+  Given a schema lookup for an old table incarnation is still in flight
+  When that table or the complete cache is invalidated before the lookup finishes
+  Then a new lookup does not join the old loader and the old result cannot repopulate the cache
+
 ## Out of Scope
 
 - Caching SQL result batches or append results.

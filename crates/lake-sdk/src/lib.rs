@@ -50,7 +50,7 @@ use prost::Message;
 use prost_types::Any;
 use sha2::{Digest, Sha256};
 use snafu::{OptionExt, ResultExt, Snafu};
-use tokio::io::AsyncRead;
+use tokio::{io::AsyncRead, sync::Mutex};
 use tonic::transport::Channel;
 
 const APPEND_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
@@ -121,9 +121,6 @@ pub enum SdkError {
 
     #[snafu(display("invalid SDK schema cache configuration: {message}"))]
     InvalidSchemaCacheConfig { message: String },
-
-    #[snafu(display("table schema lookup failed: {message}"))]
-    SchemaLookup { message: String },
 
     #[snafu(display(
         "ambiguous FILE append did not converge within {window:?}; resume the returned pending \
@@ -335,7 +332,7 @@ impl SchemaCacheConfig {
 
 #[derive(Clone)]
 struct SchemaCache {
-    entries: Cache<TableRef, SchemaRef>,
+    entries: Cache<TableRef, Arc<Mutex<Option<SchemaRef>>>>,
 }
 
 impl SchemaCache {
@@ -353,14 +350,20 @@ impl SchemaCache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<SchemaRef>>,
     {
-        self.entries
-            .try_get_with(table, async {
-                load().await.map_err(|error| error.to_string())
-            })
-            .await
-            .map_err(|message| SdkError::SchemaLookup {
-                message: message.to_string(),
-            })
+        // The cell is published before the loader starts. Invalidating the key
+        // therefore detaches an in-flight loader: it can finish for its caller,
+        // but it cannot repopulate the cache after a table incarnation change.
+        let cell = self
+            .entries
+            .get_with(table, async { Arc::new(Mutex::new(None)) })
+            .await;
+        let mut cached = cell.lock().await;
+        if let Some(schema) = cached.as_ref() {
+            return Ok(schema.clone());
+        }
+        let schema = load().await?;
+        *cached = Some(schema.clone());
+        Ok(schema)
     }
 
     async fn invalidate(&self, table: &TableRef) { self.entries.invalidate(table).await; }
@@ -947,6 +950,11 @@ mod tests {
         array::{Array, StringArray, StructArray},
         datatypes::{DataType, Field, Schema},
     };
+    use arrow_flight::{
+        FlightDescriptor, FlightInfo,
+        flight_service_server::FlightServiceServer,
+        sql::{CommandStatementQuery, SqlInfo, server::FlightSqlService},
+    };
     use aws_config::BehaviorVersion;
     use aws_sdk_s3::config::{Credentials, Region};
     use futures::TryStreamExt;
@@ -970,13 +978,94 @@ mod tests {
     use rcgen::generate_simple_self_signed;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
-    use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+    use tokio::{
+        io::{AsyncRead, AsyncReadExt, ReadBuf},
+        sync::Notify,
+    };
+    use tonic::{Request, Response, Status};
 
     use crate::{
         APPEND_RETRY_WINDOW, FileUpload, InsertValue, LakeClient, MAX_SCHEMA_CACHE_CAPACITY,
         MAX_SCHEMA_CACHE_TTL, SchemaCache, SchemaCacheConfig, SdkError, data_location,
         retry_ambiguous_append_with_window,
     };
+
+    #[derive(Clone)]
+    struct CountingSchemaService {
+        calls:              Arc<AtomicUsize>,
+        failures_remaining: Arc<AtomicUsize>,
+        schema:             Arc<Schema>,
+        delay:              Duration,
+    }
+
+    #[tonic::async_trait]
+    impl FlightSqlService for CountingSchemaService {
+        type FlightService = Self;
+
+        async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
+
+        async fn get_flight_info_statement(
+            &self,
+            _query: CommandStatementQuery,
+            request: Request<FlightDescriptor>,
+        ) -> std::result::Result<Response<FlightInfo>, Status> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(Status::unavailable("injected schema failure"));
+            }
+            let info = FlightInfo::new()
+                .try_with_schema(&self.schema)
+                .map_err(|error| Status::internal(error.to_string()))?
+                .with_descriptor(request.into_inner());
+            Ok(Response::new(info))
+        }
+    }
+
+    async fn setup_counting_schema_client(
+        root: &std::path::Path,
+        capacity: u64,
+        ttl: Duration,
+        failures: usize,
+    ) -> (LakeClient, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let query_addr = free_addr();
+        let service = CountingSchemaService {
+            calls:              calls.clone(),
+            failures_remaining: Arc::new(AtomicUsize::new(failures)),
+            schema:             Arc::new(Schema::new(vec![Field::new(
+                "episode_id",
+                DataType::Utf8,
+                false,
+            )])),
+            delay:              Duration::from_millis(20),
+        };
+        let socket = query_addr.parse().expect("query socket");
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(FlightServiceServer::new(service))
+                .serve(socket)
+                .await
+                .expect("counting Flight SQL server");
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let objects = LocalObjectStore::open(root.join("objects"))
+            .await
+            .expect("object store");
+        let client = LakeClient::builder(format!("http://{query_addr}"))
+            .with_schema_cache(capacity, ttl)
+            .expect("cache config")
+            .connect_with_store(objects)
+            .await
+            .expect("connected client");
+        (client, calls)
+    }
 
     #[tokio::test]
     async fn sdk_retries_lost_put_result_without_reupload_or_duplicate() {
@@ -1270,120 +1359,170 @@ mod tests {
     #[tokio::test]
     async fn schema_cache_coalesces_concurrent_lookups_across_clones() {
         let root = tempdir().expect("tempdir");
-        let client = LakeClient {
-            query:                 tonic::transport::Endpoint::from_static("http://127.0.0.1:9")
-                .connect_lazy(),
-            objects:               Arc::new(
-                LocalObjectStore::open(root.path().join("objects"))
-                    .await
-                    .expect("object store"),
-            ),
-            security:              ClientSecurity::new(),
-            schema_cache:          SchemaCache::new(SchemaCacheConfig {
-                capacity: 16,
-                ttl:      Duration::from_secs(1),
-            }),
-            upload_checkpoint_dir: None,
-        };
-        let calls = Arc::new(AtomicUsize::new(0));
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "episode_id",
-            DataType::Utf8,
-            false,
-        )]));
-        let table = TableRef::new("robots", "episodes");
+        let (client, calls) =
+            setup_counting_schema_client(root.path(), 16, Duration::from_secs(1), 0).await;
 
         let resolved = futures::future::join_all((0..16).map(|_| {
             let client = client.clone();
-            let calls = calls.clone();
-            let schema = schema.clone();
-            let table = table.clone();
             async move {
                 client
-                    .schema_cache
-                    .resolve(table, || async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                        Ok(schema)
-                    })
+                    .prepare_insert(
+                        "INSERT INTO robots.episodes (episode_id) VALUES (?)",
+                        vec![InsertValue::Utf8("episode-1".to_owned())],
+                    )
                     .await
-                    .expect("schema lookup")
+                    .expect("typed insert preparation")
             }
         }))
         .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(resolved.iter().all(|item| Arc::ptr_eq(item, &schema)));
+        assert_eq!(resolved.len(), 16);
         assert!(client.schema_cache.entry_count() <= 16);
     }
 
     #[tokio::test]
     async fn schema_cache_expiry_and_invalidation_refetch_without_caching_failures() {
+        let root = tempdir().expect("tempdir");
+        let (client, calls) =
+            setup_counting_schema_client(root.path(), 2, Duration::from_millis(200), 1).await;
+        let table = TableRef::new("robots", "episodes");
+        let other = TableRef::new("robots", "other");
+        let third = TableRef::new("robots", "third");
+        let prepare = |table: &TableRef| {
+            let sql = format!("INSERT INTO {table} (episode_id) VALUES (?)");
+            let client = &client;
+            async move {
+                client
+                    .prepare_insert(&sql, vec![InsertValue::Utf8("episode-1".to_owned())])
+                    .await
+            }
+        };
+
+        let failure = prepare(&table).await.expect_err("first lookup fails");
+        assert!(matches!(
+            failure,
+            SdkError::Flight {
+                source: arrow_flight::error::FlightError::Tonic(ref status),
+            } if status.code() == tonic::Code::Unavailable
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        prepare(&table).await.expect("failure is not cached");
+        prepare(&table).await.expect("cache hit");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        prepare(&other).await.expect("unrelated table");
+        client.invalidate_table_schema(&table).await;
+        prepare(&table).await.expect("invalidated table");
+        prepare(&other).await.expect("unrelated entry retained");
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        prepare(&third).await.expect("capacity overflow");
+        client.schema_cache.entries.run_pending_tasks().await;
+        assert!(client.schema_cache.entry_count() <= 2);
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        prepare(&table).await.expect("expired");
+        let before_clear = calls.load(Ordering::SeqCst);
+        client.clear_schema_cache();
+        prepare(&other).await.expect("globally cleared");
+        assert_eq!(calls.load(Ordering::SeqCst), before_clear + 1);
+    }
+
+    #[tokio::test]
+    async fn schema_cache_invalidation_fences_in_flight_loader() {
         let cache = SchemaCache::new(SchemaCacheConfig {
             capacity: 2,
-            ttl:      Duration::from_millis(25),
+            ttl:      Duration::from_secs(1),
         });
-        let calls = Arc::new(AtomicUsize::new(0));
-        let schema = Arc::new(Schema::empty());
         let table = TableRef::new("robots", "episodes");
-
-        let failures = futures::future::join_all((0..8).map(|_| {
+        let old_schema = Arc::new(Schema::empty());
+        let new_schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let old_lookup = tokio::spawn({
             let cache = cache.clone();
             let table = table.clone();
-            let calls = calls.clone();
+            let old_schema = old_schema.clone();
+            let entered = entered.clone();
+            let release = release.clone();
             async move {
                 cache
                     .resolve(table, || async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        Err(SdkError::InvalidSql {
-                            message: "injected schema failure".to_owned(),
-                        })
+                        entered.notify_one();
+                        release.notified().await;
+                        Ok(old_schema)
                     })
                     .await
             }
-        }))
-        .await;
-        assert!(failures.iter().all(|result| {
-            result
-                .as_ref()
-                .expect_err("first lookup fails")
-                .to_string()
-                .contains("injected schema failure")
-        }));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        let load = || {
-            let calls = calls.clone();
-            let schema = schema.clone();
-            async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Ok(schema)
-            }
-        };
-        cache.resolve(table.clone(), load).await.expect("retry");
-        cache
-            .resolve(table.clone(), || async {
-                panic!("cache hit must not load")
-            })
-            .await
-            .expect("cache hit");
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        });
+        entered.notified().await;
 
         cache.invalidate(&table).await;
-        cache
-            .resolve(table.clone(), load)
-            .await
-            .expect("invalidated");
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let current = tokio::time::timeout(
+            Duration::from_millis(100),
+            cache.resolve(table.clone(), || async { Ok(new_schema.clone()) }),
+        )
+        .await
+        .expect("invalidation must detach the old loader")
+        .expect("current schema");
+        assert!(Arc::ptr_eq(&current, &new_schema));
 
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        cache.resolve(table.clone(), load).await.expect("expired");
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        release.notify_one();
+        assert!(Arc::ptr_eq(
+            &old_lookup.await.expect("old task").expect("old caller"),
+            &old_schema
+        ));
+        let retained = cache
+            .resolve(table, || async { panic!("old loader repopulated cache") })
+            .await
+            .expect("new incarnation retained");
+        assert!(Arc::ptr_eq(&retained, &new_schema));
+
+        let other = TableRef::new("robots", "other");
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let old_lookup = tokio::spawn({
+            let cache = cache.clone();
+            let other = other.clone();
+            let old_schema = old_schema.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                cache
+                    .resolve(other, || async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        Ok(old_schema)
+                    })
+                    .await
+            }
+        });
+        entered.notified().await;
 
         cache.clear();
-        cache.resolve(table, load).await.expect("cleared");
-        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        let current = tokio::time::timeout(
+            Duration::from_millis(100),
+            cache.resolve(other.clone(), || async { Ok(new_schema.clone()) }),
+        )
+        .await
+        .expect("clear must detach the old loader")
+        .expect("current schema after clear");
+        assert!(Arc::ptr_eq(&current, &new_schema));
+        release.notify_one();
+        old_lookup.await.expect("old task").expect("old caller");
+        let retained = cache
+            .resolve(other, || async {
+                panic!("old loader repopulated globally cleared cache")
+            })
+            .await
+            .expect("new incarnation retained after clear");
+        assert!(Arc::ptr_eq(&retained, &new_schema));
     }
 
     #[test]
