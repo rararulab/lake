@@ -25,7 +25,6 @@
 use std::{
     collections::{BTreeSet, HashMap},
     future::Future,
-    io::Cursor,
     ops::Bound::{Excluded, Unbounded},
     pin::Pin,
     sync::{Arc, Mutex, Weak},
@@ -48,7 +47,6 @@ use arrow_flight::{
 use datafusion::{
     arrow::{
         datatypes::{Schema, SchemaRef},
-        ipc::reader::StreamReader as IpcStreamReader,
         record_batch::RecordBatch,
     },
     common::{TableReference, config::Dialect},
@@ -66,7 +64,6 @@ use lake_flight::{
 };
 use prost::Message;
 use tokio::{
-    io::AsyncReadExt,
     sync::{OwnedSemaphorePermit, Semaphore},
     time::{Instant, Sleep},
 };
@@ -75,7 +72,8 @@ use tracing::{Instrument as _, Span, field};
 
 use crate::{
     DiscoveryLimits, QueryEngine, QueryError, QueryLimits,
-    async_query::AsyncQueryCoordinator,
+    async_ipc::{IpcDecodeGuard, IpcPipelineLimits, PipelineProbe, decode_ipc_reader},
+    async_query::{AsyncQueryCoordinator, MAX_RESULT_PART_BYTES},
     telemetry,
     ticket::{MAX_TABLE_SNAPSHOTS, StatementTableSnapshot, StatementTicket, StatementTicketCodec},
 };
@@ -209,7 +207,8 @@ impl Drop for QueryPermit {
 struct AdmittedFlightStream {
     inner:    Option<<FlightSqlServiceImpl as FlightService>::DoGetStream>,
     deadline: Pin<Box<Sleep>>,
-    permit:   Option<QueryPermit>,
+    permit:   Option<Arc<QueryPermit>>,
+    decode:   Option<IpcDecodeGuard>,
 }
 
 fn apply_delegated_append_scope(
@@ -571,7 +570,22 @@ impl AdmittedFlightStream {
         Self {
             inner:    Some(inner),
             deadline: Box::pin(tokio::time::sleep_until(deadline)),
+            permit:   Some(Arc::new(permit)),
+            decode:   None,
+        }
+    }
+
+    fn new_with_decode(
+        inner: <FlightSqlServiceImpl as FlightService>::DoGetStream,
+        deadline: Instant,
+        permit: Arc<QueryPermit>,
+        decode: IpcDecodeGuard,
+    ) -> Self {
+        Self {
+            inner:    Some(inner),
+            deadline: Box::pin(tokio::time::sleep_until(deadline)),
             permit:   Some(permit),
+            decode:   Some(decode),
         }
     }
 }
@@ -585,6 +599,7 @@ impl Stream for AdmittedFlightStream {
         }
         if self.deadline.as_mut().poll(context).is_ready() {
             self.inner.take();
+            self.decode.take();
             self.permit.take();
             return Poll::Ready(Some(Err(Status::deadline_exceeded(
                 "query execution deadline exceeded",
@@ -598,6 +613,7 @@ impl Stream for AdmittedFlightStream {
             .poll_next(context);
         if matches!(poll, Poll::Ready(None | Some(Err(_)))) {
             self.inner.take();
+            self.decode.take();
             self.permit.take();
         }
         poll
@@ -1032,6 +1048,7 @@ impl TracedFlightSqlService {
             return Err(Status::unauthenticated("invalid async result handle"));
         }
         let permit = self.inner.admission.acquire(&principal).await?;
+        let permit = Arc::new(permit);
         let deadline = self.inner.admission.execution_deadline();
         let manifest = coordinator
             .load_manifest(&record)
@@ -1040,50 +1057,36 @@ impl TracedFlightSqlService {
         let location = manifest
             .part(part)
             .ok_or_else(|| Status::unauthenticated("invalid async result handle"))?;
-        let capacity = usize::try_from(location.size_bytes)
-            .map_err(|_| Status::resource_exhausted("async query result part is too large"))?;
         let reader = coordinator
             .open_result_part(&manifest, part)
             .await
             .map_err(|_| Status::unavailable("async query result is unavailable"))?;
-        let mut encoded = Vec::with_capacity(capacity);
-        tokio::time::timeout_at(
+        let decoded = tokio::time::timeout_at(
             deadline,
-            reader
-                .take(location.size_bytes.saturating_add(1))
-                .read_to_end(&mut encoded),
-        )
-        .await
-        .map_err(|_| Status::deadline_exceeded("async result read deadline exceeded"))?
-        .map_err(|_| Status::unavailable("async query result is unavailable"))?;
-        if encoded.len() != capacity {
-            return Err(Status::unavailable("async query result is unavailable"));
-        }
-        let (schema, batches) = tokio::time::timeout_at(
-            deadline,
-            tokio::task::spawn_blocking(move || {
-                let reader = IpcStreamReader::try_new(Cursor::new(encoded), None)
-                    .map_err(|_| Status::internal("async query result is invalid"))?;
-                let schema = reader.schema();
-                let batches = reader
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|_| Status::internal("async query result is invalid"))?;
-                Ok::<_, Status>((schema, batches))
-            }),
+            decode_ipc_reader(
+                reader,
+                location.size_bytes,
+                IpcPipelineLimits::production(MAX_RESULT_PART_BYTES),
+                PipelineProbe::default(),
+                permit.clone(),
+            ),
         )
         .await
         .map_err(|_| Status::deadline_exceeded("async result decode deadline exceeded"))?
-        .map_err(|_| Status::internal("async query result decoding failed"))??;
-        let batches = futures::stream::iter(batches.into_iter().map(Ok));
+        .map_err(|_| Status::internal("async query result is invalid"))?;
+        let (schema, batches, decode) = decoded.into_parts();
+        let batches = batches.into_stream().map(|batch| {
+            batch.map_err(|_| FlightError::from(Status::internal("async query result is invalid")))
+        });
         let stream: <FlightSqlServiceImpl as FlightService>::DoGetStream = Box::pin(
             FlightDataEncoderBuilder::new()
                 .with_schema(schema)
                 .build(batches)
                 .map_err(Status::from),
         );
-        Ok(Response::new(Box::pin(AdmittedFlightStream::new(
-            stream, deadline, permit,
-        ))))
+        Ok(Response::new(Box::pin(
+            AdmittedFlightStream::new_with_decode(stream, deadline, permit, decode),
+        )))
     }
 
     async fn cancel_async_query(
@@ -1604,7 +1607,7 @@ mod tests {
         arrow::{
             array::{BinaryArray, Int64Array, StringArray},
             datatypes::{DataType, Field},
-            ipc::writer::IpcWriteOptions,
+            ipc::writer::{IpcWriteOptions, StreamWriter},
             record_batch::RecordBatch,
         },
         catalog::{TableProvider, streaming::StreamingTable},
@@ -1627,10 +1630,11 @@ mod tests {
     use lake_engine_lance::LanceEngine;
     use lake_meta::{MetaStore, MetaStoreRef, RocksMeta, registry, registry::TableRegistration};
     use lake_objects::LocalObjectStore;
-    use tokio::sync::Notify;
+    use tokio::{io::AsyncWriteExt, sync::Notify};
 
     use super::*;
     use crate::{
+        async_ipc::{IpcPipelineLimits, PipelineProbe, decode_ipc_reader},
         async_query::{AsyncQueryCoordinator, AsyncQueryWorker, WorkerIdentity},
         ticket::{QueryTicketKeyRing, StatementTicketCodec},
     };
@@ -3169,6 +3173,85 @@ mod tests {
         assert!(!debug.contains("secret-subject"));
         assert!(!debug.contains("secret-tenant"));
         drop(permit);
+    }
+
+    #[tokio::test]
+    async fn async_result_stream_drop_cancels_pipeline_and_releases_permit() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let mut ipc = StreamWriter::try_new(Vec::new(), &batch.schema()).unwrap();
+        ipc.write(&batch).unwrap();
+        let first_batch_end = ipc.get_ref().len();
+        ipc.finish().unwrap();
+        let encoded = ipc.into_inner().unwrap();
+        let expected_bytes = encoded.len() as u64;
+        let (mut object_writer, object_reader) = tokio::io::duplex(64 * 1024);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            object_writer.write_all(&encoded[..first_batch_end]),
+        )
+        .await
+        .expect("schema prefix write does not block")
+        .unwrap();
+        let (probe, decoder_exit) = PipelineProbe::instrumented_with_blocked_decoder();
+        let admission = QueryAdmission::new(tenant_limits(1, 1, 2));
+        let principal = admission_principal("async-reader", "async-tenant");
+        let permit = Arc::new(admission.acquire(&principal).await.unwrap());
+        let decoded = tokio::time::timeout(
+            Duration::from_secs(1),
+            decode_ipc_reader(
+                Box::pin(object_reader),
+                expected_bytes,
+                IpcPipelineLimits::try_new(expected_bytes, 64, 1, 1).unwrap(),
+                probe.clone(),
+                permit.clone(),
+            ),
+        )
+        .await
+        .expect("schema decode does not wait for object EOF")
+        .unwrap();
+        let (schema, batches, decode) = decoded.into_parts();
+        let batches = batches.into_stream().map(|batch| {
+            batch.map_err(|_| FlightError::from(Status::internal("invalid async result")))
+        });
+        let inner: <FlightSqlServiceImpl as FlightService>::DoGetStream = Box::pin(
+            FlightDataEncoderBuilder::new()
+                .with_schema(schema)
+                .build(batches)
+                .map_err(Status::from),
+        );
+        let stream = AdmittedFlightStream::new_with_decode(
+            inner,
+            Instant::now() + Duration::from_secs(5),
+            permit,
+            decode,
+        );
+
+        drop(stream);
+        drop(object_writer);
+        let replacement_while_decoder_runs =
+            tokio::time::timeout(Duration::from_millis(20), admission.acquire(&principal)).await;
+        assert!(
+            !matches!(replacement_while_decoder_runs, Ok(Ok(_))),
+            "admission stays held until the blocking decoder actually exits"
+        );
+        decoder_exit.release();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while probe.active_tasks() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned IPC tasks stop after Flight stream drop");
+        let replacement = admission.acquire(&principal).await.unwrap();
+        drop(replacement);
     }
 
     #[tokio::test]

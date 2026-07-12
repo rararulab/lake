@@ -320,6 +320,19 @@ saturated tenant, and cancels both execution and lease renewal at the deadline.
 These limits are process-local; CAS worker leases preserve single ownership but
 do not turn them into cluster-global tenant quotas.
 
+Async result parts stay bounded while crossing the storage boundary. The IPC
+encoder writes fixed 64 KiB chunks through a four-slot channel and rejects an
+encoded part before publication when it crosses the 64 MiB ceiling. `DoGet`
+feeds verified object chunks incrementally into Arrow's `StreamDecoder` and
+buffers at most two decoded batches, so the first batch can be returned before
+object EOF without collecting the complete part. A bounded framing validator
+rejects oversized metadata, impossible body lengths, and compressed IPC before
+Arrow decoding, preventing declared decompression sizes from bypassing the
+encoded-byte ceiling. The returned Flight stream owns the reader pump, decoder,
+deadline, and admission permit; completion, failure, timeout, cancellation, or
+client drop tears down that whole pipeline, and the permit remains held until
+the blocking decoder actually exits.
+
 The wire surface is also exercised by Apache Arrow's official ADBC Flight SQL
 driver, independently of the Rust SDK. `mise run test-adbc` starts real
 loopback Query listeners and verifies a typed 20,000-row multi-batch result,

@@ -24,6 +24,7 @@
 //! `execute_sql` runs SQL in-process; [`serve`] exposes the same engine over
 //! the Arrow Flight SQL wire (see `flight`).
 
+mod async_ipc;
 mod async_query;
 mod async_scheduler;
 mod flight;

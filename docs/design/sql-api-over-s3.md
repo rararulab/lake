@@ -159,8 +159,13 @@ schema encoding, streaming, error mapping, and result-location semantics.
    Rust SDK exposes convenience and persistable-handle lifecycles, while Query
    uses an injected dedicated CAS store and result object store. Stable
    identity-bound submission ids make lost initial responses idempotent.
-3. Bounded result materialization, atomic manifest publication, exact DoGet
-   endpoints, and expiry cleanup are implemented.
+3. **Implemented:** bounded result materialization, atomic manifest
+   publication, exact `DoGet` endpoints, and expiry cleanup. IPC parts stream
+   through fixed-capacity byte channels in both directions; downloads use
+   Arrow's incremental `StreamDecoder` and a bounded batch channel instead of
+   reading or collecting a complete part. A bounded framing check rejects
+   compressed or oversized untrusted IPC before Arrow allocation, and Query
+   admission remains charged until the blocking decoder has actually exited.
 4. **Implemented:** a pinned official ADBC Flight SQL client verifies typed
    interactive streaming, bearer propagation, and read-only errors against a
    real Query listener. Standard Arrow Flight tests cover `PollFlightInfo`,
