@@ -33,6 +33,7 @@ use lake_common::{
 };
 use lake_meta::MetaStoreRef;
 use lake_objects::{ManagedObjectScope, ManagedObjectStore, open_verified};
+use ring::digest;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 use tokio::io::AsyncReadExt;
@@ -195,6 +196,8 @@ pub(crate) enum AsyncQueryCoordinatorError {
     InvalidJobSpec,
     #[snafu(display("system time cannot represent async query lifetime"))]
     InvalidTime,
+    #[snafu(display("async submission id is already bound to another statement"))]
+    SubmissionConflict,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -279,6 +282,88 @@ impl AsyncQueryCoordinator {
         self.submit(encrypted_job, principal).await
     }
 
+    pub(crate) async fn submit_statement_with_id(
+        &self,
+        statement: &StatementTicket,
+        principal: &Principal,
+        submission_id: [u8; 16],
+    ) -> Result<AsyncQuerySubmission, AsyncQueryCoordinatorError> {
+        let query_id = submission_query_id(principal, submission_id);
+        if let Some(submission) = self
+            .existing_submission(&query_id, statement, principal)
+            .await?
+        {
+            return Ok(submission);
+        }
+        let encrypted_job = self
+            .job_codec
+            .seal_statement(statement, principal)
+            .map_err(|source| AsyncQueryCoordinatorError::Ticket { source })?;
+        match self
+            .submit_with_query_id_at(&query_id, encrypted_job, principal, SystemTime::now())
+            .await
+        {
+            Ok(submission) => Ok(submission),
+            Err(AsyncQueryCoordinatorError::Store {
+                source: AsyncQueryStoreError::AlreadyExists,
+            }) => self
+                .resume_submission_with_id(&statement.sql, principal, submission_id)
+                .await?
+                .ok_or(AsyncQueryCoordinatorError::SubmissionConflict),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) async fn resume_submission_with_id(
+        &self,
+        sql: &str,
+        principal: &Principal,
+        submission_id: [u8; 16],
+    ) -> Result<Option<AsyncQuerySubmission>, AsyncQueryCoordinatorError> {
+        let query_id = submission_query_id(principal, submission_id);
+        let Some(record) = self
+            .store
+            .load(&query_id)
+            .await
+            .map_err(|source| AsyncQueryCoordinatorError::Store { source })?
+        else {
+            return Ok(None);
+        };
+        let statement = self.open_job(&record).await?;
+        if !record.belongs_to(principal) || statement.sql != sql {
+            return Err(AsyncQueryCoordinatorError::SubmissionConflict);
+        }
+        Ok(Some(AsyncQuerySubmission {
+            query_id:    query_id.clone(),
+            poll_handle: self.seal_poll_handle(&query_id, principal)?,
+            expires_at:  record.expires_at(),
+        }))
+    }
+
+    async fn existing_submission(
+        &self,
+        query_id: &str,
+        statement: &StatementTicket,
+        principal: &Principal,
+    ) -> Result<Option<AsyncQuerySubmission>, AsyncQueryCoordinatorError> {
+        let Some(record) = self
+            .store
+            .load(query_id)
+            .await
+            .map_err(|source| AsyncQueryCoordinatorError::Store { source })?
+        else {
+            return Ok(None);
+        };
+        if !record.belongs_to(principal) || self.open_job(&record).await? != *statement {
+            return Err(AsyncQueryCoordinatorError::SubmissionConflict);
+        }
+        Ok(Some(AsyncQuerySubmission {
+            query_id:    query_id.to_owned(),
+            poll_handle: self.seal_poll_handle(query_id, principal)?,
+            expires_at:  record.expires_at(),
+        }))
+    }
+
     pub(crate) async fn submit(
         &self,
         encrypted_job: Vec<u8>,
@@ -294,7 +379,22 @@ impl AsyncQueryCoordinator {
         principal: &Principal,
         now: SystemTime,
     ) -> Result<AsyncQuerySubmission, AsyncQueryCoordinatorError> {
-        if encrypted_job.is_empty() || encrypted_job.len() as u64 > MAX_JOB_SPEC_BYTES {
+        let query_id = uuid::Uuid::now_v7().to_string();
+        self.submit_with_query_id_at(&query_id, encrypted_job, principal, now)
+            .await
+    }
+
+    async fn submit_with_query_id_at(
+        &self,
+        query_id: &str,
+        encrypted_job: Vec<u8>,
+        principal: &Principal,
+        now: SystemTime,
+    ) -> Result<AsyncQuerySubmission, AsyncQueryCoordinatorError> {
+        if state_key(query_id).is_none()
+            || encrypted_job.is_empty()
+            || encrypted_job.len() as u64 > MAX_JOB_SPEC_BYTES
+        {
             return Err(AsyncQueryCoordinatorError::InvalidJobSpec);
         }
         let now = now
@@ -304,8 +404,7 @@ impl AsyncQueryCoordinator {
         let expires_at = now
             .checked_add(self.lifetime.as_secs())
             .ok_or(AsyncQueryCoordinatorError::InvalidTime)?;
-        let query_id = uuid::Uuid::now_v7().to_string();
-        let scope = ManagedObjectScope::try_new(principal.tenant().as_str(), &query_id)
+        let scope = ManagedObjectScope::try_new(principal.tenant().as_str(), query_id)
             .map_err(|source| AsyncQueryCoordinatorError::Object { source })?;
         let input = AsyncStreamReader::new(stream::iter([Ok::<Bytes, io::Error>(Bytes::from(
             encrypted_job,
@@ -321,7 +420,7 @@ impl AsyncQueryCoordinator {
             .await
             .map_err(|source| AsyncQueryCoordinatorError::Object { source })?;
         let record = AsyncQueryRecord::try_new(
-            &query_id,
+            query_id,
             principal.tenant().as_str(),
             principal.subject(),
             job_spec,
@@ -335,9 +434,9 @@ impl AsyncQueryCoordinator {
             .create(record)
             .await
             .map_err(|source| AsyncQueryCoordinatorError::Store { source })?;
-        let poll_handle = self.seal_poll_handle(&query_id, principal)?;
+        let poll_handle = self.seal_poll_handle(query_id, principal)?;
         Ok(AsyncQuerySubmission {
-            query_id,
+            query_id: query_id.to_owned(),
             poll_handle,
             expires_at,
         })
@@ -586,6 +685,25 @@ impl AsyncQueryCoordinator {
             .await
             .map_err(|source| AsyncQueryCoordinatorError::Object { source })
     }
+}
+
+fn submission_query_id(principal: &Principal, submission_id: [u8; 16]) -> String {
+    let mut context = digest::Context::new(&digest::SHA256);
+    context.update(b"lake-query-async-submission-v1\0");
+    context.update(principal.tenant().as_str().as_bytes());
+    context.update(b"\0");
+    context.update(principal.subject().as_bytes());
+    context.update(b"\0");
+    context.update(&submission_id);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    context.finish().as_ref().iter().fold(
+        String::with_capacity(digest::SHA256_OUTPUT_LEN * 2),
+        |mut output, byte| {
+            output.push(char::from(HEX[usize::from(*byte >> 4)]));
+            output.push(char::from(HEX[usize::from(*byte & 0x0f)]));
+            output
+        },
+    )
 }
 
 impl AsyncResultManifest {
@@ -1835,5 +1953,108 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(values.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn coordinator_submission_id_retries_converge_on_one_job() {
+        let state_directory = tempfile::tempdir().unwrap();
+        let state: MetaStoreRef = Arc::new(RocksMeta::open(state_directory.path()).unwrap());
+        let object_directory = tempfile::tempdir().unwrap();
+        let objects = Arc::new(
+            LocalObjectStore::open(object_directory.path())
+                .await
+                .unwrap(),
+        );
+        let coordinator = AsyncQueryCoordinator::try_new(
+            state,
+            objects,
+            QueryTicketKeyRing::try_new(
+                b"async-resume-ticket-key-material-000001",
+                std::iter::empty(),
+            )
+            .unwrap(),
+            Duration::from_hours(6),
+            Duration::from_mins(5),
+        )
+        .unwrap();
+        let statement = StatementTicket {
+            sql:       "SELECT 1".to_owned(),
+            snapshots: Vec::new(),
+        };
+        let alice = principal("restart-safe@example");
+        let submission_id = [3_u8; 16];
+
+        let (first, retried) = tokio::join!(
+            coordinator.submit_statement_with_id(&statement, &alice, submission_id),
+            coordinator.submit_statement_with_id(&statement, &alice, submission_id),
+        );
+        let first = first.unwrap();
+        let retried = retried.unwrap();
+
+        assert_eq!(first.query_id(), retried.query_id());
+        assert_eq!(
+            coordinator
+                .open_poll_handle(first.poll_handle(), &alice)
+                .unwrap(),
+            coordinator
+                .open_poll_handle(retried.poll_handle(), &alice)
+                .unwrap()
+        );
+        let (query_ids, continuation) =
+            coordinator.store().list_query_ids_page(None).await.unwrap();
+        assert_eq!(query_ids, [first.query_id()]);
+        assert!(continuation.is_none());
+    }
+
+    #[tokio::test]
+    async fn async_submission_id_rejects_statement_alias() {
+        let state_directory = tempfile::tempdir().unwrap();
+        let state: MetaStoreRef = Arc::new(RocksMeta::open(state_directory.path()).unwrap());
+        let object_directory = tempfile::tempdir().unwrap();
+        let objects = Arc::new(
+            LocalObjectStore::open(object_directory.path())
+                .await
+                .unwrap(),
+        );
+        let coordinator = AsyncQueryCoordinator::try_new(
+            state,
+            objects,
+            QueryTicketKeyRing::try_new(
+                b"async-alias-ticket-key-material-000001",
+                std::iter::empty(),
+            )
+            .unwrap(),
+            Duration::from_hours(6),
+            Duration::from_mins(5),
+        )
+        .unwrap();
+        let original = StatementTicket {
+            sql:       "SELECT 1".to_owned(),
+            snapshots: Vec::new(),
+        };
+        let replacement = StatementTicket {
+            sql:       "SELECT 2".to_owned(),
+            snapshots: Vec::new(),
+        };
+        let alice = principal("alias-safe@example");
+        let submission_id = [4_u8; 16];
+        let submitted = coordinator
+            .submit_statement_with_id(&original, &alice, submission_id)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            coordinator
+                .submit_statement_with_id(&replacement, &alice, submission_id)
+                .await,
+            Err(super::AsyncQueryCoordinatorError::SubmissionConflict)
+        ));
+        let record = coordinator
+            .store()
+            .load(submitted.query_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(coordinator.open_job(&record).await.unwrap(), original);
     }
 }

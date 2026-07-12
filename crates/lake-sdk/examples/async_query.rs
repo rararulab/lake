@@ -22,7 +22,7 @@ use lake_engine_lance::LanceEngine;
 use lake_meta::{MetaStoreRef, RocksMeta};
 use lake_objects::LocalObjectStore;
 use lake_query::{AsyncQueryConfig, QueryEngine, QueryServerConfig};
-use lake_sdk::LakeClient;
+use lake_sdk::{AsyncQueryHandle, LakeClient};
 use tempfile::tempdir;
 
 fn free_addr() -> Result<String, Box<dyn Error>> {
@@ -58,11 +58,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // result parts remain server-owned; the SDK still connects only to Query.
     let stage = LocalObjectStore::open(root.path().join("managed-files")).await?;
     let client = LakeClient::connect_with_store(format!("http://{address}"), stage).await?;
-    let mut batches = client
-        .query_async(
+    let handle = client
+        .submit_async(
             "SELECT CAST(value AS BIGINT) AS value FROM (VALUES (1), (2)) AS rows(value) ORDER BY \
              value",
         )
+        .await?;
+    let checkpoint = handle.to_json()?;
+    drop(client); // Simulate a caller restart after durable submission.
+
+    let stage = LocalObjectStore::open(root.path().join("managed-files")).await?;
+    let restarted = LakeClient::connect_with_store(format!("http://{address}"), stage).await?;
+    let mut batches = restarted
+        .resume_async(AsyncQueryHandle::from_json(&checkpoint)?)
         .await?;
     let mut values = Vec::new();
     while let Some(batch) = batches.try_next().await? {
@@ -74,7 +82,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         values.extend(column.values().iter().copied());
     }
     assert_eq!(values, [1, 2]);
-    eprintln!("durable PollFlightInfo query completed: {values:?}");
+    eprintln!("restart-safe PollFlightInfo query completed: {values:?}");
     server.abort();
     Ok(())
 }

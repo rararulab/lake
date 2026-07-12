@@ -150,8 +150,9 @@ schema encoding, streaming, error mapping, and result-location semantics.
    and staged ticket-key rotation are wired; next pin exact table snapshots,
    finish cancellation coverage, and add load tests.
 2. Add an async query state store and `PollFlightInfo`. **Implemented:** the
-   Rust SDK exposes `query_async`, while Query uses an injected dedicated CAS
-   store and result object store.
+   Rust SDK exposes convenience and persistable-handle lifecycles, while Query
+   uses an injected dedicated CAS store and result object store. Stable
+   identity-bound submission ids make lost initial responses idempotent.
 3. Bounded result materialization, atomic manifest publication, exact DoGet
    endpoints, and expiry cleanup are implemented.
 4. Add ADBC compatibility tests for streaming, polling, endpoint downloads,

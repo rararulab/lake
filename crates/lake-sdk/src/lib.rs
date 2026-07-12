@@ -23,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use arrow::{
@@ -33,7 +33,8 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_flight::{
-    Action, FlightClient, FlightData, FlightDescriptor, PutResult,
+    Action, CancelFlightInfoRequest, CancelStatus, FlightClient, FlightData, FlightDescriptor,
+    FlightInfo, PollInfo, PutResult, Ticket,
     decode::FlightRecordBatchStream,
     encode::FlightDataEncoderBuilder,
     error::FlightError,
@@ -55,6 +56,7 @@ pub use lake_objects::{ObjectIntegrityError, PresignedRead};
 use moka::{future::Cache, ops::compute::Op};
 use prost::Message;
 use prost_types::Any;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::{io::AsyncRead, sync::Mutex};
@@ -72,6 +74,12 @@ const MAX_INSERT_INPUT_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INSERT_OUTPUT_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INSERT_FLIGHT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PENDING_APPEND_CHECKPOINTS: usize = 1_024;
+const ASYNC_QUERY_HANDLE_VERSION: u8 = 1;
+const MAX_ASYNC_QUERY_HANDLE_BYTES: usize = 16 * 1024;
+const MAX_ASYNC_RESULT_ENDPOINTS: usize = 4_096;
+const ASYNC_SUBMIT_RETRY_WINDOW: Duration = Duration::from_secs(30);
+const ASYNC_POLL_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const ASYNC_POLL_MAX_BACKOFF: Duration = Duration::from_secs(2);
 
 fn ambiguous_append_error(error: &SdkError) -> bool {
     match error {
@@ -91,6 +99,20 @@ fn ambiguous_append_error(error: &SdkError) -> bool {
         // them proves a server-side rejection.
         SdkError::Flight { .. } => true,
         _ => false,
+    }
+}
+
+fn ambiguous_async_submission_error(error: &FlightError) -> bool {
+    match error {
+        FlightError::Tonic(status) => matches!(
+            status.code(),
+            tonic::Code::Cancelled
+                | tonic::Code::Unknown
+                | tonic::Code::DeadlineExceeded
+                | tonic::Code::Internal
+                | tonic::Code::Unavailable
+        ),
+        _ => true,
     }
 }
 
@@ -282,6 +304,18 @@ pub enum SdkError {
 
     #[snafu(display("asynchronous query did not complete within {timeout:?}"))]
     AsyncQueryTimeout { timeout: Duration },
+
+    #[snafu(display("asynchronous query handle is invalid"))]
+    InvalidAsyncQueryHandle,
+
+    #[snafu(display("asynchronous query capability expired at Unix second {expires_at}"))]
+    AsyncQueryHandleExpired { expires_at: u64 },
+
+    #[snafu(display("asynchronous query handle JSON is invalid"))]
+    AsyncQueryHandleJson { source: serde_json::Error },
+
+    #[snafu(display("asynchronous query result capability is invalid"))]
+    InvalidAsyncQueryResult,
 
     #[snafu(display("query result column '{column}' is missing"))]
     MissingResultColumn { column: String },
@@ -668,6 +702,137 @@ pub struct LakeClient {
 pub type AsyncQueryResultStream =
     Pin<Box<dyn Stream<Item = std::result::Result<RecordBatch, FlightError>> + Send>>;
 
+/// Result of one non-blocking durable query poll.
+pub enum AsyncQueryPoll {
+    /// Query remains queued or running; persist the refreshed capability.
+    Pending(AsyncQueryHandle),
+    /// Every immutable result part is published and ready for consumption.
+    Complete(AsyncQueryResult),
+}
+
+impl fmt::Debug for AsyncQueryPoll {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending(handle) => formatter.debug_tuple("Pending").field(handle).finish(),
+            Self::Complete(result) => formatter.debug_tuple("Complete").field(result).finish(),
+        }
+    }
+}
+
+/// Bounded exact Flight tickets for an already completed async query.
+pub struct AsyncQueryResult {
+    tickets: Vec<Ticket>,
+}
+
+impl AsyncQueryResult {
+    /// Number of ordered immutable result parts.
+    #[must_use]
+    pub fn part_count(&self) -> usize { self.tickets.len() }
+}
+
+impl fmt::Debug for AsyncQueryResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AsyncQueryResult")
+            .field("part_count", &self.tickets.len())
+            .field("tickets", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Persistable opaque capability for one durable asynchronous query.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AsyncQueryHandle {
+    version:         u8,
+    poll_descriptor: Vec<u8>,
+    expires_at_secs: u64,
+}
+
+impl AsyncQueryHandle {
+    fn try_new(poll_descriptor: Vec<u8>, expires_at_secs: u64) -> Result<Self> {
+        let handle = Self {
+            version: ASYNC_QUERY_HANDLE_VERSION,
+            poll_descriptor,
+            expires_at_secs,
+        };
+        handle.validate()?;
+        Ok(handle)
+    }
+
+    /// Serialize this opaque capability for caller-owned durable storage.
+    pub fn to_json(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|source| SdkError::AsyncQueryHandleJson { source })
+    }
+
+    /// Restore and fully validate a serialized capability.
+    pub fn from_json(encoded: &[u8]) -> Result<Self> {
+        if encoded.is_empty() || encoded.len() > MAX_ASYNC_QUERY_HANDLE_BYTES * 5 {
+            return Err(SdkError::InvalidAsyncQueryHandle);
+        }
+        let handle: Self = serde_json::from_slice(encoded)
+            .map_err(|source| SdkError::AsyncQueryHandleJson { source })?;
+        handle.validate()?;
+        Ok(handle)
+    }
+
+    /// Unix timestamp after which the current poll capability is invalid.
+    #[must_use]
+    pub const fn expires_at_unix_seconds(&self) -> u64 { self.expires_at_secs }
+
+    fn validate(&self) -> Result<()> {
+        if self.version != ASYNC_QUERY_HANDLE_VERSION
+            || self.poll_descriptor.is_empty()
+            || self.poll_descriptor.len() > MAX_ASYNC_QUERY_HANDLE_BYTES
+            || self.expires_at_secs == 0
+        {
+            return Err(SdkError::InvalidAsyncQueryHandle);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for AsyncQueryHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AsyncQueryHandle")
+            .field("version", &self.version)
+            .field("poll_descriptor", &"<redacted>")
+            .field("expires_at_secs", &self.expires_at_secs)
+            .finish()
+    }
+}
+
+fn async_poll_expiration(poll: &PollInfo) -> Result<u64> {
+    let expiration = poll
+        .expiration_time
+        .as_ref()
+        .ok_or(SdkError::InvalidAsyncQueryHandle)?;
+    if expiration.seconds <= 0 || !(0..1_000_000_000).contains(&expiration.nanos) {
+        return Err(SdkError::InvalidAsyncQueryHandle);
+    }
+    u64::try_from(expiration.seconds).map_err(|_| SdkError::InvalidAsyncQueryHandle)
+}
+
+fn async_handle_from_poll(poll: &PollInfo) -> Result<AsyncQueryHandle> {
+    let descriptor = poll
+        .flight_descriptor
+        .as_ref()
+        .ok_or(SdkError::InvalidAsyncQueryHandle)?;
+    if descriptor.cmd.is_empty() || !descriptor.path.is_empty() {
+        return Err(SdkError::InvalidAsyncQueryHandle);
+    }
+    AsyncQueryHandle::try_new(descriptor.cmd.to_vec(), async_poll_expiration(poll)?)
+}
+
+fn async_result_from_poll(poll: PollInfo) -> Result<AsyncQueryResult> {
+    let info = poll.info.context(MissingQueryEndpointSnafu)?;
+    Ok(AsyncQueryResult {
+        tickets: LakeClient::async_result_tickets(info)?,
+    })
+}
+
 /// Builder for authenticated and TLS-verified SDK connections.
 #[derive(Clone, Debug)]
 pub struct LakeClientBuilder {
@@ -1015,43 +1180,136 @@ impl LakeClient {
         if timeout.is_zero() {
             return Err(SdkError::AsyncQueryTimeout { timeout });
         }
+        tokio::time::timeout(timeout, async {
+            let handle = self.submit_async(sql).await?;
+            self.resume_async(handle).await
+        })
+        .await
+        .map_err(|_| SdkError::AsyncQueryTimeout { timeout })?
+    }
+
+    /// Submit once and return a persistable capability without waiting for
+    /// execution. Ambiguous initial responses retry with one stable id.
+    pub async fn submit_async(&self, sql: &str) -> Result<AsyncQueryHandle> {
+        self.submit_async_with_timeout(sql, ASYNC_SUBMIT_RETRY_WINDOW)
+            .await
+    }
+
+    /// As [`Self::submit_async`], with a finite initial-response retry window.
+    pub async fn submit_async_with_timeout(
+        &self,
+        sql: &str,
+        timeout: Duration,
+    ) -> Result<AsyncQueryHandle> {
+        if timeout.is_zero() {
+            return Err(SdkError::AsyncQueryTimeout { timeout });
+        }
+        let submission_id = uuid::Uuid::now_v7();
         let command = CommandStatementQuery {
             query:          sql.to_owned(),
-            transaction_id: None,
+            transaction_id: Some(submission_id.as_bytes().to_vec().into()),
         };
-        let mut descriptor = FlightDescriptor::new_cmd(command.as_any().encode_to_vec());
+        let descriptor = FlightDescriptor::new_cmd(command.as_any().encode_to_vec());
         let mut client = FlightClient::new(self.query.clone());
         self.security
             .apply_to_flight_client(&mut client)
             .context(SecuritySnafu)?;
-        let poll = tokio::time::timeout(timeout, async {
-            let mut backoff = Duration::from_millis(100);
+        tokio::time::timeout(timeout, async {
+            let mut backoff = ASYNC_POLL_INITIAL_BACKOFF;
             loop {
-                let poll = client
-                    .poll_flight_info(descriptor)
-                    .await
-                    .context(FlightSnafu)?;
-                if poll.flight_descriptor.is_none() {
-                    return Ok::<_, SdkError>(poll);
+                match client.poll_flight_info(descriptor.clone()).await {
+                    Ok(poll) => return async_handle_from_poll(&poll),
+                    Err(error) if ambiguous_async_submission_error(&error) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = backoff.saturating_mul(2).min(ASYNC_POLL_MAX_BACKOFF);
+                    }
+                    Err(source) => return Err(SdkError::Flight { source }),
                 }
-                descriptor = poll
-                    .flight_descriptor
-                    .expect("checked PollFlightInfo retry descriptor");
+            }
+        })
+        .await
+        .map_err(|_| SdkError::AsyncQueryTimeout { timeout })?
+    }
+
+    /// Perform one standard `PollFlightInfo` call using a restored handle.
+    pub async fn poll_async(&self, handle: &AsyncQueryHandle) -> Result<AsyncQueryPoll> {
+        handle.validate()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(u64::MAX, |duration| duration.as_secs());
+        if now >= handle.expires_at_secs {
+            return Err(SdkError::AsyncQueryHandleExpired {
+                expires_at: handle.expires_at_secs,
+            });
+        }
+        let mut client = FlightClient::new(self.query.clone());
+        self.security
+            .apply_to_flight_client(&mut client)
+            .context(SecuritySnafu)?;
+        let poll = client
+            .poll_flight_info(FlightDescriptor::new_cmd(handle.poll_descriptor.clone()))
+            .await
+            .context(FlightSnafu)?;
+        if poll.flight_descriptor.is_some() {
+            Ok(AsyncQueryPoll::Pending(async_handle_from_poll(&poll)?))
+        } else {
+            Ok(AsyncQueryPoll::Complete(async_result_from_poll(poll)?))
+        }
+    }
+
+    /// Resume a restored handle until completion and open its ordered parts.
+    pub async fn resume_async(&self, handle: AsyncQueryHandle) -> Result<AsyncQueryResultStream> {
+        self.resume_async_with_timeout(handle, Duration::from_hours(24))
+            .await
+    }
+
+    /// As [`Self::resume_async`], bounded by caller-selected wall time.
+    pub async fn resume_async_with_timeout(
+        &self,
+        mut handle: AsyncQueryHandle,
+        timeout: Duration,
+    ) -> Result<AsyncQueryResultStream> {
+        if timeout.is_zero() {
+            return Err(SdkError::AsyncQueryTimeout { timeout });
+        }
+        let result = tokio::time::timeout(timeout, async {
+            let mut backoff = ASYNC_POLL_INITIAL_BACKOFF;
+            loop {
+                match self.poll_async(&handle).await? {
+                    AsyncQueryPoll::Pending(refreshed) => handle = refreshed,
+                    AsyncQueryPoll::Complete(result) => return Ok::<_, SdkError>(result),
+                }
                 tokio::time::sleep(backoff).await;
-                backoff = backoff.saturating_mul(2).min(Duration::from_secs(2));
+                backoff = backoff.saturating_mul(2).min(ASYNC_POLL_MAX_BACKOFF);
             }
         })
         .await
         .map_err(|_| SdkError::AsyncQueryTimeout { timeout })??;
-        let info = poll.info.context(MissingQueryEndpointSnafu)?;
-        if info.endpoint.is_empty() {
+        self.open_async_result(result)
+    }
+
+    /// Cancel queued or running work represented by a restored handle.
+    pub async fn cancel_async(&self, handle: &AsyncQueryHandle) -> Result<CancelStatus> {
+        handle.validate()?;
+        let mut client = FlightClient::new(self.query.clone());
+        self.security
+            .apply_to_flight_client(&mut client)
+            .context(SecuritySnafu)?;
+        let result = client
+            .cancel_flight_info(CancelFlightInfoRequest::new(
+                FlightInfo::new().with_app_metadata(handle.poll_descriptor.clone()),
+            ))
+            .await
+            .context(FlightSnafu)?;
+        Ok(result.status())
+    }
+
+    /// Consume exact completed result tickets in manifest order.
+    pub fn open_async_result(&self, result: AsyncQueryResult) -> Result<AsyncQueryResultStream> {
+        if result.tickets.is_empty() || result.tickets.len() > MAX_ASYNC_RESULT_ENDPOINTS {
             return Err(SdkError::MissingQueryEndpoint);
         }
-        let tickets = info
-            .endpoint
-            .into_iter()
-            .map(|endpoint| endpoint.ticket.context(MissingQueryTicketSnafu))
-            .collect::<Result<Vec<_>>>()?;
+        let tickets = result.tickets;
         let mut requests = Vec::with_capacity(tickets.len());
         for ticket in tickets {
             let mut client = FlightClient::new(self.query.clone());
@@ -1063,6 +1321,23 @@ impl LakeClient {
         let streams = futures::stream::iter(requests)
             .then(|(mut client, ticket)| async move { client.do_get(ticket).await });
         Ok(Box::pin(streams.try_flatten()))
+    }
+
+    fn async_result_tickets(info: FlightInfo) -> Result<Vec<Ticket>> {
+        if info.endpoint.is_empty() || info.endpoint.len() > MAX_ASYNC_RESULT_ENDPOINTS {
+            return Err(SdkError::MissingQueryEndpoint);
+        }
+        let tickets = info
+            .endpoint
+            .into_iter()
+            .map(|endpoint| endpoint.ticket.context(MissingQueryTicketSnafu))
+            .collect::<Result<Vec<_>>>()?;
+        if tickets.iter().any(|ticket| {
+            ticket.ticket.is_empty() || ticket.ticket.len() > MAX_ASYNC_QUERY_HANDLE_BYTES
+        }) {
+            return Err(SdkError::InvalidAsyncQueryResult);
+        }
+        Ok(tickets)
     }
 
     /// Open a direct storage reader that verifies size and SHA-256 at EOF.
@@ -1465,7 +1740,8 @@ mod tests {
         datatypes::{DataType, Field, Schema},
     };
     use arrow_flight::{
-        FlightData, FlightDescriptor, FlightInfo,
+        CancelStatus, FlightData, FlightDescriptor, FlightInfo,
+        error::FlightError,
         flight_service_server::FlightServiceServer,
         sql::{CommandStatementQuery, SqlInfo, server::FlightSqlService},
     };
@@ -1488,7 +1764,7 @@ mod tests {
         LocalObjectStore, ManagedObjectStore, ObjectReader, Result as ObjectResult, S3ObjectStore,
         data_location_field, data_location_from_array,
     };
-    use lake_query::{AsyncQueryConfig, QueryEngine, QueryServerConfig};
+    use lake_query::{AsyncQueryConfig, QueryEngine, QueryServerConfig, QueryTicketKeyRing};
     use prost::Message;
     use rcgen::generate_simple_self_signed;
     use sha2::{Digest, Sha256};
@@ -3358,6 +3634,15 @@ mod tests {
 
     #[tokio::test]
     async fn sdk_async_query_roundtrip_uses_poll_flight_info() {
+        assert_sdk_query_async_roundtrip().await;
+    }
+
+    #[tokio::test]
+    async fn sdk_query_async_delegates_to_restart_safe_handle() {
+        assert_sdk_query_async_roundtrip().await;
+    }
+
+    async fn assert_sdk_query_async_roundtrip() {
         let root = tempdir().unwrap();
         let catalog: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("catalog")).unwrap());
         let state: MetaStoreRef =
@@ -3405,6 +3690,169 @@ mod tests {
             .unwrap();
         assert_eq!(values.value(0), 42);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn sdk_resumes_async_query_after_client_restart() {
+        let root = tempdir().unwrap();
+        let catalog: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("catalog")).unwrap());
+        let state: MetaStoreRef =
+            Arc::new(RocksMeta::open(root.path().join("async-state")).unwrap());
+        let results = Arc::new(
+            LocalObjectStore::open(root.path().join("async-results"))
+                .await
+                .unwrap(),
+        );
+        let keys = QueryTicketKeyRing::try_new(
+            b"sdk-resume-shared-ticket-key-material-000001",
+            std::iter::empty(),
+        )
+        .unwrap();
+        let first_address = free_addr();
+        let second_address = free_addr();
+        let first_server = tokio::spawn({
+            let address = first_address.clone();
+            let engine = Arc::new(QueryEngine::new(
+                catalog.clone(),
+                Arc::new(LanceEngine::new()),
+            ));
+            let config = QueryServerConfig::new()
+                .with_ticket_keys(keys.clone())
+                .with_async_queries(
+                    AsyncQueryConfig::new(state.clone(), results.clone())
+                        .with_scan_interval(Duration::from_millis(10)),
+                );
+            async move { lake_query::serve_with_config(engine, &address, config).await }
+        });
+        let second_server = tokio::spawn({
+            let address = second_address.clone();
+            let engine = Arc::new(QueryEngine::new(catalog, Arc::new(LanceEngine::new())));
+            let config = QueryServerConfig::new()
+                .with_ticket_keys(keys)
+                .with_async_queries(
+                    AsyncQueryConfig::new(state, results)
+                        .with_scan_interval(Duration::from_millis(10)),
+                );
+            async move { lake_query::serve_with_config(engine, &address, config).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let first_stage = LocalObjectStore::open(root.path().join("first-client-stage"))
+            .await
+            .unwrap();
+        let first = LakeClient::connect_with_store(format!("http://{first_address}"), first_stage)
+            .await
+            .unwrap();
+        let encoded = first
+            .submit_async("SELECT CAST(42 AS BIGINT) AS answer")
+            .await
+            .unwrap()
+            .to_json()
+            .unwrap();
+        drop(first);
+
+        let second_stage = LocalObjectStore::open(root.path().join("second-client-stage"))
+            .await
+            .unwrap();
+        let second =
+            LakeClient::connect_with_store(format!("http://{second_address}"), second_stage)
+                .await
+                .unwrap();
+        let batches = second
+            .resume_async(crate::AsyncQueryHandle::from_json(&encoded).unwrap())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let values = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 42);
+        first_server.abort();
+        second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn sdk_cancels_resumed_async_query_idempotently() {
+        let root = tempdir().unwrap();
+        let catalog: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("catalog")).unwrap());
+        let state: MetaStoreRef =
+            Arc::new(RocksMeta::open(root.path().join("async-state")).unwrap());
+        let results = Arc::new(
+            LocalObjectStore::open(root.path().join("async-results"))
+                .await
+                .unwrap(),
+        );
+        let engine = Arc::new(QueryEngine::new(catalog, Arc::new(LanceEngine::new())));
+        let address = free_addr();
+        let server = tokio::spawn({
+            let address = address.clone();
+            async move {
+                lake_query::serve_with_config(
+                    engine,
+                    &address,
+                    QueryServerConfig::new().with_async_queries(
+                        AsyncQueryConfig::new(state, results)
+                            .with_scan_interval(Duration::from_mins(1)),
+                    ),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stage = LocalObjectStore::open(root.path().join("client-stage"))
+            .await
+            .unwrap();
+        let client = LakeClient::connect_with_store(format!("http://{address}"), stage)
+            .await
+            .unwrap();
+        let encoded = client
+            .submit_async("SELECT 1")
+            .await
+            .unwrap()
+            .to_json()
+            .unwrap();
+        let restored = crate::AsyncQueryHandle::from_json(&encoded).unwrap();
+
+        assert_eq!(
+            client.cancel_async(&restored).await.unwrap(),
+            CancelStatus::Cancelled
+        );
+        assert_eq!(
+            client.cancel_async(&restored).await.unwrap(),
+            CancelStatus::Cancelled
+        );
+        assert!(matches!(
+            client.poll_async(&restored).await,
+            Err(SdkError::Flight {
+                source: FlightError::Tonic(status),
+            }) if status.code() == tonic::Code::Cancelled
+        ));
+        server.abort();
+    }
+
+    #[test]
+    fn async_query_handle_roundtrips_without_disclosing_payload() {
+        let opaque = vec![0x5a; 192];
+        let handle = crate::AsyncQueryHandle::try_new(opaque.clone(), 2_000_000_000).unwrap();
+        let encoded = handle.to_json().unwrap();
+        let restored = crate::AsyncQueryHandle::from_json(&encoded).unwrap();
+
+        assert_eq!(restored, handle);
+        assert_eq!(restored.expires_at_unix_seconds(), 2_000_000_000);
+        let debug = format!("{handle:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("5a"));
+        assert!(
+            !encoded
+                .windows(32)
+                .any(|window| window.iter().all(|byte| *byte == b'Z'))
+        );
+        assert!(crate::AsyncQueryHandle::try_new(Vec::new(), 2_000_000_000).is_err());
+        assert!(crate::AsyncQueryHandle::try_new(vec![0; 16 * 1024 + 1], 2_000_000_000).is_err());
     }
 
     fn free_addr() -> String {
