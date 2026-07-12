@@ -4321,6 +4321,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "datafusion",
+ "futures",
  "lake-common",
  "reqwest 0.13.4",
  "serde",
