@@ -459,8 +459,10 @@ design-level ones:
   SDK can group 1..=10,000 fully validated rows into one Arrow batch and one
   append operation. FILE uploads remain sequential and directly target the
   managed stage, so object-byte memory and metadata commits do not scale with
-  one another. The SDK receives only the query endpoint, discovers a
-  credential-free managed
+  one another. Caller metadata and accumulated returned locations each have a
+  16 MiB ceiling, and the final 64 MiB Flight ceiling uses protobuf encoded
+  lengths identical to Metasrv admission. The SDK receives only the query
+  endpoint, discovers a credential-free managed
   stage descriptor once, and constructs local/S3 access using process
   credentials; query forwards metadata to the leader-aware metasrv. Browser
   presigning, authenticated expiring locations, and codec indexes are

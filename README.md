@@ -45,8 +45,9 @@ let client = LakeClient::connect("http://127.0.0.1:50051").await?;
 Batch multiple episode rows into one bounded Arrow append and one table
 version. Each `FILE` still streams directly to managed storage; only its
 `DataLocation` enters the batch. Batches contain 1..=10,000 rows, cap caller
-metadata at 16 MiB and encoded Flight metadata at 64 MiB, and validate every
-row before the first upload:
+metadata and accumulated returned locations at 16 MiB each, use the exact
+protobuf size for the 64 MiB Flight limit, and validate every row before the
+first upload:
 
 ```rust
 let version = client

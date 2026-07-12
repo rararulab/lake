@@ -62,6 +62,7 @@ const MAX_SCHEMA_CACHE_CAPACITY: u64 = 65_536;
 const MAX_SCHEMA_CACHE_TTL: Duration = Duration::from_hours(1);
 const MAX_INSERT_BATCH_ROWS: usize = 10_000;
 const MAX_INSERT_INPUT_METADATA_BYTES: usize = 16 * 1024 * 1024;
+const MAX_INSERT_OUTPUT_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INSERT_FLIGHT_BYTES: usize = 64 * 1024 * 1024;
 
 fn ambiguous_append_error(error: &SdkError) -> bool {
@@ -779,10 +780,15 @@ impl LakeClient {
             }
         }
         let mut arrays = Vec::<ArrayRef>::with_capacity(schema.fields().len());
+        let mut output_metadata_bytes = 0usize;
         for (field, values) in schema.fields().iter().zip(column_values) {
             arrays.push(
-                self.upload_and_encode_column(field.data_type(), values)
-                    .await?,
+                self.upload_and_encode_column(
+                    field.data_type(),
+                    values,
+                    &mut output_metadata_bytes,
+                )
+                .await?,
             );
         }
         let batch = RecordBatch::try_new(schema, arrays).context(ArrowSnafu)?;
@@ -809,20 +815,7 @@ impl LakeClient {
             .first_mut()
             .expect("Flight encoder emits a schema message")
             .flight_descriptor = Some(descriptor);
-        let flight_bytes = messages.iter().fold(0usize, |total, message| {
-            total
-                .saturating_add(message.data_header.len())
-                .saturating_add(message.data_body.len())
-                .saturating_add(message.flight_descriptor.as_ref().map_or(0, |descriptor| {
-                    descriptor.cmd.len() + descriptor.path.iter().map(String::len).sum::<usize>()
-                }))
-        });
-        if flight_bytes > MAX_INSERT_FLIGHT_BYTES {
-            return Err(SdkError::BatchMetadataSize {
-                actual:  flight_bytes,
-                maximum: MAX_INSERT_FLIGHT_BYTES,
-            });
-        }
+        validate_flight_payload_size(&messages, MAX_INSERT_FLIGHT_BYTES)?;
         Ok(PendingAppend {
             operation_id,
             messages,
@@ -906,6 +899,7 @@ impl LakeClient {
         &self,
         data_type: &DataType,
         values: Vec<InsertValue>,
+        output_metadata_bytes: &mut usize,
     ) -> Result<ArrayRef> {
         if data_type == &DataType::Utf8 {
             let values = values
@@ -940,7 +934,16 @@ impl LakeClient {
                             .await
                     }
                 };
-                locations.push(location.context(ObjectSnafu)?);
+                let location = location.context(ObjectSnafu)?;
+                *output_metadata_bytes =
+                    output_metadata_bytes.saturating_add(data_location_metadata_bytes(&location));
+                if *output_metadata_bytes > MAX_INSERT_OUTPUT_METADATA_BYTES {
+                    return Err(SdkError::BatchMetadataSize {
+                        actual:  *output_metadata_bytes,
+                        maximum: MAX_INSERT_OUTPUT_METADATA_BYTES,
+                    });
+                }
+                locations.push(location);
             }
             return Ok(Arc::new(data_location_array(&locations)));
         }
@@ -1190,6 +1193,25 @@ fn batch_input_metadata_bytes(sql: &str, rows: &[Vec<InsertValue>]) -> usize {
     })
 }
 
+fn data_location_metadata_bytes(location: &DataLocation) -> usize {
+    location
+        .uri
+        .len()
+        .saturating_add(location.content_type.len())
+        .saturating_add(location.sha256.len())
+        .saturating_add(std::mem::size_of::<u64>())
+}
+
+fn validate_flight_payload_size(messages: &[FlightData], maximum: usize) -> Result<()> {
+    let actual = messages.iter().fold(0usize, |total, message| {
+        total.saturating_add(message.encoded_len())
+    });
+    if actual > maximum {
+        return Err(SdkError::BatchMetadataSize { actual, maximum });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1209,7 +1231,7 @@ mod tests {
         datatypes::{DataType, Field, Schema},
     };
     use arrow_flight::{
-        FlightDescriptor, FlightInfo,
+        FlightData, FlightDescriptor, FlightInfo,
         flight_service_server::FlightServiceServer,
         sql::{CommandStatementQuery, SqlInfo, server::FlightSqlService},
     };
@@ -1233,6 +1255,7 @@ mod tests {
         data_location_field, data_location_from_array,
     };
     use lake_query::{QueryEngine, QueryServerConfig};
+    use prost::Message;
     use rcgen::generate_simple_self_signed;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
@@ -1246,7 +1269,7 @@ mod tests {
         APPEND_RETRY_WINDOW, FileUpload, InsertValue, LakeClient, MAX_INSERT_BATCH_ROWS,
         MAX_INSERT_INPUT_METADATA_BYTES, MAX_SCHEMA_CACHE_CAPACITY, MAX_SCHEMA_CACHE_TTL,
         SchemaCache, SchemaCacheConfig, SdkError, data_location,
-        retry_ambiguous_append_with_window,
+        retry_ambiguous_append_with_window, validate_flight_payload_size,
     };
 
     #[derive(Clone)]
@@ -2469,15 +2492,15 @@ mod tests {
 
         let version = client
             .insert_many(
-                "INSERT INTO robots.episodes (episode_id, video) VALUES (?, ?)",
+                "INSERT INTO robots.episodes (video, episode_id) VALUES (?, ?)",
                 vec![
                     vec![
-                        InsertValue::Utf8("episode-batch-1".to_owned()),
                         InsertValue::File(FileUpload::from_path(&first, "video/mp4")),
+                        InsertValue::Utf8("episode-batch-1".to_owned()),
                     ],
                     vec![
-                        InsertValue::Utf8("episode-batch-2".to_owned()),
                         InsertValue::File(FileUpload::from_path(&second, "video/mp4")),
+                        InsertValue::Utf8("episode-batch-2".to_owned()),
                     ],
                 ],
             )
@@ -2583,6 +2606,27 @@ mod tests {
             Err(SdkError::BatchMetadataSize { .. })
         ));
         assert_eq!(object_count(&root.path().join("objects")).await, 0);
+    }
+
+    #[test]
+    fn sdk_batch_insert_flight_bound_uses_protobuf_size() {
+        let within = FlightData {
+            data_body: vec![0; 28].into(),
+            ..FlightData::default()
+        };
+        let maximum = within.encoded_len();
+        validate_flight_payload_size(std::slice::from_ref(&within), maximum).unwrap();
+
+        let over = FlightData {
+            data_body: vec![0; 29].into(),
+            ..FlightData::default()
+        };
+        assert!(over.encoded_len() > maximum);
+        assert!(matches!(
+            validate_flight_payload_size(&[over], maximum),
+            Err(SdkError::BatchMetadataSize { actual, maximum: limit })
+                if actual > limit
+        ));
     }
 
     #[tokio::test]
