@@ -83,6 +83,7 @@ principal-map permission check.
 
 - `tls.crt`, `tls.key`, and `ca.crt`;
 - `principals.json` for inbound SDK users and the health principal;
+- `ticket-keys.json`, shared byte-for-byte by every Query replica;
 - `health-token`, matching a principal-map entry;
 - `metadata-token`, matching a `query_service` principal accepted by Metasrv.
 
@@ -101,6 +102,7 @@ kubectl -n lake-system create secret generic lake-query-runtime \
   --from-file=tls.key=query/tls.key \
   --from-file=ca.crt=ca.crt \
   --from-file=principals.json=query/principals.json \
+  --from-file=ticket-keys.json=query/ticket-keys.json \
   --from-file=health-token=query/health-token \
   --from-file=metadata-token=query/metadata-token
 
@@ -112,6 +114,39 @@ kubectl -n lake-system create secret generic lake-metasrv-runtime \
   --from-file=health-token=metasrv/health-token \
   --from-file=peer-token=metasrv/peer-token
 ```
+
+The ticket key file is protected JSON. Secrets are high-entropy strings of at
+least 32 bytes; they are never key identifiers and must not be reused as bearer
+credentials. The active secret seals new statement tickets and up to three
+verification secrets decrypt tickets created during a rollout:
+
+```json
+{
+  "active": "replace-with-at-least-32-random-bytes",
+  "verification": []
+}
+```
+
+Rotate without breaking requests crossing Query replicas:
+
+1. **preload** — add the new secret to `verification` while the old secret
+   remains `active`, update the Secret, and finish the full Query rollout.
+2. **activate** — make the new secret `active`, retain the old secret in
+   `verification`, update the Secret, and finish a second full rollout.
+3. **retire** — wait longer than `LAKE_QUERY_TICKET_TTL_SECS` after the second
+   rollout, remove the old secret, and roll Query once more.
+
+Skipping preload lets a new replica issue tickets that old replicas cannot
+decrypt. Keep the file identical across all replicas behind one Flight
+endpoint; a remotely exposed Query refuses startup when it is absent.
+
+The first release that introduces encrypted statement tickets is not
+wire-compatible with an older Query binary that emits raw SQL handles. Adopt
+it with a blue/green Query Service cutover, or stop admission, drain all old
+Query connections, replace every replica, and then resume. Do not perform that
+one-time binary transition as an ordinary mixed-version rolling update. After
+every replica understands this envelope, later key changes use the staged
+rolling procedure above without downtime.
 
 The Query certificate must cover
 `lake-query.lake-system.svc.cluster.local`; the Metasrv certificate must cover

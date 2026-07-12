@@ -25,9 +25,13 @@
 //! the Arrow Flight SQL wire (see `flight`).
 
 mod flight;
+mod ticket;
 mod telemetry;
 
+pub use ticket::{QueryTicketError, QueryTicketKeyRing};
+
 use std::{
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -91,6 +95,9 @@ pub enum QueryError {
 
     #[snafu(display("invalid Query resources: {message}"))]
     InvalidResources { message: String },
+
+    #[snafu(display("invalid Query statement-ticket configuration"))]
+    InvalidTicketConfiguration,
 
     #[snafu(display("failed to initialize Query execution resources"))]
     Runtime { source: DataFusionError },
@@ -233,6 +240,8 @@ impl Default for QueryLimits {
 
 const DEFAULT_QUERY_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
 const DEFAULT_QUERY_SPILL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const DEFAULT_STATEMENT_TICKET_TTL: Duration = Duration::from_mins(5);
+const STATEMENT_TICKET_AUDIENCE: &str = "lake-query-statement-v1";
 const MIN_QUERY_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 const MIN_QUERY_SPILL_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -314,6 +323,8 @@ pub struct QueryServerConfig {
     allow_insecure:    bool,
     limits:            QueryLimits,
     discovery_limits:  DiscoveryLimits,
+    ticket_keys:       Option<QueryTicketKeyRing>,
+    ticket_ttl:        Duration,
     shutdown_grace:    Duration,
 }
 
@@ -329,6 +340,8 @@ impl QueryServerConfig {
             allow_insecure:    false,
             limits:            QueryLimits::default(),
             discovery_limits:  DiscoveryLimits::default(),
+            ticket_keys:       None,
+            ticket_ttl:        DEFAULT_STATEMENT_TICKET_TTL,
             shutdown_grace:    Duration::from_secs(30),
         }
     }
@@ -374,6 +387,22 @@ impl QueryServerConfig {
     #[must_use]
     pub const fn with_discovery_limits(mut self, limits: DiscoveryLimits) -> Self {
         self.discovery_limits = limits;
+        self
+    }
+
+    /// Install the shared active/verification key ring used by every Query
+    /// replica behind one Flight endpoint.
+    #[must_use]
+    pub fn with_ticket_keys(mut self, keys: QueryTicketKeyRing) -> Self {
+        self.ticket_keys = Some(keys);
+        self
+    }
+
+    /// Set statement-ticket validity. Values outside `1s..=1h` fail before
+    /// the server warms the catalog or binds its listener.
+    #[must_use]
+    pub const fn with_ticket_ttl(mut self, ttl: Duration) -> Self {
+        self.ticket_ttl = ttl;
         self
     }
 
@@ -529,6 +558,8 @@ where
         .server_security
         .validate_exposure(socket, config.allow_insecure)
         .context(SecuritySnafu)?;
+    let ticket_codec =
+        statement_ticket_codec_for_listener(socket, config.ticket_keys, config.ticket_ttl)?;
     let mut server = tonic::transport::Server::builder();
     if let Some(tls) = config.server_security.tls_config() {
         server = server.tls_config(tls).context(ServeSnafu)?;
@@ -564,6 +595,7 @@ where
             managed_stage:     config.managed_stage,
             admission:         flight::QueryAdmission::new(config.limits),
             discovery_limits:  config.discovery_limits,
+            ticket_codec,
         }));
 
     tracing::info!(%addr, "Flight SQL server ready");
@@ -612,6 +644,21 @@ where
     server_result?;
     refresher_result?;
     Ok(())
+}
+
+fn statement_ticket_codec_for_listener(
+    socket: SocketAddr,
+    keys: Option<QueryTicketKeyRing>,
+    ttl: Duration,
+) -> Result<ticket::StatementTicketCodec> {
+    let keys = match keys {
+        Some(keys) => keys,
+        None if socket.ip().is_loopback() => QueryTicketKeyRing::ephemeral()
+            .map_err(|_| QueryError::InvalidTicketConfiguration)?,
+        None => return Err(QueryError::InvalidTicketConfiguration),
+    };
+    ticket::StatementTicketCodec::try_new(keys, ttl, STATEMENT_TICKET_AUDIENCE)
+        .map_err(|_| QueryError::InvalidTicketConfiguration)
 }
 
 struct QueryBackgroundGuard {
@@ -681,9 +728,12 @@ mod tests {
         },
     };
     use futures::{StreamExt, TryStreamExt};
-    use lake_common::{MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor, TenantId};
+    use lake_common::{
+        MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor, Principal, PrincipalId,
+        PrincipalRole, TenantId,
+    };
     use lake_engine_lance::LanceEngine;
-    use lake_flight::{ClientSecurity, ServerSecurity};
+    use lake_flight::{BearerPrincipalBinding, ClientSecurity, ServerSecurity};
     use lake_meta::{MetaStore, MetaStoreRef};
     use rcgen::generate_simple_self_signed;
     use tokio::sync::Notify;
@@ -694,6 +744,42 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn remote_query_requires_shared_ticket_keys_before_startup() {
+        let remote = "0.0.0.0:50051".parse().unwrap();
+        let loopback = "127.0.0.1:50051".parse().unwrap();
+        let keys = QueryTicketKeyRing::try_new(
+            b"shared-query-ticket-key-material-00001",
+            std::iter::empty(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            statement_ticket_codec_for_listener(
+                remote,
+                None,
+                DEFAULT_STATEMENT_TICKET_TTL
+            ),
+            Err(QueryError::InvalidTicketConfiguration)
+        ));
+        assert!(statement_ticket_codec_for_listener(
+            loopback,
+            None,
+            DEFAULT_STATEMENT_TICKET_TTL
+        )
+        .is_ok());
+        assert!(statement_ticket_codec_for_listener(
+            remote,
+            Some(keys.clone()),
+            DEFAULT_STATEMENT_TICKET_TTL
+        )
+        .is_ok());
+        assert!(matches!(
+            statement_ticket_codec_for_listener(remote, Some(keys), Duration::ZERO),
+            Err(QueryError::InvalidTicketConfiguration)
+        ));
+    }
 
     #[derive(Default)]
     struct CountingMeta {
@@ -1002,6 +1088,85 @@ mod tests {
             descriptor.scope_to_tenant(&TenantId::try_new("deployment").unwrap())
         );
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn tls_statement_ticket_rejects_cross_principal_replay() {
+        let alice_token = "alice-query-token";
+        let bob_token = "bob-query-token";
+        let principal = |id: &str| {
+            Principal::try_new(
+                PrincipalId::try_new(id).unwrap(),
+                TenantId::try_new("tenant-alpha").unwrap(),
+                PrincipalRole::User,
+                ["alpha"],
+            )
+            .unwrap()
+        };
+        let certified = generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let certificate = certified.cert.pem();
+        let private_key = certified.key_pair.serialize_pem();
+        let server_security = ServerSecurity::with_bearer_principals([
+            BearerPrincipalBinding::new(alice_token, principal("alice")).unwrap(),
+            BearerPrincipalBinding::new(bob_token, principal("bob")).unwrap(),
+        ])
+        .unwrap()
+        .with_tls_identity_pem(certificate.as_bytes(), private_key.as_bytes());
+        let ticket_keys = QueryTicketKeyRing::try_new(
+            b"shared-tls-ticket-key-material-000001",
+            std::iter::empty(),
+        )
+        .unwrap();
+        let engine = Arc::new(QueryEngine::new(
+            Arc::new(CountingMeta::default()),
+            Arc::new(LanceEngine::new()),
+        ));
+        let addr = free_addr();
+        let config = QueryServerConfig::new()
+            .with_server_security(server_security)
+            .with_ticket_keys(ticket_keys);
+        let server = tokio::spawn(async move {
+            serve_with_config(engine, &addr.to_string(), config).await
+        });
+
+        let endpoint = format!("https://localhost:{}", addr.port());
+        let transport = ClientSecurity::new()
+            .with_ca_certificate_pem(certificate.as_bytes().to_vec())
+            .with_server_name("localhost");
+        let alice_security = transport
+            .clone()
+            .with_bearer_token(alice_token)
+            .unwrap();
+        let alice_channel = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(channel) = alice_security.connect(endpoint.clone()).await {
+                    break channel;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Query starts");
+        let mut alice = FlightSqlServiceClient::new(alice_channel);
+        alice_security.apply_to_sql_client(&mut alice);
+        let info = alice.execute("SELECT 1".to_owned(), None).await.unwrap();
+        let ticket = info.endpoint[0].ticket.clone().unwrap();
+        assert!(!ticket.ticket.windows(8).any(|window| window == b"SELECT 1"));
+
+        let bob_security = transport.with_bearer_token(bob_token).unwrap();
+        let bob_channel = bob_security.connect(endpoint).await.unwrap();
+        let mut bob = FlightSqlServiceClient::new(bob_channel);
+        bob_security.apply_to_sql_client(&mut bob);
+        let replay = bob
+            .do_get(ticket.clone())
+            .await
+            .expect_err("cross-principal replay must fail");
+        let replay: tonic::Status = replay.into();
+        assert_eq!(replay.code(), tonic::Code::Unauthenticated);
+        assert_eq!(replay.message(), "invalid statement ticket");
+
+        assert!(alice.do_get(ticket).await.is_ok());
         server.abort();
     }
 

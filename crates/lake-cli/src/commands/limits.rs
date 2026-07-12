@@ -24,6 +24,8 @@ use lake_query::{DiscoveryLimits, QueryLimits, QueryResources};
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 const DEFAULT_OPERATION_GC_PAGE_SIZE: usize = 128;
 const MAX_OPERATION_GC_PAGE_SIZE: usize = 10_000;
+const DEFAULT_QUERY_TICKET_TTL: Duration = Duration::from_mins(5);
+const MAX_QUERY_TICKET_TTL_SECS: u64 = 3600;
 
 pub(crate) fn lance_maintenance_policy_from_env() -> anyhow::Result<LanceMaintenancePolicy> {
     let retained_versions = env_value("LAKE_LANCE_RETAIN_VERSIONS")?;
@@ -202,6 +204,23 @@ pub(crate) fn query_limits_from_env() -> anyhow::Result<QueryLimits> {
     )
 }
 
+pub(crate) fn query_ticket_ttl_from_env() -> anyhow::Result<Duration> {
+    query_ticket_ttl_from_value(env_value("LAKE_QUERY_TICKET_TTL_SECS")?.as_deref())
+}
+
+fn query_ticket_ttl_from_value(value: Option<&str>) -> anyhow::Result<Duration> {
+    let seconds = parse_or(
+        "LAKE_QUERY_TICKET_TTL_SECS",
+        value,
+        DEFAULT_QUERY_TICKET_TTL.as_secs(),
+    )?;
+    anyhow::ensure!(
+        (1..=MAX_QUERY_TICKET_TTL_SECS).contains(&seconds),
+        "LAKE_QUERY_TICKET_TTL_SECS must be within 1..={MAX_QUERY_TICKET_TTL_SECS}"
+    );
+    Ok(Duration::from_secs(seconds))
+}
+
 pub(crate) fn discovery_limits_from_env() -> anyhow::Result<DiscoveryLimits> {
     let max_rows = env_value("LAKE_QUERY_MAX_DISCOVERY_ROWS")?;
     let batch_rows = env_value("LAKE_QUERY_DISCOVERY_BATCH_ROWS")?;
@@ -326,7 +345,7 @@ mod tests {
         append_limits_from_values, discovery_limits_from_values,
         lance_maintenance_policy_from_value, maintenance_limits_from_values,
         operation_policy_from_values, query_limits_from_values, query_resources_from_values,
-        shutdown_grace_from_value,
+        query_ticket_ttl_from_value, shutdown_grace_from_value,
     };
 
     #[test]
@@ -425,6 +444,21 @@ mod tests {
         assert_eq!(limits.queue_wait(), Duration::from_millis(250));
         assert_eq!(limits.execution_time(), Duration::from_secs(5));
         assert_eq!(limits.max_sql_bytes(), 4096);
+    }
+
+    #[test]
+    fn query_ticket_ttl_is_bounded_before_serving() {
+        assert_eq!(
+            query_ticket_ttl_from_value(None).unwrap(),
+            Duration::from_mins(5)
+        );
+        assert_eq!(
+            query_ticket_ttl_from_value(Some("900")).unwrap(),
+            Duration::from_mins(15)
+        );
+        for invalid in ["0", "3601", "forever"] {
+            assert!(query_ticket_ttl_from_value(Some(invalid)).is_err());
+        }
     }
 
     #[test]

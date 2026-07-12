@@ -20,7 +20,9 @@ lake-flight = { workspace = true }
 lake-meta = { workspace = true }
 metrics = { workspace = true }
 prost = { workspace = true }
+ring = { workspace = true }
 snafu = { workspace = true }
+subtle = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tonic = { workspace = true }

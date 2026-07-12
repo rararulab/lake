@@ -67,7 +67,12 @@ use tokio::{
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{Instrument as _, Span, field};
 
-use crate::{DiscoveryLimits, QueryEngine, QueryLimits, telemetry};
+use crate::{
+    DiscoveryLimits, QueryEngine, QueryLimits, telemetry,
+    ticket::StatementTicketCodec,
+};
+
+const MAX_STATEMENT_TICKET_OVERHEAD: usize = 512;
 
 #[derive(Clone, Debug)]
 pub(crate) struct QueryAdmission {
@@ -105,6 +110,20 @@ impl QueryAdmission {
     pub(crate) fn validate_sql_size(&self, bytes: &[u8]) -> std::result::Result<(), Status> {
         if bytes.len() > self.limits.max_sql_bytes() {
             telemetry::rejection("sql_too_large");
+            return Err(Status::resource_exhausted(
+                "SQL or statement ticket exceeds the configured byte limit",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_ticket_size(&self, bytes: &[u8]) -> std::result::Result<(), Status> {
+        let maximum = self
+            .limits
+            .max_sql_bytes()
+            .saturating_add(MAX_STATEMENT_TICKET_OVERHEAD);
+        if bytes.len() > maximum {
+            telemetry::rejection("ticket_too_large");
             return Err(Status::resource_exhausted(
                 "SQL or statement ticket exceeds the configured byte limit",
             ));
@@ -535,6 +554,8 @@ pub struct FlightSqlServiceImpl {
     pub(crate) admission:        QueryAdmission,
     /// Process-local row and batch bounds for metadata discovery.
     pub(crate) discovery_limits: DiscoveryLimits,
+    /// Stateless authenticated-encryption codec shared by statement RPCs.
+    pub(crate) ticket_codec:     StatementTicketCodec,
 }
 
 impl FlightSqlServiceImpl {
@@ -774,9 +795,12 @@ impl FlightSqlService for FlightSqlServiceImpl {
             .await
             .map_err(|_| Status::deadline_exceeded("query planning deadline exceeded"))??;
 
-            // The ticket carries the raw SQL so `DoGet` can re-plan and execute it.
+            let statement_handle = self
+                .ticket_codec
+                .seal(&sql, &principal)
+                .map_err(|_| Status::internal("could not issue statement ticket"))?;
             let ticket = TicketStatementQuery {
-                statement_handle: sql.into_bytes().into(),
+                statement_handle: statement_handle.into(),
             };
             let endpoint =
                 FlightEndpoint::new().with_ticket(Ticket::new(ticket.as_any().encode_to_vec()));
@@ -846,10 +870,16 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let span = query_server_span(&request, "do_get");
         let result =
             async move {
-                self.admission.validate_sql_size(&ticket.statement_handle)?;
-                let sql = String::from_utf8(ticket.statement_handle.to_vec())
-                    .map_err(|e| Status::invalid_argument(format!("ticket is not utf-8: {e}")))?;
                 let principal = self.principal(&request)?;
+                self.admission.validate_ticket_size(&ticket.statement_handle)?;
+                let sql = self
+                    .ticket_codec
+                    .open(&ticket.statement_handle, &principal)
+                    .map_err(|_| {
+                        telemetry::rejection("invalid_ticket");
+                        Status::unauthenticated("invalid statement ticket")
+                    })?;
+                self.admission.validate_sql_size(sql.as_bytes())?;
                 self.authorize_sql(&principal, &sql)?;
                 let permit = self.admission.acquire().await?;
                 let deadline = self.admission.execution_deadline();
@@ -1077,6 +1107,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::ticket::{QueryTicketKeyRing, StatementTicketCodec};
 
     #[test]
     fn flight_sql_patterns_follow_percent_and_underscore_semantics() {
@@ -1187,6 +1218,19 @@ mod tests {
         .unwrap()
     }
 
+    fn test_ticket_codec() -> StatementTicketCodec {
+        StatementTicketCodec::try_new(
+            QueryTicketKeyRing::try_new(
+                b"query-test-ticket-key-material-000001",
+                std::iter::empty(),
+            )
+            .unwrap(),
+            Duration::from_mins(5),
+            "lake-query",
+        )
+        .unwrap()
+    }
+
     async fn discovery_service(
         table_keys: &[&str],
         discovery_limits: DiscoveryLimits,
@@ -1207,6 +1251,7 @@ mod tests {
             managed_stage: None,
             admission: QueryAdmission::new(QueryLimits::default()),
             discovery_limits,
+            ticket_codec: test_ticket_codec(),
         }
     }
 
@@ -1326,6 +1371,7 @@ mod tests {
             managed_stage:     Some(descriptor.clone()),
             admission:         QueryAdmission::new(QueryLimits::default()),
             discovery_limits:  DiscoveryLimits::default(),
+            ticket_codec:      test_ticket_codec(),
         };
         let action = arrow_flight::Action {
             r#type: MANAGED_STAGE_DISCOVERY_ACTION.to_owned(),
@@ -1370,6 +1416,7 @@ mod tests {
             managed_stage:     None,
             admission:         QueryAdmission::new(QueryLimits::default()),
             discovery_limits:  DiscoveryLimits::default(),
+            ticket_codec:      test_ticket_codec(),
         };
         let principal = Principal::try_new(
             PrincipalId::try_new("alpha-reader").unwrap(),
@@ -1402,6 +1449,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn statement_ticket_replay_is_rejected_before_planning() {
+        let meta = Arc::new(PlanningMeta::default());
+        let meta_ref: MetaStoreRef = meta.clone();
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let codec = StatementTicketCodec::try_new(
+            QueryTicketKeyRing::try_new(
+                b"rpc-ticket-key-material-000000000001",
+                std::iter::empty(),
+            )
+            .unwrap(),
+            Duration::from_mins(5),
+            "lake-query",
+        )
+        .unwrap();
+        let service = FlightSqlServiceImpl {
+            engine:            Arc::new(QueryEngine::new(meta_ref, storage)),
+            metadata_addr:     None,
+            metadata_security: ClientSecurity::new(),
+            managed_stage:     None,
+            admission:         QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:  DiscoveryLimits::default(),
+            ticket_codec:      codec.clone(),
+        };
+        let principal = |id: &str| {
+            Principal::try_new(
+                PrincipalId::try_new(id).unwrap(),
+                TenantId::try_new("tenant-alpha").unwrap(),
+                PrincipalRole::User,
+                ["alpha_episodes"],
+            )
+            .unwrap()
+        };
+        let alice = principal("alice");
+        let handle = codec.seal("SELECT 1", &alice).unwrap();
+        let ticket = || TicketStatementQuery {
+            statement_handle: handle.clone().into(),
+        };
+        let request = |principal: Principal| {
+            let mut request = Request::new(Ticket::default());
+            request.extensions_mut().insert(principal);
+            request
+        };
+
+        let replay = match service
+            .do_get_statement(ticket(), request(principal("bob")))
+            .await
+        {
+            Err(status) => status,
+            Ok(_) => panic!("a ticket is bound to its issuing principal"),
+        };
+
+        assert_eq!(replay.code(), tonic::Code::Unauthenticated);
+        assert_eq!(replay.message(), "invalid statement ticket");
+        assert_eq!(meta.scans.load(Ordering::Relaxed), 0);
+        assert!(
+            service
+                .do_get_statement(ticket(), request(alice))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn query_discovery_filters_unauthorized_namespaces() {
         let meta: MetaStoreRef = Arc::new(DiscoveryMeta);
         let storage: TableEngineRef = Arc::new(LanceEngine::new());
@@ -1414,6 +1524,7 @@ mod tests {
             managed_stage: None,
             admission: QueryAdmission::new(QueryLimits::default()),
             discovery_limits: DiscoveryLimits::default(),
+            ticket_codec: test_ticket_codec(),
         };
         let principal = Principal::try_new(
             PrincipalId::try_new("alpha-reader").unwrap(),
@@ -1725,6 +1836,7 @@ mod tests {
             managed_stage: None,
             admission: QueryAdmission::new(QueryLimits::default()),
             discovery_limits: DiscoveryLimits::default(),
+            ticket_codec: test_ticket_codec(),
         };
         let principal = Principal::try_new(
             PrincipalId::try_new("alpha-reader").unwrap(),
@@ -1892,6 +2004,7 @@ mod tests {
             managed_stage: None,
             admission: QueryAdmission::new(QueryLimits::default()),
             discovery_limits: DiscoveryLimits::default(),
+            ticket_codec: test_ticket_codec(),
         };
         let principal = Principal::try_new(
             PrincipalId::try_new("alpha-reader").unwrap(),
@@ -1961,13 +2074,21 @@ mod tests {
             managed_stage: None,
             admission: QueryAdmission::new(QueryLimits::default()),
             discovery_limits: DiscoveryLimits::default(),
+            ticket_codec: test_ticket_codec(),
         };
+        let principal = Principal::deployment_admin();
         let ticket = TicketStatementQuery {
-            statement_handle: b"SELECT * FROM delayed".to_vec().into(),
+            statement_handle: service
+                .ticket_codec
+                .seal("SELECT * FROM delayed", &principal)
+                .unwrap()
+                .into(),
         };
+        let mut ticket_request = Request::new(Ticket::default());
+        ticket_request.extensions_mut().insert(principal);
         let mut request = tokio::spawn(async move {
             service
-                .do_get_statement(ticket, Request::new(Ticket::default()))
+                .do_get_statement(ticket, ticket_request)
                 .await
         });
 
@@ -2018,9 +2139,14 @@ mod tests {
             managed_stage: None,
             admission: QueryAdmission::new(limits),
             discovery_limits: DiscoveryLimits::default(),
+            ticket_codec: test_ticket_codec(),
         };
+        let statement_handle = service
+            .ticket_codec
+            .seal("SELECT * FROM admitted", &Principal::deployment_admin())
+            .unwrap();
         let ticket = || TicketStatementQuery {
-            statement_handle: b"SELECT * FROM admitted".to_vec().into(),
+            statement_handle: statement_handle.clone().into(),
         };
         let request = || {
             let mut request = Request::new(Ticket::default());
@@ -2059,6 +2185,7 @@ mod tests {
             managed_stage:     None,
             admission:         QueryAdmission::new(limits),
             discovery_limits:  DiscoveryLimits::default(),
+            ticket_codec:      test_ticket_codec(),
         };
         let query = || CommandGetDbSchemas {
             catalog:                  None,
@@ -2125,9 +2252,14 @@ mod tests {
             managed_stage: None,
             admission: QueryAdmission::new(limits),
             discovery_limits: DiscoveryLimits::default(),
+            ticket_codec: test_ticket_codec(),
         };
+        let statement_handle = service
+            .ticket_codec
+            .seal("SELECT * FROM deadline", &Principal::deployment_admin())
+            .unwrap();
         let ticket = || TicketStatementQuery {
-            statement_handle: b"SELECT * FROM deadline".to_vec().into(),
+            statement_handle: statement_handle.clone().into(),
         };
         let mut request = Request::new(Ticket::default());
         request
@@ -2179,6 +2311,7 @@ mod tests {
             managed_stage:     None,
             admission:         QueryAdmission::new(limits),
             discovery_limits:  DiscoveryLimits::default(),
+            ticket_codec:      test_ticket_codec(),
         };
         let query = CommandStatementQuery {
             query:          "SELECT 1".to_owned(),
@@ -2193,11 +2326,13 @@ mod tests {
         assert_eq!(sql_error.code(), tonic::Code::ResourceExhausted);
 
         let ticket = TicketStatementQuery {
-            statement_handle: b"SELECT 1".to_vec().into(),
+            statement_handle: vec![0_u8; MAX_STATEMENT_TICKET_OVERHEAD + 5].into(),
         };
-        let Err(ticket_error) = service
-            .do_get_statement(ticket, Request::new(Ticket::default()))
-            .await
+        let mut request = Request::new(Ticket::default());
+        request
+            .extensions_mut()
+            .insert(Principal::deployment_admin());
+        let Err(ticket_error) = service.do_get_statement(ticket, request).await
         else {
             panic!("oversized ticket must fail");
         };

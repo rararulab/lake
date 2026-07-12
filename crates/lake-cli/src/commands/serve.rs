@@ -23,11 +23,12 @@ use super::{
     Context,
     limits::{
         append_limits_from_env, discovery_limits_from_env, maintenance_limits_from_env,
-        query_limits_from_env, query_resources_from_env, shutdown_grace_from_env,
+        query_limits_from_env, query_resources_from_env, query_ticket_ttl_from_env,
+        shutdown_grace_from_env,
     },
     security::{
         allow_insecure_from_env, metadata_client_security_from_env, peer_client_security_from_env,
-        server_security_from_env,
+        query_ticket_keys_from_env, server_security_from_env,
     },
 };
 use crate::metrics;
@@ -50,14 +51,18 @@ where
         ctx.engine.clone(),
         query_resources_from_env()?,
     )?);
-    let config = QueryServerConfig::new()
+    let mut config = QueryServerConfig::new()
         .with_metadata(metadata_addr, metadata_client_security_from_env()?)
         .with_managed_stage(ctx.managed_stage().clone())
         .with_server_security(server_security_from_env()?)
         .with_limits(query_limits_from_env()?)
         .with_discovery_limits(discovery_limits_from_env()?)
+        .with_ticket_ttl(query_ticket_ttl_from_env()?)
         .with_shutdown_grace(shutdown_grace_from_env()?)
         .allow_insecure(allow_insecure_from_env()?);
+    if let Some(keys) = query_ticket_keys_from_env()? {
+        config = config.with_ticket_keys(keys);
+    }
     metrics::run_with_metrics("query", shutdown, |cancellation| async move {
         lake_query::serve_with_config_and_shutdown(
             engine,
