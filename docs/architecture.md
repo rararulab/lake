@@ -483,7 +483,9 @@ design-level ones:
   endpoint exposes bounded Query saturation/catalog signals and Metasrv
   append/leadership/maintenance signals. Its listener and upkeep work are
   owned by the server lifecycle, and labels never contain workload or object
-  identities. Scheduler manifests and distributed tracing remain production
+  identities. A hardened container and Kubernetes reference now preserve the
+  tier split, authenticated health, private metrics, finite shutdown, and
+  bounded resources in a scheduler. Distributed tracing remains production
   work.
 
 ## Phasing

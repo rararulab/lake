@@ -305,6 +305,17 @@ window is reported as an error and makes the process exit non-zero.
 For the design and invariants, see [managed objects](docs/design/managed-objects.md)
 and [architecture](docs/architecture.md).
 
+## Kubernetes deployment
+
+The repository includes a hardened multi-stage container and separate
+Kubernetes references for the stateless Query tier and the bounded Metasrv
+authority. They preserve authenticated TLS gRPC health, loopback-only metrics,
+finite shutdown, non-root execution, explicit resources, disruption budgets,
+and DynamoDB/S3 authority. See the
+[Kubernetes deployment guide](docs/guides/kubernetes.md) before applying the
+reference; image digests, cloud identity, certificates, and Secrets are
+deployment inputs and are intentionally not embedded.
+
 ## Production telemetry
 
 Query and Metasrv emit structured JSON logs and authenticated standard gRPC

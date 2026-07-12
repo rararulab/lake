@@ -22,6 +22,7 @@ uv   = "0.11.26"       # uvx runs the code-review-graph MCP server (.mcp.json)
 "github:nextest-rs/nextest" = "cargo-nextest-0.9.140"
 # Protocol Buffer compiler required by Lance build scripts.
 "aqua:protocolbuffers/protobuf/protoc" = "35.1"
+"aqua:yannh/kubeconform" = "0.7.0" # strict Kubernetes OpenAPI validation
 "cargo:bacon" = "3"   # local watch loop: `mise run watch` (clippy on save)
 
 [env]
@@ -104,6 +105,10 @@ run = "bun scripts/test-env.ts down"
 [tasks.test-integration]
 description = "run the LocalStack integration tests (up -> ignored tests -> down)"
 run = "bun scripts/test-integration.ts"
+
+[tasks.k8s-validate]
+description = "strictly validate the checked-in Kubernetes reference against Kubernetes 1.32"
+run = "kubeconform -strict -summary -kubernetes-version 1.32.0 deploy/kubernetes/lake.yaml"
 
 # ponytail: gate = the FAST local loop (hooks, cargo test, e2e, marketing site).
 # Slow passes (cargo doc warnings, spec-selftest tooling lock) run in CI
