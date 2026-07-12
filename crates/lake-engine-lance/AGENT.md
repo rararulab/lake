@@ -14,6 +14,10 @@ Lance dataset.
   digest, and reference-stage identity in Lance transaction properties.
 - Reference lineage is staged before manifest visibility and repaired from
   transaction history before a recovered version is returned.
+- Terminal staging cleanup may race another exact-operation writer or
+  reconciler. A missing stage converges only when transaction history proves
+  the exact tenant/operation/digest and complete final reference chunks prove
+  lineage; otherwise the original storage/lineage error remains fail-closed.
 - The external manifest store resolves current state through one fixed
   `{version,path}` pointer. Advancing it archives the exact prior pointer, then
   CASes latest; legacy per-version-only datasets scan once to install latest.

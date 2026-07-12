@@ -124,14 +124,36 @@ struct WriteConfig {
     // ponytail: `None` -> Lance's default object-store commit (atomic on local
     // FS). `Some` -> commits route through our `MetaStore`-backed external
     // manifest store, giving put-if-not-exists semantics on S3.
-    commit_handler:     Option<Arc<dyn CommitHandler>>,
-    manifest_store:     Option<MetaManifestStore>,
+    commit_handler:       Option<Arc<dyn CommitHandler>>,
+    manifest_store:       Option<MetaManifestStore>,
     // Empty -> local filesystem. Non-empty -> object_store config keys
     // (`aws_endpoint`, `aws_access_key_id`, …) threaded into every read/write.
-    storage_options:    HashMap<String, String>,
-    maintenance_policy: LanceMaintenancePolicy,
+    storage_options:      HashMap<String, String>,
+    maintenance_policy:   LanceMaintenancePolicy,
     #[cfg(test)]
-    history_scans:      Arc<std::sync::atomic::AtomicUsize>,
+    history_scans:        Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    stage_persist_hooks:  Option<Arc<StagePersistRaceHooks>>,
+    #[cfg(test)]
+    stage_finalize_hooks: Option<Arc<StageFinalizeRaceHooks>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct StagePersistRaceHooks {
+    stage_owner_claimed:         std::sync::atomic::AtomicBool,
+    winner_staged:               tokio::sync::Notify,
+    allow_winner_commit:         tokio::sync::Notify,
+    contender_observed_existing: tokio::sync::Notify,
+    allow_contender_stage_read:  tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct StageFinalizeRaceHooks {
+    finalizer_claimed:          std::sync::atomic::AtomicBool,
+    finalizer_saw_incomplete:   tokio::sync::Notify,
+    allow_finalizer_stage_read: tokio::sync::Notify,
 }
 
 impl WriteConfig {
@@ -704,6 +726,11 @@ async fn persist_staged_references(
         {
             Ok(_) => {}
             Err(object_store::Error::AlreadyExists { .. }) => {
+                #[cfg(test)]
+                if let Some(hooks) = &config.stage_persist_hooks {
+                    hooks.contender_observed_existing.notify_one();
+                    hooks.allow_contender_stage_read.notified().await;
+                }
                 let existing = store
                     .get(&path)
                     .await
@@ -720,6 +747,15 @@ async fn persist_staged_references(
             Err(error) => return Err(EngineError::backend(error)),
         }
     }
+    #[cfg(test)]
+    if let Some(hooks) = &config.stage_persist_hooks
+        && !hooks
+            .stage_owner_claimed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        hooks.winner_staged.notify_one();
+        hooks.allow_winner_commit.notified().await;
+    }
     Ok(stage)
 }
 
@@ -732,6 +768,15 @@ async fn finalize_staged_references(
     if final_reference_chunks_complete(config, location, table_version).await? {
         return Ok(());
     }
+    #[cfg(test)]
+    if let Some(hooks) = &config.stage_finalize_hooks
+        && !hooks
+            .finalizer_claimed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        hooks.finalizer_saw_incomplete.notify_one();
+        hooks.allow_finalizer_stage_read.notified().await;
+    }
     let url = dataset_url(location)?;
     let (store, root) = object_store::parse_url_opts(&url, config.storage_options.clone())
         .map_err(EngineError::backend)?;
@@ -741,15 +786,17 @@ async fn finalize_staged_references(
         .join("object_refs_staging")
         .join(stage)
         .join("0.json");
-    let first = store
-        .get(&first_path)
-        .await
-        .map_err(EngineError::backend)?
-        .bytes()
-        .await
-        .map_err(EngineError::backend)?;
-    let first: StagedReferenceChunk =
-        serde_json::from_slice(&first).map_err(EngineError::backend)?;
+    let Some(first) = load_staged_chunk_or_confirm_final(
+        config,
+        location,
+        store.as_ref(),
+        &first_path,
+        table_version,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
     if first.format_version != 1 || first.chunk_index != 0 || first.chunk_count == 0 {
         return Err(EngineError::ReferenceLineageUnavailable {
             location: location.clone(),
@@ -766,14 +813,18 @@ async fn finalize_staged_references(
                 .join("object_refs_staging")
                 .join(stage)
                 .join(format!("{index}.json"));
-            let bytes = store
-                .get(&path)
-                .await
-                .map_err(EngineError::backend)?
-                .bytes()
-                .await
-                .map_err(EngineError::backend)?;
-            serde_json::from_slice(&bytes).map_err(EngineError::backend)?
+            let Some(chunk) = load_staged_chunk_or_confirm_final(
+                config,
+                location,
+                store.as_ref(),
+                &path,
+                table_version,
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+            chunk
         };
         if chunk.format_version != 1
             || chunk.chunk_index != index
@@ -797,6 +848,39 @@ async fn finalize_staged_references(
         persist_reference_delta(config, location, &delta).await?;
     }
     Ok(())
+}
+
+async fn load_staged_chunk_or_confirm_final(
+    config: &WriteConfig,
+    location: &TableLocation,
+    store: &dyn object_store::ObjectStore,
+    path: &object_store::path::Path,
+    table_version: Version,
+) -> Result<Option<StagedReferenceChunk>> {
+    let result = match store.get(path).await {
+        Ok(result) => result,
+        Err(error @ object_store::Error::NotFound { .. }) => {
+            return if final_reference_chunks_complete(config, location, table_version).await? {
+                Ok(None)
+            } else {
+                Err(EngineError::backend(error))
+            };
+        }
+        Err(error) => return Err(EngineError::backend(error)),
+    };
+    let bytes = match result.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error @ object_store::Error::NotFound { .. }) => {
+            return if final_reference_chunks_complete(config, location, table_version).await? {
+                Ok(None)
+            } else {
+                Err(EngineError::backend(error))
+            };
+        }
+        Err(error) => return Err(EngineError::backend(error)),
+    };
+    let chunk = serde_json::from_slice(&bytes).map_err(EngineError::backend)?;
+    Ok(Some(chunk))
 }
 
 async fn final_reference_chunks_complete(
@@ -1051,14 +1135,21 @@ impl TableHandle for LanceTable {
             .iter()
             .cloned()
             .collect();
-        let persisted_stage = persist_staged_references(
+        let persisted_stage = match persist_staged_references(
             &self.config,
             &self.location,
             operation,
             parent_version,
             added,
         )
-        .await?;
+        .await
+        {
+            Ok(stage) => stage,
+            Err(error) => match self.reconcile_append(operation).await? {
+                Some(version) => return Ok(version),
+                None => return Err(error),
+            },
+        };
         debug_assert_eq!(persisted_stage, stage);
         let committed = CommitBuilder::new(self.dataset.clone())
             .with_max_retries(0)
@@ -1175,6 +1266,58 @@ mod tests {
 
     fn file_batch(index: usize) -> RecordBatch {
         RecordBatch::try_new(file_schema(), vec![file_array(index)]).unwrap()
+    }
+
+    async fn commit_without_finalizing_references(
+        engine: &LanceEngine,
+        location: &TableLocation,
+        operation: &AppendOperation,
+        input: RecordBatch,
+    ) -> (Version, String) {
+        let references = object_identities(&input).unwrap();
+        let stage =
+            persist_staged_references(&engine.config, location, operation, Version(1), references)
+                .await
+                .unwrap();
+        let properties = HashMap::from([
+            (
+                APPEND_TENANT_PROPERTY.to_owned(),
+                operation.tenant().as_str().to_owned(),
+            ),
+            (
+                APPEND_OPERATION_PROPERTY.to_owned(),
+                operation.operation_id().as_str().to_owned(),
+            ),
+            (
+                APPEND_DIGEST_PROPERTY.to_owned(),
+                operation.payload_digest().as_str().to_owned(),
+            ),
+            (APPEND_REFERENCE_STAGE_PROPERTY.to_owned(), stage.clone()),
+        ]);
+        let dataset = Arc::new(engine.config.open_dataset(location.as_str()).await.unwrap());
+        let params = engine
+            .config
+            .write_params(WriteMode::Append)
+            .with_transaction_properties(properties);
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            input.schema(),
+            futures::stream::iter(vec![Ok::<_, DataFusionError>(input)]),
+        ));
+        let transaction = InsertBuilder::new(dataset.clone())
+            .with_params(&params)
+            .execute_uncommitted_stream(stream)
+            .await
+            .unwrap();
+        let committed = Version(
+            CommitBuilder::new(dataset)
+                .with_max_retries(0)
+                .execute(transaction)
+                .await
+                .unwrap()
+                .version()
+                .version,
+        );
+        (committed, stage)
     }
 
     struct LiveResult {
@@ -1309,6 +1452,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_operation_append_survives_terminal_stage_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
+        let hooks = Arc::new(StagePersistRaceHooks::default());
+        let mut engine = LanceEngine::new();
+        engine.config.stage_persist_hooks = Some(hooks.clone());
+        let handle = engine.create(&location, batch().schema()).await.unwrap();
+        let competing = engine.open(&location).await.unwrap().unwrap();
+        let operation = Arc::new(operation());
+
+        let winner_operation = operation.clone();
+        let winner = tokio::spawn(async move {
+            let input = batch();
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                input.schema(),
+                futures::stream::iter(vec![Ok::<_, DataFusionError>(input)]),
+            ));
+            handle.append(&winner_operation, stream).await
+        });
+        hooks.winner_staged.notified().await;
+
+        let contender_operation = operation.clone();
+        let contender = tokio::spawn(async move {
+            let input = batch();
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                input.schema(),
+                futures::stream::iter(vec![Ok::<_, DataFusionError>(input)]),
+            ));
+            competing.append(&contender_operation, stream).await
+        });
+        hooks.contender_observed_existing.notified().await;
+
+        hooks.allow_winner_commit.notify_one();
+        let committed = winner.await.unwrap().unwrap();
+        let stage_path = dir.path().join(format!(
+            "t.lance/_lake/object_refs_staging/{}/0.json",
+            reference_stage(&operation)
+        ));
+        assert!(!stage_path.exists(), "winner performed terminal cleanup");
+
+        hooks.allow_contender_stage_read.notify_one();
+        let replayed = contender.await.unwrap().unwrap();
+        assert_eq!(replayed, committed);
+        assert_eq!(committed, Version(2));
+        assert!(!stage_path.exists(), "reconciliation leaves no staging");
+    }
+
+    #[tokio::test]
+    async fn concurrent_recovery_survives_terminal_stage_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
+        let hooks = Arc::new(StageFinalizeRaceHooks::default());
+        let mut engine = LanceEngine::new();
+        engine.config.stage_finalize_hooks = Some(hooks.clone());
+        let handle = engine.create(&location, file_schema()).await.unwrap();
+        let operation = Arc::new(operation());
+        let (committed, stage) =
+            commit_without_finalizing_references(&engine, &location, &operation, file_batch(9))
+                .await;
+        let competing = engine.open(&location).await.unwrap().unwrap();
+
+        let first_operation = operation.clone();
+        let first = tokio::spawn(async move { handle.reconcile_append(&first_operation).await });
+        hooks.finalizer_saw_incomplete.notified().await;
+
+        let second = competing.reconcile_append(&operation).await.unwrap();
+        assert_eq!(second, Some(committed));
+        let stage_path = dir
+            .path()
+            .join(format!("t.lance/_lake/object_refs_staging/{stage}/0.json"));
+        assert!(!stage_path.exists(), "second reconciler cleaned staging");
+
+        hooks.allow_finalizer_stage_read.notify_one();
+        let recovered = first.await.unwrap().unwrap();
+        assert_eq!(recovered, Some(committed));
+        let final_sidecar = dir
+            .path()
+            .join(format!("t.lance/_lake/object_refs/{}/0.json", committed.0));
+        let delta =
+            ObjectReferenceDelta::decode(&tokio::fs::read(final_sidecar).await.unwrap()).unwrap();
+        assert_eq!(delta.table_version(), committed);
+        assert_eq!(delta.added()[0].uri, "s3://lake/objects/9");
+    }
+
+    #[tokio::test]
+    async fn different_payload_replay_remains_idempotency_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
+        let engine = LanceEngine::new();
+        let handle = engine.create(&location, batch().schema()).await.unwrap();
+        let committed_operation = operation();
+        let input = batch();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            input.schema(),
+            futures::stream::iter(vec![Ok::<_, DataFusionError>(input)]),
+        ));
+        let committed = handle.append(&committed_operation, stream).await.unwrap();
+        let conflicting_operation = AppendOperation::builder()
+            .tenant(committed_operation.tenant().clone())
+            .operation_id(committed_operation.operation_id().clone())
+            .payload_digest(lake_common::AppendPayloadDigest::parse("f".repeat(64)).unwrap())
+            .build();
+
+        let error = handle
+            .reconcile_append(&conflicting_operation)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            EngineError::IdempotencyConflict { operation_id }
+                if operation_id == *committed_operation.operation_id()
+        ));
+        assert_eq!(
+            engine
+                .open(&location)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version(),
+            committed
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_stage_without_final_lineage_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
+        let engine = LanceEngine::new();
+        let handle = engine.create(&location, file_schema()).await.unwrap();
+        let operation = operation();
+        let (committed, stage) =
+            commit_without_finalizing_references(&engine, &location, &operation, file_batch(11))
+                .await;
+        delete_staged_references(&engine.config, &location, &stage)
+            .await
+            .unwrap();
+
+        assert!(handle.reconcile_append(&operation).await.is_err());
+        assert!(
+            !final_reference_chunks_complete(&engine.config, &location, committed)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn recovered_idempotent_append_restores_reference_lineage() {
         let dir = tempfile::tempdir().unwrap();
         let location = TableLocation::new(dir.path().join("t.lance").to_str().unwrap());
@@ -1316,54 +1606,8 @@ mod tests {
         let handle = engine.create(&location, file_schema()).await.unwrap();
         let operation = operation();
         let input = file_batch(7);
-        let references = object_identities(&input).unwrap();
-        let stage = persist_staged_references(
-            &engine.config,
-            &location,
-            &operation,
-            Version(1),
-            references,
-        )
-        .await
-        .unwrap();
-        let properties = HashMap::from([
-            (
-                APPEND_TENANT_PROPERTY.to_owned(),
-                operation.tenant().as_str().to_owned(),
-            ),
-            (
-                APPEND_OPERATION_PROPERTY.to_owned(),
-                operation.operation_id().as_str().to_owned(),
-            ),
-            (
-                APPEND_DIGEST_PROPERTY.to_owned(),
-                operation.payload_digest().as_str().to_owned(),
-            ),
-            (APPEND_REFERENCE_STAGE_PROPERTY.to_owned(), stage.clone()),
-        ]);
-        let dataset = Arc::new(engine.config.open_dataset(location.as_str()).await.unwrap());
-        let params = engine
-            .config
-            .write_params(WriteMode::Append)
-            .with_transaction_properties(properties);
-        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-            input.schema(),
-            futures::stream::iter(vec![Ok::<_, DataFusionError>(input)]),
-        ));
-        let transaction = InsertBuilder::new(dataset.clone())
-            .with_params(&params)
-            .execute_uncommitted_stream(stream)
-            .await
-            .unwrap();
-        let committed = Version(
-            CommitBuilder::new(dataset)
-                .with_max_retries(0)
-                .execute(transaction)
-                .await
-                .unwrap()
-                .version()
-                .version,
-        );
+        let (committed, stage) =
+            commit_without_finalizing_references(&engine, &location, &operation, input).await;
         let final_sidecar = dir
             .path()
             .join(format!("t.lance/_lake/object_refs/{}/0.json", committed.0));
