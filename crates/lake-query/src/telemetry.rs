@@ -71,6 +71,7 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use async_trait::async_trait;
+    use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
     use lake_engine::TableEngineRef;
     use lake_engine_lance::LanceEngine;
     use lake_flight::ClientSecurity;
@@ -198,20 +199,45 @@ mod tests {
         };
         tokio::join!(refresh, drive_refresh);
 
-        let limits =
-            QueryLimits::try_new(1, Duration::from_millis(1), Duration::from_secs(1), 4).unwrap();
+        let principal = |subject: &str, tenant: &str| {
+            Principal::try_new(
+                PrincipalId::try_new(subject).expect("valid subject"),
+                TenantId::try_new(tenant).expect("valid tenant"),
+                PrincipalRole::User,
+                [tenant],
+            )
+            .expect("valid principal")
+        };
+        let alpha = principal("alpha-reader", "alpha");
+        let beta = principal("beta-reader", "beta");
+        let limits = QueryLimits::try_new(1, Duration::from_millis(1), Duration::from_secs(1), 4)
+            .expect("query limits")
+            .try_with_tenant_limits(1, 2)
+            .expect("tenant query limits");
         let admission = QueryAdmission::new(limits);
-        let permit = admission.acquire().await.unwrap();
+        let permit = admission.acquire(&alpha).await.expect("alpha admitted");
         let active = handle.render();
         assert!(active.contains("lake_query_inflight_requests 1"));
-        assert!(admission.acquire().await.is_err());
+        assert!(admission.acquire(&alpha).await.is_err());
+        assert!(admission.acquire(&beta).await.is_err());
+        let tracker_limits = limits
+            .try_with_tenant_limits(1, 1)
+            .expect("tracked tenant limit");
+        let tracker_admission = QueryAdmission::new(tracker_limits);
+        let tracker_permit = tracker_admission
+            .acquire(&alpha)
+            .await
+            .expect("alpha tracker admitted");
+        assert!(tracker_admission.acquire(&beta).await.is_err());
         assert!(admission.validate_sql_size(b"12345").is_err());
-        drop(permit);
+        drop((permit, tracker_permit));
 
         let rendered = handle.render();
         for expected in [
-            "lake_query_admission_total{outcome=\"admitted\"} 1",
+            "lake_query_admission_total{outcome=\"admitted\"} 2",
             "lake_query_admission_total{outcome=\"saturated\"} 1",
+            "lake_query_admission_total{outcome=\"scope_saturated\"} 1",
+            "lake_query_admission_total{outcome=\"scope_tracker_saturated\"} 1",
             "lake_query_inflight_requests 0",
             "lake_query_rejections_total{reason=\"sql_too_large\"} 1",
             "lake_query_catalog_refresh_total{phase=\"initial\",outcome=\"success\"} 1",

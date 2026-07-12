@@ -47,8 +47,14 @@ Query Flight SQL discovery is bounded by
 `LAKE_QUERY_MAX_DISCOVERY_ROWS` (default `10000`) and
 `LAKE_QUERY_DISCOVERY_BATCH_ROWS` (default `256`). Both must be positive and
 the batch size cannot exceed the row maximum. Schema/table `DoGet` requests
-share `LAKE_QUERY_MAX_CONCURRENT` admission; queue saturation or a response
-that exceeds the matching-row maximum returns gRPC `ResourceExhausted`.
+share `LAKE_QUERY_MAX_CONCURRENT` admission. Each authenticated tenant is
+additionally capped by `LAKE_QUERY_MAX_CONCURRENT_PER_TENANT` (default `8`),
+with at most `LAKE_QUERY_MAX_TRACKED_TENANTS` (default `4096`, maximum `65536`)
+live gates. The tenant cap cannot exceed the global cap. One total
+`LAKE_QUERY_QUEUE_TIMEOUT_MS` covers tenant-first and global acquisition;
+queue/tracker saturation or a response beyond the matching-row maximum returns
+gRPC `ResourceExhausted`. The policy is per Query replica and does not claim a
+cluster-global quota.
 
 Metasrv FILE append admission uses `LAKE_APPEND_MAX_CONCURRENT` (default `8`),
 `LAKE_APPEND_QUEUE_TIMEOUT_MS` (default `100`),

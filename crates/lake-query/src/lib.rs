@@ -194,11 +194,17 @@ impl Default for DiscoveryLimits {
 /// Per-replica admission and request limits for stateless Query execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryLimits {
-    max_concurrent: usize,
-    queue_wait:     Duration,
-    execution_time: Duration,
-    max_sql_bytes:  usize,
+    max_concurrent:            usize,
+    max_concurrent_per_tenant: usize,
+    max_tracked_tenants:       usize,
+    queue_wait:                Duration,
+    execution_time:            Duration,
+    max_sql_bytes:             usize,
 }
+
+const DEFAULT_MAX_CONCURRENT_PER_TENANT: usize = 8;
+const DEFAULT_MAX_TRACKED_TENANTS: usize = 4096;
+const MAX_TRACKED_TENANTS: usize = 65_536;
 
 impl QueryLimits {
     /// Validate finite, non-zero Query limits.
@@ -231,14 +237,54 @@ impl QueryLimits {
         }
         Ok(Self {
             max_concurrent,
+            max_concurrent_per_tenant: max_concurrent.min(DEFAULT_MAX_CONCURRENT_PER_TENANT),
+            max_tracked_tenants: DEFAULT_MAX_TRACKED_TENANTS,
             queue_wait,
             execution_time,
             max_sql_bytes,
         })
     }
 
+    /// Apply finite per-tenant admission limits below the aggregate replica
+    /// ceiling.
+    pub fn try_with_tenant_limits(
+        mut self,
+        max_concurrent_per_tenant: usize,
+        max_tracked_tenants: usize,
+    ) -> Result<Self> {
+        for (valid, message) in [
+            (
+                max_concurrent_per_tenant > 0,
+                "max_concurrent_per_tenant must be greater than zero",
+            ),
+            (
+                max_concurrent_per_tenant <= self.max_concurrent,
+                "max_concurrent_per_tenant cannot exceed max_concurrent",
+            ),
+            (
+                (1..=MAX_TRACKED_TENANTS).contains(&max_tracked_tenants),
+                "max_tracked_tenants must be within 1..=65536",
+            ),
+        ] {
+            if !valid {
+                return Err(QueryError::InvalidLimits {
+                    message: message.to_owned(),
+                });
+            }
+        }
+        self.max_concurrent_per_tenant = max_concurrent_per_tenant;
+        self.max_tracked_tenants = max_tracked_tenants;
+        Ok(self)
+    }
+
     #[must_use]
     pub const fn max_concurrent(&self) -> usize { self.max_concurrent }
+
+    #[must_use]
+    pub const fn max_concurrent_per_tenant(&self) -> usize { self.max_concurrent_per_tenant }
+
+    #[must_use]
+    pub const fn max_tracked_tenants(&self) -> usize { self.max_tracked_tenants }
 
     #[must_use]
     pub const fn queue_wait(&self) -> Duration { self.queue_wait }
@@ -253,10 +299,12 @@ impl QueryLimits {
 impl Default for QueryLimits {
     fn default() -> Self {
         Self {
-            max_concurrent: 64,
-            queue_wait:     Duration::from_millis(100),
-            execution_time: Duration::from_mins(30),
-            max_sql_bytes:  1024 * 1024,
+            max_concurrent:            64,
+            max_concurrent_per_tenant: DEFAULT_MAX_CONCURRENT_PER_TENANT,
+            max_tracked_tenants:       DEFAULT_MAX_TRACKED_TENANTS,
+            queue_wait:                Duration::from_millis(100),
+            execution_time:            Duration::from_mins(30),
+            max_sql_bytes:             1024 * 1024,
         }
     }
 }

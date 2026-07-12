@@ -191,6 +191,13 @@ spill `emptyDir` is capped at 16 GiB and is disposable. Tune its memory/spill
 budgets and pod limits together: the configured 6 GiB query pool sits below
 the 8 GiB container limit.
 
+The reference gives each Query replica 64 aggregate slots and 8 slots per
+authenticated tenant, with 4096 bounded tenant trackers. Because these limits
+are replica-local, autoscaling changes cluster aggregate capacity. Keep the
+per-tenant value proportional to pod size and use a tenant-aware load balancer
+or a future distributed quota service when a strict cluster-wide entitlement
+is required.
+
 Metasrv append-operation cleanup defaults to 16 metadata pages of 128 records
 per one-minute maintenance tick. Monitor the finite-label
 `append_operations/budget_exhausted` and `append_operations/time_exhausted`
