@@ -556,14 +556,15 @@ where
         engine:       engine.clone(),
         refresher:    Some(refresher),
     };
-    let service = FlightServiceServer::new(FlightSqlServiceImpl {
-        engine:            engine.clone(),
-        metadata_addr:     config.metadata_endpoint,
-        metadata_security: config.metadata_security,
-        managed_stage:     config.managed_stage,
-        admission:         flight::QueryAdmission::new(config.limits),
-        discovery_limits:  config.discovery_limits,
-    });
+    let service =
+        FlightServiceServer::new(flight::TracedFlightSqlService::new(FlightSqlServiceImpl {
+            engine:            engine.clone(),
+            metadata_addr:     config.metadata_endpoint,
+            metadata_security: config.metadata_security,
+            managed_stage:     config.managed_stage,
+            admission:         flight::QueryAdmission::new(config.limits),
+            discovery_limits:  config.discovery_limits,
+        }));
 
     tracing::info!(%addr, "Flight SQL server ready");
     let server_shutdown = cancellation.clone();

@@ -30,8 +30,9 @@ use std::{
 };
 
 use arrow_flight::{
-    Action, ActionType, FlightClient, FlightDescriptor, FlightEndpoint, FlightInfo,
-    HandshakeRequest, HandshakeResponse, Result as FlightResult, Ticket,
+    Action, ActionType, Criteria, Empty, FlightClient, FlightData, FlightDescriptor,
+    FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, PollInfo,
+    Result as FlightResult, SchemaResult, Ticket,
     encode::FlightDataEncoderBuilder,
     error::FlightError,
     flight_service_server::FlightService,
@@ -54,13 +55,17 @@ use lake_common::{
     FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION,
     ManagedStageDescriptor, Namespace, Principal, PrincipalRole, TableName,
 };
-use lake_flight::{ClientSecurity, DELEGATED_NAMESPACE_HEADER, DELEGATED_TENANT_HEADER};
+use lake_flight::{
+    ClientSecurity, DELEGATED_NAMESPACE_HEADER, DELEGATED_TENANT_HEADER, TracedFlightStream,
+    set_span_parent_from_request,
+};
 use prost::Message;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::{Instant, Sleep},
 };
 use tonic::{Request, Response, Status, Streaming};
+use tracing::{Instrument as _, Span, field};
 
 use crate::{DiscoveryLimits, QueryEngine, QueryLimits, telemetry};
 
@@ -593,22 +598,161 @@ impl FlightSqlServiceImpl {
 /// Collapse any displayable error into an internal [`Status`].
 fn to_status<E: std::fmt::Display>(err: E) -> Status { Status::internal(err.to_string()) }
 
+fn record_rpc_outcome<T>(span: &Span, result: &std::result::Result<T, Status>) {
+    span.record("rpc.outcome", if result.is_ok() { "ok" } else { "error" });
+}
+
+fn query_server_span<T>(request: &Request<T>, method: &'static str) -> Span {
+    let span = tracing::info_span!(
+        target: "lake_query",
+        "flight.server",
+        rpc.system = "grpc",
+        rpc.service = "lake.query",
+        rpc.method = method,
+        rpc.outcome = field::Empty,
+    );
+    let _ = set_span_parent_from_request(&span, request);
+    span
+}
+
+type BoxStatusStream<T> =
+    Pin<Box<dyn Stream<Item = std::result::Result<T, Status>> + Send + 'static>>;
+
+fn finish_stream_rpc<T: Send + 'static>(
+    span: &Span,
+    result: std::result::Result<Response<BoxStatusStream<T>>, Status>,
+) -> std::result::Result<Response<BoxStatusStream<T>>, Status> {
+    match result {
+        Ok(response) => {
+            let stream: BoxStatusStream<T> =
+                Box::pin(TracedFlightStream::new(response.into_inner(), span.clone()));
+            Ok(Response::new(stream))
+        }
+        Err(error) => {
+            span.record("rpc.outcome", "error");
+            Err(error)
+        }
+    }
+}
+
+/// Delegates Arrow Flight SQL dispatch while overriding `ListActions`, the one
+/// successful RPC whose request is not exposed by `FlightSqlService` hooks.
+pub(crate) struct TracedFlightSqlService {
+    inner: FlightSqlServiceImpl,
+}
+
+impl TracedFlightSqlService {
+    pub(crate) fn new(inner: FlightSqlServiceImpl) -> Self { Self { inner } }
+}
+
+#[tonic::async_trait]
+impl FlightService for TracedFlightSqlService {
+    type DoActionStream = <FlightSqlServiceImpl as FlightService>::DoActionStream;
+    type DoExchangeStream = <FlightSqlServiceImpl as FlightService>::DoExchangeStream;
+    type DoGetStream = <FlightSqlServiceImpl as FlightService>::DoGetStream;
+    type DoPutStream = <FlightSqlServiceImpl as FlightService>::DoPutStream;
+    type HandshakeStream = <FlightSqlServiceImpl as FlightService>::HandshakeStream;
+    type ListActionsStream = <FlightSqlServiceImpl as FlightService>::ListActionsStream;
+    type ListFlightsStream = <FlightSqlServiceImpl as FlightService>::ListFlightsStream;
+
+    async fn handshake(
+        &self,
+        request: Request<Streaming<HandshakeRequest>>,
+    ) -> std::result::Result<Response<Self::HandshakeStream>, Status> {
+        <FlightSqlServiceImpl as FlightService>::handshake(&self.inner, request).await
+    }
+
+    async fn list_flights(
+        &self,
+        request: Request<Criteria>,
+    ) -> std::result::Result<Response<Self::ListFlightsStream>, Status> {
+        <FlightSqlServiceImpl as FlightService>::list_flights(&self.inner, request).await
+    }
+
+    async fn get_flight_info(
+        &self,
+        request: Request<FlightDescriptor>,
+    ) -> std::result::Result<Response<FlightInfo>, Status> {
+        <FlightSqlServiceImpl as FlightService>::get_flight_info(&self.inner, request).await
+    }
+
+    async fn poll_flight_info(
+        &self,
+        request: Request<FlightDescriptor>,
+    ) -> std::result::Result<Response<PollInfo>, Status> {
+        <FlightSqlServiceImpl as FlightService>::poll_flight_info(&self.inner, request).await
+    }
+
+    async fn get_schema(
+        &self,
+        request: Request<FlightDescriptor>,
+    ) -> std::result::Result<Response<SchemaResult>, Status> {
+        <FlightSqlServiceImpl as FlightService>::get_schema(&self.inner, request).await
+    }
+
+    async fn do_get(
+        &self,
+        request: Request<Ticket>,
+    ) -> std::result::Result<Response<Self::DoGetStream>, Status> {
+        <FlightSqlServiceImpl as FlightService>::do_get(&self.inner, request).await
+    }
+
+    async fn do_put(
+        &self,
+        request: Request<Streaming<FlightData>>,
+    ) -> std::result::Result<Response<Self::DoPutStream>, Status> {
+        <FlightSqlServiceImpl as FlightService>::do_put(&self.inner, request).await
+    }
+
+    async fn do_action(
+        &self,
+        request: Request<Action>,
+    ) -> std::result::Result<Response<Self::DoActionStream>, Status> {
+        <FlightSqlServiceImpl as FlightService>::do_action(&self.inner, request).await
+    }
+
+    async fn list_actions(
+        &self,
+        request: Request<Empty>,
+    ) -> std::result::Result<Response<Self::ListActionsStream>, Status> {
+        let span = query_server_span(&request, "list_actions");
+        let result = <FlightSqlServiceImpl as FlightService>::list_actions(&self.inner, request)
+            .instrument(span.clone())
+            .await;
+        finish_stream_rpc(&span, result)
+    }
+
+    async fn do_exchange(
+        &self,
+        request: Request<Streaming<FlightData>>,
+    ) -> std::result::Result<Response<Self::DoExchangeStream>, Status> {
+        <FlightSqlServiceImpl as FlightService>::do_exchange(&self.inner, request).await
+    }
+}
+
 #[tonic::async_trait]
 impl FlightSqlService for FlightSqlServiceImpl {
     type FlightService = Self;
 
     async fn do_handshake(
         &self,
-        _request: Request<Streaming<HandshakeRequest>>,
+        request: Request<Streaming<HandshakeRequest>>,
     ) -> std::result::Result<
         Response<
             Pin<Box<dyn Stream<Item = std::result::Result<HandshakeResponse, Status>> + Send>>,
         >,
         Status,
     > {
-        let response = HandshakeResponse::default();
-        let stream = futures::stream::once(async move { Ok(response) });
-        Ok(Response::new(Box::pin(stream)))
+        let span = query_server_span(&request, "handshake");
+        let result = async move {
+            let response = HandshakeResponse::default();
+            let stream: BoxStatusStream<HandshakeResponse> =
+                Box::pin(futures::stream::once(async move { Ok(response) }));
+            Ok(Response::new(stream))
+        }
+        .instrument(span.clone())
+        .await;
+        finish_stream_rpc(&span, result)
     }
 
     async fn get_flight_info_statement(
@@ -616,29 +760,38 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> std::result::Result<Response<FlightInfo>, Status> {
-        let CommandStatementQuery { query: sql, .. } = query;
-        self.admission.validate_sql_size(sql.as_bytes())?;
-        let principal = self.principal(&request)?;
-        self.authorize_sql(&principal, &sql)?;
-        let _permit = self.admission.acquire().await?;
-        let schema =
-            tokio::time::timeout_at(self.admission.execution_deadline(), self.plan_schema(&sql))
-                .await
-                .map_err(|_| Status::deadline_exceeded("query planning deadline exceeded"))??;
+        let span = query_server_span(&request, "get_flight_info");
+        let result = async move {
+            let CommandStatementQuery { query: sql, .. } = query;
+            self.admission.validate_sql_size(sql.as_bytes())?;
+            let principal = self.principal(&request)?;
+            self.authorize_sql(&principal, &sql)?;
+            let _permit = self.admission.acquire().await?;
+            let schema = tokio::time::timeout_at(
+                self.admission.execution_deadline(),
+                self.plan_schema(&sql),
+            )
+            .await
+            .map_err(|_| Status::deadline_exceeded("query planning deadline exceeded"))??;
 
-        // The ticket carries the raw SQL so `DoGet` can re-plan and execute it.
-        let ticket = TicketStatementQuery {
-            statement_handle: sql.into_bytes().into(),
-        };
-        let endpoint =
-            FlightEndpoint::new().with_ticket(Ticket::new(ticket.as_any().encode_to_vec()));
+            // The ticket carries the raw SQL so `DoGet` can re-plan and execute it.
+            let ticket = TicketStatementQuery {
+                statement_handle: sql.into_bytes().into(),
+            };
+            let endpoint =
+                FlightEndpoint::new().with_ticket(Ticket::new(ticket.as_any().encode_to_vec()));
 
-        let info = FlightInfo::new()
-            .try_with_schema(&schema)
-            .map_err(|e| Status::internal(format!("encode schema: {e}")))?
-            .with_endpoint(endpoint)
-            .with_descriptor(request.into_inner());
-        Ok(Response::new(info))
+            let info = FlightInfo::new()
+                .try_with_schema(&schema)
+                .map_err(|e| Status::internal(format!("encode schema: {e}")))?
+                .with_endpoint(endpoint)
+                .with_descriptor(request.into_inner());
+            Ok(Response::new(info))
+        }
+        .instrument(span.clone())
+        .await;
+        record_rpc_outcome(&span, &result);
+        result
     }
 
     async fn get_flight_info_schemas(
@@ -646,14 +799,21 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetDbSchemas,
         request: Request<FlightDescriptor>,
     ) -> std::result::Result<Response<FlightInfo>, Status> {
-        let endpoint =
-            FlightEndpoint::new().with_ticket(Ticket::new(query.as_any().encode_to_vec()));
-        let info = FlightInfo::new()
-            .try_with_schema(&query.clone().into_builder().schema())
-            .map_err(|error| Status::internal(format!("encode schema discovery: {error}")))?
-            .with_endpoint(endpoint)
-            .with_descriptor(request.into_inner());
-        Ok(Response::new(info))
+        let span = query_server_span(&request, "get_flight_info_schemas");
+        let result = async move {
+            let endpoint =
+                FlightEndpoint::new().with_ticket(Ticket::new(query.as_any().encode_to_vec()));
+            let info = FlightInfo::new()
+                .try_with_schema(&query.clone().into_builder().schema())
+                .map_err(|error| Status::internal(format!("encode schema discovery: {error}")))?
+                .with_endpoint(endpoint)
+                .with_descriptor(request.into_inner());
+            Ok(Response::new(info))
+        }
+        .instrument(span.clone())
+        .await;
+        record_rpc_outcome(&span, &result);
+        result
     }
 
     async fn get_flight_info_tables(
@@ -661,14 +821,21 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetTables,
         request: Request<FlightDescriptor>,
     ) -> std::result::Result<Response<FlightInfo>, Status> {
-        let endpoint =
-            FlightEndpoint::new().with_ticket(Ticket::new(query.as_any().encode_to_vec()));
-        let info = FlightInfo::new()
-            .try_with_schema(&query.clone().into_builder().schema())
-            .map_err(|error| Status::internal(format!("encode table discovery: {error}")))?
-            .with_endpoint(endpoint)
-            .with_descriptor(request.into_inner());
-        Ok(Response::new(info))
+        let span = query_server_span(&request, "get_flight_info_tables");
+        let result = async move {
+            let endpoint =
+                FlightEndpoint::new().with_ticket(Ticket::new(query.as_any().encode_to_vec()));
+            let info = FlightInfo::new()
+                .try_with_schema(&query.clone().into_builder().schema())
+                .map_err(|error| Status::internal(format!("encode table discovery: {error}")))?
+                .with_endpoint(endpoint)
+                .with_descriptor(request.into_inner());
+            Ok(Response::new(info))
+        }
+        .instrument(span.clone())
+        .await;
+        record_rpc_outcome(&span, &result);
+        result
     }
 
     async fn do_get_statement(
@@ -676,32 +843,38 @@ impl FlightSqlService for FlightSqlServiceImpl {
         ticket: TicketStatementQuery,
         request: Request<Ticket>,
     ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        self.admission.validate_sql_size(&ticket.statement_handle)?;
-        let sql = String::from_utf8(ticket.statement_handle.to_vec())
-            .map_err(|e| Status::invalid_argument(format!("ticket is not utf-8: {e}")))?;
-        let principal = self.principal(&request)?;
-        self.authorize_sql(&principal, &sql)?;
-        let permit = self.admission.acquire().await?;
-        let deadline = self.admission.execution_deadline();
+        let span = query_server_span(&request, "do_get");
+        let result =
+            async move {
+                self.admission.validate_sql_size(&ticket.statement_handle)?;
+                let sql = String::from_utf8(ticket.statement_handle.to_vec())
+                    .map_err(|e| Status::invalid_argument(format!("ticket is not utf-8: {e}")))?;
+                let principal = self.principal(&request)?;
+                self.authorize_sql(&principal, &sql)?;
+                let permit = self.admission.acquire().await?;
+                let deadline = self.admission.execution_deadline();
 
-        let batches = tokio::time::timeout_at(deadline, async {
-            let df = self.engine.plan_sql(&sql).await.map_err(to_status)?;
-            df.execute_stream().await.map_err(to_status)
-        })
-        .await
-        .map_err(|_| Status::deadline_exceeded("query planning deadline exceeded"))??;
-        let schema: SchemaRef = batches.schema();
-        let batches = batches.map_err(|err| FlightError::ExternalError(Box::new(err)));
+                let batches = tokio::time::timeout_at(deadline, async {
+                    let df = self.engine.plan_sql(&sql).await.map_err(to_status)?;
+                    df.execute_stream().await.map_err(to_status)
+                })
+                .await
+                .map_err(|_| Status::deadline_exceeded("query planning deadline exceeded"))??;
+                let schema: SchemaRef = batches.schema();
+                let batches = batches.map_err(|err| FlightError::ExternalError(Box::new(err)));
 
-        let stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .build(batches)
-            .map_err(Status::from);
-        Ok(Response::new(Box::pin(AdmittedFlightStream::new(
-            Box::pin(stream),
-            deadline,
-            permit,
-        ))))
+                let stream = FlightDataEncoderBuilder::new()
+                    .with_schema(schema)
+                    .build(batches)
+                    .map_err(Status::from);
+                let stream: <Self as FlightService>::DoGetStream = Box::pin(
+                    AdmittedFlightStream::new(Box::pin(stream), deadline, permit),
+                );
+                Ok(Response::new(stream))
+            }
+            .instrument(span.clone())
+            .await;
+        finish_stream_rpc(&span, result)
     }
 
     async fn do_get_schemas(
@@ -709,21 +882,29 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetDbSchemas,
         request: Request<Ticket>,
     ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let principal = self.principal(&request)?;
-        let permit = self.admission.acquire().await?;
-        let deadline = self.admission.execution_deadline();
-        let schema = query.clone().into_builder().schema();
-        let generation = self.engine.cached_catalog_generation();
-        let batches = schema_discovery_batches(query, principal, generation, self.discovery_limits);
-        let stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .build(batches)
-            .map_err(Status::from);
-        Ok(Response::new(Box::pin(AdmittedFlightStream::new(
-            Box::pin(stream),
-            deadline,
-            permit,
-        ))))
+        let span = query_server_span(&request, "do_get_schemas");
+        let result = async move {
+            let principal = self.principal(&request)?;
+            let permit = self.admission.acquire().await?;
+            let deadline = self.admission.execution_deadline();
+            let schema = query.clone().into_builder().schema();
+            let generation = self.engine.cached_catalog_generation();
+            let batches =
+                schema_discovery_batches(query, principal, generation, self.discovery_limits);
+            let stream = FlightDataEncoderBuilder::new()
+                .with_schema(schema)
+                .build(batches)
+                .map_err(Status::from);
+            let stream: BoxStatusStream<_> = Box::pin(AdmittedFlightStream::new(
+                Box::pin(stream),
+                deadline,
+                permit,
+            ));
+            Ok(Response::new(stream))
+        }
+        .instrument(span.clone())
+        .await;
+        finish_stream_rpc(&span, result)
     }
 
     async fn do_get_tables(
@@ -731,21 +912,29 @@ impl FlightSqlService for FlightSqlServiceImpl {
         query: CommandGetTables,
         request: Request<Ticket>,
     ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let principal = self.principal(&request)?;
-        let permit = self.admission.acquire().await?;
-        let deadline = self.admission.execution_deadline();
-        let schema = query.clone().into_builder().schema();
-        let generation = self.engine.cached_catalog_generation();
-        let batches = table_discovery_batches(query, principal, generation, self.discovery_limits);
-        let stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .build(batches)
-            .map_err(Status::from);
-        Ok(Response::new(Box::pin(AdmittedFlightStream::new(
-            Box::pin(stream),
-            deadline,
-            permit,
-        ))))
+        let span = query_server_span(&request, "do_get_tables");
+        let result = async move {
+            let principal = self.principal(&request)?;
+            let permit = self.admission.acquire().await?;
+            let deadline = self.admission.execution_deadline();
+            let schema = query.clone().into_builder().schema();
+            let generation = self.engine.cached_catalog_generation();
+            let batches =
+                table_discovery_batches(query, principal, generation, self.discovery_limits);
+            let stream = FlightDataEncoderBuilder::new()
+                .with_schema(schema)
+                .build(batches)
+                .map_err(Status::from);
+            let stream: BoxStatusStream<_> = Box::pin(AdmittedFlightStream::new(
+                Box::pin(stream),
+                deadline,
+                permit,
+            ));
+            Ok(Response::new(stream))
+        }
+        .instrument(span.clone())
+        .await;
+        finish_stream_rpc(&span, result)
     }
 
     async fn do_put_fallback(
@@ -753,73 +942,88 @@ impl FlightSqlService for FlightSqlServiceImpl {
         request: Request<PeekableFlightDataStream>,
         message: Any,
     ) -> std::result::Result<Response<<Self as FlightService>::DoPutStream>, Status> {
-        if message.type_url != FILE_APPEND_TYPE_URL {
-            return Err(Status::invalid_argument("invalid FILE append command"));
+        let span = query_server_span(&request, "do_put");
+        let result = async move {
+            if message.type_url != FILE_APPEND_TYPE_URL {
+                return Err(Status::invalid_argument("invalid FILE append command"));
+            }
+            let append = FileAppendRequest::from_command_payload(&message.value)
+                .ok_or_else(|| Status::invalid_argument("invalid FILE append command"))?;
+            let principal = self.principal(&request)?;
+            self.authorize_namespace(&principal, &append.table().namespace.0)?;
+            let addr = self
+                .metadata_addr
+                .as_ref()
+                .ok_or_else(|| Status::failed_precondition("FILE writes are not configured"))?;
+            let channel = self
+                .metadata_security
+                .connect(addr.clone())
+                .await
+                .map_err(|error| Status::unavailable(error.to_string()))?;
+            let mut client = FlightClient::new(channel);
+            self.metadata_security
+                .apply_to_flight_client(&mut client)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            apply_delegated_append_scope(
+                client.metadata_mut(),
+                &principal,
+                &append.table().namespace.0,
+            )?;
+            let results = client
+                .do_put(request.into_inner().map(|item| {
+                    item.map_err(|error| {
+                        arrow_flight::error::FlightError::protocol(error.to_string())
+                    })
+                }))
+                .await
+                .map_err(|error| Status::unavailable(error.to_string()))?
+                .map_err(|error| Status::internal(error.to_string()))
+                .try_collect::<Vec<_>>()
+                .await?;
+            self.engine.invalidate_registration(append.table()).await;
+            let stream: <Self as FlightService>::DoPutStream =
+                Box::pin(futures::stream::iter(results.into_iter().map(Ok)));
+            Ok(Response::new(stream))
         }
-        let append = FileAppendRequest::from_command_payload(&message.value)
-            .ok_or_else(|| Status::invalid_argument("invalid FILE append command"))?;
-        let principal = self.principal(&request)?;
-        self.authorize_namespace(&principal, &append.table().namespace.0)?;
-        let addr = self
-            .metadata_addr
-            .as_ref()
-            .ok_or_else(|| Status::failed_precondition("FILE writes are not configured"))?;
-        let channel = self
-            .metadata_security
-            .connect(addr.clone())
-            .await
-            .map_err(|error| Status::unavailable(error.to_string()))?;
-        let mut client = FlightClient::new(channel);
-        self.metadata_security
-            .apply_to_flight_client(&mut client)
-            .map_err(|error| Status::internal(error.to_string()))?;
-        apply_delegated_append_scope(
-            client.metadata_mut(),
-            &principal,
-            &append.table().namespace.0,
-        )?;
-        let results = client
-            .do_put(request.into_inner().map(|item| {
-                item.map_err(|error| arrow_flight::error::FlightError::protocol(error.to_string()))
-            }))
-            .await
-            .map_err(|error| Status::unavailable(error.to_string()))?
-            .map_err(|error| Status::internal(error.to_string()))
-            .try_collect::<Vec<_>>()
-            .await?;
-        self.engine.invalidate_registration(append.table()).await;
-        Ok(Response::new(Box::pin(futures::stream::iter(
-            results.into_iter().map(Ok),
-        ))))
+        .instrument(span.clone())
+        .await;
+        finish_stream_rpc(&span, result)
     }
 
     async fn do_action_fallback(
         &self,
         request: Request<Action>,
     ) -> std::result::Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let principal = self.principal(&request)?;
-        let action = request.into_inner();
-        if action.r#type != MANAGED_STAGE_DISCOVERY_ACTION {
-            return Err(Status::invalid_argument(format!(
-                "unknown query action '{}'",
-                action.r#type
-            )));
+        let span = query_server_span(&request, "do_action");
+        let result = async move {
+            let principal = self.principal(&request)?;
+            let action = request.into_inner();
+            if action.r#type != MANAGED_STAGE_DISCOVERY_ACTION {
+                return Err(Status::invalid_argument(format!(
+                    "unknown query action '{}'",
+                    action.r#type
+                )));
+            }
+            if !action.body.is_empty() {
+                return Err(Status::invalid_argument(
+                    "managed-stage discovery action body must be empty",
+                ));
+            }
+            let descriptor = self.managed_stage.as_ref().ok_or_else(|| {
+                Status::failed_precondition("managed FILE stage is not configured")
+            })?;
+            let body = descriptor
+                .scope_to_tenant(principal.tenant())
+                .to_wire()
+                .map_err(|error| Status::internal(error.to_string()))?;
+            let stream =
+                futures::stream::once(async move { Ok(FlightResult { body: body.into() }) });
+            let stream: <Self as FlightService>::DoActionStream = Box::pin(stream);
+            Ok(Response::new(stream))
         }
-        if !action.body.is_empty() {
-            return Err(Status::invalid_argument(
-                "managed-stage discovery action body must be empty",
-            ));
-        }
-        let descriptor = self
-            .managed_stage
-            .as_ref()
-            .ok_or_else(|| Status::failed_precondition("managed FILE stage is not configured"))?;
-        let body = descriptor
-            .scope_to_tenant(principal.tenant())
-            .to_wire()
-            .map_err(|error| Status::internal(error.to_string()))?;
-        let stream = futures::stream::once(async move { Ok(FlightResult { body: body.into() }) });
-        Ok(Response::new(Box::pin(stream)))
+        .instrument(span.clone())
+        .await;
+        finish_stream_rpc(&span, result)
     }
 
     async fn list_custom_actions(&self) -> Option<Vec<std::result::Result<ActionType, Status>>> {

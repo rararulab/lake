@@ -14,10 +14,17 @@
 
 //! Process-owned structured logging configuration.
 
-use std::env;
+use std::{env, future::Future, time::Duration};
 
 use anyhow::{Context as _, anyhow, bail};
-use tracing_subscriber::EnvFilter;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::{SpanExporter, WithExportConfig as _};
+use opentelemetry_sdk::{
+    Resource,
+    trace::{BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider},
+};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _};
+use url::Url;
 
 const DEFAULT_FILTER: &str = "lake=info,lake_query=info,lake_metasrv=info,lake_catalog=info";
 
@@ -26,24 +33,216 @@ enum LogFormat {
     Pretty,
 }
 
-pub(crate) fn init_from_env() -> anyhow::Result<()> {
+const OTLP_MAX_QUEUE_SIZE: usize = 2_048;
+const OTLP_MAX_EXPORT_BATCH_SIZE: usize = 256;
+const DEFAULT_OTLP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_OTLP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug)]
+struct OtlpConfig {
+    endpoint:              String,
+    service_name:          String,
+    export_timeout:        Duration,
+    shutdown_timeout:      Duration,
+    max_queue_size:        usize,
+    max_export_batch_size: usize,
+}
+
+impl OtlpConfig {
+    fn from_env() -> anyhow::Result<Option<Self>> {
+        let mut error = None;
+        let config = Self::from_lookup(|name| match env::var(name) {
+            Ok(value) => Some(value),
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => {
+                error = Some(anyhow!("{name} is not valid UTF-8"));
+                None
+            }
+        })?;
+        match error {
+            Some(error) => Err(error),
+            None => Ok(config),
+        }
+    }
+
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> anyhow::Result<Option<Self>> {
+        let endpoint = lookup("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+            .or_else(|| lookup("OTEL_EXPORTER_OTLP_ENDPOINT"));
+        let Some(endpoint) = endpoint else {
+            return Ok(None);
+        };
+        let parsed = Url::parse(&endpoint).context("invalid OTLP collector endpoint")?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || !matches!(parsed.path(), "" | "/")
+        {
+            bail!(
+                "invalid OTLP collector endpoint; expected an http(s) origin without credentials, \
+                 query, fragment, or path"
+            );
+        }
+
+        let service_name = lookup("OTEL_SERVICE_NAME").unwrap_or_else(|| "lake".to_owned());
+        if service_name.is_empty()
+            || service_name.len() > 64
+            || !service_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            bail!(
+                "invalid OTEL_SERVICE_NAME; expected 1..=64 ASCII alphanumeric, '.', '_', or '-'"
+            );
+        }
+
+        let shutdown_timeout = match lookup("LAKE_OTLP_SHUTDOWN_TIMEOUT_MS") {
+            Some(value) => {
+                let millis = value
+                    .parse::<u64>()
+                    .context("invalid LAKE_OTLP_SHUTDOWN_TIMEOUT_MS")?;
+                let timeout = Duration::from_millis(millis);
+                if timeout.is_zero() || timeout > MAX_OTLP_SHUTDOWN_TIMEOUT {
+                    bail!("LAKE_OTLP_SHUTDOWN_TIMEOUT_MS must be in 1..=30000");
+                }
+                timeout
+            }
+            None => DEFAULT_OTLP_SHUTDOWN_TIMEOUT,
+        };
+
+        Ok(Some(Self {
+            endpoint,
+            service_name,
+            export_timeout: shutdown_timeout / 2,
+            shutdown_timeout,
+            max_queue_size: OTLP_MAX_QUEUE_SIZE,
+            max_export_batch_size: OTLP_MAX_EXPORT_BATCH_SIZE,
+        }))
+    }
+}
+
+pub(crate) struct TelemetryGuard {
+    provider:         Option<SdkTracerProvider>,
+    shutdown_timeout: Duration,
+}
+
+impl TelemetryGuard {
+    fn disabled() -> Self {
+        Self {
+            provider:         None,
+            shutdown_timeout: DEFAULT_OTLP_SHUTDOWN_TIMEOUT,
+        }
+    }
+
+    fn from_config(config: OtlpConfig) -> anyhow::Result<Self> {
+        let exporter = SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(config.endpoint.clone())
+            // Leave the processor enough time to observe exporter completion,
+            // shut the exporter down, and join its worker within the outer bound.
+            .with_timeout(config.export_timeout)
+            .build()
+            .context("build OTLP trace exporter")?;
+        Ok(Self::from_exporter(config, exporter))
+    }
+
+    fn from_exporter(
+        config: OtlpConfig,
+        exporter: impl opentelemetry_sdk::trace::SpanExporter + 'static,
+    ) -> Self {
+        let processor = BatchSpanProcessor::builder(exporter)
+            .with_batch_config(
+                BatchConfigBuilder::default()
+                    .with_max_queue_size(config.max_queue_size)
+                    .with_max_export_batch_size(config.max_export_batch_size)
+                    .build(),
+            )
+            .build();
+        let resource = Resource::builder()
+            .with_service_name(config.service_name)
+            .build();
+        let provider = SdkTracerProvider::builder()
+            .with_resource(resource)
+            .with_span_processor(processor)
+            .build();
+        Self {
+            provider:         Some(provider),
+            shutdown_timeout: config.shutdown_timeout,
+        }
+    }
+
+    pub(crate) fn shutdown(mut self) { self.shutdown_provider(); }
+
+    fn shutdown_provider(&mut self) {
+        let Some(provider) = self.provider.take() else {
+            return;
+        };
+        if let Err(error) = provider.shutdown_with_timeout(self.shutdown_timeout) {
+            tracing::warn!(%error, "OTLP trace exporter did not shut down cleanly");
+        }
+    }
+}
+
+impl Drop for TelemetryGuard {
+    fn drop(&mut self) { self.shutdown_provider(); }
+}
+
+pub(crate) fn init_from_env() -> anyhow::Result<TelemetryGuard> {
     let format = log_format_from_env()?;
     let filter = log_filter_from_env()?;
+    let guard = match OtlpConfig::from_env()? {
+        Some(config) => TelemetryGuard::from_config(config)?,
+        None => TelemetryGuard::disabled(),
+    };
+    let telemetry = guard.provider.as_ref().map(|provider| {
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("lake"))
+            .with_location(false)
+            .with_threads(false)
+            .with_target(false)
+            .with_tracked_inactivity(false)
+    });
+    let subscriber = tracing_subscriber::registry().with(filter).with(telemetry);
     let result = match format {
-        LogFormat::Json => tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_ansi(false)
-            .json()
-            .with_writer(std::io::stderr)
+        LogFormat::Json => subscriber
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .json()
+                    .with_writer(std::io::stderr),
+            )
             .try_init(),
-        LogFormat::Pretty => tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_ansi(false)
-            .pretty()
-            .with_writer(std::io::stderr)
+        LogFormat::Pretty => subscriber
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .pretty()
+                    .with_writer(std::io::stderr),
+            )
             .try_init(),
     };
-    result.map_err(|error| anyhow!("initialize process logging: {error}"))
+    result
+        .map(|()| guard)
+        .map_err(|error| anyhow!("initialize process observability: {error}"))
+}
+
+/// Own process telemetry around the complete command future. Constructing an
+/// async command is inert, so initialization failure occurs before command
+/// parsing, storage setup, or listener binding. Cancellation drops the guard.
+pub(crate) async fn run_process<F>(
+    initialize: impl FnOnce() -> anyhow::Result<TelemetryGuard>,
+    command: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    let telemetry = initialize()?;
+    tracing::info!(target: "lake", version = env!("CARGO_PKG_VERSION"), "lake process starting");
+    let result = command.await;
+    telemetry.shutdown();
+    result
 }
 
 fn log_format_from_env() -> anyhow::Result<LogFormat> {
@@ -70,9 +269,18 @@ fn log_filter_from_env() -> anyhow::Result<EnvFilter> {
 mod tests {
     use std::{
         io::Write,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
     };
 
+    use opentelemetry::trace::{Span as _, Tracer as _, TracerProvider as _};
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SpanData, SpanExporter},
+    };
     use tracing::Level;
 
     use super::*;
@@ -92,6 +300,30 @@ mod tests {
         type Writer = Self;
 
         fn make_writer(&'writer self) -> Self::Writer { self.clone() }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct RecordingExporter {
+        exported: Arc<AtomicUsize>,
+        shutdown: Arc<AtomicBool>,
+    }
+
+    impl SpanExporter for RecordingExporter {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.exported.fetch_add(batch.len(), Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
+            self.shutdown.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    fn finish_test_span(guard: &TelemetryGuard) {
+        let provider = guard.provider.as_ref().expect("enabled provider");
+        let tracer = provider.tracer("lake-test");
+        tracer.start("bounded-test-span").end();
     }
 
     #[test]
@@ -124,5 +356,105 @@ mod tests {
             targets,
             ["lake", "lake_query", "lake_metasrv", "lake_catalog"]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn otlp_exporter_is_opt_in_and_lifecycle_owned() {
+        let disabled = OtlpConfig::from_lookup(|_| None).expect("disabled configuration");
+        assert!(disabled.is_none());
+
+        let malformed = OtlpConfig::from_lookup(|name| match name {
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" => Some("ftp://collector.invalid".to_owned()),
+            _ => None,
+        })
+        .expect_err("non-HTTP collector endpoint rejected");
+        assert!(malformed.to_string().contains("OTLP"));
+
+        let config = OtlpConfig::from_lookup(|name| match name {
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" => Some("http://127.0.0.1:9".to_owned()),
+            "OTEL_SERVICE_NAME" => Some("lake-query".to_owned()),
+            "LAKE_OTLP_SHUTDOWN_TIMEOUT_MS" => Some("25".to_owned()),
+            _ => None,
+        })
+        .expect("valid unavailable collector configuration")
+        .expect("export enabled");
+        assert_eq!(config.max_queue_size, 2_048);
+        assert_eq!(config.max_export_batch_size, 256);
+
+        let recorder = RecordingExporter::default();
+        let command_started = Arc::new(AtomicBool::new(false));
+        let started = command_started.clone();
+        run_process(
+            || {
+                let guard = TelemetryGuard::from_exporter(config.clone(), recorder.clone());
+                finish_test_span(&guard);
+                Ok(guard)
+            },
+            async move {
+                started.store(true, Ordering::Release);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(())
+            },
+        )
+        .await
+        .expect("collector state does not stop command");
+        assert!(command_started.load(Ordering::Acquire));
+        assert_eq!(recorder.exported.load(Ordering::Relaxed), 1);
+        assert!(recorder.shutdown.load(Ordering::Relaxed));
+
+        let command_polled = Arc::new(AtomicBool::new(false));
+        let polled = command_polled.clone();
+        let error = run_process(
+            || Err(anyhow!("malformed OTLP configuration")),
+            async move {
+                polled.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("initialization failure wins");
+        assert!(error.to_string().contains("malformed OTLP"));
+        assert!(!command_polled.load(Ordering::Acquire));
+
+        let started = Instant::now();
+        run_process(|| TelemetryGuard::from_config(config), async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(())
+        })
+        .await
+        .expect("unavailable collector is not fatal");
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let cancelled = RecordingExporter::default();
+        let entered = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn({
+            let cancelled = cancelled.clone();
+            let entered = entered.clone();
+            let config = OtlpConfig {
+                endpoint: "http://127.0.0.1:9".to_owned(),
+                ..OtlpConfig::from_lookup(|name| match name {
+                    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" => Some("http://127.0.0.1:9".to_owned()),
+                    _ => None,
+                })
+                .expect("configuration")
+                .expect("enabled")
+            };
+            async move {
+                run_process(
+                    || Ok(TelemetryGuard::from_exporter(config, cancelled)),
+                    async move {
+                        entered.store(true, Ordering::Release);
+                        std::future::pending().await
+                    },
+                )
+                .await
+            }
+        });
+        while !entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        let _ = task.await;
+        assert!(cancelled.shutdown.load(Ordering::Acquire));
     }
 }

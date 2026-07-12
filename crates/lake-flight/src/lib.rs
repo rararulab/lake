@@ -14,20 +14,34 @@
 
 //! Shared Flight transport-security contracts.
 
-use std::{fmt, net::SocketAddr, sync::Arc};
+use std::{
+    fmt,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context as TaskContext, Poll},
+};
 
 use arrow_flight::{FlightClient, FlightData, sql::client::FlightSqlServiceClient};
+use futures::Stream;
 use lake_common::AppendPayloadDigest;
 pub use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
+use opentelemetry::{
+    Context,
+    propagation::{Extractor, Injector, TextMapPropagator as _},
+};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use sha2::{Digest, Sha256};
 use snafu::Snafu;
 use subtle::ConstantTimeEq;
 use tonic::{
     Request, Status,
-    metadata::{Ascii, MetadataValue},
+    metadata::{Ascii, MetadataMap, MetadataValue},
     service::Interceptor,
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig},
 };
+use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 /// Metadata key used by trusted Query and metadata peers to preserve an
 /// already-authorized namespace across an internal Flight hop.
@@ -36,6 +50,126 @@ pub const DELEGATED_NAMESPACE_HEADER: &str = "x-lake-delegated-namespace";
 pub const DELEGATED_TENANT_HEADER: &str = "x-lake-delegated-tenant";
 
 const APPEND_DIGEST_DOMAIN: &[u8] = b"lake.append.flight-metadata.v1\0";
+
+const TRACEPARENT_HEADER: &str = "traceparent";
+const TRACESTATE_HEADER: &str = "tracestate";
+
+struct FlightMetadataInjector<'metadata>(&'metadata mut MetadataMap);
+
+impl Injector for FlightMetadataInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        let Ok(value) = value.parse() else {
+            return;
+        };
+        match key {
+            TRACEPARENT_HEADER => {
+                self.0.insert(TRACEPARENT_HEADER, value);
+            }
+            TRACESTATE_HEADER => {
+                self.0.insert(TRACESTATE_HEADER, value);
+            }
+            _ => {}
+        }
+    }
+}
+
+struct FlightMetadataExtractor<'metadata>(&'metadata MetadataMap);
+
+impl Extractor for FlightMetadataExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        match key {
+            TRACEPARENT_HEADER | TRACESTATE_HEADER => {
+                self.0.get(key).and_then(|value| value.to_str().ok())
+            }
+            _ => None,
+        }
+    }
+
+    fn keys(&self) -> Vec<&str> { vec![TRACEPARENT_HEADER, TRACESTATE_HEADER] }
+}
+
+/// Inject one OpenTelemetry context into the standard W3C Flight metadata
+/// headers. Baggage and Lake authentication/delegation metadata are never
+/// copied by this operation.
+pub fn inject_trace_context(context: &Context, metadata: &mut MetadataMap) {
+    TraceContextPropagator::new().inject_context(context, &mut FlightMetadataInjector(metadata));
+}
+
+/// Extract standard W3C trace context from Flight metadata. Missing or
+/// malformed context becomes an invalid remote parent and never weakens the
+/// independent authentication interceptor.
+#[must_use]
+pub fn extract_trace_context(metadata: &MetadataMap) -> Context {
+    TraceContextPropagator::new().extract(&FlightMetadataExtractor(metadata))
+}
+
+/// Inject the OpenTelemetry context attached to the current tracing span into
+/// a generated Flight request.
+pub fn inject_current_trace_context<T>(request: &mut Request<T>) {
+    inject_trace_context(&Span::current().context(), request.metadata_mut());
+}
+
+/// Parent a bounded server span from standard W3C Flight metadata. Invalid or
+/// absent metadata leaves the span as a new root.
+pub fn set_span_parent_from_request<T>(
+    span: &Span,
+    request: &Request<T>,
+) -> std::result::Result<(), tracing_opentelemetry::SetParentError> {
+    span.set_parent(extract_trace_context(request.metadata()))
+}
+
+/// Keep a server span alive for the complete lifetime of a Flight response
+/// stream, including downstream errors and cancellation by the caller.
+pub struct TracedFlightStream<T> {
+    inner:    Pin<Box<dyn Stream<Item = std::result::Result<T, Status>> + Send>>,
+    span:     Span,
+    finished: bool,
+}
+
+impl<T> TracedFlightStream<T> {
+    pub fn new(
+        inner: impl Stream<Item = std::result::Result<T, Status>> + Send + 'static,
+        span: Span,
+    ) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            span,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, outcome: &'static str) {
+        if !self.finished {
+            self.span.record("rpc.outcome", outcome);
+            self.finished = true;
+        }
+    }
+}
+
+impl<T> Stream for TracedFlightStream<T> {
+    type Item = std::result::Result<T, Status>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let polled = {
+            let span = self.span.clone();
+            let _entered = span.enter();
+            self.inner.as_mut().poll_next(context)
+        };
+        match &polled {
+            Poll::Ready(Some(Err(_))) => self.finish("error"),
+            Poll::Ready(None) => self.finish("ok"),
+            Poll::Pending | Poll::Ready(Some(Ok(_))) => {}
+        }
+        polled
+    }
+}
+
+impl<T> Drop for TracedFlightStream<T> {
+    fn drop(&mut self) { self.finish("cancelled"); }
+}
 
 /// Incrementally hashes the ordered Arrow Flight metadata messages in one
 /// append. The descriptor is excluded because it carries the digest itself;
@@ -462,6 +596,7 @@ impl ClientSecurity {
 
     /// Apply the same bearer credential to all high-level Flight operations.
     pub fn apply_to_flight_client(&self, client: &mut FlightClient) -> Result<()> {
+        inject_trace_context(&Span::current().context(), client.metadata_mut());
         if let Some(bearer) = &self.bearer {
             client
                 .metadata_mut()
@@ -472,6 +607,13 @@ impl ClientSecurity {
 
     /// Apply the same bearer credential to Flight SQL and its DoGet clients.
     pub fn apply_to_sql_client(&self, client: &mut FlightSqlServiceClient<Channel>) {
+        let mut metadata = MetadataMap::new();
+        inject_trace_context(&Span::current().context(), &mut metadata);
+        for key in [TRACEPARENT_HEADER, TRACESTATE_HEADER] {
+            if let Some(value) = metadata.get(key).and_then(|value| value.to_str().ok()) {
+                client.set_header(key, value);
+            }
+        }
         if let Some(bearer) = &self.bearer {
             client.set_token(bearer.value.to_string());
         }
@@ -479,6 +621,7 @@ impl ClientSecurity {
 
     /// Attach credentials to a generated low-level Flight request.
     pub fn authorize_request<T>(&self, mut request: Request<T>) -> Request<T> {
+        inject_current_trace_context(&mut request);
         if let Some(bearer) = &self.bearer {
             request
                 .metadata_mut()
@@ -504,16 +647,52 @@ fn ensure_crypto_provider() { let _ = rustls::crypto::ring::default_provider().i
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::{
+        net::SocketAddr,
+        sync::{Arc, Mutex},
+    };
 
     use arrow_flight::{FlightClient, sql::client::FlightSqlServiceClient};
+    use futures::StreamExt as _;
     use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
-    use tonic::{Request, service::Interceptor};
+    use opentelemetry::{
+        Context, TraceFlags, TraceId, Value,
+        trace::{SpanContext, SpanId, TraceContextExt as _, TraceState},
+    };
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
+    use tonic::{Request, Status, service::Interceptor};
+    use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::{
-        BearerAuthenticator, BearerPrincipalBinding, ClientSecurity, ServerSecurity,
-        append_flight_payload_digest,
+        BearerAuthenticator, BearerPrincipalBinding, ClientSecurity, DELEGATED_TENANT_HEADER,
+        ServerSecurity, TracedFlightStream, append_flight_payload_digest, extract_trace_context,
+        inject_trace_context,
     };
+
+    #[derive(Clone, Debug, Default)]
+    struct RecordingExporter(Arc<Mutex<Vec<SpanData>>>);
+
+    impl SpanExporter for RecordingExporter {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().expect("span recorder lock").extend(batch);
+            Ok(())
+        }
+    }
+
+    fn span_outcome(span: &SpanData) -> Option<&str> {
+        span.attributes.iter().find_map(|attribute| {
+            if attribute.key.as_str() != "rpc.outcome" {
+                return None;
+            }
+            match &attribute.value {
+                Value::String(value) => Some(value.as_str()),
+                _ => None,
+            }
+        })
+    }
 
     fn request_with_authorization(value: &str) -> Request<()> {
         let mut request = Request::new(());
@@ -521,6 +700,97 @@ mod tests {
             .metadata_mut()
             .insert("authorization", value.parse().expect("valid metadata"));
         request
+    }
+
+    #[test]
+    fn trace_context_roundtrips_through_flight_metadata_without_sensitive_fields() {
+        let span = SpanContext::new(
+            TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").expect("trace id"),
+            SpanId::from_hex("00f067aa0ba902b7").expect("span id"),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::from_key_value([("vendor", "opaque")]).expect("trace state"),
+        );
+        let parent = Context::new().with_remote_span_context(span.clone());
+        let mut request = request_with_authorization("Bearer must-stay-redacted");
+        request.metadata_mut().insert(
+            DELEGATED_TENANT_HEADER,
+            "sensitive-tenant".parse().expect("metadata"),
+        );
+
+        inject_trace_context(&parent, request.metadata_mut());
+        let extracted = extract_trace_context(request.metadata());
+
+        assert_eq!(extracted.span().span_context(), &span);
+        assert_eq!(
+            request
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer must-stay-redacted")
+        );
+        assert_eq!(
+            request
+                .metadata()
+                .get(DELEGATED_TENANT_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("sensitive-tenant")
+        );
+        let trace_keys = request
+            .metadata()
+            .keys()
+            .filter_map(|key| match key {
+                tonic::metadata::KeyRef::Ascii(key) => Some(key.as_str()),
+                tonic::metadata::KeyRef::Binary(_) => None,
+            })
+            .filter(|key| key.starts_with("trace"))
+            .collect::<Vec<_>>();
+        assert_eq!(trace_keys, ["traceparent", "tracestate"]);
+        assert!(!format!("{extracted:?}").contains("must-stay-redacted"));
+        assert!(!format!("{extracted:?}").contains("sensitive-tenant"));
+    }
+
+    #[test]
+    fn traced_flight_stream_records_late_error_and_cancellation() {
+        use opentelemetry::trace::TracerProvider as _;
+
+        let exporter = RecordingExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer()
+                .with_tracer(provider.tracer("stream-test"))
+                .with_location(false)
+                .with_threads(false)
+                .with_target(false)
+                .with_tracked_inactivity(false),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            let error_span =
+                tracing::info_span!("flight.server", rpc.outcome = tracing::field::Empty);
+            let mut error_stream = TracedFlightStream::new(
+                futures::stream::iter([Err::<(), _>(Status::unavailable("late failure"))]),
+                error_span,
+            );
+            let error = futures::executor::block_on(error_stream.next())
+                .expect("one item")
+                .expect_err("late stream error");
+            assert_eq!(error.code(), tonic::Code::Unavailable);
+
+            let cancelled_span =
+                tracing::info_span!("flight.server", rpc.outcome = tracing::field::Empty);
+            drop(TracedFlightStream::<()>::new(
+                futures::stream::pending(),
+                cancelled_span,
+            ));
+        });
+        provider.force_flush().expect("flush spans");
+        let spans = exporter.0.lock().expect("span recorder lock");
+        let mut outcomes = spans.iter().filter_map(span_outcome).collect::<Vec<_>>();
+        outcomes.sort_unstable();
+        assert_eq!(outcomes, ["cancelled", "error"]);
     }
 
     #[test]

@@ -35,6 +35,10 @@ prost-types = { workspace = true }
 rcgen = "^0.13"
 serde_json = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

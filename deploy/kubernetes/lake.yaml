@@ -190,6 +190,10 @@ spec:
           env:
             - name: LAKE_LOG_FORMAT
               value: json
+            - name: OTEL_SERVICE_NAME
+              value: lake-query
+            - name: LAKE_OTLP_SHUTDOWN_TIMEOUT_MS
+              value: "5000"
             - name: LAKE_METRICS_ADDR
               value: 127.0.0.1:9090
             - name: LAKE_SHUTDOWN_GRACE_MS
@@ -384,6 +388,10 @@ spec:
                   fieldPath: status.podIP
             - name: LAKE_LOG_FORMAT
               value: json
+            - name: OTEL_SERVICE_NAME
+              value: lake-metasrv
+            - name: LAKE_OTLP_SHUTDOWN_TIMEOUT_MS
+              value: "5000"
             - name: LAKE_METRICS_ADDR
               value: 127.0.0.1:9090
             - name: LAKE_SHUTDOWN_GRACE_MS
