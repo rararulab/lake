@@ -411,8 +411,11 @@ design-level ones:
   / `LAKE_S3_PROXY_EXCLUDES`). Verified against localstack both directly
   (`tests/s3_lance_localstack.rs`, `#[ignore]`) and through `lake selftest` in
   cloud mode.
-- No client-side SDK cache yet — the query layer caches, the SDK does not.
-  Add SDK-side catalog caching when fleet-node QPS demands another tier.
+- The Rust SDK has a finite table-schema cache shared by client clones. It
+  singleflights same-table misses, retains only successful lookups, expires
+  entries after a bounded TTL, and exposes explicit per-table/full invalidation
+  for coordinated replacement. This removes per-row schema planning without
+  weakening Query/Metasrv append validation.
 - Each stateless Query replica has finite process-local admission: bounded
   concurrent planning/execution, bounded queue wait, a stream-held execution
   deadline, and pre-planning SQL/ticket size checks. This protects one replica

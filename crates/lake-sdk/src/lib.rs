@@ -20,6 +20,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use arrow::{
@@ -44,16 +45,21 @@ use lake_objects::{
     LocalObjectStore, ManagedObjectStore, ObjectReader, S3ObjectStore, data_location_array,
     data_location_field, data_location_from_array,
 };
+use moka::{future::Cache, ops::compute::Op};
 use prost::Message;
 use prost_types::Any;
 use sha2::{Digest, Sha256};
 use snafu::{OptionExt, ResultExt, Snafu};
-use tokio::io::AsyncRead;
+use tokio::{io::AsyncRead, sync::Mutex};
 use tonic::transport::Channel;
 
 const APPEND_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 const APPEND_RETRY_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 const APPEND_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+const DEFAULT_SCHEMA_CACHE_CAPACITY: u64 = 1_024;
+const DEFAULT_SCHEMA_CACHE_TTL: Duration = Duration::from_mins(1);
+const MAX_SCHEMA_CACHE_CAPACITY: u64 = 65_536;
+const MAX_SCHEMA_CACHE_TTL: Duration = Duration::from_hours(1);
 
 fn ambiguous_append_error(error: &SdkError) -> bool {
     match error {
@@ -112,6 +118,9 @@ where
 pub enum SdkError {
     #[snafu(display("unsupported INSERT SQL: {message}"))]
     InvalidSql { message: String },
+
+    #[snafu(display("invalid SDK schema cache configuration: {message}"))]
+    InvalidSchemaCacheConfig { message: String },
 
     #[snafu(display(
         "ambiguous FILE append did not converge within {window:?}; resume the returned pending \
@@ -290,12 +299,250 @@ pub enum InsertValue {
     File(FileUpload),
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SchemaCacheConfig {
+    capacity: u64,
+    ttl:      Duration,
+}
+
+impl Default for SchemaCacheConfig {
+    fn default() -> Self {
+        Self {
+            capacity: DEFAULT_SCHEMA_CACHE_CAPACITY,
+            ttl:      DEFAULT_SCHEMA_CACHE_TTL,
+        }
+    }
+}
+
+impl SchemaCacheConfig {
+    fn validate(capacity: u64, ttl: Duration) -> Result<Self> {
+        if capacity == 0 || capacity > MAX_SCHEMA_CACHE_CAPACITY {
+            return Err(SdkError::InvalidSchemaCacheConfig {
+                message: format!("capacity must be in 1..={MAX_SCHEMA_CACHE_CAPACITY}"),
+            });
+        }
+        if ttl.is_zero() || ttl > MAX_SCHEMA_CACHE_TTL {
+            return Err(SdkError::InvalidSchemaCacheConfig {
+                message: format!("TTL must be in 1ns..={MAX_SCHEMA_CACHE_TTL:?}"),
+            });
+        }
+        Ok(Self { capacity, ttl })
+    }
+}
+
+#[derive(Clone)]
+struct SchemaCache {
+    entries: Cache<TableRef, Arc<Mutex<Option<SchemaLoadResult>>>>,
+}
+
+type SchemaLoadResult = std::result::Result<SchemaRef, SchemaLoadError>;
+
+#[derive(Clone, Debug)]
+enum SchemaLoadError {
+    Flight(FlightErrorSnapshot),
+    Arrow(ArrowErrorSnapshot),
+}
+
+impl SchemaLoadError {
+    fn into_sdk_error(self) -> SdkError {
+        match self {
+            Self::Flight(source) => SdkError::Flight {
+                source: source.into_error(),
+            },
+            Self::Arrow(source) => SdkError::Arrow {
+                source: source.into_error(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum FlightErrorSnapshot {
+    Arrow(ArrowErrorSnapshot),
+    NotYetImplemented(String),
+    Tonic(tonic::Status),
+    Protocol(String),
+    Decode(String),
+    External(String),
+}
+
+impl FlightErrorSnapshot {
+    fn from_error(error: arrow_flight::error::FlightError) -> Self {
+        use arrow_flight::error::FlightError;
+        match error {
+            FlightError::Arrow(source) => Self::Arrow(ArrowErrorSnapshot::from_error(source)),
+            FlightError::NotYetImplemented(message) => Self::NotYetImplemented(message),
+            FlightError::Tonic(status) => Self::Tonic(*status),
+            FlightError::ProtocolError(message) => Self::Protocol(message),
+            FlightError::DecodeError(message) => Self::Decode(message),
+            FlightError::ExternalError(source) => Self::External(source.to_string()),
+        }
+    }
+
+    fn into_error(self) -> arrow_flight::error::FlightError {
+        use arrow_flight::error::FlightError;
+        match self {
+            Self::Arrow(source) => FlightError::Arrow(source.into_error()),
+            Self::NotYetImplemented(message) => FlightError::NotYetImplemented(message),
+            Self::Tonic(status) => FlightError::Tonic(Box::new(status)),
+            Self::Protocol(message) => FlightError::ProtocolError(message),
+            Self::Decode(message) => FlightError::DecodeError(message),
+            Self::External(message) => {
+                FlightError::ExternalError(Box::new(std::io::Error::other(message)))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ArrowErrorSnapshot {
+    NotYetImplemented(String),
+    External(String),
+    Cast(String),
+    Memory(String),
+    Parse(String),
+    Schema(String),
+    Compute(String),
+    DivideByZero,
+    ArithmeticOverflow(String),
+    Csv(String),
+    Json(String),
+    Avro(String),
+    Io(String, std::io::ErrorKind, String),
+    Ipc(String),
+    InvalidArgument(String),
+    Parquet(String),
+    CDataInterface(String),
+    DictionaryKeyOverflow,
+    RunEndIndexOverflow,
+    OffsetOverflow(usize),
+}
+
+impl ArrowErrorSnapshot {
+    fn from_error(error: ArrowError) -> Self {
+        match error {
+            ArrowError::NotYetImplemented(message) => Self::NotYetImplemented(message),
+            ArrowError::ExternalError(source) => Self::External(source.to_string()),
+            ArrowError::CastError(message) => Self::Cast(message),
+            ArrowError::MemoryError(message) => Self::Memory(message),
+            ArrowError::ParseError(message) => Self::Parse(message),
+            ArrowError::SchemaError(message) => Self::Schema(message),
+            ArrowError::ComputeError(message) => Self::Compute(message),
+            ArrowError::DivideByZero => Self::DivideByZero,
+            ArrowError::ArithmeticOverflow(message) => Self::ArithmeticOverflow(message),
+            ArrowError::CsvError(message) => Self::Csv(message),
+            ArrowError::JsonError(message) => Self::Json(message),
+            ArrowError::AvroError(message) => Self::Avro(message),
+            ArrowError::IoError(message, source) => {
+                Self::Io(message, source.kind(), source.to_string())
+            }
+            ArrowError::IpcError(message) => Self::Ipc(message),
+            ArrowError::InvalidArgumentError(message) => Self::InvalidArgument(message),
+            ArrowError::ParquetError(message) => Self::Parquet(message),
+            ArrowError::CDataInterface(message) => Self::CDataInterface(message),
+            ArrowError::DictionaryKeyOverflowError => Self::DictionaryKeyOverflow,
+            ArrowError::RunEndIndexOverflowError => Self::RunEndIndexOverflow,
+            ArrowError::OffsetOverflowError(offset) => Self::OffsetOverflow(offset),
+        }
+    }
+
+    fn into_error(self) -> ArrowError {
+        match self {
+            Self::NotYetImplemented(message) => ArrowError::NotYetImplemented(message),
+            Self::External(message) => {
+                ArrowError::ExternalError(Box::new(std::io::Error::other(message)))
+            }
+            Self::Cast(message) => ArrowError::CastError(message),
+            Self::Memory(message) => ArrowError::MemoryError(message),
+            Self::Parse(message) => ArrowError::ParseError(message),
+            Self::Schema(message) => ArrowError::SchemaError(message),
+            Self::Compute(message) => ArrowError::ComputeError(message),
+            Self::DivideByZero => ArrowError::DivideByZero,
+            Self::ArithmeticOverflow(message) => ArrowError::ArithmeticOverflow(message),
+            Self::Csv(message) => ArrowError::CsvError(message),
+            Self::Json(message) => ArrowError::JsonError(message),
+            Self::Avro(message) => ArrowError::AvroError(message),
+            Self::Io(message, kind, source) => {
+                ArrowError::IoError(message, std::io::Error::new(kind, source))
+            }
+            Self::Ipc(message) => ArrowError::IpcError(message),
+            Self::InvalidArgument(message) => ArrowError::InvalidArgumentError(message),
+            Self::Parquet(message) => ArrowError::ParquetError(message),
+            Self::CDataInterface(message) => ArrowError::CDataInterface(message),
+            Self::DictionaryKeyOverflow => ArrowError::DictionaryKeyOverflowError,
+            Self::RunEndIndexOverflow => ArrowError::RunEndIndexOverflowError,
+            Self::OffsetOverflow(offset) => ArrowError::OffsetOverflowError(offset),
+        }
+    }
+}
+
+impl SchemaCache {
+    fn new(config: SchemaCacheConfig) -> Self {
+        Self {
+            entries: Cache::builder()
+                .max_capacity(config.capacity)
+                .time_to_live(config.ttl)
+                .build(),
+        }
+    }
+
+    async fn resolve<F, Fut>(&self, table: TableRef, load: F) -> SchemaLoadResult
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = SchemaLoadResult>,
+    {
+        // The cell is published before the loader starts. Invalidating the key
+        // therefore detaches an in-flight loader: it can finish for its caller,
+        // but it cannot repopulate the cache after a table incarnation change.
+        let cell = self
+            .entries
+            .get_with(table.clone(), async { Arc::new(Mutex::new(None)) })
+            .await;
+        let mut cached = cell.lock().await;
+        if let Some(result) = cached.as_ref() {
+            return result.clone();
+        }
+        let result = load().await;
+        *cached = Some(result.clone());
+        drop(cached);
+
+        if result.is_err() {
+            // Existing waiters retain this cell and observe the same typed
+            // failure. Remove only this exact generation so a request arriving
+            // after the cohort can retry immediately; never remove a newer cell
+            // installed by explicit invalidation.
+            let failed_cell = cell.clone();
+            self.entries
+                .entry(table)
+                .and_compute_with(move |entry| {
+                    let op = entry.map_or(Op::Nop, |entry| {
+                        if Arc::ptr_eq(&entry.into_value(), &failed_cell) {
+                            Op::Remove
+                        } else {
+                            Op::Nop
+                        }
+                    });
+                    std::future::ready(op)
+                })
+                .await;
+        }
+        result
+    }
+
+    async fn invalidate(&self, table: &TableRef) { self.entries.invalidate(table).await; }
+
+    fn clear(&self) { self.entries.invalidate_all(); }
+
+    fn entry_count(&self) -> u64 { self.entries.entry_count() }
+}
+
 /// A Rust SDK client connected to the stateless query endpoint.
 #[derive(Clone)]
 pub struct LakeClient {
     query:                 Channel,
     objects:               Arc<dyn ManagedObjectStore>,
     security:              ClientSecurity,
+    schema_cache:          SchemaCache,
     upload_checkpoint_dir: Option<PathBuf>,
 }
 
@@ -304,10 +551,17 @@ pub struct LakeClient {
 pub struct LakeClientBuilder {
     query_endpoint:        String,
     security:              ClientSecurity,
+    schema_cache:          SchemaCacheConfig,
     upload_checkpoint_dir: Option<PathBuf>,
 }
 
 impl LakeClientBuilder {
+    /// Configure the finite client-local table schema cache.
+    pub fn with_schema_cache(mut self, capacity: u64, ttl: Duration) -> Result<Self> {
+        self.schema_cache = SchemaCacheConfig::validate(capacity, ttl)?;
+        Ok(self)
+    }
+
     /// Persist resumable path-upload checkpoints in this local directory.
     #[must_use]
     pub fn with_upload_checkpoint_dir(mut self, directory: impl Into<PathBuf>) -> Self {
@@ -359,6 +613,7 @@ impl LakeClientBuilder {
             query,
             objects,
             security: self.security,
+            schema_cache: SchemaCache::new(self.schema_cache),
             upload_checkpoint_dir: self.upload_checkpoint_dir,
         })
     }
@@ -378,6 +633,7 @@ impl LakeClientBuilder {
             query,
             objects: Arc::new(objects),
             security: self.security,
+            schema_cache: SchemaCache::new(self.schema_cache),
             upload_checkpoint_dir: self.upload_checkpoint_dir,
         })
     }
@@ -389,6 +645,7 @@ impl LakeClient {
         LakeClientBuilder {
             query_endpoint:        query_endpoint.into(),
             security:              ClientSecurity::new(),
+            schema_cache:          SchemaCacheConfig::default(),
             upload_checkpoint_dir: None,
         }
     }
@@ -410,6 +667,14 @@ impl LakeClient {
             .connect_with_store(objects)
             .await
     }
+
+    /// Expire one cached table schema immediately.
+    pub async fn invalidate_table_schema(&self, table: &TableRef) {
+        self.schema_cache.invalidate(table).await;
+    }
+
+    /// Expire every cached table schema immediately.
+    pub fn clear_schema_cache(&self) { self.schema_cache.clear(); }
 
     /// Execute a parameterized, single-row INSERT with typed scalar/`FILE`
     /// values.
@@ -555,13 +820,21 @@ impl LakeClient {
     }
 
     async fn table_schema(&self, table: &TableRef) -> Result<SchemaRef> {
+        self.schema_cache
+            .resolve(table.clone(), || self.fetch_table_schema(table))
+            .await
+            .map_err(SchemaLoadError::into_sdk_error)
+    }
+
+    async fn fetch_table_schema(&self, table: &TableRef) -> SchemaLoadResult {
         let mut client = FlightSqlServiceClient::new(self.query.clone());
         self.security.apply_to_sql_client(&mut client);
         let info = client
             .execute(format!("SELECT * FROM lake.{table} LIMIT 0"), None)
             .await
-            .context(FlightSnafu)?;
-        let schema = Schema::try_from(info).context(ArrowSnafu)?;
+            .map_err(|source| SchemaLoadError::Flight(FlightErrorSnapshot::from_error(source)))?;
+        let schema = Schema::try_from(info)
+            .map_err(|source| SchemaLoadError::Arrow(ArrowErrorSnapshot::from_error(source)))?;
         Ok(Arc::new(schema))
     }
 
@@ -842,6 +1115,11 @@ mod tests {
         array::{Array, StringArray, StructArray},
         datatypes::{DataType, Field, Schema},
     };
+    use arrow_flight::{
+        FlightDescriptor, FlightInfo,
+        flight_service_server::FlightServiceServer,
+        sql::{CommandStatementQuery, SqlInfo, server::FlightSqlService},
+    };
     use aws_config::BehaviorVersion;
     use aws_sdk_s3::config::{Credentials, Region};
     use futures::TryStreamExt;
@@ -865,12 +1143,94 @@ mod tests {
     use rcgen::generate_simple_self_signed;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
-    use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+    use tokio::{
+        io::{AsyncRead, AsyncReadExt, ReadBuf},
+        sync::Notify,
+    };
+    use tonic::{Request, Response, Status};
 
     use crate::{
-        APPEND_RETRY_WINDOW, FileUpload, InsertValue, LakeClient, SdkError, data_location,
+        APPEND_RETRY_WINDOW, FileUpload, InsertValue, LakeClient, MAX_SCHEMA_CACHE_CAPACITY,
+        MAX_SCHEMA_CACHE_TTL, SchemaCache, SchemaCacheConfig, SdkError, data_location,
         retry_ambiguous_append_with_window,
     };
+
+    #[derive(Clone)]
+    struct CountingSchemaService {
+        calls:              Arc<AtomicUsize>,
+        failures_remaining: Arc<AtomicUsize>,
+        schema:             Arc<Schema>,
+        delay:              Duration,
+    }
+
+    #[tonic::async_trait]
+    impl FlightSqlService for CountingSchemaService {
+        type FlightService = Self;
+
+        async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
+
+        async fn get_flight_info_statement(
+            &self,
+            _query: CommandStatementQuery,
+            request: Request<FlightDescriptor>,
+        ) -> std::result::Result<Response<FlightInfo>, Status> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(Status::unavailable("injected schema failure"));
+            }
+            let info = FlightInfo::new()
+                .try_with_schema(&self.schema)
+                .map_err(|error| Status::internal(error.to_string()))?
+                .with_descriptor(request.into_inner());
+            Ok(Response::new(info))
+        }
+    }
+
+    async fn setup_counting_schema_client(
+        root: &std::path::Path,
+        capacity: u64,
+        ttl: Duration,
+        failures: usize,
+    ) -> (LakeClient, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let query_addr = free_addr();
+        let service = CountingSchemaService {
+            calls:              calls.clone(),
+            failures_remaining: Arc::new(AtomicUsize::new(failures)),
+            schema:             Arc::new(Schema::new(vec![Field::new(
+                "episode_id",
+                DataType::Utf8,
+                false,
+            )])),
+            delay:              Duration::from_millis(20),
+        };
+        let socket = query_addr.parse().expect("query socket");
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(FlightServiceServer::new(service))
+                .serve(socket)
+                .await
+                .expect("counting Flight SQL server");
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let objects = LocalObjectStore::open(root.join("objects"))
+            .await
+            .expect("object store");
+        let client = LakeClient::builder(format!("http://{query_addr}"))
+            .with_schema_cache(capacity, ttl)
+            .expect("cache config")
+            .connect_with_store(objects)
+            .await
+            .expect("connected client");
+        (client, calls)
+    }
 
     #[tokio::test]
     async fn sdk_retries_lost_put_result_without_reupload_or_duplicate() {
@@ -969,6 +1329,7 @@ mod tests {
                 .connect_lazy(),
             objects:               client.objects.clone(),
             security:              client.security.clone(),
+            schema_cache:          client.schema_cache.clone(),
             upload_checkpoint_dir: client.upload_checkpoint_dir.clone(),
         };
 
@@ -1158,6 +1519,237 @@ mod tests {
             crash_a_tx.take().unwrap().send(()).unwrap();
             server_a.take().unwrap().await.unwrap().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn schema_cache_coalesces_concurrent_lookups_across_clones() {
+        let root = tempdir().expect("tempdir");
+        let (client, calls) =
+            setup_counting_schema_client(root.path(), 16, Duration::from_secs(1), 0).await;
+
+        let resolved = futures::future::join_all((0..16).map(|_| {
+            let client = client.clone();
+            async move {
+                client
+                    .prepare_insert(
+                        "INSERT INTO robots.episodes (episode_id) VALUES (?)",
+                        vec![InsertValue::Utf8("episode-1".to_owned())],
+                    )
+                    .await
+                    .expect("typed insert preparation")
+            }
+        }))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resolved.len(), 16);
+        assert!(client.schema_cache.entry_count() <= 16);
+    }
+
+    #[tokio::test]
+    async fn schema_cache_expiry_and_invalidation_refetch_without_caching_failures() {
+        let root = tempdir().expect("tempdir");
+        let (client, calls) =
+            setup_counting_schema_client(root.path(), 2, Duration::from_millis(200), 1).await;
+        let table = TableRef::new("robots", "episodes");
+        let other = TableRef::new("robots", "other");
+        let third = TableRef::new("robots", "third");
+        let prepare = |table: &TableRef| {
+            let sql = format!("INSERT INTO {table} (episode_id) VALUES (?)");
+            let client = &client;
+            async move {
+                client
+                    .prepare_insert(&sql, vec![InsertValue::Utf8("episode-1".to_owned())])
+                    .await
+            }
+        };
+
+        let failures = futures::future::join_all((0..8).map(|_| {
+            let client = client.clone();
+            async move {
+                client
+                    .prepare_insert(
+                        "INSERT INTO robots.episodes (episode_id) VALUES (?)",
+                        vec![InsertValue::Utf8("episode-1".to_owned())],
+                    )
+                    .await
+            }
+        }))
+        .await;
+        assert!(failures.iter().all(|result| matches!(
+            result,
+            Err(SdkError::Flight { source }) if matches!(
+                source,
+                arrow_flight::error::FlightError::Tonic(status)
+                    if status.code() == tonic::Code::Unavailable
+            )
+        )));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        prepare(&table).await.expect("failure is not cached");
+        prepare(&table).await.expect("cache hit");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        prepare(&other).await.expect("unrelated table");
+        client.invalidate_table_schema(&table).await;
+        prepare(&table).await.expect("invalidated table");
+        prepare(&other).await.expect("unrelated entry retained");
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        prepare(&third).await.expect("capacity overflow");
+        client.schema_cache.entries.run_pending_tasks().await;
+        assert!(client.schema_cache.entry_count() <= 2);
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        prepare(&table).await.expect("expired");
+        let before_clear = calls.load(Ordering::SeqCst);
+        client.clear_schema_cache();
+        prepare(&other).await.expect("globally cleared");
+        assert_eq!(calls.load(Ordering::SeqCst), before_clear + 1);
+    }
+
+    #[tokio::test]
+    async fn schema_cache_invalidation_fences_in_flight_loader() {
+        let cache = SchemaCache::new(SchemaCacheConfig {
+            capacity: 2,
+            ttl:      Duration::from_secs(1),
+        });
+        let table = TableRef::new("robots", "episodes");
+        let old_schema = Arc::new(Schema::empty());
+        let new_schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let old_lookup = tokio::spawn({
+            let cache = cache.clone();
+            let table = table.clone();
+            let old_schema = old_schema.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                cache
+                    .resolve(table, || async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        Ok(old_schema)
+                    })
+                    .await
+            }
+        });
+        entered.notified().await;
+
+        cache.invalidate(&table).await;
+        let current = tokio::time::timeout(
+            Duration::from_millis(100),
+            cache.resolve(table.clone(), || async { Ok(new_schema.clone()) }),
+        )
+        .await
+        .expect("invalidation must detach the old loader")
+        .expect("current schema");
+        assert!(Arc::ptr_eq(&current, &new_schema));
+
+        release.notify_one();
+        assert!(Arc::ptr_eq(
+            &old_lookup.await.expect("old task").expect("old caller"),
+            &old_schema
+        ));
+        let retained = cache
+            .resolve(table, || async { panic!("old loader repopulated cache") })
+            .await
+            .expect("new incarnation retained");
+        assert!(Arc::ptr_eq(&retained, &new_schema));
+
+        let other = TableRef::new("robots", "other");
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let old_lookup = tokio::spawn({
+            let cache = cache.clone();
+            let other = other.clone();
+            let old_schema = old_schema.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                cache
+                    .resolve(other, || async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        Ok(old_schema)
+                    })
+                    .await
+            }
+        });
+        entered.notified().await;
+
+        cache.clear();
+        let current = tokio::time::timeout(
+            Duration::from_millis(100),
+            cache.resolve(other.clone(), || async { Ok(new_schema.clone()) }),
+        )
+        .await
+        .expect("clear must detach the old loader")
+        .expect("current schema after clear");
+        assert!(Arc::ptr_eq(&current, &new_schema));
+        release.notify_one();
+        old_lookup.await.expect("old task").expect("old caller");
+        let retained = cache
+            .resolve(other, || async {
+                panic!("old loader repopulated globally cleared cache")
+            })
+            .await
+            .expect("new incarnation retained after clear");
+        assert!(Arc::ptr_eq(&retained, &new_schema));
+    }
+
+    #[test]
+    fn schema_cache_rejects_unbounded_configuration() {
+        assert!(
+            LakeClient::builder("http://127.0.0.1:9")
+                .with_schema_cache(0, Duration::from_secs(1))
+                .is_err()
+        );
+        assert!(
+            LakeClient::builder("http://127.0.0.1:9")
+                .with_schema_cache(MAX_SCHEMA_CACHE_CAPACITY + 1, Duration::from_secs(1))
+                .is_err()
+        );
+        assert!(
+            LakeClient::builder("http://127.0.0.1:9")
+                .with_schema_cache(1, MAX_SCHEMA_CACHE_TTL + Duration::from_secs(1))
+                .is_err()
+        );
+        let defaults = SchemaCacheConfig::default();
+        assert_eq!(defaults.capacity, 1_024);
+        assert_eq!(defaults.ttl, Duration::from_mins(1));
+    }
+
+    #[test]
+    fn sdk_error_sources_remain_owned_public_types() {
+        let flight = SdkError::Flight {
+            source: arrow_flight::error::FlightError::Tonic(Box::new(tonic::Status::unavailable(
+                "shape check",
+            ))),
+        };
+        let SdkError::Flight {
+            source: arrow_flight::error::FlightError::Tonic(status),
+        } = flight
+        else {
+            panic!("owned FlightError source shape changed")
+        };
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+
+        let arrow = SdkError::Arrow {
+            source: arrow::error::ArrowError::SchemaError("shape check".to_owned()),
+        };
+        let SdkError::Arrow {
+            source: arrow::error::ArrowError::SchemaError(message),
+        } = arrow
+        else {
+            panic!("owned ArrowError source shape changed")
+        };
+        assert_eq!(message, "shape check");
     }
 
     async fn object_count(path: &std::path::Path) -> usize {

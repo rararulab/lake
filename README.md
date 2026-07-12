@@ -115,9 +115,18 @@ let client = LakeClient::builder("https://query.internal:50051")
     .with_bearer_token(std::fs::read_to_string("/run/secrets/query-token")?.trim())?
     .with_ca_certificate_pem(std::fs::read("/run/tls/ca.crt")?)
     .with_server_name("query.internal")
+    .with_schema_cache(1_024, std::time::Duration::from_secs(60))?
     .connect()
     .await?;
 ```
+
+The schema cache is shared by client clones, singleflights same-table misses,
+and stores only successful lookups. Defaults are 1,024 tables for 60 seconds;
+capacity is capped at 65,536 and TTL at one hour. Expiration bounds stale
+schema exposure after drop/recreate. A coordinator that replaces a table can
+call `invalidate_table_schema(&table).await` or `clear_schema_cache()` for
+immediate local refresh. Metasrv remains authoritative and still validates
+every append.
 
 Tokens are read from files rather than command-line flags and are redacted from
 all Debug/error output. Query authorizes parsed table references before planning;

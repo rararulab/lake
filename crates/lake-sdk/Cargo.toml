@@ -16,6 +16,7 @@ futures.workspace = true
 lake-common.workspace = true
 lake-flight.workspace = true
 lake-objects.workspace = true
+moka.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 snafu.workspace = true
