@@ -71,8 +71,13 @@ use crate::{AppendLimits, Metasrv, TablePlacement, leadership::Leadership, telem
 const UNSUPPORTED: &str = "metasrv control plane only serves actions and FILE append do_put";
 const CATALOG_SNAPSHOT_ATTEMPTS: usize = 3;
 pub(crate) const CATALOG_SNAPSHOT_CONCURRENCY: usize = 1;
+pub(crate) const CATALOG_ENUMERATION_CONCURRENCY: usize = 1;
 const CATALOG_SNAPSHOT_PAGE_ENTRIES: usize = 64;
 const MAX_CATALOG_GENERATION_BYTES: usize = 256;
+const MAX_ENUMERATION_PAGE_ENTRIES: usize = 256;
+const MAX_ENUMERATION_CONTINUATION_BYTES: usize = 4096;
+const MAX_ENUMERATION_NAMESPACE_BYTES: usize = 128;
+const MAX_ENUMERATION_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CatalogSnapshotLimits {
@@ -595,23 +600,26 @@ where
 /// [`Leadership`] flag it gates writes on.
 pub(crate) struct MetasrvFlightService {
     /// The registry authority every action dispatches to.
-    pub(crate) metasrv:                    Arc<Metasrv>,
+    pub(crate) metasrv: Arc<Metasrv>,
     /// The shared leadership state consulted before serving a write.
-    pub(crate) leadership:                 Arc<Leadership>,
+    pub(crate) leadership: Arc<Leadership>,
     /// This node's own Flight address, used to tell "the leader is me" apart
     /// from "forward to another node" when the leader flag is briefly stale.
-    pub(crate) own_addr:                   String,
+    pub(crate) own_addr: String,
     /// TLS and service identity for forwarding writes to the elected leader.
-    pub(crate) peer_security:              ClientSecurity,
+    pub(crate) peer_security: ClientSecurity,
     /// Trusted policy used to derive every remotely-created table location.
-    pub(crate) table_placement:            Option<TablePlacement>,
+    pub(crate) table_placement: Option<TablePlacement>,
     /// Process-local admission shared by direct and forwarded FILE appends.
-    pub(crate) append_admission:           AppendAdmission,
+    pub(crate) append_admission: AppendAdmission,
     /// Bound full-directory construction and retain admission through
     /// transport.
     pub(crate) catalog_snapshot_admission: Arc<Semaphore>,
+    /// Bound direct control-plane enumeration independently of Query catalog
+    /// refreshes and retain admission through transport.
+    pub(crate) catalog_enumeration_admission: Arc<Semaphore>,
     #[cfg(feature = "test")]
-    pub(crate) append_result_gate:         Option<Arc<crate::AppendResultGate>>,
+    pub(crate) append_result_gate: Option<Arc<crate::AppendResultGate>>,
 }
 
 /// `create_table` action body: the table to materialize and register.
@@ -635,6 +643,64 @@ struct TableIdent {
 #[derive(serde::Deserialize)]
 struct NamespaceIdent {
     namespace: String,
+}
+
+/// `list_tables_page` action body: one bounded namespace page.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TablePageRequest {
+    namespace:    String,
+    continuation: Option<String>,
+    limit:        usize,
+}
+
+/// `list_namespaces_page` action body: one bounded namespace page.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamespacePageRequest {
+    continuation: Option<String>,
+    limit:        usize,
+}
+
+/// JSON result for one bounded control-plane enumeration page.
+#[derive(serde::Serialize)]
+struct NamePageResponse {
+    names:        Vec<String>,
+    continuation: Option<String>,
+}
+
+impl TablePageRequest {
+    fn validate(&self) -> Result<(), Status> {
+        validate_enumeration_page(self.limit, self.continuation.as_deref())?;
+        validate_enumeration_namespace(&self.namespace)
+    }
+}
+
+impl NamespaceIdent {
+    fn validate(&self) -> Result<(), Status> { validate_enumeration_namespace(&self.namespace) }
+}
+
+impl NamespacePageRequest {
+    fn validate(&self) -> Result<(), Status> {
+        validate_enumeration_page(self.limit, self.continuation.as_deref())
+    }
+}
+
+fn validate_enumeration_page(limit: usize, continuation: Option<&str>) -> Result<(), Status> {
+    if !(1..=MAX_ENUMERATION_PAGE_ENTRIES).contains(&limit) {
+        return Err(Status::invalid_argument("invalid enumeration page limit"));
+    }
+    if continuation.is_some_and(|value| value.len() > MAX_ENUMERATION_CONTINUATION_BYTES) {
+        return Err(Status::invalid_argument("invalid enumeration continuation"));
+    }
+    Ok(())
+}
+
+fn validate_enumeration_namespace(namespace: &str) -> Result<(), Status> {
+    if namespace.is_empty() || namespace.len() > MAX_ENUMERATION_NAMESPACE_BYTES {
+        return Err(Status::invalid_argument("invalid enumeration namespace"));
+    }
+    Ok(())
 }
 
 /// Decode a JSON action body, mapping any parse failure to `invalid_argument`.
@@ -701,7 +767,70 @@ fn respond_catalog_snapshot(
     Ok(Response::new(stream))
 }
 
+struct AdmittedEnumerationBody {
+    body:    Vec<u8>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for AdmittedEnumerationBody {
+    fn as_ref(&self) -> &[u8] { &self.body }
+}
+
+struct BoundedJsonBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl io::Write for BoundedJsonBuffer {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let next = self
+            .bytes
+            .len()
+            .checked_add(buffer.len())
+            .ok_or_else(|| io::Error::other("enumeration response exceeds byte limit"))?;
+        if next > self.limit {
+            return Err(io::Error::other("enumeration response exceeds byte limit"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+fn serialize_enumeration_json<T: Serialize>(value: &T) -> Result<Vec<u8>, Status> {
+    let mut buffer = BoundedJsonBuffer {
+        bytes: Vec::new(),
+        limit: MAX_ENUMERATION_RESPONSE_BYTES,
+    };
+    serde_json::to_writer(&mut buffer, value)
+        .map_err(|_| Status::resource_exhausted("enumeration response exceeds byte limit"))?;
+    Ok(buffer.bytes)
+}
+
+fn respond_enumeration_json<T: Serialize>(
+    value: &T,
+    permit: OwnedSemaphorePermit,
+) -> Result<Response<ActionStream>, Status> {
+    let body = serialize_enumeration_json(value)?;
+    let result = FlightResult {
+        body: Bytes::from_owner(AdmittedEnumerationBody {
+            body,
+            _permit: permit,
+        }),
+    };
+    let stream: ActionStream = Box::pin(futures::stream::once(async move { Ok(result) }));
+    Ok(Response::new(stream))
+}
+
 impl MetasrvFlightService {
+    fn admit_enumeration(&self) -> Result<OwnedSemaphorePermit, Status> {
+        self.catalog_enumeration_admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("control enumeration is busy"))
+    }
+
     /// Decide how to serve a write action given current leadership.
     ///
     /// Returns `Ok(None)` when this node should serve the write locally (it
@@ -851,43 +980,145 @@ impl MetasrvFlightService {
         respond_json(&reg)
     }
 
-    /// `list_tables`: return the namespace's table names as a JSON array.
+    /// `list_tables`: return one legacy bounded namespace listing.
+    ///
+    /// A continuation means the backend has not proved that this one scan is
+    /// namespace-complete. In particular, a Dynamo v1 `Scan` can return a
+    /// continuation after filtering unrelated physical rows. The legacy wire
+    /// contract cannot return a partial list, so it rejects every such result
+    /// instead of mistaking a filtered scan boundary for a name-count limit.
     async fn action_list_tables(&self, body: &[u8]) -> Result<Response<ActionStream>, Status> {
         let req: NamespaceIdent = parse_body(body)?;
-        let names = self
+        req.validate()?;
+        let permit = self.admit_enumeration()?;
+        let page = self
             .metasrv
-            .list_tables(&Namespace(req.namespace))
+            .list_tables_page(
+                &Namespace(req.namespace),
+                None,
+                MAX_ENUMERATION_PAGE_ENTRIES,
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        let names: Vec<String> = names.into_iter().map(|t| t.0).collect();
-        respond_json(&names)
+        let (names, continuation) = page.into_parts();
+        if continuation.is_some() {
+            return Err(Status::resource_exhausted(
+                "legacy table enumeration cannot prove a complete bounded result; use \
+                 list_tables_page",
+            ));
+        }
+        let names: Vec<String> = names.into_iter().map(|name| name.0).collect();
+        respond_enumeration_json(&names, permit)
     }
 
-    /// `list_namespaces`: return every namespace as a JSON array.
+    /// `list_tables_page`: return one bounded namespace page.
+    async fn action_list_tables_page(&self, body: &[u8]) -> Result<Response<ActionStream>, Status> {
+        let request: TablePageRequest = parse_body(body)?;
+        request.validate()?;
+        let permit = self.admit_enumeration()?;
+        let page = self
+            .metasrv
+            .list_tables_page(
+                &Namespace(request.namespace),
+                request.continuation.as_deref(),
+                request.limit,
+            )
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let (names, continuation) = page.into_parts();
+        respond_enumeration_json(
+            &NamePageResponse {
+                names: names.into_iter().map(|name| name.0).collect(),
+                continuation,
+            },
+            permit,
+        )
+    }
+
+    async fn namespace_page_response(
+        &self,
+        principal: &Principal,
+        delegated: Option<&str>,
+        request: NamespacePageRequest,
+    ) -> Result<NamePageResponse, Status> {
+        if delegated.is_some() && principal.role() == PrincipalRole::User {
+            return Err(Status::permission_denied(RESOURCE_UNAVAILABLE));
+        }
+        let (names, continuation) = match principal.role() {
+            PrincipalRole::User => {
+                let mut grants = principal
+                    .namespaces()
+                    .filter(|namespace| {
+                        request
+                            .continuation
+                            .as_deref()
+                            .is_none_or(|cursor| *namespace > cursor)
+                    })
+                    .take(request.limit + 1)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                let has_more = grants.len() > request.limit;
+                grants.truncate(request.limit);
+                let continuation = has_more.then(|| {
+                    grants
+                        .last()
+                        .cloned()
+                        .expect("a non-empty page has a continuation")
+                });
+                (grants, continuation)
+            }
+            PrincipalRole::Admin | PrincipalRole::QueryService | PrincipalRole::MetadataPeer => {
+                return Err(Status::failed_precondition(
+                    "global namespace enumeration requires a durable namespace index",
+                ));
+            }
+        };
+        Ok(NamePageResponse {
+            names,
+            continuation,
+        })
+    }
+
+    /// `list_namespaces`: return one legacy bounded namespace listing.
     async fn action_list_namespaces(
         &self,
         principal: &Principal,
         delegated: Option<&str>,
     ) -> Result<Response<ActionStream>, Status> {
-        if delegated.is_some() && principal.role() == PrincipalRole::User {
-            return Err(Status::permission_denied(RESOURCE_UNAVAILABLE));
+        let permit = self.admit_enumeration()?;
+        let response = self
+            .namespace_page_response(
+                principal,
+                delegated,
+                NamespacePageRequest {
+                    continuation: None,
+                    limit:        MAX_ENUMERATION_PAGE_ENTRIES,
+                },
+            )
+            .await?;
+        if response.continuation.is_some() {
+            return Err(Status::resource_exhausted(
+                "legacy namespace enumeration exceeds its page limit; use list_namespaces_page",
+            ));
         }
-        let namespaces = self
-            .metasrv
-            .list_namespaces()
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let namespaces: Vec<String> = namespaces
-            .into_iter()
-            .filter(|namespace| match principal.role() {
-                PrincipalRole::Admin
-                | PrincipalRole::QueryService
-                | PrincipalRole::MetadataPeer => true,
-                PrincipalRole::User => principal.can_access_namespace(&namespace.0),
-            })
-            .map(|n| n.0)
-            .collect();
-        respond_json(&namespaces)
+        respond_enumeration_json(&response.names, permit)
+    }
+
+    /// `list_namespaces_page`: return one bounded User-grant page. Global
+    /// namespace enumeration fails closed until the registry has an index.
+    async fn action_list_namespaces_page(
+        &self,
+        principal: &Principal,
+        delegated: Option<&str>,
+        body: &[u8],
+    ) -> Result<Response<ActionStream>, Status> {
+        let request: NamespacePageRequest = parse_body(body)?;
+        request.validate()?;
+        let permit = self.admit_enumeration()?;
+        let response = self
+            .namespace_page_response(principal, delegated, request)
+            .await?;
+        respond_enumeration_json(&response, permit)
     }
 
     /// Return one conditional, generation-coherent catalog directory.
@@ -1073,11 +1304,22 @@ impl FlightService for MetasrvFlightService {
                 }
                 "list_tables" => {
                     let req: NamespaceIdent = parse_body(&action.body)?;
+                    req.validate()?;
                     authorize_namespace(&principal, delegated.as_deref(), &req.namespace)?;
                     self.action_list_tables(&action.body).await
                 }
+                "list_tables_page" => {
+                    let req: TablePageRequest = parse_body(&action.body)?;
+                    req.validate()?;
+                    authorize_namespace(&principal, delegated.as_deref(), &req.namespace)?;
+                    self.action_list_tables_page(&action.body).await
+                }
                 "list_namespaces" => {
                     self.action_list_namespaces(&principal, delegated.as_deref())
+                        .await
+                }
+                "list_namespaces_page" => {
+                    self.action_list_namespaces_page(&principal, delegated.as_deref(), &action.body)
                         .await
                 }
                 "catalog_snapshot" => match principal.role() {
@@ -1128,8 +1370,22 @@ impl FlightService for MetasrvFlightService {
                 description: "List table names in a namespace. Body JSON: {namespace}".to_string(),
             },
             ActionType {
+                r#type:      "list_tables_page".to_string(),
+                description: "List one bounded table-name page. Body JSON: {namespace, limit, \
+                              continuation?}"
+                    .to_string(),
+            },
+            ActionType {
                 r#type:      "list_namespaces".to_string(),
-                description: "List all namespaces. No body.".to_string(),
+                description: "List a User's accessible namespaces; global enumeration requires a \
+                              durable namespace index. No body."
+                    .to_string(),
+            },
+            ActionType {
+                r#type:      "list_namespaces_page".to_string(),
+                description: "List one bounded User-grant page; global enumeration requires a \
+                              durable namespace index. Body JSON: {limit, continuation?}"
+                    .to_string(),
             },
             ActionType {
                 r#type:      "catalog_snapshot".to_string(),
@@ -2299,8 +2555,8 @@ mod catalog_snapshot_tests {
     use tokio::sync::Semaphore;
 
     use super::{
-        AppendAdmission, CATALOG_SNAPSHOT_CONCURRENCY, CatalogSnapshotLimits, MetasrvFlightService,
-        build_catalog_snapshot,
+        AppendAdmission, CATALOG_ENUMERATION_CONCURRENCY, CATALOG_SNAPSHOT_CONCURRENCY,
+        CatalogSnapshotLimits, MetasrvFlightService, build_catalog_snapshot,
     };
     use crate::{AppendLimits, Metasrv, leadership::Leadership};
 
@@ -2477,6 +2733,9 @@ mod catalog_snapshot_tests {
             table_placement: None,
             append_admission: AppendAdmission::new(AppendLimits::default()),
             catalog_snapshot_admission: Arc::new(Semaphore::new(CATALOG_SNAPSHOT_CONCURRENCY)),
+            catalog_enumeration_admission: Arc::new(Semaphore::new(
+                CATALOG_ENUMERATION_CONCURRENCY,
+            )),
             #[cfg(feature = "test")]
             append_result_gate: None,
         };
@@ -2530,6 +2789,619 @@ mod catalog_snapshot_tests {
 }
 
 #[cfg(test)]
+mod enumeration_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use arrow_flight::{Action, flight_service_server::FlightService};
+    use async_trait::async_trait;
+    use futures::TryStreamExt;
+    use lake_common::{
+        Principal, PrincipalId, PrincipalRole, TableLocation, TableRef, TenantId, Version,
+    };
+    use lake_engine::TableEngineRef;
+    use lake_engine_lance::LanceEngine;
+    use lake_flight::ClientSecurity;
+    use lake_meta::{
+        GuardedMutation, MetaScanPage, MetaStore, MetaStoreRef, RocksMeta, SignaledMutation,
+        registry::{self, TableRegistration},
+    };
+    use serde_json::json;
+    use tokio::sync::Semaphore;
+
+    use super::{
+        AppendAdmission, CATALOG_ENUMERATION_CONCURRENCY, CATALOG_SNAPSHOT_CONCURRENCY,
+        MAX_ENUMERATION_PAGE_ENTRIES, MetasrvFlightService,
+    };
+    use crate::{AppendLimits, Metasrv, leadership::Leadership};
+
+    struct CountingPageMeta {
+        inner:         MetaStoreRef,
+        list_prefixes: AtomicUsize,
+        scan_prefixes: AtomicUsize,
+        scan_pages:    AtomicUsize,
+    }
+
+    /// Models Dynamo v1 `Scan` pagination: `Limit` and `LastEvaluatedKey`
+    /// count physical rows before `FilterExpression`, so a page may contain
+    /// fewer matching registry entries while still requiring a continuation.
+    struct DynamoV1FilteredPageMeta;
+
+    #[async_trait]
+    impl MetaStore for DynamoV1FilteredPageMeta {
+        async fn get(&self, _key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            unreachable!("enumeration reads only a bounded prefix page")
+        }
+
+        async fn cas(
+            &self,
+            _key: &str,
+            _expected: Option<&[u8]>,
+            _new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            unreachable!("enumeration is read-only")
+        }
+
+        async fn signaled_mutate(
+            &self,
+            _mutation: SignaledMutation<'_>,
+        ) -> lake_meta::Result<bool> {
+            unreachable!("enumeration is read-only")
+        }
+
+        async fn guarded_mutate(&self, _mutation: GuardedMutation<'_>) -> lake_meta::Result<bool> {
+            unreachable!("enumeration is read-only")
+        }
+
+        async fn list_prefix(&self, _prefix: &str) -> lake_meta::Result<Vec<String>> {
+            unreachable!("bounded enumeration must not materialize a prefix")
+        }
+
+        async fn scan_prefix(&self, _prefix: &str) -> lake_meta::Result<Vec<(String, Vec<u8>)>> {
+            unreachable!("bounded enumeration must not materialize registry values")
+        }
+
+        async fn scan_prefix_page(
+            &self,
+            prefix: &str,
+            continuation: Option<&str>,
+            limit: usize,
+        ) -> lake_meta::Result<MetaScanPage> {
+            assert_eq!(prefix, "tbl/robots/");
+            assert!(continuation.is_none());
+            assert_eq!(limit, MAX_ENUMERATION_PAGE_ENTRIES);
+            Ok(MetaScanPage::new(
+                vec![("only-table".to_owned(), Vec::new())],
+                Some("unrelated-physical-key".to_owned()),
+            ))
+        }
+
+        async fn delete(&self, _key: &str, _expected: &[u8]) -> lake_meta::Result<bool> {
+            unreachable!("enumeration is read-only")
+        }
+    }
+
+    #[async_trait]
+    impl MetaStore for CountingPageMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn signaled_mutate(&self, mutation: SignaledMutation<'_>) -> lake_meta::Result<bool> {
+            self.inner.signaled_mutate(mutation).await
+        }
+
+        async fn guarded_mutate(&self, mutation: GuardedMutation<'_>) -> lake_meta::Result<bool> {
+            self.inner.guarded_mutate(mutation).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.list_prefixes.fetch_add(1, Ordering::Relaxed);
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn scan_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<(String, Vec<u8>)>> {
+            self.scan_prefixes.fetch_add(1, Ordering::Relaxed);
+            self.inner.scan_prefix(prefix).await
+        }
+
+        async fn scan_prefix_page(
+            &self,
+            prefix: &str,
+            continuation: Option<&str>,
+            limit: usize,
+        ) -> lake_meta::Result<MetaScanPage> {
+            self.scan_pages.fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .scan_prefix_page(prefix, continuation, limit)
+                .await
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
+        }
+    }
+
+    fn registration(name: &str) -> TableRegistration {
+        TableRegistration::new(
+            TableLocation::new(format!("mem://{name}")),
+            "lance",
+            Version(1),
+            Vec::new(),
+        )
+    }
+
+    fn admin() -> Principal {
+        Principal::try_new(
+            PrincipalId::try_new("admin-a").expect("valid principal id"),
+            TenantId::try_new("tenant-a").expect("valid tenant id"),
+            PrincipalRole::Admin,
+            std::iter::empty::<&str>(),
+        )
+        .expect("valid admin principal")
+    }
+
+    fn user(grants: impl IntoIterator<Item = &'static str>) -> Principal {
+        Principal::try_new(
+            PrincipalId::try_new("user-a").expect("valid principal id"),
+            TenantId::try_new("tenant-a").expect("valid tenant id"),
+            PrincipalRole::User,
+            grants,
+        )
+        .expect("valid user principal")
+    }
+
+    fn service(meta: MetaStoreRef) -> MetasrvFlightService {
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        MetasrvFlightService {
+            metasrv: Arc::new(Metasrv::new(meta, engine)),
+            leadership: Arc::new(Leadership::new()),
+            own_addr: "127.0.0.1:50052".to_owned(),
+            peer_security: ClientSecurity::new(),
+            table_placement: None,
+            append_admission: AppendAdmission::new(AppendLimits::default()),
+            catalog_snapshot_admission: Arc::new(Semaphore::new(CATALOG_SNAPSHOT_CONCURRENCY)),
+            catalog_enumeration_admission: Arc::new(Semaphore::new(
+                CATALOG_ENUMERATION_CONCURRENCY,
+            )),
+            #[cfg(feature = "test")]
+            append_result_gate: None,
+        }
+    }
+
+    async fn page(
+        service: &MetasrvFlightService,
+        action_type: &str,
+        body: serde_json::Value,
+        principal: Principal,
+    ) -> serde_json::Value {
+        let action = Action {
+            r#type: action_type.to_owned(),
+            body:   serde_json::to_vec(&body)
+                .expect("serialize action body")
+                .into(),
+        };
+        let mut request = tonic::Request::new(action);
+        request.extensions_mut().insert(principal);
+        let response = FlightService::do_action(service, request)
+            .await
+            .expect("page action succeeds");
+        let mut results = response.into_inner();
+        let result = results
+            .try_next()
+            .await
+            .expect("result stream is valid")
+            .expect("page action returns one result");
+        assert!(
+            results
+                .try_next()
+                .await
+                .expect("result stream remains valid")
+                .is_none(),
+            "page actions return exactly one JSON result"
+        );
+        serde_json::from_slice(&result.body).expect("page result is JSON")
+    }
+
+    #[tokio::test]
+    async fn control_enumeration_pages_tables_without_full_prefix_scan() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let inner: MetaStoreRef =
+            Arc::new(RocksMeta::open(root.path().join("meta")).expect("open metastore"));
+        for name in ["alpha", "beta", "gamma"] {
+            registry::register(
+                inner.as_ref(),
+                &TableRef::new("robots", name),
+                &registration(name),
+            )
+            .await
+            .expect("register table");
+        }
+        let counted = Arc::new(CountingPageMeta {
+            inner,
+            list_prefixes: AtomicUsize::new(0),
+            scan_prefixes: AtomicUsize::new(0),
+            scan_pages: AtomicUsize::new(0),
+        });
+        let service = service(counted.clone());
+        let mut continuation = None;
+        let mut names = Vec::new();
+
+        loop {
+            let response = page(
+                &service,
+                "list_tables_page",
+                json!({
+                    "namespace": "robots",
+                    "limit": 1,
+                    "continuation": continuation,
+                }),
+                admin(),
+            )
+            .await;
+            let page_names = response["names"].as_array().expect("names array");
+            assert!(page_names.len() <= 1, "page respects requested limit");
+            names.extend(
+                page_names
+                    .iter()
+                    .map(|name| name.as_str().expect("table name string").to_owned()),
+            );
+            continuation = response["continuation"].as_str().map(ToOwned::to_owned);
+            if continuation.is_none() {
+                break;
+            }
+        }
+
+        assert_eq!(names, ["alpha", "beta", "gamma"]);
+        assert_eq!(
+            counted.list_prefixes.load(Ordering::Relaxed),
+            0,
+            "paged enumeration must not materialize a namespace key list"
+        );
+        assert_eq!(
+            counted.scan_prefixes.load(Ordering::Relaxed),
+            0,
+            "paged enumeration must not materialize registry values"
+        );
+        assert!(
+            counted.scan_pages.load(Ordering::Relaxed) >= 3,
+            "small client pages must drive bounded metastore scans"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_enumeration_pages_user_grants_without_global_scan() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let inner: MetaStoreRef =
+            Arc::new(RocksMeta::open(root.path().join("meta")).expect("open metastore"));
+        let counted = Arc::new(CountingPageMeta {
+            inner,
+            list_prefixes: AtomicUsize::new(0),
+            scan_prefixes: AtomicUsize::new(0),
+            scan_pages: AtomicUsize::new(0),
+        });
+        let service = service(counted.clone());
+        let mut continuation = None;
+        let mut namespaces = Vec::new();
+
+        loop {
+            let response = page(
+                &service,
+                "list_namespaces_page",
+                json!({ "limit": 1, "continuation": continuation }),
+                user(["alpha", "beta", "gamma"]),
+            )
+            .await;
+            let page_names = response["names"].as_array().expect("names array");
+            assert!(page_names.len() <= 1, "page respects requested limit");
+            namespaces.extend(
+                page_names
+                    .iter()
+                    .map(|name| name.as_str().expect("namespace name string").to_owned()),
+            );
+            continuation = response["continuation"].as_str().map(ToOwned::to_owned);
+            if continuation.is_none() {
+                break;
+            }
+        }
+
+        assert_eq!(namespaces, ["alpha", "beta", "gamma"]);
+        assert_eq!(
+            counted.scan_pages.load(Ordering::Relaxed),
+            0,
+            "User namespace grants must not trigger a global registry scan"
+        );
+        assert_eq!(counted.list_prefixes.load(Ordering::Relaxed), 0);
+        assert_eq!(counted.scan_prefixes.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_table_enumeration_fails_closed_at_page_boundary() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let meta: MetaStoreRef =
+            Arc::new(RocksMeta::open(root.path().join("meta")).expect("open metastore"));
+        for index in 0..=MAX_ENUMERATION_PAGE_ENTRIES {
+            let name = format!("episode-{index:04}");
+            registry::register(
+                meta.as_ref(),
+                &TableRef::new("robots", &name),
+                &registration(&name),
+            )
+            .await
+            .expect("register table");
+        }
+        let service = service(meta);
+        let action = Action {
+            r#type: "list_tables".to_owned(),
+            body:   serde_json::to_vec(&json!({ "namespace": "robots" }))
+                .expect("serialize action body")
+                .into(),
+        };
+        let mut request = tonic::Request::new(action);
+        request.extensions_mut().insert(admin());
+
+        let error = match FlightService::do_action(&service, request).await {
+            Ok(_) => panic!("legacy action must not serialize an over-limit catalog"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            error.message().contains("list_tables_page"),
+            "migration error names the bounded action"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_table_enumeration_fails_closed_on_dynamo_v1_filtered_scan() {
+        let service = service(Arc::new(DynamoV1FilteredPageMeta));
+        let action = Action {
+            r#type: "list_tables".to_owned(),
+            body:   serde_json::to_vec(&json!({ "namespace": "robots" }))
+                .expect("serialize action body")
+                .into(),
+        };
+        let mut request = tonic::Request::new(action);
+        request.extensions_mut().insert(admin());
+
+        let error = match FlightService::do_action(&service, request).await {
+            Ok(_) => panic!("legacy action must not return an incomplete filtered scan"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert!(error.message().contains("complete bounded result"));
+        assert!(error.message().contains("list_tables_page"));
+    }
+
+    #[tokio::test]
+    async fn legacy_namespace_enumeration_fails_closed_without_namespace_index() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let meta: MetaStoreRef =
+            Arc::new(RocksMeta::open(root.path().join("meta")).expect("open metastore"));
+        registry::register(
+            meta.as_ref(),
+            &TableRef::new("zone", "episodes"),
+            &registration("episodes"),
+        )
+        .await
+        .expect("register table");
+        let service = service(meta);
+        let action = Action {
+            r#type: "list_namespaces".to_owned(),
+            body:   Vec::new().into(),
+        };
+        let mut request = tonic::Request::new(action);
+        request.extensions_mut().insert(admin());
+
+        let error = match FlightService::do_action(&service, request).await {
+            Ok(_) => panic!("global namespace enumeration requires an index"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("namespace index"));
+    }
+
+    #[tokio::test]
+    async fn global_namespace_enumeration_fails_closed_without_namespace_index() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let meta: MetaStoreRef =
+            Arc::new(RocksMeta::open(root.path().join("meta")).expect("open metastore"));
+        registry::register(
+            meta.as_ref(),
+            &TableRef::new("alpha", "episodes"),
+            &registration("episodes"),
+        )
+        .await
+        .expect("register table");
+        let service = service(meta);
+        let action = Action {
+            r#type: "list_namespaces_page".to_owned(),
+            body:   serde_json::to_vec(&json!({
+                "limit": 1,
+                "continuation": null,
+            }))
+            .expect("serialize action body")
+            .into(),
+        };
+        let mut request = tonic::Request::new(action);
+        request.extensions_mut().insert(admin());
+
+        let error = match FlightService::do_action(&service, request).await {
+            Ok(_) => panic!("global namespace enumeration requires an index"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("namespace index"));
+    }
+
+    #[tokio::test]
+    async fn control_enumeration_admission_is_held_through_response() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let meta: MetaStoreRef =
+            Arc::new(RocksMeta::open(root.path().join("meta")).expect("open metastore"));
+        registry::register(
+            meta.as_ref(),
+            &TableRef::new("robots", "episodes"),
+            &registration("episodes"),
+        )
+        .await
+        .expect("register table");
+        let service = service(meta);
+        let action = Action {
+            r#type: "list_tables_page".to_owned(),
+            body:   serde_json::to_vec(&json!({
+                "namespace": "robots",
+                "limit": 1,
+                "continuation": null,
+            }))
+            .expect("serialize action body")
+            .into(),
+        };
+        let mut first_request = tonic::Request::new(action.clone());
+        first_request.extensions_mut().insert(admin());
+        let first = FlightService::do_action(&service, first_request)
+            .await
+            .expect("first enumeration is admitted");
+
+        let mut second_request = tonic::Request::new(action.clone());
+        second_request.extensions_mut().insert(admin());
+        let error = match FlightService::do_action(&service, second_request).await {
+            Ok(_) => panic!("second enumeration must be rejected while first response is held"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        drop(first);
+
+        let mut third_request = tonic::Request::new(action);
+        third_request.extensions_mut().insert(admin());
+        assert!(
+            FlightService::do_action(&service, third_request)
+                .await
+                .is_ok(),
+            "dropping the response releases enumeration admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_enumeration_rejects_oversized_json_page() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let meta: MetaStoreRef =
+            Arc::new(RocksMeta::open(root.path().join("meta")).expect("open metastore"));
+        let oversized_name = "x".repeat(2 * 1024 * 1024);
+        registry::register(
+            meta.as_ref(),
+            &TableRef::new("robots", &oversized_name),
+            &registration("oversized"),
+        )
+        .await
+        .expect("register oversized test key");
+        let service = service(meta);
+        let action = Action {
+            r#type: "list_tables_page".to_owned(),
+            body:   serde_json::to_vec(&json!({
+                "namespace": "robots",
+                "limit": 1,
+                "continuation": null,
+            }))
+            .expect("serialize action body")
+            .into(),
+        };
+        let mut request = tonic::Request::new(action);
+        request.extensions_mut().insert(admin());
+
+        let error = match FlightService::do_action(&service, request).await {
+            Ok(_) => panic!("oversized page must not be serialized"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn control_enumeration_rejects_oversized_continuation() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let meta: MetaStoreRef =
+            Arc::new(RocksMeta::open(root.path().join("meta")).expect("open metastore"));
+        let service = service(meta);
+        let action = Action {
+            r#type: "list_tables_page".to_owned(),
+            body:   serde_json::to_vec(&json!({
+                "namespace": "robots",
+                "limit": 1,
+                "continuation": "x".repeat(4097),
+            }))
+            .expect("serialize action body")
+            .into(),
+        };
+        let mut request = tonic::Request::new(action);
+        request.extensions_mut().insert(admin());
+
+        let error = match FlightService::do_action(&service, request).await {
+            Ok(_) => panic!("oversized continuation must fail before a metadata scan"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn control_enumeration_rejects_oversized_namespace() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let meta: MetaStoreRef =
+            Arc::new(RocksMeta::open(root.path().join("meta")).expect("open metastore"));
+        let service = service(meta);
+        let action = Action {
+            r#type: "list_tables_page".to_owned(),
+            body:   serde_json::to_vec(&json!({
+                "namespace": "x".repeat(129),
+                "limit": 1,
+                "continuation": null,
+            }))
+            .expect("serialize action body")
+            .into(),
+        };
+        let mut request = tonic::Request::new(action);
+        request.extensions_mut().insert(admin());
+
+        let error = match FlightService::do_action(&service, request).await {
+            Ok(_) => panic!("oversized namespace must fail before a metadata scan"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn legacy_control_enumeration_rejects_oversized_namespace() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let meta: MetaStoreRef =
+            Arc::new(RocksMeta::open(root.path().join("meta")).expect("open metastore"));
+        let service = service(meta);
+        let action = Action {
+            r#type: "list_tables".to_owned(),
+            body:   serde_json::to_vec(&json!({ "namespace": "x".repeat(129) }))
+                .expect("serialize action body")
+                .into(),
+        };
+        let mut request = tonic::Request::new(action);
+        request.extensions_mut().insert(admin());
+
+        let error = match FlightService::do_action(&service, request).await {
+            Ok(_) => panic!("legacy oversized namespace must fail before a metadata scan"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+}
+
+#[cfg(test)]
 mod schema_tests {
     use lake_objects::data_location_field;
 
@@ -2557,7 +3429,10 @@ mod table_placement_tests {
     use tokio::sync::Semaphore;
     use tonic::Code;
 
-    use super::{AppendAdmission, CATALOG_SNAPSHOT_CONCURRENCY, MetasrvFlightService};
+    use super::{
+        AppendAdmission, CATALOG_ENUMERATION_CONCURRENCY, CATALOG_SNAPSHOT_CONCURRENCY,
+        MetasrvFlightService,
+    };
     use crate::{AppendLimits, Metasrv, TablePlacement, leadership::Leadership};
 
     fn service(root: &tempfile::TempDir) -> MetasrvFlightService {
@@ -2574,6 +3449,9 @@ mod table_placement_tests {
             table_placement: Some(TablePlacement::local(root.path().join("tables"))),
             append_admission: AppendAdmission::new(AppendLimits::default()),
             catalog_snapshot_admission: Arc::new(Semaphore::new(CATALOG_SNAPSHOT_CONCURRENCY)),
+            catalog_enumeration_admission: Arc::new(Semaphore::new(
+                CATALOG_ENUMERATION_CONCURRENCY,
+            )),
             #[cfg(feature = "test")]
             append_result_gate: None,
         }

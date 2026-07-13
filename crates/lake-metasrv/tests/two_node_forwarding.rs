@@ -349,12 +349,13 @@ async fn do_file_append(addr: &str, table: TableRef) -> Result<(), Status> {
     do_file_append_messages(addr, messages).await.map(|_| ())
 }
 
-/// Block until `addr` answers a read (`list_namespaces` is served locally on
-/// any node regardless of leadership), i.e. the server is accepting requests.
+/// Block until `addr` answers a bounded read (`list_tables` for an empty
+/// namespace is served locally on any node regardless of leadership), i.e.
+/// the server is accepting requests.
 async fn wait_serving(addr: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if do_action(addr, "list_namespaces", json!(null))
+        if do_action(addr, "list_tables", json!({ "namespace": "health" }))
             .await
             .is_ok()
         {
@@ -926,9 +927,14 @@ async fn secure_do_action(
 async fn wait_secure_serving(addr: &str, security: &ClientSecurity) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if secure_do_action(addr, security, "list_namespaces", json!(null))
-            .await
-            .is_ok()
+        if secure_do_action(
+            addr,
+            security,
+            "list_tables",
+            json!({ "namespace": "health" }),
+        )
+        .await
+        .is_ok()
         {
             return;
         }

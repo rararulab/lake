@@ -24,6 +24,8 @@ use lake_objects::data_location_field;
 
 use super::Context;
 
+const CONTROL_ENUMERATION_PAGE_ENTRIES: usize = 128;
+
 #[derive(Subcommand)]
 pub enum TableCmd {
     /// Create an empty table with a column schema.
@@ -106,15 +108,29 @@ async fn drop_table(ctx: &Context, table: &str) -> anyhow::Result<()> {
 async fn list(ctx: &Context, namespace: Option<&str>) -> anyhow::Result<()> {
     match namespace {
         Some(ns) => {
-            let tables = ctx.metasrv.list_tables(&Namespace(ns.to_string())).await?;
-            for t in tables {
-                println!("{ns}.{}", t.0);
+            let namespace = Namespace(ns.to_string());
+            let mut continuation = None;
+            loop {
+                let page = ctx
+                    .metasrv
+                    .list_tables_page(
+                        &namespace,
+                        continuation.as_deref(),
+                        CONTROL_ENUMERATION_PAGE_ENTRIES,
+                    )
+                    .await?;
+                let (tables, next) = page.into_parts();
+                for table in tables {
+                    println!("{ns}.{}", table.0);
+                }
+                let Some(next) = next else { break };
+                continuation = Some(next);
             }
         }
         None => {
-            for ns in ctx.metasrv.list_namespaces().await? {
-                println!("{}", ns.0);
-            }
+            anyhow::bail!(
+                "global namespace enumeration requires a durable namespace index; pass --namespace"
+            );
         }
     }
     Ok(())
