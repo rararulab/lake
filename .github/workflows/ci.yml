@@ -75,8 +75,12 @@ jobs:
               - 'scripts/**'
             cargo_deps:
               - 'Cargo.toml'
+              - 'crates/**/Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
+              - 'mise.toml'
+              - '.github/workflows/ci.yml'
+              - '.github/actions/setup-lake-build/**'
 
   # One check per job so they run in parallel on separate GitHub-hosted runners
   # (public repo => free, unlimited, ~20 concurrent).
