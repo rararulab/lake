@@ -3657,6 +3657,17 @@ mod tests {
         assert!(!example.contains(".execute_sql("));
     }
 
+    #[test]
+    fn managed_file_example_streams_direct_reads_to_sink() {
+        let example = include_str!("../examples/managed_file.rs");
+
+        assert!(example.contains("client.open(&location)"));
+        assert!(example.contains("let mut sink = tokio::fs::File::create("));
+        assert!(example.contains("tokio::io::copy(&mut reader, &mut sink)"));
+        assert!(example.contains("assert_eq!(copied, location.size_bytes)"));
+        assert!(!example.contains("read_to_end"));
+    }
+
     #[tokio::test]
     async fn sdk_batch_insert_commits_multiple_files_as_one_version() {
         let root = tempdir().unwrap();

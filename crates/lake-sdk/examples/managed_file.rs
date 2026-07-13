@@ -30,7 +30,6 @@ use lake_objects::data_location_field;
 use lake_query::QueryEngine;
 use lake_sdk::{FileUpload, InsertValue, LakeClient, data_location};
 use tempfile::tempdir;
-use tokio::io::AsyncReadExt;
 
 fn free_addr() -> Result<String, Box<dyn Error>> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -126,12 +125,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     assert_eq!(episode_ids.value(1), "episode-2");
     assert!(results.try_next().await?.is_none());
 
-    for (row, expected) in expected.into_iter().enumerate() {
+    for row in 0..expected.len() {
         let location = data_location(&batch, "video", row)?;
         let mut reader = client.open(&location).await?;
-        let mut actual = Vec::new();
-        reader.read_to_end(&mut actual).await?;
-        assert_eq!(actual, expected);
+        let mut sink = tokio::fs::File::create(
+            root.path()
+                .join(format!("downloaded-episode-{}.mp4", row + 1)),
+        )
+        .await?;
+        let copied = tokio::io::copy(&mut reader, &mut sink).await?;
+        assert_eq!(copied, location.size_bytes);
         eprintln!("FILE upload and direct read succeeded: {}", location.uri);
     }
     Ok(())
