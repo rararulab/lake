@@ -129,6 +129,8 @@ impl UploadCheckpointV1 {
 
     pub(crate) fn parts(&self) -> &[CheckpointPart] { &self.parts }
 
+    pub(crate) const fn part_size_bytes(&self) -> usize { self.part_size_bytes }
+
     pub(crate) const fn upload_concurrency(&self) -> usize { self.upload_concurrency }
 
     /// Persist a wider possible crash suffix before starting more concurrent
@@ -157,7 +159,9 @@ impl UploadCheckpointV1 {
                 field: "content type",
             });
         }
-        if self.part_size_bytes != binding.part_size_bytes {
+        if !crate::s3::is_supported_resumable_part_size(self.part_size_bytes)
+            || !crate::s3::is_supported_resumable_part_size(binding.part_size_bytes)
+        {
             return Err(ObjectError::CheckpointMismatch { field: "part size" });
         }
         if !(1..=crate::s3::MAX_UPLOAD_CONCURRENCY).contains(&self.upload_concurrency) {
@@ -334,6 +338,55 @@ mod tests {
         assert!(matches!(
             loaded.validate(&changed_stage),
             Err(ObjectError::CheckpointMismatch { field: "stage" })
+        ));
+    }
+
+    #[test]
+    fn resumable_checkpoint_accepts_legacy_part_size_when_default_grows() {
+        let legacy_binding = CheckpointBinding {
+            bucket:             "lake-managed".to_owned(),
+            prefix:             "objects".to_owned(),
+            content_type:       "video/mp4".to_owned(),
+            part_size_bytes:    5 * 1024 * 1024,
+            upload_concurrency: 1,
+            source:             SourceIdentity {
+                size_bytes:          8 * 1024 * 1024,
+                modified_unix_nanos: 42,
+            },
+        };
+        let checkpoint = UploadCheckpointV1::new(
+            legacy_binding.clone(),
+            "objects/random-key".to_owned(),
+            "s3-upload-id".to_owned(),
+        );
+        let mut default_binding = legacy_binding;
+        default_binding.part_size_bytes = 64 * 1024 * 1024;
+
+        checkpoint.validate(&default_binding).unwrap();
+    }
+
+    #[test]
+    fn resumable_checkpoint_rejects_unrecognized_part_size() {
+        let binding = CheckpointBinding {
+            bucket:             "lake-managed".to_owned(),
+            prefix:             "objects".to_owned(),
+            content_type:       "video/mp4".to_owned(),
+            part_size_bytes:    1,
+            upload_concurrency: 1,
+            source:             SourceIdentity {
+                size_bytes:          8 * 1024 * 1024,
+                modified_unix_nanos: 42,
+            },
+        };
+        let checkpoint = UploadCheckpointV1::new(
+            binding.clone(),
+            "objects/random-key".to_owned(),
+            "s3-upload-id".to_owned(),
+        );
+
+        assert!(matches!(
+            checkpoint.validate(&binding),
+            Err(ObjectError::CheckpointMismatch { field: "part size" })
         ));
     }
 

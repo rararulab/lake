@@ -84,9 +84,9 @@ bucket/prefix and an AWS SDK client
 configured from the descriptor plus the process credential chain. It uses
 multipart upload for non-empty objects. It reads and hashes source bytes in
 order while polling four `UploadPart` requests concurrently by default. Each
-request owns one 5 MiB buffer, so the default request-body ceiling is 20 MiB
+request owns one 64 MiB buffer, so the default request-body ceiling is 256 MiB
 per object; the public S3 store configuration accepts `1..=16`, whose hard
-ceiling is 80 MiB. Response order cannot change the completed-part order or
+ceiling is 1 GiB. Response order cannot change the completed-part order or
 whole-object SHA-256.
 Reader-backed uploads abort on failure. Each ordinary multipart upload owns
 one metadata-only cleanup task while it is active. Normal completion disarms
@@ -105,12 +105,25 @@ checkpoints default that field to one. A retry takes an OS file lock,
 reconciles paginated S3 `ListParts`, rereads and verifies completed local parts
 while rebuilding the whole-file SHA-256 state, then overwrites every bounded,
 untrusted remote suffix part from the source and uploads only what remains.
+New V1 checkpoints record 64 MiB parts. Existing V1 checkpoints recorded with
+the former 5 MiB size remain resumable: recovery uses their persisted size for
+completed-prefix verification and the subsequent pipeline, rather than
+repartitioning the source. The only accepted resumable V1 sizes are 5 MiB and
+64 MiB; any other persisted value fails closed before source or S3 progress.
 Explicit cancellation aborts the
 exact upload and removes its checkpoint. If multipart completion succeeds but
 its response is lost, the retry streams the random destination once and
 requires its size and SHA-256 to match before clearing the checkpoint. Only
 verified completion produces a `DataLocation`; empty objects use one ordinary
 `PutObject`.
+
+S3 accepts only part numbers `1..=10,000`. After a non-empty 10,000th part,
+the stage reads once more to distinguish EOF from another part: EOF completes
+normally, while a non-empty 10,001st part returns a typed local error before
+constructing `UploadPart`. Ordinary uploads abort through their existing
+failure path; the same terminal error aborts a resumable upload and removes
+its checkpoint. With full 64 MiB parts, this bounds unknown-length streams to
+roughly 625 GiB. It does not claim support for S3's full maximum object range.
 
 After all values have become `DataLocation`s, the SDK persists a separate
 versioned append checkpoint before the first Flight RPC when the same

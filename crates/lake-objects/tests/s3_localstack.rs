@@ -35,7 +35,8 @@ use tokio::{
     sync::oneshot,
 };
 
-const PART_BYTES: usize = 5 * 1024 * 1024;
+const PART_BYTES: usize = 64 * 1024 * 1024;
+const LEGACY_PART_BYTES: usize = 5 * 1024 * 1024;
 
 fn localstack_client(endpoint: &str) -> aws_sdk_s3::Client {
     let config = aws_sdk_s3::config::Builder::new()
@@ -193,7 +194,7 @@ async fn s3_multipart_roundtrip_localstack() {
     let Some((_client, store, bucket)) = stage().await else {
         return;
     };
-    let bytes = (0..(PART_BYTES * 5 + 12_345))
+    let bytes = (0..(PART_BYTES + 12_345))
         .map(|index| u8::try_from(index % 251).unwrap())
         .collect::<Vec<_>>();
 
@@ -556,6 +557,16 @@ async fn seed_resumable_checkpoint(
     source: &std::path::Path,
     checkpoint: &std::path::Path,
 ) {
+    seed_resumable_checkpoint_with_part_size(client, bucket, source, checkpoint, PART_BYTES).await;
+}
+
+async fn seed_resumable_checkpoint_with_part_size(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    source: &std::path::Path,
+    checkpoint: &std::path::Path,
+    part_size_bytes: usize,
+) {
     let key = format!("managed/objects/{}", uuid::Uuid::now_v7());
     let created = client
         .create_multipart_upload()
@@ -568,7 +579,7 @@ async fn seed_resumable_checkpoint(
         .expect("create resumable multipart upload");
     let upload_id = created.upload_id().expect("S3 returns upload id");
     let bytes = tokio::fs::read(source).await.expect("read source");
-    let first = &bytes[..PART_BYTES];
+    let first = &bytes[..part_size_bytes];
     let uploaded = client
         .upload_part()
         .bucket(bucket)
@@ -590,7 +601,7 @@ async fn seed_resumable_checkpoint(
         "bucket": bucket,
         "prefix": "managed/objects",
         "content_type": "video/mp4",
-        "part_size_bytes": PART_BYTES,
+        "part_size_bytes": part_size_bytes,
         "source": {
             "size_bytes": metadata.len(),
             "modified_unix_nanos": u64::try_from(modified.as_nanos()).expect("mtime fits u64")
@@ -599,7 +610,7 @@ async fn seed_resumable_checkpoint(
         "upload_id": upload_id,
         "parts": [{
             "number": 1,
-            "size_bytes": PART_BYTES,
+            "size_bytes": part_size_bytes,
             "e_tag": uploaded.e_tag().expect("S3 returns part ETag"),
             "checksum_crc32": uploaded.checksum_crc32(),
             "sha256": format!("{:x}", Sha256::digest(first))
@@ -611,6 +622,47 @@ async fn seed_resumable_checkpoint(
     )
     .await
     .expect("write checkpoint");
+}
+
+#[tokio::test]
+#[ignore = "requires LocalStack S3; set LAKE_S3_ENDPOINT and run with --ignored"]
+async fn resumable_s3_upload_finishes_legacy_5m_checkpoint_without_reupload_localstack() {
+    let Some((client, store, bucket)) = stage().await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("episode.mp4");
+    let checkpoint = dir.path().join("episode.upload.json");
+    let bytes = vec![7_u8; LEGACY_PART_BYTES];
+    tokio::fs::write(&source, &bytes).await.unwrap();
+    seed_resumable_checkpoint_with_part_size(
+        &client,
+        &bucket,
+        &source,
+        &checkpoint,
+        LEGACY_PART_BYTES,
+    )
+    .await;
+
+    let location = store
+        .put_path(source, "video/mp4".to_owned(), Some(checkpoint.clone()))
+        .await
+        .expect("a 64 MiB-default store resumes the completed legacy part");
+
+    assert!(!checkpoint.exists());
+    assert_eq!(location.size_bytes, LEGACY_PART_BYTES as u64);
+    assert_eq!(location.sha256, format!("{:x}", Sha256::digest(&bytes)));
+    let uploads = client
+        .list_multipart_uploads()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+    assert!(uploads.uploads().is_empty());
+    let mut reader = store.open_reader(&location).await.unwrap();
+    let mut actual = Vec::new();
+    reader.read_to_end(&mut actual).await.unwrap();
+    assert_eq!(actual, bytes);
 }
 
 #[tokio::test]
@@ -664,7 +716,7 @@ async fn resumable_s3_pipeline_overwrites_ambiguous_suffix_localstack() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("episode.mp4");
     let checkpoint = dir.path().join("episode.upload.json");
-    let bytes = (0..(PART_BYTES * 3 + 12_345))
+    let bytes = (0..(PART_BYTES * 2 + 12_345))
         .map(|index| u8::try_from(index % 251).unwrap())
         .collect::<Vec<_>>();
     tokio::fs::write(&source, &bytes).await.unwrap();
@@ -677,7 +729,7 @@ async fn resumable_s3_pipeline_overwrites_ambiguous_suffix_localstack() {
         .unwrap();
     let key = document["object_key"].as_str().unwrap();
     let upload_id = document["upload_id"].as_str().unwrap();
-    for number in [2, 4] {
+    for number in [2, 3] {
         client
             .upload_part()
             .bucket(&bucket)
@@ -686,7 +738,7 @@ async fn resumable_s3_pipeline_overwrites_ambiguous_suffix_localstack() {
             .part_number(number)
             .body(ByteStream::from(vec![
                 0_u8;
-                if number == 4 {
+                if number == 3 {
                     12_345
                 } else {
                     PART_BYTES
@@ -727,7 +779,7 @@ async fn resumable_s3_pipeline_rejects_suffix_outside_creator_window_localstack(
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("episode.mp4");
     let checkpoint = dir.path().join("episode.upload.json");
-    let bytes = vec![7_u8; PART_BYTES * 3];
+    let bytes = vec![7_u8; PART_BYTES * 2];
     tokio::fs::write(&source, &bytes).await.unwrap();
     seed_resumable_checkpoint(&client, &bucket, &source, &checkpoint).await;
     let document: serde_json::Value =

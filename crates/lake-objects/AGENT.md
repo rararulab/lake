@@ -10,6 +10,9 @@ Managed large-object values and direct storage access for the Rust SDK.
 - Arrow conversion is the only bridge between object values and Lance tables.
 - Storage backends must stream files in bounded chunks; never buffer whole
   videos or models in memory.
+- S3 uploads use 64 MiB parts and a 64 KiB read buffer. A non-empty 10,001st
+  part fails locally with a typed error before `UploadPart`; unknown-length
+  streams therefore do not claim the full S3 maximum-object range.
 - Full SDK reads validate the expected SHA-256 before storage I/O and verify
   exact size plus SHA-256 only at EOF, using constant memory. An early drop is
   not a successful verification.
