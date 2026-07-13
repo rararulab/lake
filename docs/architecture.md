@@ -617,7 +617,15 @@ design-level ones:
   `DataLocation`, and then delegates the bounded signing operation to its
   optional S3-only issuer. No signed URL, header value, credential, or object
   bytes reaches Arrow, Query persistence, or Metasrv. Local Query deployments
-  install no issuer and fail the action closed. Codec indexes remain deferred.
+  install no issuer and fail the action closed. `open_via_query` and
+  `open_range_via_query` consume that capability internally with one shared
+  Rustls HTTP client whose redirects are disabled; their response bodies stream
+  directly between the SDK and object storage. A full read retains the
+  constant-memory SHA-256-at-EOF check; a range read sends the exact bounded
+  interval and requires an exact `206 Content-Range` plus content length before
+  it exposes a reader. Signed URL/header-bearing transport failures map to
+  opaque SDK errors, and dropping the reader drops the response body rather
+  than draining it in the background. Codec indexes remain deferred.
   When the operator configures the SDK checkpoint directory, the exact append
   operation also becomes restart-durable before its first RPC: UUIDv7 identity,
   encoded metadata, stage identity, and integrity digest are atomically fsynced
