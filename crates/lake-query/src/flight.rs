@@ -55,7 +55,7 @@ use datafusion::{
 use futures::{Stream, StreamExt, TryStreamExt};
 use lake_catalog::{CatalogGeneration, TableSnapshot};
 use lake_common::{
-    FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION,
+    FILE_APPEND_TYPE_URL, FileAppendRequest, MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageBackend,
     ManagedStageDescriptor, Namespace, Principal, TableLocation, TableName, TableRef, Version,
 };
 use lake_flight::{
@@ -757,6 +757,7 @@ impl FlightSqlServiceImpl {
         let issuer = self.read_capability_issuer.as_ref().ok_or_else(|| {
             Status::failed_precondition("managed read capabilities are not configured")
         })?;
+        let _permit = self.admission.acquire(principal).await?;
         issuer
             .validate(&stage, request.location())
             .map_err(|_| Status::permission_denied("managed object is not available"))?;
@@ -1637,16 +1638,24 @@ impl FlightSqlService for FlightSqlServiceImpl {
     }
 
     async fn list_custom_actions(&self) -> Option<Vec<std::result::Result<ActionType, Status>>> {
-        Some(vec![
-            Ok(ActionType {
-                r#type:      MANAGED_STAGE_DISCOVERY_ACTION.to_owned(),
-                description: "Return the versioned credential-free managed FILE stage".to_owned(),
-            }),
-            Ok(ActionType {
+        let mut actions = vec![Ok(ActionType {
+            r#type:      MANAGED_STAGE_DISCOVERY_ACTION.to_owned(),
+            description: "Return the versioned credential-free managed FILE stage".to_owned(),
+        })];
+        if self.read_capability_issuer.is_some()
+            && matches!(
+                self.managed_stage
+                    .as_ref()
+                    .map(ManagedStageDescriptor::backend),
+                Some(ManagedStageBackend::S3 { .. })
+            )
+        {
+            actions.push(Ok(ActionType {
                 r#type:      MANAGED_READ_CAPABILITY_ACTION.to_owned(),
                 description: "Issue a bounded tenant-scoped managed FILE GET capability".to_owned(),
-            }),
-        ])
+            }));
+        }
+        Some(actions)
     }
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
@@ -1771,6 +1780,40 @@ mod tests {
             Ok(PresignedRead::new(
                 "https://objects.example/episode?X-Amz-Signature=server-secret",
                 vec![("x-amz-security-token".to_owned(), "server-token".to_owned())],
+                SystemTime::now() + expires_in,
+            ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingReadCapabilityIssuer {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        issues:  Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ManagedReadCapabilityIssuer for BlockingReadCapabilityIssuer {
+        fn validate(
+            &self,
+            stage: &ManagedStageDescriptor,
+            location: &DataLocation,
+        ) -> lake_objects::Result<()> {
+            RecordingReadCapabilityIssuer::default().validate(stage, location)
+        }
+
+        async fn issue(
+            &self,
+            _stage: &ManagedStageDescriptor,
+            _location: &DataLocation,
+            expires_in: Duration,
+        ) -> lake_objects::Result<PresignedRead> {
+            self.issues.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(PresignedRead::new(
+                "https://objects.example/episode?X-Amz-Signature=server-secret",
+                Vec::new(),
                 SystemTime::now() + expires_in,
             ))
         }
@@ -2324,6 +2367,14 @@ mod tests {
         let mut request = Request::new(action);
         request.extensions_mut().insert(principal.clone());
 
+        let actions = service
+            .list_custom_actions()
+            .await
+            .expect("custom action listing");
+        assert!(actions.into_iter().any(|action| {
+            action.expect("advertised action").r#type == MANAGED_READ_CAPABILITY_ACTION
+        }));
+
         let results = service
             .do_action_fallback(request)
             .await
@@ -2344,6 +2395,76 @@ mod tests {
         assert_eq!(seen[0].0, descriptor.scope_to_tenant(principal.tenant()));
         assert_eq!(seen[0].1, location);
         assert_eq!(seen[0].2, Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn managed_read_capability_action_is_admission_controlled() {
+        let descriptor = ManagedStageDescriptor::s3(
+            "lake-managed",
+            "managed-objects",
+            Some("us-east-1".to_owned()),
+            None,
+            false,
+        );
+        let issuer = Arc::new(BlockingReadCapabilityIssuer {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            issues:  Arc::new(AtomicUsize::new(0)),
+        });
+        let service = Arc::new(FlightSqlServiceImpl {
+            engine:                 Arc::new(QueryEngine::new(
+                Arc::new(EmptyMeta),
+                Arc::new(LanceEngine::new()),
+            )),
+            metadata_addr:          None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          Some(descriptor),
+            read_capability_issuer: Some(issuer.clone()),
+            admission:              QueryAdmission::new(tenant_limits(1, 1, 8)),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_codec:           test_ticket_codec(),
+        });
+        let principal = admission_principal("tenant-a-reader", "tenant-a");
+        let location = DataLocation::builder()
+            .uri("s3://lake-managed/managed-objects/tenants/tenant-a/episode.mp4")
+            .content_type("video/mp4")
+            .size_bytes(4_294_967_296)
+            .sha256("f00d")
+            .build();
+        let body = ManagedReadCapabilityRequest::try_new(location, Duration::from_secs(60))
+            .expect("bounded request")
+            .to_wire()
+            .expect("encoded request");
+
+        let entered = issuer.entered.notified();
+        let first_service = service.clone();
+        let first_principal = principal.clone();
+        let first_body = body.clone();
+        let first = tokio::spawn(async move {
+            first_service
+                .managed_read_capability_action(&first_principal, &first_body)
+                .await
+        });
+        entered.await;
+
+        let error = match tokio::time::timeout(
+            Duration::from_millis(100),
+            service.managed_read_capability_action(&principal, &body),
+        )
+        .await
+        {
+            Ok(Err(error)) => error,
+            Ok(Ok(_)) => panic!("second signing request must be admission-controlled"),
+            Err(_) => panic!("second signing request waited for the issuer instead of admission"),
+        };
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(issuer.issues.load(Ordering::SeqCst), 1);
+
+        issuer.release.notify_one();
+        first
+            .await
+            .expect("first request joins")
+            .expect("first request completes after release");
     }
 
     #[tokio::test]
@@ -2431,6 +2552,13 @@ mod tests {
             discovery_limits:       DiscoveryLimits::default(),
             ticket_codec:           test_ticket_codec(),
         };
+        let advertised = unconfigured
+            .list_custom_actions()
+            .await
+            .expect("custom action listing");
+        assert!(advertised.into_iter().all(|action| {
+            action.expect("advertised action").r#type != MANAGED_READ_CAPABILITY_ACTION
+        }));
         let location = DataLocation::builder()
             .uri("s3://lake-managed/managed-objects/tenants/tenant-a/episode.mp4")
             .content_type("video/mp4")

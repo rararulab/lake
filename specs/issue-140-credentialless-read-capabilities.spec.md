@@ -89,6 +89,15 @@ Scenario: Query denies unsafe or unavailable capability requests before signing
   Then the action returns a typed Flight precondition/invalid-argument error
   and the issuer is not called
 
+Scenario: Query admission bounds concurrent capability signing
+  Test:
+    Package: lake-query
+    Filter: managed_read_capability_action_is_admission_controlled
+  Given a tenant whose single admitted capability signing request is blocked
+  When that tenant requests a second managed read capability
+  Then the second request returns Flight resource-exhausted before issuing and
+  the signer receives only the first request
+
 Rule: sdk-remote-capability — the SDK can receive a capability without cloud credentials
 
 Scenario: SDK receives a server-issued capability without SDK cloud credentials

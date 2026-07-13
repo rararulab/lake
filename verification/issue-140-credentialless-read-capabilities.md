@@ -1,7 +1,7 @@
 # Verification: credentialless managed read capabilities
 
 Issue: #140
-Base: `990146066bbcca06640489cd995569887ec7636c`
+Base: `00535ac90fb608004cacc6548a0e0afec3bb99ba`
 
 ## Delivered contract
 
@@ -14,8 +14,10 @@ Base: `990146066bbcca06640489cd995569887ec7636c`
   RPC behavior.
 - Query authenticates before dispatch, derives the caller's exact
   `tenants/<tenant-id>` stage, validates the requested identity before issuing,
-  and returns only safe Flight status messages on malformed, foreign, or
-  unconfigured requests.
+  admits signing through the existing global and per-tenant Query limits, and
+  returns only safe Flight status messages on malformed, foreign, saturated, or
+  unconfigured requests. `ListActions` advertises the signing action only when
+  an S3 issuer is actually configured.
 - `lake query` installs `S3ReadCapabilityIssuer` only for an S3 stage. The
   issuer derives a tightly scoped `S3ObjectStore`, rejects query-bearing S3
   identities before signing, and uses the Query process's AWS client without
@@ -32,9 +34,11 @@ Base: `990146066bbcca06640489cd995569887ec7636c`
   s3_read_capability_issuer_rejects_unsafe_identity_before_signing --
   --nocapture`: PASS.
 - `cargo test -p lake-query managed_read_capability_action_ -- --nocapture`:
-  PASS, 2/2 tenant scoping and fail-closed tests. The denial selector covers
-  malformed wire, zero expiry, foreign tenant identity, and absent issuer
-  without invoking the issuer.
+  PASS, 3/3 tenant scoping, fail-closed, and admission tests. The denial
+  selector covers malformed wire, zero expiry, foreign tenant identity, and
+  absent issuer without invoking the issuer. The admission selector holds one
+  signing request and verifies that a second same-tenant request returns
+  `ResourceExhausted` without entering the issuer.
 - `cargo test -p lake-cli query_server_capability_issuer_is_s3_only --
   --nocapture`: PASS.
 - `cargo test -p lake-sdk
@@ -43,7 +47,7 @@ Base: `990146066bbcca06640489cd995569887ec7636c`
   action, does no discovery, redacts the returned bearer values, and rejects
   local object reads.
 - `mise run spec-lifecycle
-  specs/issue-140-credentialless-read-capabilities.spec.md`: PASS, 4/4
+  specs/issue-140-credentialless-read-capabilities.spec.md`: PASS, 5/5
   scenarios and every selector executed at least one test.
 - `mise run gate`: PASS. Hooks, workspace all-target Rust tests, upstream ADBC
   interoperability (3/3), local E2E selftest, and site typecheck/test/build
