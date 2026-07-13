@@ -28,6 +28,11 @@ each part URI. It passes the current URI validation, but JSON serialization
 exceeds the Arrow result-part ceiling. Under concurrent poll/DoGet requests,
 the first reproducer causes avoidable allocations outside DataFusion's
 execution accounting; the second makes the advertised structural bound false.
+A third reproducer constructs `S3ObjectStore` with a prefix containing a
+space, non-ASCII byte, quote, or backslash. The current constructor accepts
+it and emits that raw prefix in `s3://` part locations; the worker can upload
+parts and only then fail the async-manifest URI check. Invalid stage identity
+must fail before any S3 request, not after durable part upload.
 
 ## Decisions
 
@@ -38,6 +43,16 @@ execution accounting; the second makes the advertised structural bound false.
   emit that language. This rejects controls, quote, and backslash before a
   URI can expand during JSON serialization, while preserving durable object
   identity, key layout, and the JSON protocol.
+- `S3ObjectStore::new` normalizes its existing leading/trailing-slash handling
+  and then fails closed before retaining the client binding. Its bucket must
+  be a non-empty DNS-style S3 bucket token: lowercase ASCII letters, digits,
+  dot, and hyphen; it starts and ends with a letter or digit and has no empty
+  dot label. Its non-empty prefix is slash-delimited raw URI-path text: each
+  non-slash byte is RFC 3986 `pchar` (`unreserved`, sub-delimiter, colon,
+  at-sign, or a percent followed by two ASCII hex digits). This excludes
+  controls, space, non-ASCII, quote, backslash, query, and fragment markers.
+  The generated `s3://<bucket>/<prefix>/...` values are consequently
+  JSON-safe without changing object keys, URI layout, or the storage API.
 - Define `MAX_RESULT_MANIFEST_BYTES` as the fixed 32 MiB ceiling. The current
   immutable JSON layout has a conservative maximum of 21,684,406 bytes:
   4,096 part objects * 4,269 bytes plus separators/brackets = 17,489,921;
@@ -111,6 +126,18 @@ Scenario: The maximum JSON-safe manifest structure fits the fixed ceiling
   Then it is semantically valid, the serialized result is at most
   21,684,406 bytes, and that result is below the 32 MiB manifest ceiling and
   the Arrow result-part ceiling
+
+Scenario: S3 stage construction rejects unsafe URI components before I/O
+  Test:
+    Package: lake-objects
+    Filter: s3_stage_rejects_unsafe_uri_components_before_io
+  Given a valid S3 client, bucket `lake-managed`, and prefix
+  `tenants/tenant-a/objects`
+  When `S3ObjectStore::new` constructs the stage
+  Then the stage succeeds and its emitted `s3://` identity is JSON-safe
+  And construction with a space, non-ASCII byte, quote, or backslash in the
+  bucket or prefix returns the existing invalid-stage failure before any S3
+  upload, multipart, or object request is issued
 
 Scenario: The existing async-query lifecycle remains valid
   Test:

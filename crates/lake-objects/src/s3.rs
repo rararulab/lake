@@ -54,6 +54,69 @@ const MAX_SCOPED_DELETE_OBJECTS: usize = 4_100;
 
 type PartFuture<'a> = Pin<Box<dyn Future<Output = Result<UploadedPipelinePart>> + Send + 'a>>;
 
+fn is_dns_safe_bucket(bucket: &str) -> bool {
+    bucket.split('.').all(|label| {
+        let bytes = label.as_bytes();
+        let Some(&first) = bytes.first() else {
+            return false;
+        };
+        let Some(&last) = bytes.last() else {
+            return false;
+        };
+        (first.is_ascii_lowercase() || first.is_ascii_digit())
+            && (last.is_ascii_lowercase() || last.is_ascii_digit())
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+    })
+}
+
+fn is_raw_uri_path(prefix: &str) -> bool {
+    let bytes = prefix.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'/' || is_uri_pchar(byte) {
+            index += 1;
+        } else if byte == b'%'
+            && bytes
+                .get(index + 1..index + 3)
+                .is_some_and(|escape| escape.iter().all(u8::is_ascii_hexdigit))
+        {
+            index += 3;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_uri_pchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'@'
+        )
+}
+
 struct UploadedPipelinePart {
     number:     i32,
     size_bytes: usize,
@@ -251,7 +314,7 @@ pub struct S3ObjectStore {
 }
 
 impl S3ObjectStore {
-    /// Bind a client to one non-empty Lake-owned bucket prefix.
+    /// Bind a client to one non-empty, URI-safe Lake-owned bucket prefix.
     pub fn new(
         client: Client,
         bucket: impl Into<String>,
@@ -259,7 +322,7 @@ impl S3ObjectStore {
     ) -> Result<Self> {
         let bucket = bucket.into();
         let prefix = prefix.into().trim_matches('/').to_owned();
-        if bucket.is_empty() || prefix.is_empty() {
+        if !is_dns_safe_bucket(&bucket) || !is_raw_uri_path(&prefix) {
             return Err(ObjectError::InvalidS3Stage);
         }
         Ok(Self {
@@ -1218,7 +1281,7 @@ mod pipeline_tests {
         S3ObjectStore, read_part,
     };
     use crate::{
-        ObjectReader,
+        ManagedObjectStore, ObjectError, ObjectReader,
         checkpoint::{CheckpointBinding, CheckpointPart, SourceIdentity, UploadCheckpointV1},
     };
 
@@ -1232,7 +1295,7 @@ mod pipeline_tests {
         }
     }
 
-    fn test_store() -> S3ObjectStore {
+    fn test_client() -> aws_sdk_s3::Client {
         let config = aws_sdk_s3::config::Builder::new()
             .behavior_version(BehaviorVersion::latest())
             .endpoint_url("http://127.0.0.1:1")
@@ -1240,12 +1303,49 @@ mod pipeline_tests {
             .credentials_provider(Credentials::new("test", "test", None, None, "test"))
             .force_path_style(true)
             .build();
-        S3ObjectStore::new(
-            aws_sdk_s3::Client::from_conf(config),
-            "lake-managed",
-            "managed/objects",
-        )
-        .unwrap()
+        aws_sdk_s3::Client::from_conf(config)
+    }
+
+    fn test_store() -> S3ObjectStore {
+        S3ObjectStore::new(test_client(), "lake-managed", "managed/objects").unwrap()
+    }
+
+    #[test]
+    fn s3_stage_rejects_unsafe_uri_components_before_io() {
+        let store =
+            S3ObjectStore::new(test_client(), "lake-managed", "tenants/tenant-a/objects").unwrap();
+        assert!(
+            store
+                .stage_identity()
+                .bytes()
+                .all(|byte| (0x21..=0x7e).contains(&byte) && byte != b'"' && byte != b'\\')
+        );
+        assert_eq!(
+            S3ObjectStore::new(test_client(), "lake-managed", "tenants/%7Etenant-a/objects",)
+                .unwrap()
+                .stage_identity(),
+            "s3://lake-managed/tenants/%7Etenant-a/objects"
+        );
+
+        for (bucket, prefix) in [
+            ("lake managed", "tenants/tenant-a/objects"),
+            ("lakeémanaged", "tenants/tenant-a/objects"),
+            ("lake\"managed", "tenants/tenant-a/objects"),
+            ("lake\\managed", "tenants/tenant-a/objects"),
+            ("lake-managed", "tenants/tenant a/objects"),
+            ("lake-managed", "tenants/tenant-é/objects"),
+            ("lake-managed", "tenants/tenant-\"/objects"),
+            ("lake-managed", "tenants/tenant-\\/objects"),
+            ("lake-managed", "tenants/tenant?/objects"),
+            ("lake-managed", "tenants/tenant#/objects"),
+            ("lake-managed", "tenants/tenant%2/objects"),
+            ("lake-managed", "tenants/tenant%GG/objects"),
+        ] {
+            assert!(matches!(
+                S3ObjectStore::new(test_client(), bucket, prefix),
+                Err(ObjectError::InvalidS3Stage)
+            ));
+        }
     }
 
     #[test]
