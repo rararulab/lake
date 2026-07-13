@@ -32,11 +32,14 @@ match pre-provisioned infrastructure. The manifest deliberately does not
 contain static AWS credentials. Annotate the separate `lake-query` and
 `lake-metasrv` ServiceAccounts for the cluster's workload-identity mechanism:
 
-- Query receives read/list access to the registry and table/object prefixes.
+- Query receives read access to `$LAKE_MANIFEST_DYNAMODB_TABLE` and its
+  `_prefix_v2` companion plus table/object prefixes.
+  Query must have no access to `$LAKE_DYNAMODB_TABLE` or its companion;
+  catalog reads use authenticated Metasrv Flight RPCs.
 - Query receives conditional read/write access to the separate async-query
   tables and read/write/delete access to `LAKE_ASYNC_RESULT_PREFIX`.
-- Metasrv receives registry conditional-write and table/object read/write
-  access.
+- Metasrv receives registry conditional-write, manifest conditional-write, and
+  table/object read/write access.
 
 The exact IAM resources are deployment-specific and are intentionally not
 created by this repository. Query and Metasrv both use DynamoDB/S3; neither
@@ -53,6 +56,51 @@ they observe v2 authority before resuming writes. Runtime identities need
 `DescribeTable` plus their normal data-plane permissions, not `CreateTable`.
 Keep both table ARNs in the runtime IAM policy and retain v1 for at least one
 append-operation retention horizon.
+
+Separately provision `$LAKE_MANIFEST_DYNAMODB_TABLE` (HASH key `pk`) and its
+`_prefix_v2` companion. The name must differ from `$LAKE_DYNAMODB_TABLE`.
+Metasrv mutates these pre-provisioned physical Lance pointers; Query startup never
+creates tables and its workload identity should receive only
+`dynamodb:DescribeTable` and `dynamodb:GetItem` for the manifest pair. The
+read-only adapter rejects missing latest pointers before any prefix enumeration
+or mutation.
+
+For an existing shared-table deployment, cut over the manifest authority
+independently from the registry migration:
+
+1. While the old authority is live, ensure every dataset has a fixed
+   `lance-manifest-latest/` pointer. Query will not perform this migration.
+2. Pause metadata writes. Copy `lance-manifest/`, `lance-manifest-latest/`, and
+   `lance-manifest-cleanup/` from the old registry table into the new manifest
+   v1 table, then verify exact key/value equality for those three families.
+3. With a one-shot migration identity, override `LAKE_DYNAMODB_TABLE` only in
+   the migrator shell (never in the runtime ConfigMap), and run bounded pages
+   until `page.complete` is `true`:
+
+   ```bash
+   export LAKE_DYNAMODB_TABLE="$LAKE_MANIFEST_DYNAMODB_TABLE"
+   lake dynamo-migrate --page-size 500 --json
+   ```
+
+4. Keep writes paused and finalize the manifest pair independently:
+
+   ```bash
+   lake dynamo-migrate --page-size 500 --finalize \
+     --acknowledge-dual-rollout --acknowledge-write-quiescence --json
+   ```
+
+   Require `verification.finalized=true` and equal `legacy_items`/`v2_items`.
+   The migration identity needs create/scan/query/read/write permissions on the
+   manifest pair; runtime Query does not.
+5. Restore the ordinary registry environment, deploy the distinct manifest
+   table name to every Metasrv and Query process, wait for readiness, then
+   resume writes. Retain the old manifest keys for at least one append-operation
+   retention horizon. Rollback requires another write pause and exact reverse
+   synchronization; never point Query at the registry table as a live fallback.
+
+The Query adapter rejects all manifest mutations, including legacy
+latest-pointer installation. Lake intentionally does not fall back to registry
+storage when the manifest table is missing.
 
 When `LAKE_ASYNC_QUERIES=true`, also provision
 `$LAKE_ASYNC_DYNAMODB_TABLE` and

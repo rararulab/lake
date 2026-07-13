@@ -521,8 +521,16 @@ design-level ones:
 - The full prod path (Lance on S3 + DynamoDB commit pointer via
   `ExternalManifestStore`) is wired end to end: `LanceEngine::for_object_store`
   threads S3 storage options + the commit handler through create/open/append,
-  and `lake-cli` selects it via `LAKE_S3_BUCKET` (+ `LAKE_DYNAMODB_*` / `AWS_*`
-  / `LAKE_S3_PROXY_EXCLUDES`). Verified against localstack both directly
+  and `lake-cli` selects it via `LAKE_S3_BUCKET` plus the independent
+  `LAKE_MANIFEST_DYNAMODB_TABLE`. Served Query constructs a minimal context
+  with that physical-manifest handle but no catalog `MetaStore`, Metasrv, table
+  placement, or Dynamo provisioning path. Its IAM is read-only on the manifest
+  table pair and absent on `LAKE_DYNAMODB_TABLE`; Metasrv holds the separate
+  registry authority and the manifest write authority. Equal table names fail
+  before I/O. Query's manifest adapter rejects commit/delete and missing legacy
+  latest-pointer migration before KV mutation, so read-only IAM is real rather
+  than documentary; no legacy shared-table fallback exists. Verified against
+  localstack both directly
   (`tests/s3_lance_localstack.rs`, `#[ignore]`) and through `lake selftest` in
   cloud mode.
 - The Rust SDK has a finite table-schema cache shared by client clones. It

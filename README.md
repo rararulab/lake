@@ -88,6 +88,7 @@ in application code:
 ```bash
 LAKE_S3_BUCKET=embodied-data \
 LAKE_MANAGED_OBJECT_PREFIX=lake/managed-files \
+LAKE_MANIFEST_DYNAMODB_TABLE=lake_manifests \
 LAKE_ASYNC_QUERIES=true \
 LAKE_ASYNC_DYNAMODB_TABLE=lake_async_queries \
 LAKE_ASYNC_RESULT_PREFIX=lake/async-query-results \
@@ -488,6 +489,20 @@ In cloud mode, `lake meta` and local administrative commands derive table
 datasets as `s3://$LAKE_S3_BUCKET/$LAKE_TABLE_PREFIX/<namespace>/<table>.lance`.
 `LAKE_TABLE_PREFIX` defaults to the bucket root for compatibility. It is
 process configuration, never a Flight DDL field.
+
+Catalog and physical-manifest DynamoDB authority are deliberately separate.
+`LAKE_DYNAMODB_TABLE` (default `lake_registry`) belongs to Metasrv;
+`LAKE_MANIFEST_DYNAMODB_TABLE` (default `lake_manifests`) stores only Lance
+external manifest pointers/history. The two names must differ. Served Query
+constructs no catalog `MetaStore` or local Metasrv and does not provision
+DynamoDB tables; its workload identity needs read access only to the manifest
+table pair and no access to the registry pair. Metasrv needs registry writes
+and manifest reads/writes. Existing shared-table deployments must ensure every
+dataset has a fixed `lance-manifest-latest/` pointer, then copy and verify the
+`lance-manifest/`, `lance-manifest-latest/`, and `lance-manifest-cleanup/`
+families during a write-quiescent cutover. Query's read-only adapter never
+installs a missing legacy pointer; there is intentionally no runtime fallback
+to the registry table.
 
 Plaintext anonymous serving is allowed only on loopback and receives the named
 development principal. A non-loopback Query or Metasrv listener requires either

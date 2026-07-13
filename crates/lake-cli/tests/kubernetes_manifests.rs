@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fs, path::PathBuf, process::Command};
+use std::{collections::BTreeSet, fs, path::PathBuf, process::Command};
 
 use serde::Deserialize as _;
 use serde_yaml::Value;
@@ -245,6 +245,7 @@ fn kubernetes_reference_is_secure_and_matches_runtime_contract() {
         "LAKE_TABLE_PREFIX",
         "LAKE_MANAGED_OBJECT_PREFIX",
         "LAKE_DYNAMODB_TABLE",
+        "LAKE_MANIFEST_DYNAMODB_TABLE",
         "LAKE_ASYNC_QUERIES",
         "LAKE_ASYNC_DYNAMODB_TABLE",
         "LAKE_ASYNC_RESULT_PREFIX",
@@ -255,6 +256,27 @@ fn kubernetes_reference_is_secure_and_matches_runtime_contract() {
         assert!(
             config["data"][key].is_string(),
             "missing cloud authority {key}"
+        );
+    }
+    assert_ne!(
+        config["data"]["LAKE_DYNAMODB_TABLE"].as_str(),
+        config["data"]["LAKE_MANIFEST_DYNAMODB_TABLE"].as_str(),
+        "catalog and physical manifest authorities must be distinct"
+    );
+    let mut physical_tables = BTreeSet::new();
+    for key in [
+        "LAKE_DYNAMODB_TABLE",
+        "LAKE_MANIFEST_DYNAMODB_TABLE",
+        "LAKE_ASYNC_DYNAMODB_TABLE",
+    ] {
+        let base = config["data"][key].as_str().expect("DynamoDB table name");
+        assert!(
+            physical_tables.insert(base.to_owned()),
+            "duplicate table {base}"
+        );
+        assert!(
+            physical_tables.insert(format!("{base}_prefix_v2")),
+            "duplicate companion for {base}"
         );
     }
 
@@ -297,6 +319,7 @@ fn kubernetes_reference_is_secure_and_matches_runtime_contract() {
     }
     let runbook =
         fs::read_to_string(root().join("docs/guides/kubernetes.md")).expect("Kubernetes runbook");
+    assert!(runbook.contains("Query must have no access to `$LAKE_DYNAMODB_TABLE`"));
     assert!(runbook.contains("--from-file=ticket-keys.json=query/ticket-keys.json"));
     for step in ["preload", "activate", "retire"] {
         assert!(

@@ -237,6 +237,26 @@ impl LanceEngine {
             },
         }
     }
+
+    /// Build the object-storage engine used by stateless Query replicas.
+    ///
+    /// Its external manifest adapter serves reads but rejects legacy pointer
+    /// installation and every commit/delete operation before metastore I/O.
+    #[must_use]
+    pub fn for_read_only_object_store(
+        meta: MetaStoreRef,
+        storage_options: HashMap<String, String>,
+    ) -> Self {
+        let manifest_store = MetaManifestStore::new_read_only(meta);
+        Self {
+            config: WriteConfig {
+                commit_handler: Some(external_handler(manifest_store.clone())),
+                manifest_store: Some(manifest_store),
+                storage_options,
+                ..WriteConfig::default()
+            },
+        }
+    }
 }
 
 fn external_handler(manifest_store: MetaManifestStore) -> Arc<dyn CommitHandler> {

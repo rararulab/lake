@@ -137,7 +137,8 @@ enum LatestResolution {
 /// [`MetaStore`]: lake_meta::MetaStore
 #[derive(Clone)]
 pub struct MetaManifestStore {
-    meta: MetaStoreRef,
+    meta:     MetaStoreRef,
+    writable: bool,
 }
 
 impl std::fmt::Debug for MetaManifestStore {
@@ -150,7 +151,32 @@ impl std::fmt::Debug for MetaManifestStore {
 
 impl MetaManifestStore {
     #[must_use]
-    pub fn new(meta: MetaStoreRef) -> Self { Self { meta } }
+    pub fn new(meta: MetaStoreRef) -> Self {
+        Self {
+            meta,
+            writable: true,
+        }
+    }
+
+    /// Build the manifest view used by stateless Query replicas.
+    ///
+    /// Reads never install a missing legacy latest pointer and every mutation
+    /// method fails before touching the metastore, matching read-only IAM.
+    #[must_use]
+    pub fn new_read_only(meta: MetaStoreRef) -> Self {
+        Self {
+            meta,
+            writable: false,
+        }
+    }
+
+    fn require_writable(&self) -> Result<()> {
+        if self.writable {
+            Ok(())
+        } else {
+            Err(Error::io("read-only manifest store rejects mutation"))
+        }
+    }
 
     fn version_key(base_uri: &str, version: u64) -> String {
         format!("{KEY_PREFIX}/{base_uri}/{version}")
@@ -205,6 +231,12 @@ impl MetaManifestStore {
     async fn latest_or_migrate(&self, base_uri: &str) -> Result<LatestResolution> {
         if let Some(record) = self.read_latest(base_uri).await? {
             return Self::resolve_record(base_uri, Some(record));
+        }
+
+        if !self.writable {
+            return Err(Error::io(format!(
+                "manifest latest pointer requires metadata migration: {base_uri}"
+            )));
         }
 
         let prefix = Self::base_prefix(base_uri);
@@ -362,6 +394,7 @@ impl MetaManifestStore {
         objects: &dyn ManifestExistence,
         limit: usize,
     ) -> Result<ManifestHistoryCleanupStats> {
+        self.require_writable()?;
         if limit == 0 {
             return Err(Error::invalid_input(
                 "manifest history cleanup limit must be positive",
@@ -540,6 +573,7 @@ impl ExternalManifestStore for MetaManifestStore {
         _size: u64,
         _e_tag: Option<String>,
     ) -> Result<()> {
+        self.require_writable()?;
         let latest_key = Self::latest_key(base_uri);
         match self.latest_or_migrate(base_uri).await? {
             LatestResolution::Missing { expected } => {
@@ -627,6 +661,7 @@ impl ExternalManifestStore for MetaManifestStore {
         _size: u64,
         _e_tag: Option<String>,
     ) -> Result<()> {
+        self.require_writable()?;
         let latest = match self.latest_or_migrate(base_uri).await? {
             LatestResolution::Present(latest) => latest,
             LatestResolution::Missing { .. } => {
@@ -701,6 +736,7 @@ impl ExternalManifestStore for MetaManifestStore {
     }
 
     async fn delete(&self, base_uri: &str) -> Result<()> {
+        self.require_writable()?;
         let latest_key = Self::latest_key(base_uri);
         let (deleting, incarnation) = match self.read_latest(base_uri).await? {
             Some(LatestRecord::Delete {
@@ -1772,6 +1808,74 @@ mod tests {
             Some((2, "v2.manifest".to_owned()))
         );
         assert_eq!(meta.lists.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn read_only_manifest_store_never_mutates_legacy_state() {
+        let dir = tempdir().unwrap();
+        let meta = Arc::new(RocksMeta::open(dir.path()).unwrap());
+        let base_uri = "s3://bucket/legacy.lance";
+        let history_key = MetaManifestStore::version_key(base_uri, 7);
+        assert!(
+            meta.cas(
+                &history_key,
+                None,
+                &encode_legacy("_versions/7.manifest").unwrap(),
+            )
+            .await
+            .unwrap()
+        );
+        let store = MetaManifestStore::new_read_only(meta.clone());
+
+        let error = store
+            .get_latest_version(base_uri)
+            .await
+            .expect_err("read-only Query must not install a latest pointer");
+        assert!(error.to_string().contains("requires metadata migration"));
+        assert!(
+            meta.get(&MetaManifestStore::latest_key(base_uri))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .put_if_not_exists(base_uri, 8, "_versions/8.manifest", 0, None)
+                .await
+                .is_err()
+        );
+
+        let current_uri = "s3://bucket/current.lance";
+        MetaManifestStore::new(meta.clone())
+            .put_if_not_exists(current_uri, 3, "_versions/3.manifest", 0, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_latest_version(current_uri).await.unwrap(),
+            Some((3, "_versions/3.manifest".to_owned()))
+        );
+        assert!(
+            store
+                .put_if_exists(current_uri, 4, "_versions/4.manifest", 0, None)
+                .await
+                .is_err()
+        );
+        let objects = FakeManifestExistence {
+            existing: Mutex::new(HashSet::new()),
+            calls:    AtomicUsize::new(0),
+        };
+        assert!(
+            store
+                .reclaim_removed_history(current_uri, &objects, 1)
+                .await
+                .is_err()
+        );
+        assert_eq!(objects.calls.load(Ordering::SeqCst), 0);
+        assert!(store.delete(current_uri).await.is_err());
+        assert_eq!(
+            store.get_latest_version(current_uri).await.unwrap(),
+            Some((3, "_versions/3.manifest".to_owned()))
+        );
     }
 
     #[tokio::test]
