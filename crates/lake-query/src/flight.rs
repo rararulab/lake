@@ -1006,6 +1006,15 @@ impl TracedFlightSqlService {
                     "async submission id is already bound to another statement",
                 )
             }
+            crate::async_query::AsyncQueryCoordinatorError::Store {
+                source: crate::async_query::AsyncQueryStoreError::QuotaExceeded,
+            } => {
+                crate::telemetry::async_quota_rejection("outstanding_jobs");
+                Status::resource_exhausted("async tenant outstanding query limit reached")
+            }
+            crate::async_query::AsyncQueryCoordinatorError::SubmissionPending => {
+                Status::unavailable("async query submission is in progress")
+            }
             _ => Status::internal("could not persist async query"),
         })?;
         let info = FlightInfo::new()
@@ -1635,7 +1644,9 @@ mod tests {
     use super::*;
     use crate::{
         async_ipc::{IpcPipelineLimits, PipelineProbe, decode_ipc_reader},
-        async_query::{AsyncQueryCoordinator, AsyncQueryWorker, WorkerIdentity},
+        async_query::{
+            AsyncQueryCoordinator, AsyncQueryWorker, AsyncResourceLimits, WorkerIdentity,
+        },
         ticket::{QueryTicketKeyRing, StatementTicketCodec},
     };
 
@@ -2473,6 +2484,59 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(values.values(), &[7]);
+    }
+
+    #[tokio::test]
+    async fn async_tenant_quota_is_identity_free_resource_exhausted() {
+        let catalog_directory = tempfile::tempdir().unwrap();
+        let catalog: MetaStoreRef = Arc::new(RocksMeta::open(catalog_directory.path()).unwrap());
+        let service = snapshot_service(catalog, Arc::new(LanceEngine::new()), test_ticket_codec());
+        let state_directory = tempfile::tempdir().unwrap();
+        let state: MetaStoreRef = Arc::new(RocksMeta::open(state_directory.path()).unwrap());
+        let object_directory = tempfile::tempdir().unwrap();
+        let objects = Arc::new(
+            LocalObjectStore::open(object_directory.path())
+                .await
+                .unwrap(),
+        );
+        let coordinator = AsyncQueryCoordinator::try_new_with_resources(
+            state,
+            objects,
+            test_ticket_keys(),
+            Duration::from_hours(1),
+            Duration::from_mins(5),
+            AsyncResourceLimits::try_new(1, 64 << 20).unwrap(),
+        )
+        .unwrap();
+        let service = TracedFlightSqlService::with_async_queries(service, coordinator);
+        let principal = robots_reader();
+        for submission_id in [[1_u8; 16]] {
+            let query = CommandStatementQuery {
+                query:          "SELECT 1".to_owned(),
+                transaction_id: Some(bytes::Bytes::copy_from_slice(&submission_id)),
+            };
+            let mut request =
+                Request::new(FlightDescriptor::new_cmd(query.as_any().encode_to_vec()));
+            request.extensions_mut().insert(principal.clone());
+            FlightService::poll_flight_info(&service, request)
+                .await
+                .expect("first submission is admitted");
+        }
+        let query = CommandStatementQuery {
+            query:          "SELECT 1".to_owned(),
+            transaction_id: Some(bytes::Bytes::from_static(&[2_u8; 16])),
+        };
+        let mut request = Request::new(FlightDescriptor::new_cmd(query.as_any().encode_to_vec()));
+        request.extensions_mut().insert(principal);
+        let error = FlightService::poll_flight_info(&service, request)
+            .await
+            .expect_err("second retained job exceeds durable quota");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            error.message(),
+            "async tenant outstanding query limit reached"
+        );
+        assert!(!error.message().contains("robots-tenant"));
     }
 
     #[tokio::test]

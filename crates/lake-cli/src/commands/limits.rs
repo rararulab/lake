@@ -253,6 +253,37 @@ pub(crate) fn async_scheduler_limits_from_env() -> anyhow::Result<(usize, usize,
     )
 }
 
+pub(crate) fn async_resource_limits_from_env() -> anyhow::Result<(usize, u64)> {
+    let outstanding = env_value("LAKE_ASYNC_MAX_OUTSTANDING_PER_TENANT")?;
+    let result_bytes = env_value("LAKE_ASYNC_MAX_RESULT_BYTES")?;
+    async_resource_limits_from_values(outstanding.as_deref(), result_bytes.as_deref())
+}
+
+fn async_resource_limits_from_values(
+    outstanding: Option<&str>,
+    result_bytes: Option<&str>,
+) -> anyhow::Result<(usize, u64)> {
+    let outstanding = parse_or(
+        "LAKE_ASYNC_MAX_OUTSTANDING_PER_TENANT",
+        outstanding,
+        8_usize,
+    )?;
+    let result_bytes = parse_or(
+        "LAKE_ASYNC_MAX_RESULT_BYTES",
+        result_bytes,
+        16_u64 * 1024 * 1024 * 1024,
+    )?;
+    anyhow::ensure!(
+        (1..=128).contains(&outstanding),
+        "LAKE_ASYNC_MAX_OUTSTANDING_PER_TENANT must be within 1..=128"
+    );
+    anyhow::ensure!(
+        (64_u64 * 1024 * 1024..=256_u64 * 1024 * 1024 * 1024).contains(&result_bytes),
+        "LAKE_ASYNC_MAX_RESULT_BYTES must be within 64 MiB..=256 GiB"
+    );
+    Ok((outstanding, result_bytes))
+}
+
 fn async_scheduler_limits_from_values(
     workers: Option<&str>,
     workers_per_tenant: Option<&str>,
@@ -403,10 +434,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        append_limits_from_values, async_scheduler_limits_from_values,
-        discovery_limits_from_values, lance_maintenance_policy_from_value,
-        maintenance_limits_from_values, operation_policy_from_values, query_limits_from_values,
-        query_resources_from_values, query_ticket_ttl_from_value, shutdown_grace_from_value,
+        append_limits_from_values, async_resource_limits_from_values,
+        async_scheduler_limits_from_values, discovery_limits_from_values,
+        lance_maintenance_policy_from_value, maintenance_limits_from_values,
+        operation_policy_from_values, query_limits_from_values, query_resources_from_values,
+        query_ticket_ttl_from_value, shutdown_grace_from_value,
     };
 
     #[test]
@@ -572,6 +604,28 @@ mod tests {
         assert_eq!(
             async_scheduler_limits_from_values(Some("8"), Some("2"), Some("5000")).unwrap(),
             (8, 2, Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn async_resource_limit_values_are_validated_before_serving() {
+        assert_eq!(
+            async_resource_limits_from_values(None, None).unwrap(),
+            (8, 16 * 1024 * 1024 * 1024)
+        );
+        for values in [
+            (Some("0"), None),
+            (Some("129"), None),
+            (None, Some("67108863")),
+            (None, Some("274877906945")),
+            (Some("many"), None),
+            (None, Some("huge")),
+        ] {
+            assert!(async_resource_limits_from_values(values.0, values.1).is_err());
+        }
+        assert_eq!(
+            async_resource_limits_from_values(Some("128"), Some("274877906944")).unwrap(),
+            (128, 256 * 1024 * 1024 * 1024)
         );
     }
 

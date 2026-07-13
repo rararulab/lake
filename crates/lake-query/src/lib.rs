@@ -416,6 +416,8 @@ pub struct AsyncQueryConfig {
     worker_concurrency: usize,
     worker_concurrency_per_tenant: usize,
     execution_time: Duration,
+    max_outstanding_per_tenant: usize,
+    max_result_bytes: u64,
 }
 
 impl AsyncQueryConfig {
@@ -431,6 +433,8 @@ impl AsyncQueryConfig {
             worker_concurrency: 4,
             worker_concurrency_per_tenant: 1,
             execution_time: Duration::from_mins(30),
+            max_outstanding_per_tenant: async_query::DEFAULT_OUTSTANDING_PER_TENANT,
+            max_result_bytes: async_query::DEFAULT_RESULT_BYTES,
         }
     }
 
@@ -479,6 +483,20 @@ impl AsyncQueryConfig {
         self.execution_time = execution_time;
         Ok(self)
     }
+
+    /// Set durable per-tenant outstanding-job and immutable per-job result
+    /// storage bounds.
+    pub fn try_with_resource_limits(
+        mut self,
+        outstanding_per_tenant: usize,
+        result_bytes: u64,
+    ) -> Result<Self> {
+        async_query::AsyncResourceLimits::try_new(outstanding_per_tenant, result_bytes)
+            .map_err(|_| QueryError::InvalidAsyncConfiguration)?;
+        self.max_outstanding_per_tenant = outstanding_per_tenant;
+        self.max_result_bytes = result_bytes;
+        Ok(self)
+    }
 }
 
 impl std::fmt::Debug for AsyncQueryConfig {
@@ -497,6 +515,11 @@ impl std::fmt::Debug for AsyncQueryConfig {
                 &self.worker_concurrency_per_tenant,
             )
             .field("execution_time", &self.execution_time)
+            .field(
+                "max_outstanding_per_tenant",
+                &self.max_outstanding_per_tenant,
+            )
+            .field("max_result_bytes", &self.max_result_bytes)
             .finish()
     }
 }
@@ -854,12 +877,20 @@ where
             if async_config.scan_interval.is_zero() || scheduler_limits.is_err() {
                 return Err(QueryError::InvalidAsyncConfiguration);
             }
-            let coordinator = async_query::AsyncQueryCoordinator::try_new(
+            let resources = async_query::AsyncResourceLimits::try_new(
+                async_config.max_outstanding_per_tenant,
+                async_config.max_result_bytes,
+            );
+            if resources.is_err() {
+                return Err(QueryError::InvalidAsyncConfiguration);
+            }
+            let coordinator = async_query::AsyncQueryCoordinator::try_new_with_resources(
                 async_config.state,
                 async_config.results,
                 ticket_keys,
                 async_config.job_lifetime,
                 async_config.poll_ttl,
+                resources.expect("validated above"),
             )
             .map_err(|_| QueryError::InvalidAsyncConfiguration)?;
             let identity = async_query::WorkerIdentity::new(*uuid::Uuid::now_v7().as_bytes());

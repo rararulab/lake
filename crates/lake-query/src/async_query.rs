@@ -51,16 +51,28 @@ const MAX_PRINCIPAL_BYTES: usize = 128;
 const MAX_URI_BYTES: usize = 4_096;
 const MAX_JOB_SPEC_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_FAILURE_CODE_BYTES: usize = 64;
+const MAX_RESERVATION_TOKEN_BYTES: usize = 64;
 const MAX_JOB_LIFETIME_SECS: u64 = 24 * 60 * 60;
 const MAX_WORKER_LEASE_SECS: u64 = 5 * 60;
 const MAX_RESULT_PARTS: u64 = 4_096;
 const MAX_RESULT_BYTES: u64 = 1 << 40;
+pub(crate) const MIN_CONFIG_RESULT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_CONFIG_RESULT_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_RESULT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_OUTSTANDING_PER_TENANT: usize = 8;
+pub(crate) const MAX_OUTSTANDING_PER_TENANT: usize = 128;
 pub(crate) const MAX_RESULT_PART_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RESULT_PART_ROWS: usize = 65_536;
 const MAX_RESULT_SCHEMA_BYTES: usize = 1024 * 1024;
 const MAX_STATE_RECORD_BYTES: usize = 16 * 1024;
+const MAX_TENANT_INDEX_BYTES: usize = 32 * 1024;
+const TENANT_RESERVATION_GRACE_SECS: u64 = 5 * 60;
+const TENANT_CAS_ATTEMPTS: usize = 8;
+const SUBMISSION_RESUME_ATTEMPTS: usize = 100;
+const SUBMISSION_RESUME_RETRY: Duration = Duration::from_millis(10);
 const SCAN_PAGE_JOBS: usize = 256;
 const STATE_KEY_PREFIX: &str = "async-query/";
+const TENANT_KEY_PREFIX: &str = "async-query-tenant/";
 const ASYNC_JOB_CONTENT_TYPE: &str = "application/vnd.lake.async-job";
 const ASYNC_PART_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 const ASYNC_MANIFEST_CONTENT_TYPE: &str = "application/vnd.lake.async-result-manifest+json";
@@ -113,6 +125,64 @@ enum AsyncQueryState {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AsyncResourceLimits {
+    outstanding_per_tenant: usize,
+    result_bytes:           u64,
+}
+
+impl AsyncResourceLimits {
+    pub(crate) fn try_new(
+        outstanding_per_tenant: usize,
+        result_bytes: u64,
+    ) -> Result<Self, AsyncQueryTransitionError> {
+        if !(1..=MAX_OUTSTANDING_PER_TENANT).contains(&outstanding_per_tenant)
+            || !(MIN_CONFIG_RESULT_BYTES..=MAX_CONFIG_RESULT_BYTES).contains(&result_bytes)
+        {
+            return Err(AsyncQueryTransitionError::InvalidRecord);
+        }
+        Ok(Self {
+            outstanding_per_tenant,
+            result_bytes,
+        })
+    }
+
+    pub(crate) const fn outstanding_per_tenant(self) -> usize { self.outstanding_per_tenant }
+
+    pub(crate) const fn result_bytes(self) -> u64 { self.result_bytes }
+}
+
+impl Default for AsyncResourceLimits {
+    fn default() -> Self {
+        Self {
+            outstanding_per_tenant: DEFAULT_OUTSTANDING_PER_TENANT,
+            result_bytes:           DEFAULT_RESULT_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AsyncRecordResources {
+    result_limit_bytes:       u64,
+    tenant_reservation_token: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TenantResourceIndex {
+    schema_version: u8,
+    entries:        Vec<TenantReservation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TenantReservation {
+    query_id:   String,
+    token:      String,
+    expires_at: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AsyncQueryRecord {
@@ -125,6 +195,8 @@ pub(crate) struct AsyncQueryRecord {
     expires_at:       u64,
     next_lease_epoch: u64,
     state:            AsyncQueryState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resources:        Option<AsyncRecordResources>,
 }
 
 #[derive(Debug, Eq, PartialEq, Snafu)]
@@ -155,6 +227,10 @@ pub(crate) enum AsyncQueryStoreError {
     RecordTooLarge,
     #[snafu(display("async query already exists"))]
     AlreadyExists,
+    #[snafu(display("async tenant outstanding query quota is exhausted"))]
+    QuotaExceeded,
+    #[snafu(display("an idempotent async submission is still being created"))]
+    ReservationHeld,
     #[snafu(display("async query state changed concurrently"))]
     Conflict,
     #[snafu(display("async query transition failed"))]
@@ -196,6 +272,8 @@ pub(crate) enum AsyncQueryCoordinatorError {
     InvalidTime,
     #[snafu(display("async submission id is already bound to another statement"))]
     SubmissionConflict,
+    #[snafu(display("async submission is still being created"))]
+    SubmissionPending,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -242,6 +320,7 @@ pub(crate) struct AsyncQueryCoordinator {
     job_codec:  StatementTicketCodec,
     lifetime:   Duration,
     poll_ttl:   Duration,
+    resources:  AsyncResourceLimits,
 }
 
 impl AsyncQueryCoordinator {
@@ -251,6 +330,24 @@ impl AsyncQueryCoordinator {
         keys: QueryTicketKeyRing,
         job_lifetime: Duration,
         poll_ttl: Duration,
+    ) -> Result<Self, AsyncQueryCoordinatorError> {
+        Self::try_new_with_resources(
+            state,
+            objects,
+            keys,
+            job_lifetime,
+            poll_ttl,
+            AsyncResourceLimits::default(),
+        )
+    }
+
+    pub(crate) fn try_new_with_resources(
+        state: MetaStoreRef,
+        objects: Arc<dyn ManagedObjectStore>,
+        keys: QueryTicketKeyRing,
+        job_lifetime: Duration,
+        poll_ttl: Duration,
+        resources: AsyncResourceLimits,
     ) -> Result<Self, AsyncQueryCoordinatorError> {
         if job_lifetime.is_zero() || job_lifetime.as_secs() > MAX_JOB_LIFETIME_SECS {
             return Err(AsyncQueryCoordinatorError::InvalidLifetime);
@@ -267,6 +364,7 @@ impl AsyncQueryCoordinator {
             job_codec,
             lifetime: job_lifetime,
             poll_ttl,
+            resources,
         })
     }
 
@@ -299,19 +397,33 @@ impl AsyncQueryCoordinator {
             .job_codec
             .seal_statement(statement, principal)
             .map_err(|source| AsyncQueryCoordinatorError::Ticket { source })?;
-        match self
-            .submit_with_query_id_at(&query_id, encrypted_job, principal, SystemTime::now())
-            .await
-        {
-            Ok(submission) => Ok(submission),
-            Err(AsyncQueryCoordinatorError::Store {
-                source: AsyncQueryStoreError::AlreadyExists,
-            }) => self
-                .resume_submission_with_id(&statement.sql, principal, submission_id)
-                .await?
-                .ok_or(AsyncQueryCoordinatorError::SubmissionConflict),
-            Err(error) => Err(error),
+        for _ in 0..SUBMISSION_RESUME_ATTEMPTS {
+            match self
+                .submit_with_query_id_at(
+                    &query_id,
+                    encrypted_job.clone(),
+                    principal,
+                    SystemTime::now(),
+                )
+                .await
+            {
+                Ok(submission) => return Ok(submission),
+                Err(AsyncQueryCoordinatorError::Store {
+                    source:
+                        AsyncQueryStoreError::AlreadyExists | AsyncQueryStoreError::ReservationHeld,
+                }) => {
+                    if let Some(submission) = self
+                        .resume_submission_with_id(&statement.sql, principal, submission_id)
+                        .await?
+                    {
+                        return Ok(submission);
+                    }
+                    tokio::time::sleep(SUBMISSION_RESUME_RETRY).await;
+                }
+                Err(error) => return Err(error),
+            }
         }
+        Err(AsyncQueryCoordinatorError::SubmissionPending)
     }
 
     pub(crate) async fn resume_submission_with_id(
@@ -404,6 +516,17 @@ impl AsyncQueryCoordinator {
         let expires_at = now
             .checked_add(self.lifetime.as_secs())
             .ok_or(AsyncQueryCoordinatorError::InvalidTime)?;
+        let reservation_token = uuid::Uuid::now_v7().to_string();
+        self.store
+            .reserve_tenant(
+                principal.tenant().as_str(),
+                query_id,
+                &reservation_token,
+                now,
+                self.resources.outstanding_per_tenant(),
+            )
+            .await
+            .map_err(|source| AsyncQueryCoordinatorError::Store { source })?;
         let scope = ManagedObjectScope::try_new(principal.tenant().as_str(), query_id)
             .map_err(|source| AsyncQueryCoordinatorError::Object { source })?;
         let input = AsyncStreamReader::new(stream::iter([Ok::<Bytes, io::Error>(Bytes::from(
@@ -419,19 +542,42 @@ impl AsyncQueryCoordinator {
             )
             .await
             .map_err(|source| AsyncQueryCoordinatorError::Object { source })?;
-        let record = AsyncQueryRecord::try_new(
+        let record = AsyncQueryRecord::try_new_with_resources(
             query_id,
             principal.tenant().as_str(),
             principal.subject(),
             job_spec,
             now,
             expires_at,
+            &reservation_token,
+            self.resources,
         )
         .map_err(|source| AsyncQueryCoordinatorError::Store {
             source: AsyncQueryStoreError::Transition { source },
         })?;
+        match self.store.create(record).await {
+            Ok(()) => {}
+            Err(AsyncQueryStoreError::AlreadyExists) => {
+                // A schema-v1 replica can win a deterministic create after this
+                // v2 coordinator reserved capacity. Release only our exact
+                // token before the caller resumes that legacy record.
+                self.store
+                    .release_tenant(principal.tenant().as_str(), query_id, &reservation_token)
+                    .await
+                    .map_err(|source| AsyncQueryCoordinatorError::Store { source })?;
+                return Err(AsyncQueryCoordinatorError::Store {
+                    source: AsyncQueryStoreError::AlreadyExists,
+                });
+            }
+            Err(source) => return Err(AsyncQueryCoordinatorError::Store { source }),
+        }
         self.store
-            .create(record)
+            .confirm_tenant(
+                principal.tenant().as_str(),
+                query_id,
+                &reservation_token,
+                expires_at,
+            )
             .await
             .map_err(|source| AsyncQueryCoordinatorError::Store { source })?;
         let poll_handle = self.seal_poll_handle(query_id, principal)?;
@@ -609,6 +755,12 @@ impl AsyncQueryCoordinator {
             .delete_cleaning(query_id)
             .await
             .map_err(|source| AsyncQueryCoordinatorError::Store { source })?;
+        if let Some(reservation_token) = record.tenant_reservation_token() {
+            self.store
+                .release_tenant(record.tenant_id(), query_id, reservation_token)
+                .await
+                .map_err(|source| AsyncQueryCoordinatorError::Store { source })?;
+        }
         Ok(true)
     }
 
@@ -668,7 +820,13 @@ impl AsyncQueryCoordinator {
         let (parts, rows, bytes) = record
             .completed_summary()
             .ok_or(AsyncQueryCoordinatorError::InvalidJobSpec)?;
-        manifest.validate(&record.query_id, parts, rows, bytes)?;
+        manifest.validate(
+            &record.query_id,
+            parts,
+            rows,
+            bytes,
+            record.result_limit_bytes(),
+        )?;
         Ok(manifest)
     }
 
@@ -719,6 +877,7 @@ impl AsyncResultManifest {
         parts: u64,
         rows: u64,
         bytes: u64,
+        result_limit_bytes: u64,
     ) -> Result<(), AsyncQueryCoordinatorError> {
         if self.schema_version != 1
             || self.query_id != query_id
@@ -729,7 +888,7 @@ impl AsyncResultManifest {
             || self.bytes != bytes
             || self.parts.is_empty()
             || self.parts.len() as u64 > MAX_RESULT_PARTS
-            || self.bytes > MAX_RESULT_BYTES
+            || self.bytes > result_limit_bytes
             || self
                 .parts
                 .iter()
@@ -868,6 +1027,7 @@ impl AsyncQueryWorker {
         let mut parts = Vec::new();
         let mut rows = 0_u64;
         let mut bytes = 0_u64;
+        let result_limit_bytes = record.result_limit_bytes();
         while let Some(batch) = batches.next().await {
             let batch = batch.map_err(|source| AsyncQueryWorkerError::Query {
                 source: QueryError::Execute { source },
@@ -877,14 +1037,20 @@ impl AsyncQueryWorker {
                 .ok_or(AsyncQueryWorkerError::ResultBound)?;
             for offset in (0..batch.num_rows()).step_by(MAX_RESULT_PART_ROWS) {
                 let length = (batch.num_rows() - offset).min(MAX_RESULT_PART_ROWS);
-                self.write_part(&scope, batch.slice(offset, length), &mut parts, &mut bytes)
-                    .await?;
+                self.write_part(
+                    &scope,
+                    batch.slice(offset, length),
+                    &mut parts,
+                    &mut bytes,
+                    result_limit_bytes,
+                )
+                .await?;
                 self.renew(query_id, lease).await?;
             }
         }
         if parts.is_empty() {
             let empty = RecordBatch::new_empty(schema);
-            self.write_part(&scope, empty, &mut parts, &mut bytes)
+            self.write_part(&scope, empty, &mut parts, &mut bytes, result_limit_bytes)
                 .await?;
         }
         let manifest = AsyncResultManifest {
@@ -936,11 +1102,12 @@ impl AsyncQueryWorker {
         batch: RecordBatch,
         parts: &mut Vec<DataLocation>,
         total_bytes: &mut u64,
+        result_limit_bytes: u64,
     ) -> Result<(), AsyncQueryWorkerError> {
         if parts.len() as u64 >= MAX_RESULT_PARTS {
             return Err(AsyncQueryWorkerError::ResultBound);
         }
-        let remaining_total = MAX_RESULT_BYTES
+        let remaining_total = result_limit_bytes
             .checked_sub(*total_bytes)
             .ok_or(AsyncQueryWorkerError::ResultBound)?;
         let encoded_limit = MAX_RESULT_PART_BYTES.min(remaining_total);
@@ -969,7 +1136,7 @@ impl AsyncQueryWorker {
         let next_total = total_bytes
             .checked_add(part_bytes)
             .ok_or(AsyncQueryWorkerError::ResultBound)?;
-        if part_bytes == 0 || part_bytes > encoded_limit || next_total > MAX_RESULT_BYTES {
+        if part_bytes == 0 || part_bytes > encoded_limit || next_total > result_limit_bytes {
             return Err(AsyncQueryWorkerError::ResultBound);
         }
         *total_bytes = next_total;
@@ -1029,6 +1196,162 @@ impl AsyncQueryStore {
         } else {
             Err(AsyncQueryStoreError::AlreadyExists)
         }
+    }
+
+    pub(crate) async fn reserve_tenant(
+        &self,
+        tenant_id: &str,
+        query_id: &str,
+        token: &str,
+        now: u64,
+        limit: usize,
+    ) -> Result<(), AsyncQueryStoreError> {
+        if !bounded(tenant_id, MAX_TENANT_BYTES)
+            || state_key(query_id).is_none()
+            || !valid_reservation_token(token)
+            || !(1..=MAX_OUTSTANDING_PER_TENANT).contains(&limit)
+        {
+            return Err(AsyncQueryStoreError::InvalidStateRecord);
+        }
+        let key = tenant_index_key(tenant_id).ok_or(AsyncQueryStoreError::InvalidStateRecord)?;
+        for _ in 0..TENANT_CAS_ATTEMPTS {
+            let expected = self
+                .meta
+                .get(&key)
+                .await
+                .map_err(|source| AsyncQueryStoreError::Meta { source })?;
+            let mut index = decode_tenant_index(expected.as_deref())?;
+            self.reconcile_tenant_index(tenant_id, &mut index, now)
+                .await?;
+            if let Some(entry) = index
+                .entries
+                .iter_mut()
+                .find(|entry| entry.query_id == query_id)
+            {
+                if entry.token != token {
+                    return Err(AsyncQueryStoreError::ReservationHeld);
+                }
+                entry.expires_at = entry
+                    .expires_at
+                    .max(now.saturating_add(TENANT_RESERVATION_GRACE_SECS));
+            } else {
+                if index.entries.len() >= limit {
+                    return Err(AsyncQueryStoreError::QuotaExceeded);
+                }
+                index.entries.push(TenantReservation {
+                    query_id:   query_id.to_owned(),
+                    token:      token.to_owned(),
+                    expires_at: now
+                        .checked_add(TENANT_RESERVATION_GRACE_SECS)
+                        .ok_or(AsyncQueryStoreError::InvalidStateRecord)?,
+                });
+            }
+            let encoded = encode_tenant_index(&index)?;
+            if self
+                .meta
+                .cas(&key, expected.as_deref(), &encoded)
+                .await
+                .map_err(|source| AsyncQueryStoreError::Meta { source })?
+            {
+                return Ok(());
+            }
+        }
+        Err(AsyncQueryStoreError::Conflict)
+    }
+
+    pub(crate) async fn confirm_tenant(
+        &self,
+        tenant_id: &str,
+        query_id: &str,
+        token: &str,
+        expires_at: u64,
+    ) -> Result<(), AsyncQueryStoreError> {
+        self.mutate_tenant_index(tenant_id, |index| {
+            let entry = index
+                .entries
+                .iter_mut()
+                .find(|entry| entry.query_id == query_id && entry.token == token)
+                .ok_or(AsyncQueryStoreError::InvalidStateRecord)?;
+            entry.expires_at = expires_at;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn release_tenant(
+        &self,
+        tenant_id: &str,
+        query_id: &str,
+        token: &str,
+    ) -> Result<(), AsyncQueryStoreError> {
+        self.mutate_tenant_index(tenant_id, |index| {
+            index
+                .entries
+                .retain(|entry| entry.query_id != query_id || entry.token != token);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn reconcile_tenant_index(
+        &self,
+        tenant_id: &str,
+        index: &mut TenantResourceIndex,
+        now: u64,
+    ) -> Result<(), AsyncQueryStoreError> {
+        let mut retained = Vec::with_capacity(index.entries.len());
+        for mut entry in index.entries.drain(..) {
+            if entry.expires_at > now {
+                retained.push(entry);
+                continue;
+            }
+            if let Some(record) = self.load(&entry.query_id).await? {
+                if record.tenant_id() != tenant_id {
+                    return Err(AsyncQueryStoreError::InvalidStateRecord);
+                }
+                if let Some(token) = record.tenant_reservation_token() {
+                    if token != entry.token {
+                        return Err(AsyncQueryStoreError::InvalidStateRecord);
+                    }
+                    entry.expires_at = record
+                        .expires_at()
+                        .max(now.saturating_add(TENANT_RESERVATION_GRACE_SECS));
+                    retained.push(entry);
+                }
+            }
+        }
+        index.entries = retained;
+        Ok(())
+    }
+
+    async fn mutate_tenant_index<F>(
+        &self,
+        tenant_id: &str,
+        mutate: F,
+    ) -> Result<(), AsyncQueryStoreError>
+    where
+        F: Fn(&mut TenantResourceIndex) -> Result<(), AsyncQueryStoreError>,
+    {
+        let key = tenant_index_key(tenant_id).ok_or(AsyncQueryStoreError::InvalidStateRecord)?;
+        for _ in 0..TENANT_CAS_ATTEMPTS {
+            let expected = self
+                .meta
+                .get(&key)
+                .await
+                .map_err(|source| AsyncQueryStoreError::Meta { source })?;
+            let mut index = decode_tenant_index(expected.as_deref())?;
+            mutate(&mut index)?;
+            let encoded = encode_tenant_index(&index)?;
+            if self
+                .meta
+                .cas(&key, expected.as_deref(), &encoded)
+                .await
+                .map_err(|source| AsyncQueryStoreError::Meta { source })?
+            {
+                return Ok(());
+            }
+        }
+        Err(AsyncQueryStoreError::Conflict)
     }
 
     pub(crate) async fn load(
@@ -1262,7 +1585,54 @@ impl AsyncQueryRecord {
             expires_at,
             next_lease_epoch: 1,
             state: AsyncQueryState::Queued,
+            resources: None,
         })
+    }
+
+    pub(crate) fn try_new_with_resources(
+        query_id: impl Into<String>,
+        tenant_id: impl Into<String>,
+        principal_id: impl Into<String>,
+        job_spec: DataLocation,
+        created_at: u64,
+        expires_at: u64,
+        tenant_reservation_token: impl Into<String>,
+        limits: AsyncResourceLimits,
+    ) -> Result<Self, AsyncQueryTransitionError> {
+        let mut record = Self::try_new(
+            query_id,
+            tenant_id,
+            principal_id,
+            job_spec,
+            created_at,
+            expires_at,
+        )?;
+        record.schema_version = 2;
+        let tenant_reservation_token = tenant_reservation_token.into();
+        if !valid_reservation_token(&tenant_reservation_token) {
+            return Err(AsyncQueryTransitionError::InvalidRecord);
+        }
+        record.resources = Some(AsyncRecordResources {
+            result_limit_bytes: limits.result_bytes(),
+            tenant_reservation_token,
+        });
+        Ok(record)
+    }
+
+    pub(crate) fn result_limit_bytes(&self) -> u64 {
+        self.resources
+            .as_ref()
+            .map_or(MAX_RESULT_BYTES, |resources| resources.result_limit_bytes)
+    }
+
+    pub(crate) fn has_tenant_reservation(&self) -> bool {
+        self.tenant_reservation_token().is_some()
+    }
+
+    pub(crate) fn tenant_reservation_token(&self) -> Option<&str> {
+        self.resources
+            .as_ref()
+            .map(|resources| resources.tenant_reservation_token.as_str())
     }
 
     pub(crate) fn claim(
@@ -1333,7 +1703,7 @@ impl AsyncQueryRecord {
         if !valid_result_location(&manifest, ASYNC_MANIFEST_CONTENT_TYPE)
             || parts == 0
             || parts > MAX_RESULT_PARTS
-            || bytes > MAX_RESULT_BYTES
+            || bytes > self.result_limit_bytes()
         {
             return Err(AsyncQueryTransitionError::InvalidRecord);
         }
@@ -1529,7 +1899,16 @@ impl AsyncQueryRecord {
     }
 
     fn validate(&self) -> Result<(), AsyncQueryTransitionError> {
-        if self.schema_version != 1
+        let resources_valid = match (&self.schema_version, &self.resources) {
+            (1, None) => true,
+            (2, Some(resources)) => {
+                valid_reservation_token(&resources.tenant_reservation_token)
+                    && (MIN_CONFIG_RESULT_BYTES..=MAX_CONFIG_RESULT_BYTES)
+                        .contains(&resources.result_limit_bytes)
+            }
+            _ => false,
+        };
+        if !resources_valid
             || state_key(&self.query_id).is_none()
             || !bounded(&self.tenant_id, MAX_TENANT_BYTES)
             || !bounded(&self.principal_id, MAX_PRINCIPAL_BYTES)
@@ -1562,7 +1941,7 @@ impl AsyncQueryRecord {
             } if valid_result_location(manifest, ASYNC_MANIFEST_CONTENT_TYPE)
                 && *parts > 0
                 && *parts <= MAX_RESULT_PARTS
-                && *bytes <= MAX_RESULT_BYTES =>
+                && *bytes <= self.result_limit_bytes() =>
             {
                 Ok(())
             }
@@ -1609,12 +1988,86 @@ fn valid_result_location(location: &DataLocation, content_type: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+fn valid_reservation_token(token: &str) -> bool {
+    bounded(token, MAX_RESERVATION_TOKEN_BYTES)
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
 fn state_key(query_id: &str) -> Option<String> {
     (bounded(query_id, MAX_QUERY_ID_BYTES)
         && query_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
     .then(|| format!("{STATE_KEY_PREFIX}{query_id}"))
+}
+
+fn tenant_index_key(tenant_id: &str) -> Option<String> {
+    if !bounded(tenant_id, MAX_TENANT_BYTES) {
+        return None;
+    }
+    let mut context = digest::Context::new(&digest::SHA256);
+    context.update(b"lake-query-async-tenant-resource-v1\0");
+    context.update(tenant_id.as_bytes());
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = context.finish();
+    let encoded = digest.as_ref().iter().fold(
+        String::with_capacity(digest::SHA256_OUTPUT_LEN * 2),
+        |mut output, byte| {
+            output.push(char::from(HEX[usize::from(*byte >> 4)]));
+            output.push(char::from(HEX[usize::from(*byte & 0x0f)]));
+            output
+        },
+    );
+    Some(format!("{TENANT_KEY_PREFIX}{encoded}"))
+}
+
+fn decode_tenant_index(
+    encoded: Option<&[u8]>,
+) -> Result<TenantResourceIndex, AsyncQueryStoreError> {
+    let Some(encoded) = encoded else {
+        return Ok(TenantResourceIndex {
+            schema_version: 1,
+            entries:        Vec::new(),
+        });
+    };
+    if encoded.len() > MAX_TENANT_INDEX_BYTES {
+        return Err(AsyncQueryStoreError::RecordTooLarge);
+    }
+    let index: TenantResourceIndex = serde_json::from_slice(encoded)
+        .map_err(|source| AsyncQueryStoreError::Decode { source })?;
+    if index.schema_version != 1
+        || index.entries.len() > MAX_OUTSTANDING_PER_TENANT
+        || index
+            .entries
+            .iter()
+            .any(|entry| state_key(&entry.query_id).is_none() || entry.expires_at == 0)
+        || index
+            .entries
+            .iter()
+            .any(|entry| !valid_reservation_token(&entry.token))
+        || index.entries.iter().enumerate().any(|(position, entry)| {
+            index.entries[..position]
+                .iter()
+                .any(|other| other.query_id == entry.query_id)
+        })
+    {
+        return Err(AsyncQueryStoreError::InvalidStateRecord);
+    }
+    Ok(index)
+}
+
+fn encode_tenant_index(index: &TenantResourceIndex) -> Result<Vec<u8>, AsyncQueryStoreError> {
+    if index.schema_version != 1 || index.entries.len() > MAX_OUTSTANDING_PER_TENANT {
+        return Err(AsyncQueryStoreError::InvalidStateRecord);
+    }
+    let encoded =
+        serde_json::to_vec(index).map_err(|source| AsyncQueryStoreError::Encode { source })?;
+    if encoded.len() > MAX_TENANT_INDEX_BYTES {
+        return Err(AsyncQueryStoreError::RecordTooLarge);
+    }
+    Ok(encoded)
 }
 
 fn encode_record(record: &AsyncQueryRecord) -> Result<Vec<u8>, AsyncQueryStoreError> {
@@ -1632,7 +2085,7 @@ mod tests {
         io::Cursor,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::{Duration, UNIX_EPOCH},
     };
@@ -1647,7 +2100,9 @@ mod tests {
 
     use super::{
         ASYNC_MANIFEST_CONTENT_TYPE, AsyncQueryCoordinator, AsyncQueryRecord, AsyncQueryStore,
-        AsyncQueryStoreError, AsyncQueryTransitionError, AsyncQueryWorker, WorkerIdentity,
+        AsyncQueryStoreError, AsyncQueryTransitionError, AsyncQueryWorker, AsyncResourceLimits,
+        MAX_RESULT_BYTES, MAX_WORKER_LEASE_SECS, MIN_CONFIG_RESULT_BYTES, STATE_KEY_PREFIX,
+        WorkerIdentity,
     };
     use crate::{
         QueryEngine, QueryTicketKeyRing,
@@ -1655,9 +2110,18 @@ mod tests {
         ticket::StatementTicket,
     };
 
+    const TEST_RESERVATION_TOKEN: &str = "018f73b1-12b0-7d20-b8ab-8195ce8bfe01";
+
     struct ScanCountingMeta {
         inner: RocksMeta,
         gets:  Arc<AtomicUsize>,
+    }
+
+    /// Simulates an old replica winning the state-record create after a new
+    /// replica has reserved quota, but before it can create schema-v2 state.
+    struct V1CreateRaceMeta {
+        inner:    RocksMeta,
+        injected: AtomicBool,
     }
 
     #[async_trait]
@@ -1673,6 +2137,63 @@ mod tests {
             expected: Option<&[u8]>,
             new: &[u8],
         ) -> lake_meta::Result<bool> {
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn scan_prefix_page(
+            &self,
+            prefix: &str,
+            continuation: Option<&str>,
+            limit: usize,
+        ) -> lake_meta::Result<MetaScanPage> {
+            self.inner
+                .scan_prefix_page(prefix, continuation, limit)
+                .await
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
+        }
+    }
+
+    #[async_trait]
+    impl MetaStore for V1CreateRaceMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            if key.starts_with(STATE_KEY_PREFIX)
+                && expected.is_none()
+                && !self.injected.swap(true, Ordering::AcqRel)
+            {
+                let v2: AsyncQueryRecord =
+                    serde_json::from_slice(new).expect("coordinator writes schema-v2 state");
+                let v1 = AsyncQueryRecord::try_new(
+                    v2.query_id,
+                    v2.tenant_id,
+                    v2.principal_id,
+                    v2.job_spec,
+                    v2.created_at,
+                    v2.expires_at,
+                )
+                .expect("old replica writes a valid schema-v1 state record");
+                let encoded = serde_json::to_vec(&v1).expect("encode schema-v1 state");
+                assert!(
+                    self.inner.cas(key, None, &encoded).await?,
+                    "the simulated old replica wins the create race"
+                );
+                return Ok(false);
+            }
             self.inner.cas(key, expected, new).await
         }
 
@@ -1722,6 +2243,498 @@ mod tests {
             ["tenant-a"],
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn async_resource_v1_records_remain_compatible() {
+        let state_directory = tempfile::tempdir().unwrap();
+        let state: MetaStoreRef = Arc::new(RocksMeta::open(state_directory.path()).unwrap());
+        let catalog_directory = tempfile::tempdir().unwrap();
+        let catalog: MetaStoreRef = Arc::new(RocksMeta::open(catalog_directory.path()).unwrap());
+        let object_directory = tempfile::tempdir().unwrap();
+        let objects = Arc::new(
+            LocalObjectStore::open(object_directory.path())
+                .await
+                .unwrap(),
+        );
+        let coordinator = AsyncQueryCoordinator::try_new(
+            state,
+            objects,
+            QueryTicketKeyRing::try_new(
+                b"async-v1-compatibility-ticket-key-00001",
+                std::iter::empty(),
+            )
+            .unwrap(),
+            Duration::from_hours(6),
+            Duration::from_mins(5),
+        )
+        .unwrap();
+        let owner = principal("legacy@example");
+        let job = coordinator
+            .submit_statement(
+                &StatementTicket {
+                    sql:       "SELECT CAST(42 AS BIGINT) AS answer".to_owned(),
+                    snapshots: Vec::new(),
+                },
+                &owner,
+            )
+            .await
+            .unwrap();
+        let source = coordinator
+            .store()
+            .load(job.query_id())
+            .await
+            .unwrap()
+            .expect("v2 job supplies a real encrypted job object");
+        let query_id = "0198f73b-12b0-7d20-b8ab-8195ce8bfe70";
+        let created_at = source.created_at;
+        let expires_at = source.expires_at();
+        let legacy = AsyncQueryRecord::try_new(
+            query_id,
+            "tenant-a",
+            "legacy@example",
+            source.job_spec().clone(),
+            created_at,
+            expires_at,
+        )
+        .expect("legacy queued record");
+        let encoded = serde_json::to_vec(&legacy).expect("encode queued v1");
+        let decoded: AsyncQueryRecord = serde_json::from_slice(&encoded).expect("decode queued v1");
+        decoded.validate().expect("queued v1 remains valid");
+        assert_eq!(decoded.result_limit_bytes(), MAX_RESULT_BYTES);
+        assert!(!decoded.has_tenant_reservation());
+        coordinator.store().create(decoded).await.unwrap();
+
+        let poll_handle = coordinator.refresh_poll_handle(query_id, &owner).unwrap();
+        assert_eq!(
+            coordinator.open_poll_handle(&poll_handle, &owner).unwrap(),
+            query_id,
+            "current poll capability continues to address a v1 record"
+        );
+        let worker = AsyncQueryWorker::try_new(
+            coordinator.clone(),
+            Arc::new(QueryEngine::new(catalog, Arc::new(LanceEngine::new()))),
+            WorkerIdentity::new([6; 16]),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        worker.run(query_id, Duration::from_secs(30)).await.unwrap();
+
+        let completed = coordinator
+            .store()
+            .load(query_id)
+            .await
+            .unwrap()
+            .expect("completed v1 state is loadable");
+        assert!(completed.is_completed());
+        let encoded = serde_json::to_vec(&completed).expect("encode completed v1");
+        let decoded: AsyncQueryRecord =
+            serde_json::from_slice(&encoded).expect("decode completed v1");
+        decoded.validate().expect("completed v1 remains valid");
+        assert_eq!(decoded.result_limit_bytes(), MAX_RESULT_BYTES);
+        assert!(!decoded.has_tenant_reservation());
+
+        assert!(
+            !coordinator
+                .cleanup_if_expired(query_id, expires_at)
+                .await
+                .unwrap(),
+            "v1 cleanup first persists the normal cleanup fence"
+        );
+        let cleaning = coordinator
+            .store()
+            .load(query_id)
+            .await
+            .unwrap()
+            .expect("cleaning v1 state is loadable");
+        let encoded = serde_json::to_vec(&cleaning).expect("encode cleaning v1");
+        let decoded: AsyncQueryRecord =
+            serde_json::from_slice(&encoded).expect("decode cleaning v1");
+        decoded.validate().expect("cleaning v1 remains valid");
+        assert!(!decoded.has_tenant_reservation());
+        assert!(
+            coordinator
+                .cleanup_if_expired(query_id, expires_at + MAX_WORKER_LEASE_SECS)
+                .await
+                .unwrap(),
+            "current coordinator cleans a v1 record without a fabricated reservation"
+        );
+        assert!(coordinator.store().load(query_id).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn async_resource_limits_reject_values_outside_protocol_bounds() {
+        assert!(AsyncResourceLimits::try_new(0, 16 << 30).is_err());
+        assert!(AsyncResourceLimits::try_new(129, 16 << 30).is_err());
+        assert!(AsyncResourceLimits::try_new(8, (64 << 20) - 1).is_err());
+        assert!(AsyncResourceLimits::try_new(8, (256 << 30) + 1).is_err());
+        assert!(AsyncResourceLimits::try_new(1, 64 << 20).is_ok());
+        assert!(AsyncResourceLimits::try_new(128, 256 << 30).is_ok());
+    }
+
+    #[tokio::test]
+    async fn async_tenant_quota_is_durable_and_isolated() {
+        let directory = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(directory.path()).unwrap());
+        let stores = [
+            AsyncQueryStore::new(meta.clone()),
+            AsyncQueryStore::new(meta.clone()),
+            AsyncQueryStore::new(meta),
+        ];
+        let reservations = [
+            ("0198f73b-12b0-7d20-b8ab-8195ce8bfe61", &stores[0]),
+            ("0198f73b-12b0-7d20-b8ab-8195ce8bfe62", &stores[1]),
+            ("0198f73b-12b0-7d20-b8ab-8195ce8bfe63", &stores[2]),
+        ];
+        let results = futures::future::join_all(reservations.map(|(query_id, store)| {
+            store.reserve_tenant("tenant-a", query_id, TEST_RESERVATION_TOKEN, 1_000, 2)
+        }))
+        .await;
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 2);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(AsyncQueryStoreError::QuotaExceeded)))
+                .count(),
+            1
+        );
+        stores[0]
+            .reserve_tenant(
+                "tenant-b",
+                "0198f73b-12b0-7d20-b8ab-8195ce8bfe64",
+                TEST_RESERVATION_TOKEN,
+                1_000,
+                2,
+            )
+            .await
+            .expect("another tenant has independent capacity");
+    }
+
+    #[tokio::test]
+    async fn async_tenant_quota_reclaims_stale_reservations() {
+        let directory = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(directory.path()).unwrap());
+        let store = AsyncQueryStore::new(meta);
+        let missing = "0198f73b-12b0-7d20-b8ab-8195ce8bfe65";
+        store
+            .reserve_tenant("tenant-a", missing, TEST_RESERVATION_TOKEN, 1_000, 1)
+            .await
+            .unwrap();
+        store
+            .reserve_tenant(
+                "tenant-a",
+                "0198f73b-12b0-7d20-b8ab-8195ce8bfe66",
+                TEST_RESERVATION_TOKEN,
+                1_301,
+                1,
+            )
+            .await
+            .expect("missing stale owner is reclaimed");
+
+        let live = "0198f73b-12b0-7d20-b8ab-8195ce8bfe67";
+        store
+            .reserve_tenant("tenant-b", live, TEST_RESERVATION_TOKEN, 2_000, 1)
+            .await
+            .unwrap();
+        store
+            .create(
+                AsyncQueryRecord::try_new_with_resources(
+                    live,
+                    "tenant-b",
+                    "reader@example",
+                    job_spec(),
+                    2_000,
+                    3_000,
+                    TEST_RESERVATION_TOKEN,
+                    AsyncResourceLimits::try_new(1, 64 << 20).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let blocked = store
+            .reserve_tenant(
+                "tenant-b",
+                "0198f73b-12b0-7d20-b8ab-8195ce8bfe68",
+                TEST_RESERVATION_TOKEN,
+                2_301,
+                1,
+            )
+            .await;
+        assert!(matches!(blocked, Err(AsyncQueryStoreError::QuotaExceeded)));
+    }
+
+    #[tokio::test]
+    async fn v1_record_reconciles_a_leaked_v2_reservation() {
+        let directory = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(directory.path()).unwrap());
+        let store = AsyncQueryStore::new(meta);
+        let legacy = "0198f73b-12b0-7d20-b8ab-8195ce8bfe69";
+        store
+            .reserve_tenant("tenant-a", legacy, TEST_RESERVATION_TOKEN, 1_000, 1)
+            .await
+            .unwrap();
+        store
+            .create(
+                AsyncQueryRecord::try_new(
+                    legacy,
+                    "tenant-a",
+                    "legacy@example",
+                    job_spec(),
+                    1_000,
+                    2_000,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        store
+            .reserve_tenant(
+                "tenant-a",
+                "0198f73b-12b0-7d20-b8ab-8195ce8bfe6a",
+                "018f73b1-12b0-7d20-b8ab-8195ce8bfe6a",
+                1_301,
+                1,
+            )
+            .await
+            .expect("a v1 owner cannot permanently retain a v2 reservation");
+    }
+
+    #[tokio::test]
+    async fn async_cleanup_releases_exact_tenant_reservation() {
+        let directory = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(directory.path()).unwrap());
+        let store = AsyncQueryStore::new(meta);
+        let first = "0198f73b-12b0-7d20-b8ab-8195ce8bfe51";
+        let second = "0198f73b-12b0-7d20-b8ab-8195ce8bfe52";
+        let limits = AsyncResourceLimits::try_new(2, 64 << 20).unwrap();
+        for query_id in [first, second] {
+            store
+                .reserve_tenant("tenant-a", query_id, TEST_RESERVATION_TOKEN, 1_000, 2)
+                .await
+                .unwrap();
+            store
+                .create(
+                    AsyncQueryRecord::try_new_with_resources(
+                        query_id,
+                        "tenant-a",
+                        "reader@example",
+                        job_spec(),
+                        1_000,
+                        2_000,
+                        TEST_RESERVATION_TOKEN,
+                        limits,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            store
+                .confirm_tenant("tenant-a", query_id, TEST_RESERVATION_TOKEN, 2_000)
+                .await
+                .unwrap();
+        }
+        store.begin_cleanup(first, 2_000).await.unwrap();
+        store.delete_cleaning(first).await.unwrap();
+        store
+            .release_tenant("tenant-a", first, TEST_RESERVATION_TOKEN)
+            .await
+            .unwrap();
+        store
+            .release_tenant("tenant-a", first, TEST_RESERVATION_TOKEN)
+            .await
+            .unwrap();
+
+        store
+            .reserve_tenant(
+                "tenant-a",
+                "0198f73b-12b0-7d20-b8ab-8195ce8bfe53",
+                TEST_RESERVATION_TOKEN,
+                2_001,
+                2,
+            )
+            .await
+            .expect("only the cleaned reservation is released");
+        let neighbor = store.load(second).await.unwrap().expect("neighbor record");
+        assert!(neighbor.has_tenant_reservation());
+    }
+
+    #[tokio::test]
+    async fn async_cleanup_release_token_fences_deterministic_resubmission_aba() {
+        let directory = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(directory.path()).unwrap());
+        let store = AsyncQueryStore::new(meta);
+        let query_id = super::submission_query_id(&principal("aba@example"), [12; 16]);
+        let limits = AsyncResourceLimits::try_new(1, 64 << 20).unwrap();
+        let old_token = "018f73b1-12b0-7d20-b8ab-8195ce8bfe51";
+        let new_token = "018f73b1-12b0-7d20-b8ab-8195ce8bfe52";
+
+        store
+            .reserve_tenant("tenant-a", &query_id, old_token, 1_000, 1)
+            .await
+            .unwrap();
+        store
+            .create(
+                AsyncQueryRecord::try_new_with_resources(
+                    &query_id,
+                    "tenant-a",
+                    "aba@example",
+                    job_spec(),
+                    1_000,
+                    2_000,
+                    old_token,
+                    limits,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        store
+            .confirm_tenant("tenant-a", &query_id, old_token, 2_000)
+            .await
+            .unwrap();
+        store.begin_cleanup(&query_id, 2_000).await.unwrap();
+        store.delete_cleaning(&query_id).await.unwrap();
+
+        store
+            .reserve_tenant("tenant-a", &query_id, new_token, 2_001, 1)
+            .await
+            .expect("state deletion permits a fresh fenced reservation");
+        store
+            .create(
+                AsyncQueryRecord::try_new_with_resources(
+                    &query_id,
+                    "tenant-a",
+                    "aba@example",
+                    job_spec(),
+                    2_001,
+                    3_001,
+                    new_token,
+                    limits,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        store
+            .confirm_tenant("tenant-a", &query_id, new_token, 3_001)
+            .await
+            .unwrap();
+
+        store
+            .release_tenant("tenant-a", &query_id, old_token)
+            .await
+            .expect("old cleanup cannot release the new reservation");
+        assert!(matches!(
+            store
+                .reserve_tenant(
+                    "tenant-a",
+                    "0198f73b-12b0-7d20-b8ab-8195ce8bfe50",
+                    "018f73b1-12b0-7d20-b8ab-8195ce8bfe53",
+                    2_002,
+                    1,
+                )
+                .await,
+            Err(AsyncQueryStoreError::QuotaExceeded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn async_result_limit_is_immutable_across_worker_restart() {
+        let state_directory = tempfile::tempdir().unwrap();
+        let state: MetaStoreRef = Arc::new(RocksMeta::open(state_directory.path()).unwrap());
+        let catalog_directory = tempfile::tempdir().unwrap();
+        let catalog: MetaStoreRef = Arc::new(RocksMeta::open(catalog_directory.path()).unwrap());
+        let object_directory = tempfile::tempdir().unwrap();
+        let objects = Arc::new(
+            LocalObjectStore::open(object_directory.path())
+                .await
+                .unwrap(),
+        );
+        let keys = QueryTicketKeyRing::try_new(
+            b"async-restart-result-limit-ticket-key-001",
+            std::iter::empty(),
+        )
+        .unwrap();
+        let persisted_limit = MIN_CONFIG_RESULT_BYTES;
+        let first = AsyncQueryCoordinator::try_new_with_resources(
+            state.clone(),
+            objects.clone(),
+            keys.clone(),
+            Duration::from_hours(6),
+            Duration::from_mins(5),
+            AsyncResourceLimits::try_new(8, persisted_limit).unwrap(),
+        )
+        .unwrap();
+        let submission = first
+            .submit_statement(
+                &StatementTicket {
+                    sql:       format!("SELECT repeat('x', {persisted_limit}) AS payload"),
+                    snapshots: Vec::new(),
+                },
+                &principal("restart-limit@example"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .store()
+                .load(submission.query_id())
+                .await
+                .unwrap()
+                .expect("persisted job")
+                .result_limit_bytes(),
+            persisted_limit
+        );
+
+        let restarted = AsyncQueryCoordinator::try_new_with_resources(
+            state,
+            objects,
+            keys,
+            Duration::from_hours(6),
+            Duration::from_mins(5),
+            AsyncResourceLimits::try_new(8, persisted_limit * 2).unwrap(),
+        )
+        .unwrap();
+        let worker = AsyncQueryWorker::try_new(
+            restarted.clone(),
+            Arc::new(QueryEngine::new(catalog, Arc::new(LanceEngine::new()))),
+            WorkerIdentity::new([9; 16]),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        worker
+            .run(submission.query_id(), Duration::from_secs(30))
+            .await
+            .expect_err("the restarted worker must use the persisted smaller ceiling");
+
+        let record = restarted
+            .store()
+            .load(submission.query_id())
+            .await
+            .unwrap()
+            .expect("failed record remains durable for polling and cleanup");
+        assert_eq!(record.result_limit_bytes(), persisted_limit);
+        assert_eq!(record.failure_code(), Some("execution_failed"));
+        assert!(
+            record.completed_manifest().is_none(),
+            "a bounded failure must not publish the completion pointer"
+        );
+        let part_directory = object_directory
+            .path()
+            .join("tenant-a")
+            .join(submission.query_id())
+            .join("part");
+        assert!(
+            !part_directory.exists()
+                || std::fs::read_dir(part_directory)
+                    .expect("part directory is readable")
+                    .next()
+                    .is_none(),
+            "the oversized IPC part was rejected before publication"
+        );
     }
 
     #[test]
@@ -2237,6 +3250,66 @@ mod tests {
         assert_eq!(query_ids, [first.query_id()]);
         assert!(continuation.is_none());
         assert_eq!(invalid, 0);
+    }
+
+    #[tokio::test]
+    async fn v1_create_race_releases_new_reservation_before_idempotent_resume() {
+        let state_directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(V1CreateRaceMeta {
+            inner:    RocksMeta::open(state_directory.path()).unwrap(),
+            injected: AtomicBool::new(false),
+        });
+        let object_directory = tempfile::tempdir().unwrap();
+        let objects = Arc::new(
+            LocalObjectStore::open(object_directory.path())
+                .await
+                .unwrap(),
+        );
+        let coordinator = AsyncQueryCoordinator::try_new_with_resources(
+            state.clone(),
+            objects,
+            QueryTicketKeyRing::try_new(
+                b"async-v1-create-race-ticket-key-material-01",
+                std::iter::empty(),
+            )
+            .unwrap(),
+            Duration::from_hours(6),
+            Duration::from_mins(5),
+            AsyncResourceLimits::try_new(1, MIN_CONFIG_RESULT_BYTES).unwrap(),
+        )
+        .unwrap();
+        let statement = StatementTicket {
+            sql:       "SELECT CAST(42 AS BIGINT) AS answer".to_owned(),
+            snapshots: Vec::new(),
+        };
+        let owner = principal("v1-race@example");
+        let submission_id = [5_u8; 16];
+        let resumed = coordinator
+            .submit_statement_with_id(&statement, &owner, submission_id)
+            .await
+            .expect("a valid v1 winner remains resumable");
+        let query_id = super::submission_query_id(&owner, submission_id);
+        assert!(state.injected.load(Ordering::Acquire));
+        assert_eq!(resumed.query_id(), query_id);
+        let legacy = coordinator
+            .store()
+            .load(&query_id)
+            .await
+            .unwrap()
+            .expect("the old replica's state record persists");
+        assert!(!legacy.has_tenant_reservation());
+
+        coordinator
+            .store()
+            .reserve_tenant(
+                "tenant-a",
+                "0198f73b-12b0-7d20-b8ab-8195ce8bfe6f",
+                "018f73b1-12b0-7d20-b8ab-8195ce8bfe6f",
+                legacy.created_at,
+                1,
+            )
+            .await
+            .expect("the losing v2 reservation must not poison tenant capacity");
     }
 
     #[tokio::test]

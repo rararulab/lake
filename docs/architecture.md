@@ -493,7 +493,13 @@ design-level ones:
   writes to the observed leader, serializes mutations per table, and gates
   maintenance on the same lease. Durable asynchronous queries deliberately use
   a separate injected state store rather than this catalog/control-plane
-  authority.
+  authority. That store also owns a point-addressed, SHA-256-domain-separated,
+  bounded tenant reservation index. Submission reserves before object upload;
+  cleanup releases only after scoped objects and the exact state record are
+  deleted. Schema-v2 records persist the per-job result byte ceiling, while v1
+  records retain their legacy protocol ceiling. CAS and reconciliation work is
+  bounded; ambiguous crashes may over-count temporarily but never under-count
+  a live durable job.
 - Every production Flight hop shares `lake-flight`: a server interceptor
   authenticates every RPC, TLS configuration is verified by the client, and
   non-loopback plaintext/anonymous listeners fail closed. This covers
@@ -547,8 +553,9 @@ design-level ones:
   identities. Durable async workers separately use bounded page candidates,
   per-tenant round-robin selection, a process-local tenant ceiling, and an
   absolute execution deadline; saturated tenants never park a worker slot.
-  Cluster-global quotas, a durable tenant queue index, and byte/resource
-  accounting remain production policy work.
+  Durable retained async storage is additionally bounded by a CAS tenant index
+  and immutable record-level result-byte ceiling. Cluster-global CPU/memory
+  quotas, billing, and execution-fairness policy remain future work.
 - Each Metasrv replica separately bounds concurrent FILE appends and reserves
   worst-case buffered control bytes before reading a request. A follower and
   leader each enforce their own local ceiling while one forwarded upload is in
@@ -660,9 +667,9 @@ design-level ones:
   maintenance are wired. Structured process logging and authenticated gRPC
   health readiness, bounded Prometheus metrics, and distributed tracing are
   wired. Durable SDK append state and finite client-side schema caching are
-  wired. Per-replica foreground and async tenant concurrency isolation is
-  wired; remaining policy work is cluster-global async fairness and tenant
-  byte/resource accounting. A
+  wired. Per-replica foreground and async tenant concurrency isolation plus
+  durable retained-job/result-byte accounting are wired; remaining policy work
+  is cluster-global async fairness. A
   self-built engine slots in behind `TableEngine`
   if/when Lance's ceiling is hit.
 

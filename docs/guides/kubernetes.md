@@ -118,6 +118,34 @@ tenant, and a 30-minute execution deadline. Tune
 result-prefix capacity. Replica autoscaling multiplies aggregate worker
 capacity; these settings are not cluster-global quotas.
 
+The ConfigMap also sets `LAKE_ASYNC_MAX_OUTSTANDING_PER_TENANT=8` and
+`LAKE_ASYNC_MAX_RESULT_BYTES=17179869184`. Unlike worker concurrency, these
+limits are enforced by shared durable state: every new job reserves one tenant
+entry before object upload, and its result ceiling is immutable in the job
+record. Allowed ranges are 1..=128 jobs and 64 MiB..=256 GiB. A failed replica
+may temporarily over-count until the five-minute reservation grace is
+reconciled by bounded point reads; it never admits capacity by under-counting a
+live record. Size storage and lifecycle policies for the result prefix from
+these retained-object bounds; they do not reserve pod memory or CPU.
+
+### Async schema-v2 rollout
+
+Async schema-v2 records are intentionally not readable by a schema-v1 Query
+binary. Do not use a rolling rollout, do not mix images, and do not mix durable
+quota values against one shared async authority. The reference `lake-query`
+Deployment therefore uses `strategy: Recreate`.
+
+For the first v2 enablement, pause `PollFlightInfo` async submission at the
+edge, leave one schema-v1 worker fleet running until every existing v1 async
+record has expired and fenced cleanup has removed its `async-query/` state and
+scoped result objects, then replace the entire Query fleet and resume
+admission. The same drain is required before changing either durable quota
+value. Once any v2 record exists, an old image must not be rolled back into the
+async fleet: forward-fix the v2 image, or pause admission and drain all v2
+records/objects before a full old-image replacement. This procedure is
+necessary because v1 jobs have no durable tenant reservation and must never be
+silently counted as v2 jobs.
+
 A failed finalize leaves its durable barrier held. Keep admission paused,
 finish backfill, and rerun finalize. Do not delete the barrier as a routine
 rollback mechanism; doing so can re-admit stale dual writers during parity

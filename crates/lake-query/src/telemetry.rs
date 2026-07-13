@@ -45,6 +45,10 @@ pub(crate) fn describe() {
         "lake_query_async_active_workers",
         "Durable async jobs currently owning process-local worker capacity"
     );
+    metrics::describe_counter!(
+        "lake_query_async_quota_rejections_total",
+        "Durable async submission quota rejections by bounded reason"
+    );
 }
 
 pub(crate) fn admission(outcome: &'static str) {
@@ -84,6 +88,10 @@ pub(crate) fn async_active_increment() {
 
 pub(crate) fn async_active_decrement() {
     metrics::gauge!("lake_query_async_active_workers").decrement(1.0);
+}
+
+pub(crate) fn async_quota_rejection(reason: &'static str) {
+    metrics::counter!("lake_query_async_quota_rejections_total", "reason" => reason).increment(1);
 }
 
 #[cfg(test)]
@@ -317,7 +325,19 @@ mod tests {
             )));
         }
         assert!(rendered.contains("lake_query_async_active_workers 0"));
-        for forbidden in ["secret-tenant", "query-id", "principal", "tenant"] {
+        super::async_quota_rejection("outstanding_jobs");
+        let rendered = handle.render();
+        assert!(
+            rendered
+                .contains("lake_query_async_quota_rejections_total{reason=\"outstanding_jobs\"} 1")
+        );
+        for forbidden in [
+            "secret-tenant",
+            "tenant-a",
+            "query-id",
+            "principal",
+            "tenant_id",
+        ] {
             assert!(!rendered.contains(forbidden));
         }
     }

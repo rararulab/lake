@@ -88,7 +88,10 @@ impl IpcPipelineLimits {
     #[cfg(test)]
     pub(crate) const fn decode_window_bytes(&self) -> usize {
         self.byte_chunk_bytes
-            .saturating_mul(self.byte_channel_capacity.saturating_add(1))
+            // The bounded channel, one sender-held chunk waiting for capacity,
+            // and one decoder-owned chunk after it frees that capacity can all
+            // be live concurrently.
+            .saturating_mul(self.byte_channel_capacity.saturating_add(2))
     }
 
     #[cfg(test)]
@@ -918,7 +921,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         assert!(probe.peak_decoded_batches() <= limits.decode_window_batches());
-        assert!(probe.peak_input_bytes() <= limits.decode_window_bytes());
+        assert!(
+            probe.peak_input_bytes() <= limits.decode_window_bytes(),
+            "input peak {} exceeded window {}",
+            probe.peak_input_bytes(),
+            limits.decode_window_bytes()
+        );
 
         let mut batches = 0;
         while let Some(batch) = decoded.batches_mut().recv().await {
