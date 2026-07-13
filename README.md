@@ -35,6 +35,10 @@ Run the complete local example:
 cargo run -p lake-sdk --example managed_file
 ```
 
+The example uploads two `FILE` values, queries their `DataLocation` rows, and
+streams each direct read to a temporary file sink rather than retaining an
+object-sized buffer in the SDK process.
+
 The SDK connects only to the public query endpoint; it does not construct,
 embed, or connect directly to `lake-metasrv`:
 
