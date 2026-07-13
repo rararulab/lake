@@ -62,6 +62,20 @@ pub(crate) const DEFAULT_RESULT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub(crate) const DEFAULT_OUTSTANDING_PER_TENANT: usize = 8;
 pub(crate) const MAX_OUTSTANDING_PER_TENANT: usize = 128;
 pub(crate) const MAX_RESULT_PART_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RESULT_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_RESULT_MANIFEST_PART_JSON_BYTES: u64 = 4_269;
+const MAX_RESULT_MANIFEST_ENVELOPE_BYTES: u64 = 180;
+// JSON-safe URIs bound the immutable JSON manifest below its separate ceiling.
+const MAX_RESULT_MANIFEST_STRUCTURE_BYTES: u64 = MAX_RESULT_PARTS
+    * MAX_RESULT_MANIFEST_PART_JSON_BYTES
+    + (MAX_RESULT_PARTS - 1)
+    + 2
+    + (MAX_RESULT_SCHEMA_BYTES as u64 * 4)
+    + 1
+    + MAX_RESULT_MANIFEST_ENVELOPE_BYTES;
+const _: () = assert!(MAX_RESULT_MANIFEST_STRUCTURE_BYTES == 21_684_406);
+const _: () = assert!(MAX_RESULT_MANIFEST_STRUCTURE_BYTES < MAX_RESULT_MANIFEST_BYTES);
+const _: () = assert!(MAX_RESULT_MANIFEST_BYTES < MAX_RESULT_PART_BYTES);
 const MAX_RESULT_PART_ROWS: usize = 65_536;
 const MAX_RESULT_SCHEMA_BYTES: usize = 1024 * 1024;
 const MAX_STATE_RECORD_BYTES: usize = 16 * 1024;
@@ -798,17 +812,17 @@ impl AsyncQueryCoordinator {
         let location = record
             .completed_manifest()
             .ok_or(AsyncQueryCoordinatorError::InvalidJobSpec)?;
-        let capacity = usize::try_from(location.size_bytes)
-            .map_err(|_| AsyncQueryCoordinatorError::InvalidJobSpec)?;
-        if capacity == 0 || capacity as u64 > MAX_RESULT_PART_BYTES {
+        if !valid_manifest_location(location) {
             return Err(AsyncQueryCoordinatorError::InvalidJobSpec);
         }
+        let capacity = usize::try_from(location.size_bytes)
+            .map_err(|_| AsyncQueryCoordinatorError::InvalidJobSpec)?;
         let reader = open_verified(self.objects.as_ref(), location)
             .await
             .map_err(|source| AsyncQueryCoordinatorError::Object { source })?;
         let mut encoded = Vec::with_capacity(capacity);
         reader
-            .take(MAX_RESULT_PART_BYTES + 1)
+            .take(MAX_RESULT_MANIFEST_BYTES + 1)
             .read_to_end(&mut encoded)
             .await
             .map_err(|_| AsyncQueryCoordinatorError::InvalidJobSpec)?;
@@ -879,7 +893,8 @@ impl AsyncResultManifest {
         bytes: u64,
         result_limit_bytes: u64,
     ) -> Result<(), AsyncQueryCoordinatorError> {
-        if self.schema_version != 1
+        if state_key(query_id).is_none()
+            || self.schema_version != 1
             || self.query_id != query_id
             || self.schema_ipc.is_empty()
             || self.schema_ipc.len() > MAX_RESULT_SCHEMA_BYTES
@@ -902,6 +917,26 @@ impl AsyncResultManifest {
             return Err(AsyncQueryCoordinatorError::InvalidJobSpec);
         }
         Ok(())
+    }
+
+    fn encode_for_publication(
+        &self,
+        result_limit_bytes: u64,
+    ) -> Result<Vec<u8>, AsyncQueryWorkerError> {
+        self.validate(
+            &self.query_id,
+            self.parts.len() as u64,
+            self.rows,
+            self.bytes,
+            result_limit_bytes,
+        )
+        .map_err(|_| AsyncQueryWorkerError::ResultBound)?;
+        let encoded = serde_json::to_vec(self)
+            .map_err(|source| AsyncQueryWorkerError::Manifest { source })?;
+        if encoded.is_empty() || encoded.len() as u64 > MAX_RESULT_MANIFEST_BYTES {
+            return Err(AsyncQueryWorkerError::ResultBound);
+        }
+        Ok(encoded)
     }
 }
 
@@ -1061,11 +1096,7 @@ impl AsyncQueryWorker {
             rows,
             bytes,
         };
-        let encoded = serde_json::to_vec(&manifest)
-            .map_err(|source| AsyncQueryWorkerError::Manifest { source })?;
-        if encoded.is_empty() || encoded.len() as u64 > MAX_RESULT_PART_BYTES {
-            return Err(AsyncQueryWorkerError::ResultBound);
-        }
+        let encoded = manifest.encode_for_publication(result_limit_bytes)?;
         let input =
             AsyncStreamReader::new(stream::iter([Ok::<Bytes, io::Error>(Bytes::from(encoded))]));
         let manifest_location = self
@@ -1700,7 +1731,7 @@ impl AsyncQueryRecord {
             }
             _ => return Err(AsyncQueryTransitionError::Terminal),
         }
-        if !valid_result_location(&manifest, ASYNC_MANIFEST_CONTENT_TYPE)
+        if !valid_manifest_location(&manifest)
             || parts == 0
             || parts > MAX_RESULT_PARTS
             || bytes > self.result_limit_bytes()
@@ -1938,7 +1969,7 @@ impl AsyncQueryRecord {
                 parts,
                 bytes,
                 ..
-            } if valid_result_location(manifest, ASYNC_MANIFEST_CONTENT_TYPE)
+            } if valid_manifest_location(manifest)
                 && *parts > 0
                 && *parts <= MAX_RESULT_PARTS
                 && *bytes <= self.result_limit_bytes() =>
@@ -1977,7 +2008,7 @@ fn valid_job_spec(location: &DataLocation) -> bool {
 }
 
 fn valid_result_location(location: &DataLocation, content_type: &str) -> bool {
-    bounded(&location.uri, MAX_URI_BYTES)
+    valid_async_result_uri(&location.uri)
         && location.content_type == content_type
         && location.size_bytes > 0
         && location.size_bytes <= MAX_RESULT_PART_BYTES
@@ -1986,6 +2017,19 @@ fn valid_result_location(location: &DataLocation, content_type: &str) -> bool {
             .sha256
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn valid_manifest_location(location: &DataLocation) -> bool {
+    valid_result_location(location, ASYNC_MANIFEST_CONTENT_TYPE)
+        && location.size_bytes <= MAX_RESULT_MANIFEST_BYTES
+}
+
+fn valid_async_result_uri(uri: &str) -> bool {
+    !uri.is_empty()
+        && uri
+            .bytes()
+            .all(|byte| (0x21..=0x7e).contains(&byte) && byte != b'"' && byte != b'\\')
+        && uri.len() <= MAX_URI_BYTES
 }
 
 fn valid_reservation_token(token: &str) -> bool {
@@ -2083,6 +2127,7 @@ fn encode_record(record: &AsyncQueryRecord) -> Result<Vec<u8>, AsyncQueryStoreEr
 mod tests {
     use std::{
         io::Cursor,
+        ops::Range,
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -2095,14 +2140,18 @@ mod tests {
     use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
     use lake_engine_lance::LanceEngine;
     use lake_meta::{MetaScanPage, MetaStore, MetaStoreRef, RocksMeta};
-    use lake_objects::LocalObjectStore;
+    use lake_objects::{
+        LocalObjectStore, ManagedObjectStore, ObjectError, ObjectReader, Result as ObjectResult,
+    };
     use tokio::io::AsyncReadExt;
 
     use super::{
-        ASYNC_MANIFEST_CONTENT_TYPE, AsyncQueryCoordinator, AsyncQueryRecord, AsyncQueryStore,
-        AsyncQueryStoreError, AsyncQueryTransitionError, AsyncQueryWorker, AsyncResourceLimits,
-        MAX_RESULT_BYTES, MAX_WORKER_LEASE_SECS, MIN_CONFIG_RESULT_BYTES, STATE_KEY_PREFIX,
-        WorkerIdentity,
+        ASYNC_MANIFEST_CONTENT_TYPE, ASYNC_PART_CONTENT_TYPE, AsyncQueryCoordinator,
+        AsyncQueryRecord, AsyncQueryState, AsyncQueryStore, AsyncQueryStoreError,
+        AsyncQueryTransitionError, AsyncQueryWorker, AsyncResourceLimits, MAX_QUERY_ID_BYTES,
+        MAX_RESULT_BYTES, MAX_RESULT_MANIFEST_BYTES, MAX_RESULT_MANIFEST_STRUCTURE_BYTES,
+        MAX_RESULT_PART_BYTES, MAX_RESULT_PARTS, MAX_RESULT_SCHEMA_BYTES, MAX_URI_BYTES,
+        MAX_WORKER_LEASE_SECS, MIN_CONFIG_RESULT_BYTES, STATE_KEY_PREFIX, WorkerIdentity,
     };
     use crate::{
         QueryEngine, QueryTicketKeyRing,
@@ -2122,6 +2171,37 @@ mod tests {
     struct V1CreateRaceMeta {
         inner:    RocksMeta,
         injected: AtomicBool,
+    }
+
+    struct NoReadObjectStore {
+        opens: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ManagedObjectStore for NoReadObjectStore {
+        async fn put_reader(
+            &self,
+            _input: ObjectReader,
+            _content_type: String,
+        ) -> ObjectResult<lake_common::DataLocation> {
+            panic!("manifest declaration rejection must not upload")
+        }
+
+        async fn open_reader(
+            &self,
+            _location: &lake_common::DataLocation,
+        ) -> ObjectResult<ObjectReader> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Err(ObjectError::ScopedWriteUnsupported)
+        }
+
+        async fn open_range(
+            &self,
+            _location: &lake_common::DataLocation,
+            _range: Range<u64>,
+        ) -> ObjectResult<ObjectReader> {
+            panic!("manifest declaration rejection must not open ranges")
+        }
     }
 
     #[async_trait]
@@ -2243,6 +2323,122 @@ mod tests {
             ["tenant-a"],
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn async_result_manifest_rejects_part_sized_location_before_read() {
+        let state_directory = tempfile::tempdir().unwrap();
+        let state: MetaStoreRef = Arc::new(RocksMeta::open(state_directory.path()).unwrap());
+        let objects = Arc::new(NoReadObjectStore {
+            opens: AtomicUsize::new(0),
+        });
+        let coordinator = AsyncQueryCoordinator::try_new(
+            state,
+            objects.clone(),
+            QueryTicketKeyRing::try_new(
+                b"async-manifest-bound-ticket-key-00001",
+                std::iter::empty(),
+            )
+            .unwrap(),
+            Duration::from_hours(6),
+            Duration::from_mins(5),
+        )
+        .unwrap();
+        let mut record = AsyncQueryRecord::try_new(
+            "0198f73b-12b0-7d20-b8ab-8195ce8bfe80",
+            "tenant-a",
+            "reader@example",
+            job_spec(),
+            1_000,
+            2_000,
+        )
+        .unwrap();
+        record.state = AsyncQueryState::Completed {
+            manifest: lake_common::DataLocation {
+                uri:          "s3://async-results/tenant-a/query/manifest/result.json".to_owned(),
+                content_type: ASYNC_MANIFEST_CONTENT_TYPE.to_owned(),
+                size_bytes:   MAX_RESULT_PART_BYTES,
+                sha256:       "cd".repeat(32),
+            },
+            parts:    1,
+            rows:     0,
+            bytes:    1,
+        };
+
+        let error = coordinator
+            .load_manifest(&record)
+            .await
+            .expect_err("part-sized manifest declaration is invalid before object I/O");
+
+        assert!(matches!(
+            error,
+            super::AsyncQueryCoordinatorError::InvalidJobSpec
+        ));
+        assert_eq!(
+            objects.opens.load(Ordering::SeqCst),
+            0,
+            "invalid declaration must not open the manifest object"
+        );
+    }
+
+    #[test]
+    fn async_result_manifest_rejects_json_escaped_uri_before_serialization() {
+        let manifest = super::AsyncResultManifest {
+            schema_version: 1,
+            query_id:       "q".repeat(MAX_QUERY_ID_BYTES),
+            schema_ipc:     vec![1],
+            parts:          vec![lake_common::DataLocation {
+                uri:          "\0".repeat(MAX_URI_BYTES),
+                content_type: ASYNC_PART_CONTENT_TYPE.to_owned(),
+                size_bytes:   1,
+                sha256:       "ab".repeat(32),
+            }],
+            rows:           1,
+            bytes:          1,
+        };
+
+        assert!(matches!(
+            manifest.encode_for_publication(MAX_RESULT_BYTES),
+            Err(super::AsyncQueryWorkerError::ResultBound)
+        ));
+    }
+
+    #[test]
+    fn async_result_manifest_maximum_json_safe_structure_fits_ceiling() {
+        let part = lake_common::DataLocation {
+            uri:          "x".repeat(MAX_URI_BYTES),
+            content_type: ASYNC_PART_CONTENT_TYPE.to_owned(),
+            size_bytes:   MAX_RESULT_PART_BYTES,
+            sha256:       "ab".repeat(32),
+        };
+        let manifest = super::AsyncResultManifest {
+            schema_version: 1,
+            query_id:       "q".repeat(MAX_QUERY_ID_BYTES),
+            schema_ipc:     vec![u8::MAX; MAX_RESULT_SCHEMA_BYTES],
+            parts:          vec![part; MAX_RESULT_PARTS as usize],
+            rows:           u64::MAX,
+            bytes:          MAX_RESULT_PART_BYTES * MAX_RESULT_PARTS,
+        };
+
+        let encoded = manifest
+            .encode_for_publication(MAX_RESULT_BYTES)
+            .expect("maximum JSON-safe manifest structure remains publishable");
+
+        assert!(
+            manifest
+                .validate(
+                    &manifest.query_id,
+                    MAX_RESULT_PARTS,
+                    u64::MAX,
+                    MAX_RESULT_PART_BYTES * MAX_RESULT_PARTS,
+                    MAX_RESULT_BYTES,
+                )
+                .is_ok()
+        );
+        assert_eq!(MAX_RESULT_MANIFEST_STRUCTURE_BYTES, 21_684_406);
+        assert!(encoded.len() as u64 <= MAX_RESULT_MANIFEST_STRUCTURE_BYTES);
+        assert!(encoded.len() as u64 <= MAX_RESULT_MANIFEST_BYTES);
+        assert!(MAX_RESULT_MANIFEST_BYTES < MAX_RESULT_PART_BYTES);
     }
 
     #[tokio::test]
