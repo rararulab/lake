@@ -35,19 +35,21 @@ mod ticket;
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use datafusion::{
+    arrow::record_batch::RecordBatch,
     catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider},
     dataframe::DataFrame,
     error::DataFusionError,
     execution::{memory_pool::FairSpillPool, runtime_env::RuntimeEnvBuilder},
-    physical_plan::SendableRecordBatchStream,
     prelude::{SQLOptions, SessionConfig, SessionContext},
 };
+use futures::{Stream, TryStreamExt};
 use lake_catalog::{
     CatalogGeneration, CatalogRefreshHealth, CatalogSourceError, CatalogSourceRef, LakeCatalog,
     LocalCatalogSource, ProviderLoadError, TableSnapshot,
@@ -151,6 +153,10 @@ pub enum QueryError {
 }
 
 pub type Result<T> = std::result::Result<T, QueryError>;
+
+/// A backpressured direct-SQL record-batch stream whose item errors retain
+/// Lake's public query-error boundary.
+pub type QueryRecordBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>;
 
 /// Connect the authenticated, read-only Metasrv catalog source used by served
 /// Query.
@@ -783,9 +789,15 @@ impl QueryEngine {
     }
 
     /// Execute a SQL statement as a backpressured record-batch stream.
-    pub async fn execute_sql(&self, sql: &str) -> Result<SendableRecordBatchStream> {
+    ///
+    /// Errors while polling the stream are returned as [`QueryError::Execute`],
+    /// just like errors before the first batch.
+    pub async fn execute_sql(&self, sql: &str) -> Result<QueryRecordBatchStream> {
         let df = self.plan_sql(sql).await?;
-        df.execute_stream().await.context(ExecuteSnafu)
+        let batches = df.execute_stream().await.context(ExecuteSnafu)?;
+        Ok(Box::pin(
+            batches.map_err(|source| QueryError::Execute { source }),
+        ))
     }
 
     /// Validate and plan a statement through the public read-only SQL surface.
@@ -1444,6 +1456,53 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct LateErrorPartition {
+        schema: SchemaRef,
+    }
+
+    impl PartitionStream for LateErrorPartition {
+        fn schema(&self) -> &SchemaRef { &self.schema }
+
+        fn execute(&self, _context: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let first = RecordBatch::try_new(
+                self.schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1]))],
+            )
+            .expect("first batch");
+            let batches = futures::stream::once(async move { Ok(first) }).chain(
+                futures::stream::once(async move {
+                    Err::<RecordBatch, _>(DataFusionError::Execution(
+                        "late batch failure".to_owned(),
+                    ))
+                }),
+            );
+            Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), batches))
+        }
+    }
+
+    fn test_query_engine(
+        provider: Arc<dyn TableProvider>,
+        registration_name: &str,
+    ) -> Arc<QueryEngine> {
+        let location = TableLocation::new("mem://robots/shutdown-stream/incarnation");
+        let IpcMessage(schema_ipc) =
+            SchemaAsIpc::new(&provider.schema(), &IpcWriteOptions::default())
+                .try_into()
+                .expect("encode test schema");
+        let registration = TableRegistration::new(
+            location.clone(),
+            registration_name,
+            Version(1),
+            schema_ipc.to_vec(),
+        );
+        let meta: MetaStoreRef = Arc::new(ShutdownMeta {
+            registration: serde_json::to_vec(&registration).expect("encode registration"),
+        });
+        let storage: TableEngineRef = Arc::new(ShutdownEngine { location, provider });
+        Arc::new(QueryEngine::new(meta, storage))
+    }
+
     fn shutdown_query_engine(release: Arc<Notify>) -> Arc<QueryEngine> {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
@@ -1455,24 +1514,21 @@ mod tests {
             vec![Arc::new(ShutdownPartition { schema, release })],
         )
         .expect("streaming table");
-        let location = TableLocation::new("mem://robots/shutdown-stream/incarnation");
-        let IpcMessage(schema_ipc) = SchemaAsIpc::new(&table.schema(), &IpcWriteOptions::default())
-            .try_into()
-            .expect("encode shutdown schema");
-        let registration = TableRegistration::new(
-            location.clone(),
-            "shutdown-test",
-            Version(1),
-            schema_ipc.to_vec(),
-        );
-        let meta: MetaStoreRef = Arc::new(ShutdownMeta {
-            registration: serde_json::to_vec(&registration).expect("encode registration"),
-        });
-        let storage: TableEngineRef = Arc::new(ShutdownEngine {
-            location,
-            provider: Arc::new(table),
-        });
-        Arc::new(QueryEngine::new(meta, storage))
+        test_query_engine(Arc::new(table), "shutdown-test")
+    }
+
+    fn late_error_query_engine() -> Arc<QueryEngine> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let table = StreamingTable::try_new(
+            schema.clone(),
+            vec![Arc::new(LateErrorPartition { schema })],
+        )
+        .expect("streaming table");
+        test_query_engine(Arc::new(table), "late-error-test")
     }
 
     #[tokio::test]
@@ -1518,6 +1574,32 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("value column");
         assert_eq!(second_values.value(0), 2);
+    }
+
+    #[tokio::test]
+    async fn direct_sql_stream_maps_late_execution_errors() {
+        let engine = late_error_query_engine();
+        let mut batches = engine
+            .execute_sql("SELECT * FROM lake.robots.shutdown_stream")
+            .await
+            .expect("plan direct SQL query");
+
+        assert!(
+            batches
+                .try_next()
+                .await
+                .expect("read first batch")
+                .is_some(),
+            "the stream must expose its first batch before the late error"
+        );
+        let error = match batches.try_next().await {
+            Ok(_) => panic!("late execution failure must reach the caller"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("query execution failed"),
+            "late errors must retain the QueryError::Execute boundary: {error}"
+        );
     }
 
     fn free_addr() -> std::net::SocketAddr {
@@ -1587,9 +1669,9 @@ mod tests {
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
         let query = QueryEngine::new(meta_ref, engine);
 
-        query.execute_sql("SELECT 1").await.unwrap();
+        drop(query.execute_sql("SELECT 1").await.unwrap());
         let after_first = meta.scans.load(Ordering::Relaxed);
-        query.execute_sql("SELECT 2").await.unwrap();
+        drop(query.execute_sql("SELECT 2").await.unwrap());
 
         assert_eq!(after_first, 1, "the first query warms the listing cache");
         assert_eq!(
@@ -1611,7 +1693,7 @@ mod tests {
         let meta_ref: MetaStoreRef = meta.clone();
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
         let query = Arc::new(QueryEngine::new(meta_ref, engine));
-        query.execute_sql("SELECT 1").await.unwrap();
+        drop(query.execute_sql("SELECT 1").await.unwrap());
         tokio::time::advance(CATALOG_MAX_AGE + Duration::from_millis(1)).await;
         meta.pause.store(true, Ordering::SeqCst);
         let entered = meta.entered.notified();
@@ -1628,7 +1710,7 @@ mod tests {
             "warm SQL planning must not await the paused authority scan"
         );
         meta.release.notify_one();
-        planner.await.unwrap().unwrap();
+        drop(planner.await.unwrap().unwrap());
         assert_eq!(meta.scans.load(Ordering::SeqCst), 2);
     }
 
@@ -1638,8 +1720,8 @@ mod tests {
         let engine: TableEngineRef = Arc::new(LanceEngine::new());
         let query = QueryEngine::new(meta, engine);
 
-        query.execute_sql("SELECT 1").await.unwrap();
-        query.execute_sql("EXPLAIN SELECT 1").await.unwrap();
+        drop(query.execute_sql("SELECT 1").await.unwrap());
+        drop(query.execute_sql("EXPLAIN SELECT 1").await.unwrap());
 
         query
             .context()

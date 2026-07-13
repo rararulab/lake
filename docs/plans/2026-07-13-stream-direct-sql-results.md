@@ -7,12 +7,12 @@ the currently processed `RecordBatch`, rather than collecting an entire query
 result.
 
 **Architecture:** Preserve `QueryEngine`'s catalog refresh, read-only planning,
-and DataFusion runtime. Change `execute_sql` to return DataFusion's
-`SendableRecordBatchStream` from `DataFrame::execute_stream`; callers own
-progress and naturally apply backpressure by polling the next batch. The local
-CLI and selftest render/inspect each batch immediately, so their live result
-memory is bounded by the DataFusion batch and formatter rather than result
-cardinality.
+and DataFusion runtime. Change `execute_sql` to return Lake's
+`QueryRecordBatchStream`, backed by `DataFrame::execute_stream`; callers own
+progress and naturally apply backpressure by polling the next batch, while
+late DataFusion errors still map to `QueryError::Execute`. The local CLI and
+selftest render/inspect each batch immediately, so their live result memory is
+bounded by the DataFusion batch and formatter rather than result cardinality.
 
 **Tech Stack:** Rust, Tokio, Futures streams, DataFusion record-batch streams,
 Arrow pretty formatter, jj, agent-spec.
@@ -48,12 +48,12 @@ not return before the blocked source completes.
 
 **Step 3: Implement the minimal stream return**
 
-- Import `datafusion::physical_plan::SendableRecordBatchStream` in production
-  code instead of importing `RecordBatch` solely for the collected return.
+- Define a public `QueryRecordBatchStream` that owns a `Send` stream of
+  `Result<RecordBatch, QueryError>` items.
 - Keep the `execute_sql` name but change its return type to
-  `Result<SendableRecordBatchStream>`.
+  `Result<QueryRecordBatchStream>`.
 - Plan with the existing `plan_sql`, then call `DataFrame::execute_stream()`
-  and map its error through `ExecuteSnafu`.
+  and map both stream creation and later item errors through `QueryError::Execute`.
 - Do not add a buffer, spawned drain task, or compatibility method that calls
   `collect`.
 

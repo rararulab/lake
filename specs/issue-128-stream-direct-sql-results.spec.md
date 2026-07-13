@@ -15,11 +15,13 @@ record-batch stream and consume it one batch at a time.
 ## Decisions
 
 - Keep `execute_sql` as the direct-query entry point, but change its successful
-  result to `SendableRecordBatchStream`; its name still describes execution
-  while the type makes ownership and backpressure explicit.
+  result to Lake's `QueryRecordBatchStream`, backed by DataFusion's native
+  record-batch stream; its name still describes execution while the type makes
+  ownership, backpressure, and Lake's error boundary explicit.
 - Planning, catalog freshness, snapshot resolution, read-only validation, and
   DataFusion execution errors retain their current boundaries. Only result
-  materialization changes from `collect` to `execute_stream`.
+  materialization changes from `collect` to `execute_stream`; every later
+  stream-item execution error is mapped back to `QueryError::Execute`.
 - `lake sql` and `lake selftest` consume one successful batch at a time. The
   CLI formats each batch independently rather than retaining prior batches.
 - Keep Flight SQL, async query state/tickets/objects, SDK direct `DataLocation`

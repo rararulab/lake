@@ -25,10 +25,20 @@ $ cargo test -p lake-query --lib direct_sql_results_stream_before_source_complet
 test tests::direct_sql_results_stream_before_source_completion ... ok
 ```
 
-`QueryEngine::execute_sql` now returns DataFusion's
-`SendableRecordBatchStream` from `DataFrame::execute_stream`. The query CLI
-and selftest use `try_next` and retain only their current batch; no direct
-production call site collects the result stream.
+`QueryEngine::execute_sql` now returns Lake's `QueryRecordBatchStream`, backed
+by `DataFrame::execute_stream`; both creation-time and later item errors map to
+`QueryError::Execute`. The query CLI and selftest use `try_next` and retain
+only their current batch; no direct production call site collects the result
+stream.
+
+The review repair adds a source that yields one batch and then returns a
+DataFusion execution error. It verifies that the second `try_next` returns the
+Lake error boundary rather than leaking a raw DataFusion error:
+
+```console
+$ cargo test -p lake-query --lib direct_sql_stream_maps_late_execution_errors
+test tests::direct_sql_stream_maps_late_execution_errors ... ok
+```
 
 ## Boundary and consumer checks
 
@@ -37,7 +47,7 @@ $ cargo test -p lake-query --lib public_sql_surface_is_read_only
 test tests::public_sql_surface_is_read_only ... ok
 
 $ cargo test -p lake-query --lib
-test result: ok. 90 passed; 0 failed
+test result: ok. 91 passed; 0 failed
 
 $ cargo test -p lake-cli --all-targets
 test result: ok. 36 passed; 0 failed
