@@ -708,16 +708,24 @@ pub struct LakeClient {
     upload_checkpoint_dir: Option<PathBuf>,
 }
 
-/// Arrow batches streamed from one synchronous SQL query across local
-/// endpoints.
+/// Type-erased stream for the complete result of one synchronous SQL query.
 ///
-/// The stream redeems every validated endpoint in the order declared by the
-/// server. It does not expose per-endpoint headers or trailers because those
-/// values cannot form one whole-result response.
+/// Consume its [`Stream`] items with `futures::TryStreamExt`, such as
+/// `try_next` or `try_collect`. The SDK redeems every validated local result
+/// endpoint in declared order without collecting the complete result.
+///
+/// This deliberately replaces Arrow's `FlightRecordBatchStream` as the
+/// synchronous query return type. Per-`DoGet` headers and trailers have no
+/// well-defined whole-result meaning, so this stream exposes only
+/// [`RecordBatch`] values and terminal [`FlightError`]s.
 pub type QueryResultStream =
     Pin<Box<dyn Stream<Item = std::result::Result<RecordBatch, FlightError>> + Send>>;
 
-/// Ordered Arrow batches materialized by one durable asynchronous SQL query.
+/// Ordered Arrow batches materialized from a durable asynchronous-query result
+/// manifest.
+///
+/// This alias and its asynchronous manifest API retain their existing behavior;
+/// the synchronous [`QueryResultStream`] migration does not change them.
 pub type AsyncQueryResultStream = QueryResultStream;
 
 /// Result of one non-blocking durable query poll.
@@ -1164,8 +1172,22 @@ impl LakeClient {
             .context(MissingAppendResultSnafu)
     }
 
-    /// Execute read-only SQL through the query endpoint and stream Arrow
-    /// record batches as they arrive.
+    /// Execute read-only SQL through the query endpoint and stream its complete
+    /// Arrow result.
+    ///
+    /// Before the first `DoGet`, validates every endpoint in the returned
+    /// `FlightInfo`: each must have a bounded non-empty ticket and may have no
+    /// locations or only the exact `arrow-flight-reuse-connection://?`
+    /// location. The SDK then consumes the validated endpoints sequentially
+    /// in declared order. An invalid endpoint returns a typed, redacted
+    /// [`SdkError`] before any result stream is redeemed; the SDK neither
+    /// follows external endpoint locations nor forwards credentials to
+    /// them.
+    ///
+    /// The returned [`QueryResultStream`] is the deliberate semver migration
+    /// from Arrow's `FlightRecordBatchStream`: callers keep normal
+    /// `futures::TryStreamExt` consumption, while per-`DoGet` headers and
+    /// trailers are not exposed because they have no whole-result meaning.
     pub async fn query(&self, sql: &str) -> Result<QueryResultStream> {
         let client =
             arrow_flight::flight_service_client::FlightServiceClient::new(self.query.clone())
