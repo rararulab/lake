@@ -39,6 +39,58 @@ use crate::{
 /// Bounded copy chunk, chosen to keep multi-gigabyte uploads off the heap.
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
+/// Owns an unpublished local staging path until upload publication succeeds.
+///
+/// Dropping the caller-facing owner closes the channel and lets the detached
+/// path-only task remove staging after the caller task is cancelled. The task
+/// never owns the reader, copy buffer, or published destination.
+struct LocalUploadCleanupOwner {
+    decision: Option<tokio::sync::oneshot::Sender<()>>,
+    task:     Option<tokio::task::JoinHandle<()>>,
+}
+
+impl LocalUploadCleanupOwner {
+    fn new(staging: PathBuf) -> Self {
+        let (decision, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            if receiver.await.is_err() {
+                let _ = tokio::fs::remove_file(staging).await;
+            }
+        });
+        Self {
+            decision: Some(decision),
+            task:     Some(task),
+        }
+    }
+
+    async fn remove(mut self) {
+        self.decision.take();
+        self.join().await;
+    }
+
+    async fn disarm(mut self) {
+        if let Some(decision) = self.decision.take() {
+            let _ = decision.send(());
+        }
+        self.join().await;
+    }
+
+    async fn join(&mut self) {
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+/// Keeps the local file handle ahead of its cancellation cleanup owner.
+///
+/// Struct fields drop in declaration order, so cancellation closes the file
+/// before closing the owner channel that allows asynchronous removal.
+struct LocalUploadStaging {
+    output:  File,
+    cleanup: LocalUploadCleanupOwner,
+}
+
 /// Development managed stage rooted at a Lake-owned local directory.
 #[derive(Clone, Debug)]
 pub struct LocalObjectStore {
@@ -100,7 +152,7 @@ impl LocalObjectStore {
         let object_id = uuid::Uuid::now_v7().to_string();
         let staging = self.root.join(format!(".{object_id}.uploading"));
         let destination = self.root.join(object_id);
-        let mut output = OpenOptions::new()
+        let output = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&staging)
@@ -110,6 +162,10 @@ impl LocalObjectStore {
                 path:   staging.clone(),
                 source: source_error,
             })?;
+        let mut upload = LocalUploadStaging {
+            output,
+            cleanup: LocalUploadCleanupOwner::new(staging.clone()),
+        };
 
         let copied: Result<(u64, String)> = async {
             let mut hasher = Sha256::new();
@@ -124,7 +180,8 @@ impl LocalObjectStore {
                     break;
                 }
                 hasher.update(&buffer[..read]);
-                output
+                upload
+                    .output
                     .write_all(&buffer[..read])
                     .await
                     .map_err(|source_error| ObjectError::Io {
@@ -134,7 +191,8 @@ impl LocalObjectStore {
                     })?;
                 size_bytes = size_bytes.saturating_add(read as u64);
             }
-            output
+            upload
+                .output
                 .flush()
                 .await
                 .map_err(|source_error| ObjectError::Io {
@@ -142,30 +200,36 @@ impl LocalObjectStore {
                     path:   staging.clone(),
                     source: source_error,
                 })?;
-            output.sync_all().await.map_err(|source| ObjectError::Io {
-                action: "durably syncing".to_owned(),
-                path: staging.clone(),
-                source,
-            })?;
+            upload
+                .output
+                .sync_all()
+                .await
+                .map_err(|source| ObjectError::Io {
+                    action: "durably syncing".to_owned(),
+                    path: staging.clone(),
+                    source,
+                })?;
             Ok((size_bytes, format!("{:x}", hasher.finalize())))
         }
         .await;
+        let LocalUploadStaging { output, cleanup } = upload;
         drop(output);
         let (size_bytes, sha256) = match copied {
             Ok(copied) => copied,
             Err(error) => {
-                let _ = tokio::fs::remove_file(&staging).await;
+                cleanup.remove().await;
                 return Err(error);
             }
         };
         if let Err(source) = tokio::fs::rename(&staging, &destination).await {
-            let _ = tokio::fs::remove_file(&staging).await;
+            cleanup.remove().await;
             return Err(ObjectError::Io {
                 action: "publishing".to_owned(),
                 path: destination.clone(),
                 source,
             });
         }
+        cleanup.disarm().await;
         let directory_sync = File::open(&self.root)
             .await
             .map_err(|source| ObjectError::Io {
