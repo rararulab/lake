@@ -62,6 +62,12 @@ range's expected and observed byte counts. The returned type is still a
 streaming `AsyncRead`, so callers can feed a decoder without allocating the
 interval or downloading the object prefix.
 
+Before exposing an S3 range body, the stage requires its one GET response to
+declare exactly `Content-Range: bytes start-(end-1)/size_bytes` and
+`Content-Length: end-start`. Missing or mismatched metadata—including a proxy
+that ignores the Range header and returns byte zero—is rejected without a HEAD
+request or body buffering.
+
 Range and presigned reads do not claim the full-object SHA-256. A partial
 interval cannot establish the identity of bytes it did not read; per-range
 checksums require a future chunk/Merkle identity format rather than pretending

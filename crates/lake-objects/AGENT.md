@@ -19,7 +19,8 @@ Managed large-object values and direct storage access for the Rust SDK.
 - Byte ranges are non-empty half-open intervals checked against immutable
   `DataLocation.size_bytes` before local or S3 I/O. A drained range reader
   yields exactly the requested byte count or a typed early-EOF error, without
-  reading beyond the interval or buffering it.
+  reading beyond the interval or buffering it. S3 also requires one Range GET
+  response to declare the exact interval and length before exposing its body.
 - GC never scans table rows, never trusts draft output, and never deletes
   without a fully verified immutable plan plus page checkpoint.
 

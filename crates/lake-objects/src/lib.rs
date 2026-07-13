@@ -110,6 +110,9 @@ pub enum ObjectError {
         prefix: String,
     },
 
+    #[snafu(display("S3 Range GET response metadata does not match the requested interval"))]
+    InvalidS3RangeResponse,
+
     #[snafu(display("S3 operation '{action}' failed: {message}"))]
     S3 {
         action:  &'static str,

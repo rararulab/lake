@@ -24,6 +24,10 @@ therefore treat incomplete range bytes as valid input.
 - Local and S3 direct store APIs enforce this contract. `LakeClient::open_range`
   applies the same unoverrideable guard so an injected or adapted store cannot
   make the SDK silently accept a short range stream.
+- The S3 stage must also require its one Range GET response to declare the
+  exact requested `Content-Range` and `Content-Length` before exposing its
+  body. A proxy that ignores the Range header and returns byte zero is a
+  wrong interval even when its returned length happens to match.
 - This is not a full-object integrity claim. Per-range checksums, Merkle
   identities, full-object SHA-256 verification, HEAD metadata, and bytes
   through Query or Metasrv remain out of scope.
@@ -86,6 +90,16 @@ Scenario: SDK range reads reject a short adapted storage stream
   When the caller drains `LakeClient::open_range`
   Then the SDK returns the same typed terminal InvalidData error without
   contacting Query or Metasrv
+
+Scenario: S3 response metadata confirms the requested interval
+  Test:
+    Package: lake-objects
+    Filter: s3_range_response_requires_exact_interval
+  Given the one S3 Range GET response metadata for a valid requested interval
+  When the response omits, shifts, or changes either Content-Range or
+  Content-Length
+  Then the S3 stage rejects it before yielding a body; only the exact interval
+  and exact range length are accepted
 
 Scenario: the S3 range protocol smoke test remains wired
   Test:

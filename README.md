@@ -399,6 +399,11 @@ source; the reader never exposes bytes beyond the requested interval. A partial
 range cannot prove the full-object SHA-256, so `open_range` intentionally makes
 no full-object integrity claim.
 
+For S3, Lake also rejects the one Range GET response before yielding its body
+unless `Content-Range` is exactly `bytes start-(end-1)/size_bytes` and
+`Content-Length` is exactly `end-start`. This rejects a proxy that ignores a
+Range header without issuing a HEAD request or buffering the payload.
+
 A credentialed Rust process can delegate one S3 read without handing its AWS
 credentials to the eventual HTTP consumer. This local-IAM path is valid for 1
 second through 1 hour, is scoped to the already validated tenant child-prefix,
