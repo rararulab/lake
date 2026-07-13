@@ -4463,6 +4463,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_query_only_reader_cancels_direct_object_stream() {
+        let cancelled = Arc::new(Notify::new());
+        let (object_url, object_server) = spawn_cancellation_object_server(cancelled.clone()).await;
+        let actions = Arc::new(StdMutex::new(Vec::new()));
+        let (client, query_server) = connect_query_only_with_capability(
+            actions.clone(),
+            object_url,
+            vec![("x-object-token".to_owned(), "header-secret".to_owned())],
+        )
+        .await;
+        let mut reader = client
+            .open_via_query(&test_data_location(b"first-stream"), Duration::from_mins(1))
+            .await
+            .expect("Query-only reader opens a direct stream");
+        let mut prefix = [0; 5];
+        reader
+            .read_exact(&mut prefix)
+            .await
+            .expect("object prefix arrives before cancellation");
+        assert_eq!(&prefix, b"first");
+
+        drop(reader);
+        tokio::time::timeout(Duration::from_secs(1), cancelled.notified())
+            .await
+            .expect("dropping the reader cancels the object response body");
+        assert_eq!(actions.lock().expect("recorded actions").len(), 1);
+
+        query_server.abort();
+        object_server.abort();
+    }
+
+    #[tokio::test]
     async fn query_only_range_reader_requires_exact_partial_response() {
         let bytes = b"0123456789";
         let observed_headers = Arc::new(StdMutex::new(Vec::new()));
@@ -5258,6 +5290,71 @@ mod tests {
             )
             .await
             .expect("object server");
+        });
+        (
+            format!("http://{address}/object?X-Amz-Signature=http-secret"),
+            server,
+        )
+    }
+
+    #[derive(Clone)]
+    struct CancellationObjectState {
+        cancelled: Arc<Notify>,
+    }
+
+    struct ResponseDropNotice(Arc<Notify>);
+
+    impl Drop for ResponseDropNotice {
+        fn drop(&mut self) { self.0.notify_one(); }
+    }
+
+    async fn cancellation_object(
+        State(state): State<CancellationObjectState>,
+    ) -> axum::response::Response {
+        let stream = futures::stream::unfold(
+            (0_u8, ResponseDropNotice(state.cancelled)),
+            |state| async move {
+                match state.0 {
+                    0 => Some((
+                        Ok::<Bytes, Infallible>(Bytes::from_static(b"first")),
+                        (1, state.1),
+                    )),
+                    _ => {
+                        futures::future::pending::<
+                            Option<(Result<Bytes, Infallible>, (u8, ResponseDropNotice))>,
+                        >()
+                        .await
+                    }
+                }
+            },
+        );
+        let mut response = axum::response::Response::new(Body::from_stream(stream));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            "12".parse().expect("valid test length"),
+        );
+        response
+    }
+
+    async fn spawn_cancellation_object_server(
+        cancelled: Arc<Notify>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind cancellation object server");
+        let address = listener
+            .local_addr()
+            .expect("cancellation object server address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/object", get(cancellation_object))
+                    .with_state(CancellationObjectState { cancelled }),
+            )
+            .await
+            .expect("cancellation object server");
         });
         (
             format!("http://{address}/object?X-Amz-Signature=http-secret"),
