@@ -18,6 +18,9 @@ The query layer: stateless SQL compute. `QueryEngine` wires a DataFusion
   it never proxies object bytes or exposes SDK process credentials.
 - Production `serve_with_config` authenticates every inbound Flight RPC and
   uses one TLS/auth `ClientSecurity` for Query-to-Metasrv forwarding.
+- Served Query constructs its catalog only from the authenticated remote
+  `CatalogSource` and connects before bind. It never falls back to direct
+  registry reads; in-process SQL/selftest may use the explicit local adapter.
 - Caches the catalog with a bounded-staleness refresh window; concurrent
   refreshes coalesce and the server refreshes in the background so metadata
   scans stay off the per-query hot path.

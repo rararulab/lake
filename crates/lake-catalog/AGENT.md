@@ -7,10 +7,14 @@ authority.
 ## Invariants
 
 - DataFusion's sync listing methods (`schema_names`, `table_names`) read an
-  in-memory snapshot only — they must NEVER block on the metastore (doing so
+  in-memory snapshot only — they must NEVER block on the catalog source (doing so
   panics inside the async runtime). Refresh the snapshot with
   `LakeCatalog::refresh`.
-- Per-table lookups hit the moka cache before the registry.
+- Per-table lookups hit the moka cache before the read-only `CatalogSource`.
+- `CatalogSource` exposes only conditional coherent directory reads and point
+  resolution. It never exposes raw KV mutation or scan operations; production
+  Query uses a remote implementation and local tools/tests use the metastore
+  adapter.
 - DataFusion providers are cached per exact table generation (name, engine,
   location, incarnation, version); concurrent misses coalesce and the cache is
   capacity-bounded.
@@ -30,6 +34,7 @@ authority.
 
 ## Layout
 
+- `source.rs` — read-only source contract, wire DTOs, and local registry adapter
 - `catalog.rs` — `CatalogState` + `LakeCatalog` (`CatalogProvider`, immutable generation,
   registration/provider caches, `refresh`)
 - `schema.rs` — `LakeSchema` (`SchemaProvider`: snapshot listing + live

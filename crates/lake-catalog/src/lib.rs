@@ -24,9 +24,14 @@
 mod catalog;
 mod ops;
 mod schema;
+mod source;
 
 pub use catalog::{
     CatalogGeneration, CatalogRefreshHealth, CatalogState, LakeCatalog, ProviderLoadError,
     TableSnapshot,
 };
 pub use ops::{CatalogError, create_table};
+pub use source::{
+    CATALOG_SOURCE_SCHEMA_VERSION, CatalogDirectoryRequest, CatalogDirectoryResponse,
+    CatalogSource, CatalogSourceError, CatalogSourceRef, CatalogSourceResult, LocalCatalogSource,
+};

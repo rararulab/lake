@@ -27,6 +27,7 @@
 mod async_ipc;
 mod async_query;
 mod async_scheduler;
+mod catalog_client;
 mod flight;
 mod telemetry;
 mod ticket;
@@ -48,7 +49,8 @@ use datafusion::{
     prelude::{SQLOptions, SessionConfig, SessionContext},
 };
 use lake_catalog::{
-    CatalogGeneration, CatalogRefreshHealth, LakeCatalog, ProviderLoadError, TableSnapshot,
+    CatalogGeneration, CatalogRefreshHealth, CatalogSourceError, CatalogSourceRef, LakeCatalog,
+    LocalCatalogSource, ProviderLoadError, TableSnapshot,
 };
 use lake_common::{ManagedStageDescriptor, TableRef};
 use lake_engine::TableEngineRef;
@@ -80,7 +82,7 @@ fn read_only_sql_options() -> SQLOptions {
 #[snafu(visibility(pub))]
 pub enum QueryError {
     #[snafu(display("catalog refresh failed"))]
-    Refresh { source: lake_meta::MetaError },
+    Refresh { source: CatalogSourceError },
 
     #[snafu(display("query execution failed: {source}"))]
     Execute { source: DataFusionError },
@@ -88,7 +90,7 @@ pub enum QueryError {
     #[snafu(display("failed to resolve snapshot for {table}: {source}"))]
     SnapshotResolution {
         table:  TableRef,
-        source: lake_meta::MetaError,
+        source: CatalogSourceError,
     },
 
     #[snafu(display("table {table} has no pinnable incarnation"))]
@@ -113,6 +115,9 @@ pub enum QueryError {
     Security {
         source: lake_flight::FlightSecurityError,
     },
+
+    #[snafu(display("failed to connect Query catalog authority"))]
+    CatalogConnection { source: CatalogSourceError },
 
     #[snafu(display("invalid Query limits: {message}"))]
     InvalidLimits { message: String },
@@ -146,6 +151,17 @@ pub enum QueryError {
 }
 
 pub type Result<T> = std::result::Result<T, QueryError>;
+
+/// Connect the authenticated, read-only Metasrv catalog source used by served
+/// Query.
+pub async fn connect_remote_catalog_source(
+    endpoint: impl Into<String>,
+    security: ClientSecurity,
+) -> Result<CatalogSourceRef> {
+    catalog_client::RemoteCatalogSource::connect_ref(endpoint, security)
+        .await
+        .map_err(|source| QueryError::CatalogConnection { source })
+}
 
 /// Per-request row and batch bounds for Flight SQL metadata discovery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -612,13 +628,32 @@ impl QueryEngine {
             .expect("default Query resources must initialize")
     }
 
+    /// Build a served Query engine over a read-only catalog authority source.
+    pub fn with_catalog_source(source: CatalogSourceRef, engine: TableEngineRef) -> Self {
+        Self::try_with_catalog_source_and_resources(source, engine, QueryResources::default())
+            .expect("default Query resources must initialize")
+    }
+
     /// Build a query engine with explicit process-wide execution resources.
     pub fn try_with_resources(
         meta: MetaStoreRef,
         engine: TableEngineRef,
         resources: QueryResources,
     ) -> Result<Self> {
-        let catalog = LakeCatalog::new(meta, engine);
+        Self::try_with_catalog_source_and_resources(
+            Arc::new(LocalCatalogSource::new(meta)),
+            engine,
+            resources,
+        )
+    }
+
+    /// Build a Query engine with an explicit catalog authority and resources.
+    pub fn try_with_catalog_source_and_resources(
+        source: CatalogSourceRef,
+        engine: TableEngineRef,
+        resources: QueryResources,
+    ) -> Result<Self> {
+        let catalog = LakeCatalog::with_source(source, engine);
         let sort_spill_reservation_bytes = resources.sort_spill_reservation_bytes();
         std::fs::create_dir_all(&resources.spill_root).context(SpillDirectorySnafu {
             path: resources.spill_root.clone(),

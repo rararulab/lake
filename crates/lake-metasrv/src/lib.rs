@@ -1098,6 +1098,9 @@ where
         peer_security: config.peer_security,
         table_placement: config.table_placement,
         append_admission: AppendAdmission::new(config.append_limits),
+        catalog_snapshot_admission: Arc::new(tokio::sync::Semaphore::new(
+            control::CATALOG_SNAPSHOT_CONCURRENCY,
+        )),
         #[cfg(feature = "test")]
         append_result_gate: config.append_result_gate,
     };

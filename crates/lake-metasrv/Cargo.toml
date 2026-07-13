@@ -14,6 +14,7 @@ test = []
 [dependencies]
 arrow-flight = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
 lake-catalog = { workspace = true }

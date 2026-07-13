@@ -16,6 +16,7 @@ lake-common = { workspace = true }
 lake-engine = { workspace = true }
 lake-meta = { workspace = true }
 moka = { workspace = true }
+serde = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
