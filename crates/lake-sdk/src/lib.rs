@@ -18,11 +18,11 @@ mod append_checkpoint;
 
 use std::{
     collections::BTreeMap,
-    fmt,
+    fmt, io,
     ops::Range,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -51,7 +51,7 @@ use lake_objects::{
     LocalObjectStore, MANAGED_READ_CAPABILITY_ACTION, ManagedObjectStore,
     ManagedReadCapabilityRequest, ManagedReadCapabilityResponse, ObjectReader, S3ObjectStore,
     data_location_array, data_location_field, data_location_from_array, open_verified,
-    validate_presign_expiration,
+    validate_integrity, validate_presign_expiration, validate_range, verify_reader,
 };
 pub use lake_objects::{ObjectIntegrityError, PresignedRead};
 use moka::{future::Cache, ops::compute::Op};
@@ -61,6 +61,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::{io::AsyncRead, sync::Mutex};
+use tokio_util::io::StreamReader;
 use tonic::transport::Channel;
 
 const APPEND_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
@@ -86,6 +87,14 @@ const FLIGHT_REUSE_CONNECTION_LOCATION: &str = "arrow-flight-reuse-connection://
 const ASYNC_SUBMIT_RETRY_WINDOW: Duration = Duration::from_secs(30);
 const ASYNC_POLL_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const ASYNC_POLL_MAX_BACKOFF: Duration = Duration::from_secs(2);
+
+static DIRECT_READ_HTTP_CLIENT: LazyLock<std::result::Result<reqwest::Client, ()>> =
+    LazyLock::new(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| ())
+    });
 
 fn ambiguous_append_error(error: &SdkError) -> bool {
     match error {
@@ -307,6 +316,18 @@ pub enum SdkError {
 
     #[snafu(display("query returned an invalid managed read capability"))]
     InvalidManagedReadCapability { source: lake_objects::ObjectError },
+
+    #[snafu(display("could not initialize direct managed-object HTTP transport"))]
+    DirectReadClient,
+
+    #[snafu(display("direct managed-object HTTP request failed"))]
+    DirectReadRequest,
+
+    #[snafu(display("direct managed-object HTTP response had unexpected status {status}"))]
+    DirectReadResponse { status: u16 },
+
+    #[snafu(display("direct managed-object range response does not match the requested interval"))]
+    DirectReadRangeResponse,
 
     #[snafu(display("query returned no FILE append result"))]
     MissingAppendResult,
@@ -1593,6 +1614,43 @@ impl LakeClient {
         Ok(capability)
     }
 
+    /// Stream one complete managed object through a Query-issued capability.
+    ///
+    /// This is the credentialless counterpart to [`Self::open`]. It asks Query
+    /// to authorize and sign exactly one direct storage GET, then reads that
+    /// response without routing object bytes through Query or Metasrv. The
+    /// returned reader verifies the declared size and SHA-256 only at EOF, so
+    /// callers must drain it for the immutable identity check to complete.
+    pub async fn open_via_query(
+        &self,
+        location: &DataLocation,
+        expires_in: Duration,
+    ) -> Result<ObjectReader> {
+        validate_integrity(location).context(ObjectSnafu)?;
+        let capability = self.presign_read_via_query(location, expires_in).await?;
+        let reader = open_direct_capability(&capability).await?;
+        verify_reader(reader, location).context(ObjectSnafu)
+    }
+
+    /// Stream one exact non-empty byte range through a Query-issued capability.
+    ///
+    /// The response must be a `206 Partial Content` whose `Content-Range` and
+    /// `Content-Length` exactly describe `range`; this method never falls back
+    /// to downloading the complete object. Partial reads cannot establish the
+    /// whole-object SHA-256, so callers should use [`Self::open_via_query`]
+    /// when they need immutable identity verification.
+    pub async fn open_range_via_query(
+        &self,
+        location: &DataLocation,
+        range: Range<u64>,
+        expires_in: Duration,
+    ) -> Result<ObjectReader> {
+        let expected_length = validate_range(location, &range).context(ObjectSnafu)?;
+        let capability = self.presign_read_via_query(location, expires_in).await?;
+        open_direct_range_capability(&capability, &range, expected_length, location.size_bytes)
+            .await
+    }
+
     async fn table_schema(&self, table: &TableRef) -> Result<SchemaRef> {
         self.schema_cache
             .resolve(table.clone(), || self.fetch_table_schema(table))
@@ -1715,6 +1773,73 @@ fn validate_presigned_capability_lifetime(
         });
     }
     Ok(())
+}
+
+fn direct_read_http_client() -> Result<reqwest::Client> {
+    DIRECT_READ_HTTP_CLIENT
+        .as_ref()
+        .cloned()
+        .map_err(|_| SdkError::DirectReadClient)
+}
+
+fn direct_read_request(capability: &PresignedRead) -> Result<reqwest::RequestBuilder> {
+    let mut request = direct_read_http_client()?.get(capability.url());
+    for (name, value) in capability.headers() {
+        if name.eq_ignore_ascii_case("range") {
+            return Err(SdkError::DirectReadRequest);
+        }
+        request = request.header(name, value);
+    }
+    Ok(request)
+}
+
+fn direct_read_stream(response: reqwest::Response) -> ObjectReader {
+    let stream = response
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(|_| io::Error::other("direct managed-object body read failed")));
+    Box::pin(StreamReader::new(stream))
+}
+
+async fn open_direct_capability(capability: &PresignedRead) -> Result<ObjectReader> {
+    let response = direct_read_request(capability)?
+        .send()
+        .await
+        .map_err(|_| SdkError::DirectReadRequest)?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(SdkError::DirectReadResponse {
+            status: response.status().as_u16(),
+        });
+    }
+    Ok(direct_read_stream(response))
+}
+
+async fn open_direct_range_capability(
+    capability: &PresignedRead,
+    range: &Range<u64>,
+    expected_length: u64,
+    total_size: u64,
+) -> Result<ObjectReader> {
+    let range_header = format!("bytes={}-{}", range.start, range.end - 1);
+    let response = direct_read_request(capability)?
+        .header(reqwest::header::RANGE, range_header)
+        .send()
+        .await
+        .map_err(|_| SdkError::DirectReadRequest)?;
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(SdkError::DirectReadResponse {
+            status: response.status().as_u16(),
+        });
+    }
+    let expected_content_range = format!("bytes {}-{}/{}", range.start, range.end - 1, total_size);
+    let content_range_matches = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        == Some(expected_content_range.as_str());
+    if !content_range_matches || response.content_length() != Some(expected_length) {
+        return Err(SdkError::DirectReadRangeResponse);
+    }
+    Ok(direct_read_stream(response))
 }
 
 async fn discover_managed_stage(
@@ -1948,6 +2073,7 @@ fn validate_flight_payload_size(messages: &[FlightData], maximum: usize) -> Resu
 #[cfg(test)]
 mod tests {
     use std::{
+        convert::Infallible,
         io,
         path::PathBuf,
         pin::Pin,
@@ -1977,6 +2103,14 @@ mod tests {
     };
     use aws_config::BehaviorVersion;
     use aws_sdk_s3::config::{Credentials, Region};
+    use axum::{
+        Router,
+        body::Body,
+        extract::State,
+        http::{HeaderMap, StatusCode, header},
+        routing::get,
+    };
+    use bytes::Bytes;
     use futures::TryStreamExt;
     use lake_common::{
         ManagedStageDescriptor, Principal, PrincipalId, PrincipalRole, TableLocation, TableRef,
@@ -4062,6 +4196,217 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_only_full_read_streams_and_verifies_without_stage_access() {
+        let bytes = b"first-stream";
+        let state = StreamingObjectState {
+            observed_headers: Arc::new(StdMutex::new(Vec::new())),
+            release:          Arc::new(Notify::new()),
+        };
+        let (object_url, object_server) = spawn_streaming_object_server(state.clone()).await;
+        let actions = Arc::new(StdMutex::new(Vec::new()));
+        let (client, query_server) = connect_query_only_with_capability(
+            actions.clone(),
+            object_url,
+            vec![("x-object-token".to_owned(), "header-secret".to_owned())],
+        )
+        .await;
+        let location = test_data_location(bytes);
+
+        let mut reader = client
+            .open_via_query(&location, Duration::from_secs(60))
+            .await
+            .expect("Query-only reader opens the direct HTTP object stream");
+        let mut prefix = [0; 5];
+        reader
+            .read_exact(&mut prefix)
+            .await
+            .expect("first streamed chunk arrives before the remainder");
+        assert_eq!(&prefix, b"first");
+
+        state.release.notify_one();
+        let mut suffix = Vec::new();
+        reader
+            .read_to_end(&mut suffix)
+            .await
+            .expect("draining the direct reader verifies its immutable identity");
+        assert_eq!([prefix.as_slice(), suffix.as_slice()].concat(), bytes);
+
+        let actions = actions.lock().expect("recorded actions");
+        assert_eq!(actions.len(), 1, "only the capability action reaches Query");
+        assert_eq!(
+            ManagedReadCapabilityRequest::from_wire(&actions[0].body)
+                .expect("bounded capability request")
+                .location(),
+            &location
+        );
+        let headers = state
+            .observed_headers
+            .lock()
+            .expect("recorded HTTP headers");
+        assert_eq!(headers.len(), 1, "one direct object GET");
+        assert_eq!(
+            headers[0]
+                .get("x-object-token")
+                .expect("required signed header")
+                .to_str()
+                .expect("ASCII test header"),
+            "header-secret"
+        );
+
+        query_server.abort();
+        object_server.abort();
+    }
+
+    #[tokio::test]
+    async fn query_only_range_reader_requires_exact_partial_response() {
+        let bytes = b"0123456789";
+        let observed_headers = Arc::new(StdMutex::new(Vec::new()));
+        let (object_url, object_server) = spawn_range_object_server(
+            observed_headers.clone(),
+            "bytes 3-6/10".to_owned(),
+            b"3456".to_vec(),
+        )
+        .await;
+        let actions = Arc::new(StdMutex::new(Vec::new()));
+        let (client, query_server) = connect_query_only_with_capability(
+            actions.clone(),
+            object_url,
+            vec![("x-object-token".to_owned(), "header-secret".to_owned())],
+        )
+        .await;
+        let location = test_data_location(bytes);
+
+        let mut reader = client
+            .open_range_via_query(&location, 3..7, Duration::from_secs(60))
+            .await
+            .expect("exact partial response opens a direct range reader");
+        let mut actual = Vec::new();
+        reader
+            .read_to_end(&mut actual)
+            .await
+            .expect("range body streams to completion");
+        assert_eq!(actual, b"3456");
+
+        assert_eq!(
+            actions.lock().expect("recorded actions").len(),
+            1,
+            "only one capability action reaches Query"
+        );
+        let headers = observed_headers.lock().expect("recorded HTTP headers");
+        assert_eq!(headers.len(), 1, "one direct range GET");
+        assert_eq!(
+            headers[0]
+                .get(header::RANGE)
+                .expect("range header")
+                .to_str()
+                .expect("ASCII range header"),
+            "bytes=3-6"
+        );
+
+        query_server.abort();
+        object_server.abort();
+    }
+
+    #[tokio::test]
+    async fn query_only_range_reader_rejects_mismatched_partial_response() {
+        let bytes = b"0123456789";
+        let observed_headers = Arc::new(StdMutex::new(Vec::new()));
+        let (object_url, object_server) = spawn_range_object_server(
+            observed_headers,
+            "bytes 3-7/10".to_owned(),
+            b"3456".to_vec(),
+        )
+        .await;
+        let actions = Arc::new(StdMutex::new(Vec::new()));
+        let (client, query_server) = connect_query_only_with_capability(
+            actions.clone(),
+            object_url,
+            vec![("x-object-token".to_owned(), "header-secret".to_owned())],
+        )
+        .await;
+
+        let error = match client
+            .open_range_via_query(&test_data_location(bytes), 3..7, Duration::from_secs(60))
+            .await
+        {
+            Ok(_) => panic!("mismatched partial response must not open a range reader"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SdkError::DirectReadRangeResponse));
+        assert_eq!(actions.lock().expect("recorded actions").len(), 1);
+
+        query_server.abort();
+        object_server.abort();
+    }
+
+    #[tokio::test]
+    async fn query_only_reader_fails_closed_and_redacts_capability() {
+        let redirects_followed = Arc::new(AtomicUsize::new(0));
+        let (redirect_url, redirect_server) =
+            spawn_redirect_object_server(redirects_followed.clone()).await;
+        let redirect_actions = Arc::new(StdMutex::new(Vec::new()));
+        let (redirect_client, redirect_query_server) = connect_query_only_with_capability(
+            redirect_actions.clone(),
+            redirect_url,
+            vec![("x-object-token".to_owned(), "header-secret".to_owned())],
+        )
+        .await;
+        let location = test_data_location(b"good");
+
+        let error = match redirect_client
+            .open_via_query(&location, Duration::from_secs(60))
+            .await
+        {
+            Ok(_) => panic!("redirect response must not open a reader"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SdkError::DirectReadResponse { status: 307 }
+        ));
+        let diagnostic = format!("{error:?} {error}");
+        assert!(!diagnostic.contains("http-secret"));
+        assert!(!diagnostic.contains("header-secret"));
+        assert_eq!(redirects_followed.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            redirect_actions.lock().expect("recorded actions").len(),
+            1,
+            "the rejected object GET is never retried through Query"
+        );
+
+        let (corrupt_url, corrupt_server) = spawn_static_object_server(b"evil".to_vec()).await;
+        let corrupt_actions = Arc::new(StdMutex::new(Vec::new()));
+        let (corrupt_client, corrupt_query_server) = connect_query_only_with_capability(
+            corrupt_actions.clone(),
+            corrupt_url,
+            vec![("x-object-token".to_owned(), "header-secret".to_owned())],
+        )
+        .await;
+        let mut reader = corrupt_client
+            .open_via_query(&location, Duration::from_secs(60))
+            .await
+            .expect("a same-length corrupt response opens until EOF verification");
+        let mut actual = Vec::new();
+        let error = reader
+            .read_to_end(&mut actual)
+            .await
+            .expect_err("corrupt immutable bytes fail at EOF");
+        let diagnostic = format!("{error:?} {error}");
+        assert!(!diagnostic.contains("http-secret"));
+        assert!(!diagnostic.contains("header-secret"));
+        assert_eq!(
+            corrupt_actions.lock().expect("recorded actions").len(),
+            1,
+            "only a capability action reaches Query for corrupt object reads"
+        );
+
+        redirect_query_server.abort();
+        redirect_server.abort();
+        corrupt_query_server.abort();
+        corrupt_server.abort();
+    }
+
+    #[tokio::test]
     async fn sdk_open_verifies_datalocation_identity_without_query() {
         let expected = b"immutable managed object bytes";
         let opens = Arc::new(AtomicUsize::new(0));
@@ -4570,6 +4915,294 @@ mod tests {
         }
 
         async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
+    }
+
+    #[derive(Clone)]
+    struct StaticReadCapabilityService {
+        actions: Arc<StdMutex<Vec<Action>>>,
+        url:     String,
+        headers: Vec<(String, String)>,
+    }
+
+    #[tonic::async_trait]
+    impl FlightSqlService for StaticReadCapabilityService {
+        type FlightService = Self;
+
+        async fn do_action_fallback(
+            &self,
+            request: Request<Action>,
+        ) -> std::result::Result<
+            Response<<Self as arrow_flight::flight_service_server::FlightService>::DoActionStream>,
+            Status,
+        > {
+            let action = request.into_inner();
+            if action.r#type != lake_objects::MANAGED_READ_CAPABILITY_ACTION {
+                return Err(Status::invalid_argument("unexpected Flight action"));
+            }
+            let capability_request = ManagedReadCapabilityRequest::from_wire(&action.body)
+                .map_err(|_| Status::invalid_argument("invalid capability request"))?;
+            self.actions
+                .lock()
+                .expect("recording action mutex")
+                .push(action);
+            let capability = ManagedReadCapabilityResponse::new(PresignedRead::new(
+                self.url.clone(),
+                self.headers.clone(),
+                SystemTime::now() + capability_request.expires_in(),
+            ));
+            let body = capability
+                .to_wire()
+                .map_err(|_| Status::internal("could not encode capability"))?;
+            let stream =
+                futures::stream::once(async move { Ok(FlightResult { body: body.into() }) });
+            Ok(Response::new(Box::pin(stream)))
+        }
+
+        async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
+    }
+
+    #[derive(Clone)]
+    struct StreamingObjectState {
+        observed_headers: Arc<StdMutex<Vec<HeaderMap>>>,
+        release:          Arc<Notify>,
+    }
+
+    async fn streaming_object(
+        State(state): State<StreamingObjectState>,
+        headers: HeaderMap,
+    ) -> axum::response::Response {
+        state
+            .observed_headers
+            .lock()
+            .expect("record HTTP headers")
+            .push(headers);
+        let release = state.release;
+        let stream = futures::stream::unfold(0_u8, move |part| {
+            let release = release.clone();
+            async move {
+                match part {
+                    0 => Some((Ok::<Bytes, Infallible>(Bytes::from_static(b"first")), 1)),
+                    1 => {
+                        release.notified().await;
+                        Some((Ok(Bytes::from_static(b"-stream")), 2))
+                    }
+                    _ => None,
+                }
+            }
+        });
+        let mut response = axum::response::Response::new(Body::from_stream(stream));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            "12".parse().expect("valid test length"),
+        );
+        response
+    }
+
+    async fn spawn_streaming_object_server(
+        state: StreamingObjectState,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind object server");
+        let address = listener.local_addr().expect("object server address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/object", get(streaming_object))
+                    .with_state(state),
+            )
+            .await
+            .expect("object server");
+        });
+        (
+            format!("http://{address}/object?X-Amz-Signature=http-secret"),
+            server,
+        )
+    }
+
+    #[derive(Clone)]
+    struct RedirectObjectState {
+        redirects_followed: Arc<AtomicUsize>,
+    }
+
+    async fn redirecting_object() -> axum::response::Response {
+        let mut response = axum::response::Response::new(Body::empty());
+        *response.status_mut() = StatusCode::TEMPORARY_REDIRECT;
+        response.headers_mut().insert(
+            header::LOCATION,
+            "/redirect-target".parse().expect("valid redirect location"),
+        );
+        response
+    }
+
+    async fn redirect_target(State(state): State<RedirectObjectState>) -> axum::response::Response {
+        state.redirects_followed.fetch_add(1, Ordering::SeqCst);
+        axum::response::Response::new(Body::from("redirect followed"))
+    }
+
+    async fn spawn_redirect_object_server(
+        redirects_followed: Arc<AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect object server");
+        let address = listener
+            .local_addr()
+            .expect("redirect object server address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/object", get(redirecting_object))
+                    .route("/redirect-target", get(redirect_target))
+                    .with_state(RedirectObjectState { redirects_followed }),
+            )
+            .await
+            .expect("redirect object server");
+        });
+        (
+            format!("http://{address}/object?X-Amz-Signature=http-secret"),
+            server,
+        )
+    }
+
+    #[derive(Clone)]
+    struct StaticObjectState {
+        body: Vec<u8>,
+    }
+
+    async fn static_object(State(state): State<StaticObjectState>) -> axum::response::Response {
+        let content_length = state.body.len().to_string();
+        let mut response = axum::response::Response::new(Body::from(state.body));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            content_length.parse().expect("valid test length"),
+        );
+        response
+    }
+
+    async fn spawn_static_object_server(body: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind static object server");
+        let address = listener.local_addr().expect("static object server address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/object", get(static_object))
+                    .with_state(StaticObjectState { body }),
+            )
+            .await
+            .expect("static object server");
+        });
+        (
+            format!("http://{address}/object?X-Amz-Signature=http-secret"),
+            server,
+        )
+    }
+
+    #[derive(Clone)]
+    struct RangeObjectState {
+        observed_headers: Arc<StdMutex<Vec<HeaderMap>>>,
+        content_range:    String,
+        body:             Vec<u8>,
+    }
+
+    async fn range_object(
+        State(state): State<RangeObjectState>,
+        headers: HeaderMap,
+    ) -> axum::response::Response {
+        state
+            .observed_headers
+            .lock()
+            .expect("record HTTP headers")
+            .push(headers);
+        let content_length = state.body.len().to_string();
+        let mut response = axum::response::Response::new(Body::from(state.body));
+        *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+        response.headers_mut().insert(
+            header::CONTENT_RANGE,
+            state
+                .content_range
+                .parse()
+                .expect("valid test content-range"),
+        );
+        response.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            content_length.parse().expect("valid test length"),
+        );
+        response
+    }
+
+    async fn spawn_range_object_server(
+        observed_headers: Arc<StdMutex<Vec<HeaderMap>>>,
+        content_range: String,
+        body: Vec<u8>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind range object server");
+        let address = listener.local_addr().expect("range object server address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/object", get(range_object))
+                    .with_state(RangeObjectState {
+                        observed_headers,
+                        content_range,
+                        body,
+                    }),
+            )
+            .await
+            .expect("range object server");
+        });
+        (
+            format!("http://{address}/object?X-Amz-Signature=http-secret"),
+            server,
+        )
+    }
+
+    async fn connect_query_only_with_capability(
+        actions: Arc<StdMutex<Vec<Action>>>,
+        url: String,
+        headers: Vec<(String, String)>,
+    ) -> (LakeClient, tokio::task::JoinHandle<()>) {
+        let address = free_addr();
+        let server = tokio::spawn({
+            let socket = address.parse().expect("capability service socket");
+            async move {
+                tonic::transport::Server::builder()
+                    .add_service(FlightServiceServer::new(StaticReadCapabilityService {
+                        actions,
+                        url,
+                        headers,
+                    }))
+                    .serve(socket)
+                    .await
+                    .expect("capability service")
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        (
+            LakeClient::connect_query_only(format!("http://{address}"))
+                .await
+                .expect("Query-only SDK connection"),
+            server,
+        )
+    }
+
+    fn test_data_location(bytes: &[u8]) -> lake_common::DataLocation {
+        lake_common::DataLocation::builder()
+            .uri("s3://lake-managed/managed-objects/tenants/acme/episode.mp4")
+            .content_type("video/mp4")
+            .size_bytes(u64::try_from(bytes.len()).expect("test byte length"))
+            .sha256(format!("{:x}", Sha256::digest(bytes)))
+            .build()
     }
 
     struct StaticReadStore {

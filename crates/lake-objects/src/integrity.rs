@@ -155,6 +155,27 @@ impl AsyncRead for IntegrityReader {
     }
 }
 
+/// Validate an immutable object's declared size and SHA-256 identity.
+///
+/// Call this before starting an externally authorized read so malformed
+/// identities do not cause an otherwise unnecessary storage request.
+pub fn validate_integrity(location: &DataLocation) -> Result<()> {
+    ExpectedIntegrity::try_from(location)
+        .map(|_| ())
+        .map_err(|source| ObjectError::Integrity { source })
+}
+
+/// Wrap one object reader with constant-memory declared-size and SHA-256
+/// verification at EOF.
+///
+/// The identity is validated before returning the wrapper. The caller must
+/// drain it to EOF for verification to complete.
+pub fn verify_reader(reader: ObjectReader, location: &DataLocation) -> Result<ObjectReader> {
+    let expected = ExpectedIntegrity::try_from(location)
+        .map_err(|source| ObjectError::Integrity { source })?;
+    Ok(Box::pin(IntegrityReader::new(reader, expected)))
+}
+
 /// Open a managed object and verify its declared size and SHA-256 at EOF.
 ///
 /// The expected identity is validated before storage I/O. The wrapper keeps
@@ -163,8 +184,7 @@ pub async fn open_verified(
     store: &dyn ManagedObjectStore,
     location: &DataLocation,
 ) -> Result<ObjectReader> {
-    let expected = ExpectedIntegrity::try_from(location)
-        .map_err(|source| ObjectError::Integrity { source })?;
+    validate_integrity(location)?;
     let inner = store.open_reader(location).await?;
-    Ok(Box::pin(IntegrityReader::new(inner, expected)))
+    verify_reader(inner, location)
 }

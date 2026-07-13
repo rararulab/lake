@@ -31,6 +31,14 @@ The Rust SDK's typed write and direct-read surface.
   `FILE`, and `open` reads directly while verifying size/SHA-256 at EOF.
 - `open_range` delegates one validated half-open interval directly to the
   configured stage; query and metasrv never proxy range bytes.
+- `open_via_query` and `open_range_via_query` are the credentialless direct-read
+  paths: they obtain one Query-issued capability and stream directly from
+  object storage without constructing a managed-stage client. Full reads retain
+  EOF size/SHA-256 verification; range reads require an exact `206`
+  `Content-Range` response and make no whole-object integrity claim.
+- Query-only direct-read HTTP follows no redirects, keeps capability URL/header
+  values out of public errors, and drops an unfinished response on reader drop;
+  it never buffers or proxies an object through a Lake service.
 - `presign_read` delegates a bounded S3 GET capability only after the same
   managed-prefix validation; capability URLs and headers are redacted by
   default and never enter SQL rows or Flight services.

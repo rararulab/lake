@@ -44,7 +44,7 @@ mod reference_index;
 pub use gc::{GcPlanPage, GcPlanner, ObjectCandidate};
 pub use gc_apply::{DeleteOutcome, GcApplyProgress, GcPlanApplier, ManagedObjectDeleter};
 pub use gc_plan::{GcPlan, GcPlanWriter};
-pub use integrity::{ObjectIntegrityError, open_verified};
+pub use integrity::{ObjectIntegrityError, open_verified, validate_integrity, verify_reader};
 pub use inventory::{InventoryPage, InventoryRequest, ManagedObjectInventory};
 pub use local::LocalObjectStore;
 pub use reference_index::{LiveReferenceIndex, LiveReferenceIndexBuild, LiveReferenceIndexBuilder};
@@ -611,7 +611,8 @@ pub fn validate_presign_expiration(expires_in: Duration) -> Result<()> {
     Ok(())
 }
 
-fn validate_range(location: &DataLocation, range: &Range<u64>) -> Result<u64> {
+/// Validate one non-empty half-open byte range and return its exact length.
+pub fn validate_range(location: &DataLocation, range: &Range<u64>) -> Result<u64> {
     let is_non_empty = range.start < range.end;
     let is_in_bounds = range.end <= location.size_bytes;
     if !is_non_empty || !is_in_bounds {

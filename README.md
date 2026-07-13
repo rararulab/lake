@@ -410,14 +410,15 @@ External presigned-URL consumers own their own integrity policy; minting a
 capability does not imply that its eventual body was drained and verified.
 
 For an SDK process with no cloud-storage credentials, use a Query-only
-connection and ask Query to issue the capability instead. `connect_query_only`
-does not discover a stage, construct an S3 client, or permit local object I/O;
-it sends only the authenticated Flight action below. A production `lake query`
-installs this issuer only for its configured S3 managed stage. Query scopes the
-requested `DataLocation` to `tenants/<tenant-id>` before signing with its own
-AWS identity, returns one bounded 1-second-through-1-hour capability, and
-never proxies video/model bytes or exposes the URL/header values in logs,
-Arrow rows, or metadata.
+connection and read the `DataLocation` directly through the SDK.
+`connect_query_only` does not discover a stage, construct an S3 client, or
+permit local object I/O; each reader sends only one authenticated Flight action
+to obtain a bounded capability, then streams bytes directly from object
+storage. A production `lake query` installs this issuer only for its configured
+S3 managed stage. Query scopes the requested `DataLocation` to
+`tenants/<tenant-id>` before signing with its own AWS identity and never
+proxies video/model bytes or exposes the URL/header values in logs, Arrow rows,
+or metadata.
 
 ```rust
 let client = LakeClient::builder("https://query.internal:50051")
@@ -425,11 +426,29 @@ let client = LakeClient::builder("https://query.internal:50051")
     .with_ca_certificate_pem(std::fs::read("/run/tls/ca.crt")?)
     .connect_query_only()
     .await?;
-let capability = client
-    .presign_read_via_query(&location, std::time::Duration::from_secs(300))
+let mut object = client
+    .open_via_query(&location, std::time::Duration::from_secs(300))
     .await?;
-// `capability.url()` and `capability.headers()` are sensitive bearer values.
+tokio::io::copy(&mut object, &mut tokio::io::sink()).await?;
+
+let mut window = client
+    .open_range_via_query(
+        &location,
+        8 * 1024 * 1024..9 * 1024 * 1024,
+        std::time::Duration::from_secs(300),
+    )
+    .await?;
+// Read only the requested 1 MiB window from `window`.
 ```
+
+The full reader keeps constant memory and verifies declared size plus SHA-256
+when it is drained to EOF. The range reader sends the exact HTTP `Range` header
+and accepts only an exact matching `206 Content-Range` response; it cannot make
+a whole-object SHA-256 claim. The SDK uses Rustls, does not follow redirects,
+and keeps the signed URL and required headers internal. Advanced callers that
+need to pass the capability to another HTTP client may still use
+`presign_read_via_query`, but its URL and headers are bearer values and must not
+be logged.
 
 The example performs a multi-row insert, query, `DataLocation` decoding, and
 direct open through `LakeClient`. Local development discovers a `file://`

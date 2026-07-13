@@ -20,17 +20,21 @@ libc.workspace = true
 moka.workspace = true
 prost.workspace = true
 prost-types.workspace = true
+reqwest = { workspace = true, features = ["rustls", "stream"] }
 serde.workspace = true
 snafu.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
 tonic.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+axum.workspace = true
+bytes.workspace = true
 lake-engine.workspace = true
 lake-engine-lance.workspace = true
 lake-meta.workspace = true
@@ -38,6 +42,7 @@ lake-metasrv = { workspace = true, features = ["test"] }
 lake-query.workspace = true
 rcgen = "^0.13"
 tempfile = "^3.0"
+tokio = { workspace = true, features = ["net"] }
 
 [lints]
 workspace = true
