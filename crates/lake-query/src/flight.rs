@@ -766,6 +766,17 @@ fn invalid_statement_ticket() -> Status {
 /// Collapse any displayable error into an internal [`Status`].
 fn to_status<E: std::fmt::Display>(err: E) -> Status { Status::internal(err.to_string()) }
 
+fn forwarded_append_status(status: Status) -> Status {
+    Status::new(status.code(), "metadata FILE append rejected")
+}
+
+fn forwarded_append_error(error: FlightError) -> Status {
+    match error {
+        FlightError::Tonic(status) => forwarded_append_status(*status),
+        _ => Status::unavailable("metadata FILE append is unavailable"),
+    }
+}
+
 fn query_status(error: QueryError) -> Status {
     match error {
         QueryError::UnpinnableTable { .. } | QueryError::SnapshotProvider { .. } => {
@@ -1535,8 +1546,8 @@ impl FlightSqlService for FlightSqlServiceImpl {
                     })
                 }))
                 .await
-                .map_err(|error| Status::unavailable(error.to_string()))?
-                .map_err(|error| Status::internal(error.to_string()))
+                .map_err(forwarded_append_error)?
+                .map_err(forwarded_append_error)
                 .try_collect::<Vec<_>>()
                 .await?;
             self.engine.invalidate_registration(append.table()).await;
