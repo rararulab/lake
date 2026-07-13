@@ -172,14 +172,14 @@ jj has no staging area and no commit-time hooks. Two layers cover this:
    only pushes if green. Raw `jj git push` bypasses it. This is the fast,
    automatic gate.
 2. **`mise run ship`** runs the *comprehensive* local gate before pushing:
-   `mise run ci` (gate + doc + spec-selftest + **integration/LocalStack**) +
-   `mise run check-commits` + push. This is deliberately broader than CI —
-   local has Docker and no ephemeral limits, so it covers more than the
-   `main`-only CI backstop.
+   `mise run ci` (gate + dependency policy + doc + spec-selftest +
+   **integration/LocalStack**) + `mise run check-commits` + push. This is
+   deliberately broader than CI — local has Docker and no ephemeral limits, so
+   it covers more than the `main`-only CI backstop.
 
 ```bash
 mise run gate        # fast: hooks + Rust tests + e2e + site
-mise run ci          # comprehensive: + doc + spec-selftest + integration
+mise run ci          # comprehensive: + dependency policy + doc + spec-selftest + integration
 mise run ship        # mise run ci + conventional-commit check + push
 ```
 
