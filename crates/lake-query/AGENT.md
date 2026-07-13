@@ -48,6 +48,12 @@ The query layer: stateless SQL compute. `QueryEngine` wires a DataFusion
 - `QueryResources` gives the replica one shared DataFusion `FairSpillPool` and
   one size-limited local spill manager. Every constructor is bounded; the CLI
   validates deployment overrides before binding Flight.
+- Durable async submission reserves one bounded tenant-index entry before
+  object upload. The index is CAS-authoritative across replicas; raw tenant
+  identity and its digest never become output, logs, or metric labels.
+- New async records persist an immutable result byte ceiling. Workers and
+  manifest validation use the record value after restart; schema-v1 records
+  keep the legacy hard ceiling without fabricating a reservation.
 
 ## Layout
 

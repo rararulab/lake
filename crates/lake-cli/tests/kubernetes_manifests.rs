@@ -252,6 +252,8 @@ fn kubernetes_reference_is_secure_and_matches_runtime_contract() {
         "LAKE_ASYNC_WORKER_CONCURRENCY",
         "LAKE_ASYNC_WORKER_CONCURRENCY_PER_TENANT",
         "LAKE_ASYNC_EXECUTION_TIMEOUT_MS",
+        "LAKE_ASYNC_MAX_OUTSTANDING_PER_TENANT",
+        "LAKE_ASYNC_MAX_RESULT_BYTES",
     ] {
         assert!(
             config["data"][key].is_string(),
@@ -285,6 +287,11 @@ fn kubernetes_reference_is_secure_and_matches_runtime_contract() {
         query["spec"]["replicas"]
             .as_u64()
             .is_some_and(|replicas| replicas >= 2)
+    );
+    assert_eq!(
+        query["spec"]["strategy"]["type"].as_str(),
+        Some("Recreate"),
+        "async schema-v2 writers cannot mix with v1 writers"
     );
     assert_pod_contract(
         query,
@@ -321,6 +328,7 @@ fn kubernetes_reference_is_secure_and_matches_runtime_contract() {
         fs::read_to_string(root().join("docs/guides/kubernetes.md")).expect("Kubernetes runbook");
     assert!(runbook.contains("Query must have no access to `$LAKE_DYNAMODB_TABLE`"));
     assert!(runbook.contains("--from-file=ticket-keys.json=query/ticket-keys.json"));
+    assert!(runbook.contains("Async schema-v2 rollout"));
     for step in ["preload", "activate", "retire"] {
         assert!(
             runbook.contains(step),

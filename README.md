@@ -328,6 +328,18 @@ saturated tenant, and cancels both execution and lease renewal at the deadline.
 These limits are process-local; CAS worker leases preserve single ownership but
 do not turn them into cluster-global tenant quotas.
 
+Retained async storage is bounded separately and durably across replicas.
+`LAKE_ASYNC_MAX_OUTSTANDING_PER_TENANT` defaults to 8 (range 1..=128), and
+`LAKE_ASYNC_MAX_RESULT_BYTES` defaults to 17179869184 bytes / 16 GiB (range
+64 MiB..=256 GiB). Submission reserves a tenant slot in the shared async state
+store before uploading its encrypted job. A schema-v2 job persists its byte
+ceiling, so restarting a worker with looser configuration cannot enlarge an
+existing result. Crashes may conservatively retain a slot until bounded
+point-read reconciliation, but cannot under-count a live job. Quota metrics and
+Flight errors contain no tenant, principal, digest, query, or configured-size
+labels. These are retained-object limits, not CPU, memory, billing, or
+cluster-global execution-fairness guarantees.
+
 Async result parts stay bounded while crossing the storage boundary. The IPC
 encoder writes fixed 64 KiB chunks through a four-slot channel and rejects an
 encoded part before publication when it crosses the 64 MiB ceiling. `DoGet`

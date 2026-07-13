@@ -68,6 +68,12 @@ total), and `LAKE_ASYNC_EXECUTION_TIMEOUT_MS` (default 1800000; maximum
 The policy is parsed before local or cloud storage construction and remains
 immutable for the process lifetime.
 
+Durable retained async resources use
+`LAKE_ASYNC_MAX_OUTSTANDING_PER_TENANT` (default 8, range 1..=128) and
+`LAKE_ASYNC_MAX_RESULT_BYTES` (default 17179869184, range 67108864..=
+274877906944). Parse both before listener bind; they are shared-storage bounds,
+not per-pod worker concurrency.
+
 ## Append operation policy
 
 - `LAKE_APPEND_OPERATION_RETENTION_SECS` (default 604800)

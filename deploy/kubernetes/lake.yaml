@@ -39,6 +39,8 @@ data:
   LAKE_ASYNC_WORKER_CONCURRENCY: "4"
   LAKE_ASYNC_WORKER_CONCURRENCY_PER_TENANT: "1"
   LAKE_ASYNC_EXECUTION_TIMEOUT_MS: "1800000"
+  LAKE_ASYNC_MAX_OUTSTANDING_PER_TENANT: "8"
+  LAKE_ASYNC_MAX_RESULT_BYTES: "17179869184"
   # Async state uses lake-async-queries_prefix_v2, never the catalog tables.
 ---
 apiVersion: v1
@@ -113,10 +115,9 @@ spec:
   replicas: 3
   revisionHistoryLimit: 3
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 0
-      maxSurge: 1
+    # Async schema-v2 writers must not overlap schema-v1 writers. See the
+    # Kubernetes runbook for the required async admission pause and drain.
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: lake-query
