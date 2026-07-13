@@ -19,8 +19,8 @@
 //! pure client: it holds no local storage, so it never builds a
 //! [`Context`](super::Context) and needs only the server `--addr`. Each
 //! subcommand issues the matching Flight `do_action` (`create_table`,
-//! `drop_table`, `resolve`, `list_tables`/`list_namespaces`) against the
-//! control plane defined in `lake-metasrv`.
+//! `drop_table`, `resolve`, `list_tables_page`/`list_namespaces_page`) against
+//! the control plane defined in `lake-metasrv`.
 //! Remote `drop_table` uses the server's durable tombstone protocol, so a
 //! repeated request can finish cleanup after a crash or leader handoff.
 
@@ -37,6 +37,14 @@ use super::{security::metadata_client_security_from_env, table::parse_table_ref}
 struct MetasrvClient {
     inner:    FlightServiceClient<Channel>,
     security: ClientSecurity,
+}
+
+const CONTROL_ENUMERATION_PAGE_ENTRIES: usize = 128;
+
+#[derive(serde::Deserialize)]
+struct NamePage {
+    names:        Vec<String>,
+    continuation: Option<String>,
 }
 
 /// Subcommands of `lake client`, each a single Flight `do_action` call.
@@ -195,18 +203,63 @@ async fn resolve(client: &mut MetasrvClient, table: &str) -> anyhow::Result<()> 
 }
 
 async fn list(client: &mut MetasrvClient, namespace: Option<&str>) -> anyhow::Result<()> {
-    let action = match namespace {
-        Some(ns) => action("list_tables", &json!({ "namespace": ns }))?,
-        None => Action {
-            r#type: "list_namespaces".to_owned(),
-            body:   Vec::new().into(),
-        },
-    };
-    let results = do_action(client, action).await?;
-    let first = results.first().context("list returned no result")?;
-    let names: Vec<String> = serde_json::from_slice(&first.body)?;
-    for name in names {
-        println!("{name}");
+    let mut continuation = None;
+    loop {
+        let (action_type, body) = match namespace {
+            Some(namespace) => (
+                "list_tables_page",
+                json!({
+                    "namespace": namespace,
+                    "limit": CONTROL_ENUMERATION_PAGE_ENTRIES,
+                    "continuation": continuation.clone(),
+                }),
+            ),
+            None => (
+                "list_namespaces_page",
+                json!({
+                    "limit": CONTROL_ENUMERATION_PAGE_ENTRIES,
+                    "continuation": continuation.clone(),
+                }),
+            ),
+        };
+        let results = do_action(client, action(action_type, &body)?).await?;
+        let first = results.first().context("list page returned no result")?;
+        let page: NamePage = serde_json::from_slice(&first.body)?;
+        if results.len() != 1 {
+            anyhow::bail!("list page returned more than one result");
+        }
+        for name in page.names {
+            println!("{name}");
+        }
+        let Some(next) = page.continuation else {
+            return Ok(());
+        };
+        continuation = Some(next);
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn client_list_follows_control_enumeration_pages() {
+        let source = include_str!("client.rs");
+        let (_, list) = source
+            .split_once("async fn list(client: &mut MetasrvClient, namespace: Option<&str>)")
+            .expect("client list function exists");
+        let (list, _) = list
+            .split_once("\n#[cfg(test)]")
+            .expect("client list is followed by its test module");
+
+        assert!(list.contains("list_tables_page"));
+        assert!(list.contains("list_namespaces_page"));
+        assert!(list.contains("loop {"));
+        assert!(
+            !list.contains("\"list_tables\""),
+            "remote list must not use the legacy whole-namespace action"
+        );
+        assert!(
+            !list.contains("\"list_namespaces\""),
+            "remote list must not use the legacy whole-catalog action"
+        );
+    }
 }

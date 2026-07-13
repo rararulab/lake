@@ -47,7 +47,7 @@ use std::{
 use arrow_flight::flight_service_server::FlightServiceServer;
 use datafusion::{arrow::datatypes::SchemaRef, execution::SendableRecordBatchStream};
 use lake_catalog::create_table;
-use lake_common::{AppendOperation, Namespace, TableLocation, TableName, TableRef, Version};
+use lake_common::{AppendOperation, Namespace, TableLocation, TableRef, Version};
 use lake_engine::TableEngineRef;
 use lake_flight::{ClientSecurity, ServerSecurity};
 use lake_meta::{MetaStoreRef, registry, registry::TableRegistration};
@@ -887,16 +887,14 @@ impl Metasrv {
             .context(RegistrySnafu)
     }
 
-    /// List the tables in a namespace.
-    pub async fn list_tables(&self, namespace: &Namespace) -> Result<Vec<TableName>> {
-        registry::list(self.meta().as_ref(), namespace)
-            .await
-            .context(RegistrySnafu)
-    }
-
-    /// List all namespaces.
-    pub async fn list_namespaces(&self) -> Result<Vec<Namespace>> {
-        registry::list_namespaces(self.meta().as_ref())
+    /// Return one bounded page of table names in `namespace`.
+    pub async fn list_tables_page(
+        &self,
+        namespace: &Namespace,
+        continuation: Option<&str>,
+        limit: usize,
+    ) -> Result<registry::TableNamePage> {
+        registry::list_page(self.meta().as_ref(), namespace, continuation, limit)
             .await
             .context(RegistrySnafu)
     }
@@ -1100,6 +1098,9 @@ where
         append_admission: AppendAdmission::new(config.append_limits),
         catalog_snapshot_admission: Arc::new(tokio::sync::Semaphore::new(
             control::CATALOG_SNAPSHOT_CONCURRENCY,
+        )),
+        catalog_enumeration_admission: Arc::new(tokio::sync::Semaphore::new(
+            control::CATALOG_ENUMERATION_CONCURRENCY,
         )),
         #[cfg(feature = "test")]
         append_result_gate: config.append_result_gate,

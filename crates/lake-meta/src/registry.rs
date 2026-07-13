@@ -267,6 +267,48 @@ pub async fn list(meta: &dyn MetaStore, namespace: &Namespace) -> Result<Vec<Tab
     Ok(names.into_iter().map(TableName).collect())
 }
 
+/// One bounded page of table names in a namespace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableNamePage {
+    names:        Vec<TableName>,
+    continuation: Option<String>,
+}
+
+impl TableNamePage {
+    /// Borrow the table names returned by this page.
+    #[must_use]
+    pub fn names(&self) -> &[TableName] { &self.names }
+
+    /// Borrow the backend-opaque token for the next page.
+    #[must_use]
+    pub fn continuation(&self) -> Option<&str> { self.continuation.as_deref() }
+
+    /// Consume the names and continuation returned by this page.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<TableName>, Option<String>) { (self.names, self.continuation) }
+}
+
+/// List at most `limit` table names in a namespace.
+pub async fn list_page(
+    meta: &dyn MetaStore,
+    namespace: &Namespace,
+    continuation: Option<&str>,
+    limit: usize,
+) -> Result<TableNamePage> {
+    ensure!(limit > 0, InvalidScanLimitSnafu);
+    let page = meta
+        .scan_prefix_page(&prefix(namespace), continuation, limit)
+        .await?;
+    let (entries, continuation) = page.into_parts();
+    Ok(TableNamePage {
+        names: entries
+            .into_iter()
+            .map(|(name, _)| TableName(name))
+            .collect(),
+        continuation,
+    })
+}
+
 /// List the distinct namespaces that have at least one table. Scans the
 /// whole `tbl/` prefix and dedups the first path segment. Small at lake's
 /// scale (~10⁴ tables); a namespace index goes here if it ever isn't.
