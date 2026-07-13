@@ -7,8 +7,9 @@ tables. clap derive, thin `main.rs`, one handler module per command.
 
 - Application boundary: the ONLY crate allowed `anyhow`. Domain crates use
   per-crate snafu enums.
-- `main.rs` stays thin — parse, build `Context`, dispatch. Command logic
-  lives in `commands/`, split by subcommand.
+- `main.rs` stays thin — parse, build the command-specific context, dispatch.
+  Served Query must use `QueryContext`, never the catalog/admin `Context`.
+  Command logic lives in `commands/`, split by subcommand.
 - Agent-friendly: results to stdout, deterministic exit codes. (Structured
   `--format json` output is a planned addition.)
 - `selftest` must keep proving the whole path (create → ingest → SQL) in one
@@ -16,11 +17,14 @@ tables. clap derive, thin `main.rs`, one handler module per command.
 - Non-loopback serving fails without inbound TLS + bearer authentication unless
   `LAKE_ALLOW_INSECURE=true` explicitly declares a trusted terminating proxy.
 
-## Storage modes (`commands/mod.rs::Context`)
+## Storage modes (`commands/mod.rs::{Context, QueryContext}`)
 
 - **local** (default) — RocksDB metastore + local-FS Lance under `--data-dir`.
-- **cloud** — set `LAKE_S3_BUCKET` → `DynamoMeta` + Lance on S3. Config:
-  `LAKE_DYNAMODB_ENDPOINT`/`LAKE_DYNAMODB_TABLE`, `LAKE_S3_ENDPOINT`,
+- **cloud** — set `LAKE_S3_BUCKET` → distinct registry and physical-manifest
+  `DynamoMeta` handles + Lance on S3. Served Query opens only
+  `LAKE_MANIFEST_DYNAMODB_TABLE` without provisioning and must have no registry
+  IAM. Metasrv/admin `Context` also opens `LAKE_DYNAMODB_TABLE`. Config:
+  `LAKE_DYNAMODB_ENDPOINT`, both table variables, `LAKE_S3_ENDPOINT`,
   `LAKE_TABLE_PREFIX`, `LAKE_MANAGED_OBJECT_PREFIX`, `AWS_*`, and
   `LAKE_S3_PROXY_EXCLUDES` (bypass
   an ambient `PROXY_URL` for the endpoint;

@@ -28,7 +28,7 @@ use lake_query::{
 };
 
 use super::{
-    Context,
+    Context, QueryContext,
     limits::{
         append_limits_from_env, async_scheduler_limits_from_env, discovery_limits_from_env,
         maintenance_limits_from_env, query_limits_from_env, query_resources_from_env,
@@ -41,12 +41,12 @@ use super::{
 };
 use crate::metrics;
 
-pub async fn query(ctx: &Context, addr: &str, metadata_addr: &str) -> anyhow::Result<()> {
+pub async fn query(ctx: &QueryContext, addr: &str, metadata_addr: &str) -> anyhow::Result<()> {
     query_with_shutdown(ctx, addr, metadata_addr, shutdown_signal()).await
 }
 
 async fn query_with_shutdown<F>(
-    ctx: &Context,
+    ctx: &QueryContext,
     addr: &str,
     metadata_addr: &str,
     shutdown: F,
@@ -74,7 +74,7 @@ where
     if let Some(keys) = query_ticket_keys_from_env()? {
         config = config.with_ticket_keys(keys);
     }
-    if async_queries_enabled_from_env()? {
+    if ctx.async_enabled() {
         config = config.with_async_queries(async_query_config(ctx).await?);
     }
     metrics::run_with_metrics("query", shutdown, |cancellation| async move {
@@ -91,7 +91,7 @@ where
 }
 
 async fn query_engine_for_server(
-    ctx: &Context,
+    ctx: &QueryContext,
     metadata_addr: &str,
     security: ClientSecurity,
     resources: QueryResources,
@@ -107,19 +107,7 @@ async fn query_engine_for_server(
     Ok((Arc::new(engine), endpoint))
 }
 
-fn async_queries_enabled_from_env() -> anyhow::Result<bool> {
-    match std::env::var("LAKE_ASYNC_QUERIES") {
-        Err(std::env::VarError::NotPresent) => Ok(false),
-        Err(error) => Err(error.into()),
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(true),
-            "0" | "false" | "no" | "off" => Ok(false),
-            _ => anyhow::bail!("LAKE_ASYNC_QUERIES must be a boolean"),
-        },
-    }
-}
-
-async fn async_query_config(ctx: &Context) -> anyhow::Result<AsyncQueryConfig> {
+async fn async_query_config(ctx: &QueryContext) -> anyhow::Result<AsyncQueryConfig> {
     let (state, results): (MetaStoreRef, Arc<dyn ManagedObjectStore>) =
         match ctx.managed_stage().backend() {
             ManagedStageBackend::Local { root } => {
@@ -139,10 +127,11 @@ async fn async_query_config(ctx: &Context) -> anyhow::Result<AsyncQueryConfig> {
                 force_path_style,
                 ..
             } => {
-                let table = std::env::var("LAKE_ASYNC_DYNAMODB_TABLE")
-                    .unwrap_or_else(|_| "lake_async_queries".to_owned());
+                let table = ctx.async_table().ok_or_else(|| {
+                    anyhow::anyhow!("async DynamoDB authority was not validated before connect")
+                })?;
                 let dynamo_endpoint = std::env::var("LAKE_DYNAMODB_ENDPOINT").ok();
-                let dynamo = DynamoMeta::connect(dynamo_endpoint.as_deref(), &table).await?;
+                let dynamo = DynamoMeta::connect(dynamo_endpoint.as_deref(), table).await?;
                 dynamo.open_tables().await?;
                 let state: MetaStoreRef = Arc::new(dynamo);
                 let mut loader = aws_config::defaults(BehaviorVersion::latest());
@@ -238,7 +227,7 @@ mod tests {
     use lake_query::QueryResources;
 
     use super::query_engine_for_server;
-    use crate::commands::Context;
+    use crate::commands::QueryContext;
 
     #[test]
     fn server_commands_use_injected_shutdown_path() {
@@ -254,9 +243,10 @@ mod tests {
     #[tokio::test]
     async fn query_catalog_wiring_requires_remote_metadata_source() {
         let root = tempfile::tempdir().unwrap();
-        let ctx = Context::open_local(
+        let ctx = QueryContext::open_local(
             root.path().to_str().unwrap(),
             LanceMaintenancePolicy::default(),
+            false,
         )
         .unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

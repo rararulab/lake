@@ -13,8 +13,8 @@
 // limitations under the License.
 
 //! The all-in-one `lake` binary. Thin entry point: parse args, build the
-//! shared context, dispatch to a command module. Command logic lives in
-//! `commands/`, not here.
+//! command-specific context, dispatch to a command module. Command logic lives
+//! in `commands/`, not here.
 
 // CLI binary: stdout is the output channel.
 #![allow(clippy::print_stdout)]
@@ -94,10 +94,20 @@ async fn main() -> anyhow::Result<()> {
             // build a Context (which would require a data-dir or S3 config).
             Command::Client { addr, command } => commands::client::run(&addr, command).await,
             Command::DynamoMigrate(command) => commands::dynamo_migrate::run(command).await,
+            Command::Query {
+                addr,
+                metadata_addr,
+            } => run_query(&data_dir, &addr, &metadata_addr).await,
             command => run_with_context(&data_dir, command).await,
         }
     })
     .await
+}
+
+/// Run stateless Query without constructing the catalog/admin context.
+async fn run_query(data_dir: &str, addr: &str, metadata_addr: &str) -> anyhow::Result<()> {
+    let ctx = commands::QueryContext::open(data_dir).await?;
+    commands::serve::query(&ctx, addr, metadata_addr).await
 }
 
 /// Run a command that needs the in-process tiers wired from `--data-dir`.
@@ -113,10 +123,7 @@ async fn run_with_context(data_dir: &str, command: Command) -> anyhow::Result<()
         Command::DynamoMigrate(_) => {
             unreachable!("DynamoMigrate is dispatched before Context::open")
         }
-        Command::Query {
-            addr,
-            metadata_addr,
-        } => commands::serve::query(&ctx, &addr, &metadata_addr).await,
+        Command::Query { .. } => unreachable!("Query is dispatched before Context::open"),
         Command::Meta { addr } => commands::serve::meta(&ctx, &addr).await,
         Command::Client { .. } => unreachable!("Client is dispatched before Context::open"),
     }

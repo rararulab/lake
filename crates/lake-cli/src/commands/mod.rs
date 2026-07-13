@@ -18,10 +18,11 @@
 //!
 //! - **local** (default) — RocksDB metastore and local-filesystem Lance
 //!   datasets under `--data-dir`. Zero config; the dev/laptop path.
-//! - **cloud** — set `LAKE_S3_BUCKET` to use `DynamoMeta` (the prod HA
-//!   registry) with Lance datasets on S3. The DynamoDB endpoint/table come from
-//!   `LAKE_DYNAMODB_*`, and the S3 endpoint plus credentials from
-//!   `LAKE_S3_ENDPOINT` and the standard `AWS_*` variables.
+//! - **cloud** — set `LAKE_S3_BUCKET` to use separate `DynamoMeta` authorities
+//!   for the prod HA registry (`LAKE_DYNAMODB_TABLE`) and Lance physical
+//!   manifests (`LAKE_MANIFEST_DYNAMODB_TABLE`), with datasets on S3. Query
+//!   opens only the manifest authority without provisioning; Metasrv opens
+//!   both.
 
 pub mod catalog_finalize;
 pub mod client;
@@ -45,6 +46,106 @@ use lake_metasrv::{Metasrv, TablePlacement};
 
 use self::limits::{lance_maintenance_policy_from_env, operation_policy_from_env};
 
+const DEFAULT_REGISTRY_TABLE: &str = "lake_registry";
+const DEFAULT_MANIFEST_TABLE: &str = "lake_manifests";
+const DEFAULT_ASYNC_TABLE: &str = "lake_async_queries";
+const DYNAMO_V2_TABLE_SUFFIX_BYTES: usize = "_prefix_v2".len();
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CloudStoragePlan {
+    registry:    String,
+    manifest:    String,
+    async_state: Option<String>,
+}
+
+impl CloudStoragePlan {
+    fn try_new(
+        registry_table: impl Into<String>,
+        manifest_table: impl Into<String>,
+        async_table: Option<impl Into<String>>,
+    ) -> anyhow::Result<Self> {
+        let registry_table = registry_table.into();
+        let manifest_table = manifest_table.into();
+        let async_table = async_table.map(Into::into);
+        validate_dynamo_table_name("LAKE_DYNAMODB_TABLE", &registry_table)?;
+        validate_dynamo_table_name("LAKE_MANIFEST_DYNAMODB_TABLE", &manifest_table)?;
+        if let Some(table) = &async_table {
+            validate_dynamo_table_name("LAKE_ASYNC_DYNAMODB_TABLE", table)?;
+        }
+        ensure_disjoint_authorities([
+            ("catalog", Some(registry_table.as_str())),
+            ("manifest", Some(manifest_table.as_str())),
+            ("async", async_table.as_deref()),
+        ])?;
+        Ok(Self {
+            registry:    registry_table,
+            manifest:    manifest_table,
+            async_state: async_table,
+        })
+    }
+
+    fn from_env(async_enabled: bool) -> anyhow::Result<Self> {
+        Self::try_new(
+            std::env::var("LAKE_DYNAMODB_TABLE")
+                .unwrap_or_else(|_| DEFAULT_REGISTRY_TABLE.to_owned()),
+            std::env::var("LAKE_MANIFEST_DYNAMODB_TABLE")
+                .unwrap_or_else(|_| DEFAULT_MANIFEST_TABLE.to_owned()),
+            async_enabled.then(|| {
+                std::env::var("LAKE_ASYNC_DYNAMODB_TABLE")
+                    .unwrap_or_else(|_| DEFAULT_ASYNC_TABLE.to_owned())
+            }),
+        )
+    }
+
+    fn metadata_authorities(&self) -> [&str; 2] { [&self.registry, &self.manifest] }
+
+    fn query_authorities(&self) -> [&str; 1] { [&self.manifest] }
+
+    fn async_authority(&self) -> Option<&str> { self.async_state.as_deref() }
+}
+
+fn ensure_disjoint_authorities<const N: usize>(
+    authorities: [(&str, Option<&str>); N],
+) -> anyhow::Result<()> {
+    let mut physical = std::collections::BTreeMap::new();
+    for (authority, base) in authorities {
+        let Some(base) = base else { continue };
+        for table in [base.to_owned(), format!("{base}_prefix_v2")] {
+            if let Some(previous) = physical.insert(table.clone(), authority) {
+                anyhow::bail!(
+                    "{authority} and {previous} DynamoDB authorities overlap at physical table \
+                     '{table}'"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn async_queries_enabled_from_env() -> anyhow::Result<bool> {
+    match std::env::var("LAKE_ASYNC_QUERIES") {
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(error) => Err(error.into()),
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => anyhow::bail!("LAKE_ASYNC_QUERIES must be a boolean"),
+        },
+    }
+}
+
+fn validate_dynamo_table_name(variable: &str, table: &str) -> anyhow::Result<()> {
+    let maximum = 255 - DYNAMO_V2_TABLE_SUFFIX_BYTES;
+    anyhow::ensure!(
+        (3..=maximum).contains(&table.len())
+            && table
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')),
+        "{variable} must be a valid DynamoDB table name of 3..={maximum} ASCII characters"
+    );
+    Ok(())
+}
+
 /// Shared, process-wide handles. Built from `--data-dir` (local) or the
 /// `LAKE_S3_BUCKET`/`LAKE_DYNAMODB_*`/`AWS_*` environment (cloud).
 pub struct Context {
@@ -55,11 +156,89 @@ pub struct Context {
     managed_stage:   ManagedStageDescriptor,
 }
 
+/// Minimal handles held by a served Query replica.
+///
+/// Catalog authority is reachable only through the authenticated Metasrv
+/// client constructed by `serve`; this context intentionally cannot expose a
+/// registry `MetaStore`, local `Metasrv`, or table-placement policy.
+pub struct QueryContext {
+    pub engine:    TableEngineRef,
+    managed_stage: ManagedStageDescriptor,
+    async_table:   Option<String>,
+    async_enabled: bool,
+}
+
+impl QueryContext {
+    pub async fn open(data_dir: &str) -> anyhow::Result<Self> {
+        let maintenance_policy = lance_maintenance_policy_from_env()?;
+        let async_enabled = async_queries_enabled_from_env()?;
+        match std::env::var("LAKE_S3_BUCKET") {
+            Ok(bucket) => Self::open_cloud(bucket, maintenance_policy, async_enabled).await,
+            Err(_) => Self::open_local(data_dir, maintenance_policy, async_enabled),
+        }
+    }
+
+    fn open_local(
+        data_dir: &str,
+        maintenance_policy: LanceMaintenancePolicy,
+        async_enabled: bool,
+    ) -> anyhow::Result<Self> {
+        let root = PathBuf::from(data_dir);
+        std::fs::create_dir_all(&root)?;
+        let root = std::fs::canonicalize(root)?;
+        Ok(Self {
+            engine: Arc::new(LanceEngine::new().with_maintenance_policy(maintenance_policy)),
+            managed_stage: local_managed_stage_descriptor(&root),
+            async_table: None,
+            async_enabled,
+        })
+    }
+
+    async fn open_cloud(
+        bucket: String,
+        maintenance_policy: LanceMaintenancePolicy,
+        async_enabled: bool,
+    ) -> anyhow::Result<Self> {
+        let endpoint = std::env::var("LAKE_DYNAMODB_ENDPOINT").ok();
+        let plan = CloudStoragePlan::from_env(async_enabled)?;
+        let [manifest_table] = plan.query_authorities();
+        let manifests = DynamoMeta::connect(endpoint.as_deref(), manifest_table).await?;
+        // This waits for pre-provisioned tables and reads the monotonic v2
+        // marker with Describe/Get only. Query never calls ensure/create.
+        manifests.open_tables().await?;
+        let manifests: MetaStoreRef = Arc::new(manifests);
+        let engine: TableEngineRef = Arc::new(
+            LanceEngine::for_read_only_object_store(manifests, s3_storage_options())
+                .with_maintenance_policy(maintenance_policy),
+        );
+        let managed_prefix = std::env::var("LAKE_MANAGED_OBJECT_PREFIX")
+            .unwrap_or_else(|_| "managed-objects".to_owned());
+        Ok(Self {
+            engine,
+            managed_stage: s3_managed_stage_descriptor(
+                &bucket,
+                &managed_prefix,
+                std::env::var("AWS_REGION").ok(),
+                std::env::var("LAKE_S3_ENDPOINT").ok(),
+            ),
+            async_table: plan.async_state,
+            async_enabled,
+        })
+    }
+
+    pub fn managed_stage(&self) -> &ManagedStageDescriptor { &self.managed_stage }
+
+    pub fn async_table(&self) -> Option<&str> { self.async_table.as_deref() }
+
+    pub const fn async_enabled(&self) -> bool { self.async_enabled }
+}
+
 impl Context {
     pub async fn open(data_dir: &str) -> anyhow::Result<Self> {
         let maintenance_policy = lance_maintenance_policy_from_env()?;
+        let async_enabled = async_queries_enabled_from_env()?;
         match std::env::var("LAKE_S3_BUCKET") {
-            Ok(bucket) => Self::open_cloud(bucket, maintenance_policy).await,
+            Ok(bucket) => Self::open_cloud(bucket, maintenance_policy, async_enabled).await,
             Err(_) => Self::open_local(data_dir, maintenance_policy),
         }
     }
@@ -88,14 +267,19 @@ impl Context {
     async fn open_cloud(
         bucket: String,
         maintenance_policy: LanceMaintenancePolicy,
+        async_enabled: bool,
     ) -> anyhow::Result<Self> {
         let endpoint = std::env::var("LAKE_DYNAMODB_ENDPOINT").ok();
-        let table = std::env::var("LAKE_DYNAMODB_TABLE").unwrap_or_else(|_| "lake_registry".into());
-        let dynamo = DynamoMeta::connect(endpoint.as_deref(), &table).await?;
-        dynamo.open_tables().await?;
-        let meta: MetaStoreRef = Arc::new(dynamo);
+        let plan = CloudStoragePlan::from_env(async_enabled)?;
+        let [registry_table, manifest_table] = plan.metadata_authorities();
+        let registry = DynamoMeta::connect(endpoint.as_deref(), registry_table).await?;
+        registry.open_tables().await?;
+        let manifests = DynamoMeta::connect(endpoint.as_deref(), manifest_table).await?;
+        manifests.open_tables().await?;
+        let meta: MetaStoreRef = Arc::new(registry);
+        let manifests: MetaStoreRef = Arc::new(manifests);
         let engine: TableEngineRef = Arc::new(
-            LanceEngine::for_object_store(meta.clone(), s3_storage_options())
+            LanceEngine::for_object_store(manifests, s3_storage_options())
                 .with_maintenance_policy(maintenance_policy),
         );
         let table_prefix = std::env::var("LAKE_TABLE_PREFIX").unwrap_or_default();
@@ -242,5 +426,87 @@ mod managed_stage_tests {
         let json = std::str::from_utf8(&wire).expect("JSON wire");
         assert!(!json.contains("access_key"));
         assert!(!json.contains("secret"));
+    }
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use lake_common::ManagedStageBackend;
+    use lake_engine_lance::LanceMaintenancePolicy;
+
+    use super::{CloudStoragePlan, QueryContext};
+
+    #[test]
+    fn cloud_manifest_table_alias_fails_before_connect() {
+        assert!(CloudStoragePlan::try_new("lake-registry", "lake-registry", None::<&str>).is_err());
+        assert!(CloudStoragePlan::try_new("foo", "foo_prefix_v2", None::<&str>).is_err());
+        assert!(CloudStoragePlan::try_new("foo_prefix_v2", "foo", None::<&str>).is_err());
+        assert!(CloudStoragePlan::try_new("", "lake-manifests", None::<&str>).is_err());
+        assert!(CloudStoragePlan::try_new("lake-registry", "", None::<&str>).is_err());
+        assert!(
+            CloudStoragePlan::try_new("lake-registry", "lake-manifests", Some("lake-registry"))
+                .is_err()
+        );
+        assert!(
+            CloudStoragePlan::try_new(
+                "lake-registry",
+                "lake-manifests",
+                Some("lake-registry_prefix_v2")
+            )
+            .is_err()
+        );
+        assert!(
+            CloudStoragePlan::try_new("lake-registry", "lake-manifests", Some("lake-manifests"))
+                .is_err()
+        );
+        assert!(
+            CloudStoragePlan::try_new(
+                "lake-registry",
+                "lake-manifests",
+                Some("lake-manifests_prefix_v2")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cloud_storage_wiring_separates_registry_and_manifest_authority() {
+        let plan = CloudStoragePlan::try_new(
+            "lake-registry",
+            "lake-manifests",
+            Some("lake-async-queries"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.metadata_authorities(),
+            ["lake-registry", "lake-manifests"]
+        );
+        assert_eq!(plan.query_authorities(), ["lake-manifests"]);
+        assert_eq!(plan.async_authority(), Some("lake-async-queries"));
+        let wiring = include_str!("mod.rs");
+        assert!(wiring.contains("LanceEngine::for_read_only_object_store"));
+    }
+
+    #[test]
+    fn query_context_has_no_catalog_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("query");
+
+        let context = QueryContext::open_local(
+            data.to_str().unwrap(),
+            LanceMaintenancePolicy::default(),
+            false,
+        )
+        .unwrap();
+
+        assert!(!data.join("meta").exists());
+        assert!(matches!(
+            context.managed_stage().backend(),
+            ManagedStageBackend::Local { .. }
+        ));
+        let main = include_str!("../main.rs");
+        assert!(main.contains("commands::QueryContext::open(data_dir)"));
+        assert!(main.contains("Query is dispatched before Context::open"));
     }
 }
