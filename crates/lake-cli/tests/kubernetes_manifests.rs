@@ -329,6 +329,13 @@ fn kubernetes_reference_is_secure_and_matches_runtime_contract() {
     assert!(runbook.contains("Query must have no access to `$LAKE_DYNAMODB_TABLE`"));
     assert!(runbook.contains("--from-file=ticket-keys.json=query/ticket-keys.json"));
     assert!(runbook.contains("Async schema-v2 rollout"));
+    assert!(
+        runbook.contains(
+            "Its deliberate\n  `Recreate` strategy takes every Query replica down during a rollout"
+        ),
+        "the runbook must not promise zero-downtime Query rollouts while the manifest uses \
+         Recreate"
+    );
     for step in ["preload", "activate", "retire"] {
         assert!(
             runbook.contains(step),

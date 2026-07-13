@@ -294,9 +294,12 @@ within the node's Dynamo request, table-maintenance, and shutdown budgets.
 
 ## Availability model
 
-- Query is a three-replica Deployment with zero-unavailable rolling updates,
-  topology spreading, and a disruption budget. It remains stateless and can be
-  autoscaled externally.
+- Query is a three-replica Deployment with topology spreading and a disruption
+  budget. It remains stateless and can be autoscaled externally. Its deliberate
+  `Recreate` strategy takes every Query replica down during a rollout, including
+  the async schema-v2 transition; pause and drain admission, then plan that
+  bounded unavailability window instead of treating the disruption budget as a
+  zero-downtime upgrade mechanism.
 - Metasrv is exactly three replicas with stable StatefulSet pod identity,
   topology spreading, and `minAvailable: 2`. It still stores authority in
   DynamoDB. Each pod advertises its downward-API pod IP for leader forwarding;
