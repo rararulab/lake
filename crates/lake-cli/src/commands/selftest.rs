@@ -26,6 +26,7 @@ use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter,
 };
+use futures::TryStreamExt;
 use lake_common::{AppendOperation, AppendOperationId, AppendPayloadDigest, TableRef, TenantId};
 use lake_query::QueryEngine;
 
@@ -78,18 +79,20 @@ pub async fn run(ctx: &Context) -> anyhow::Result<()> {
 
     // 3. Query it back with plain SQL.
     let engine = QueryEngine::new(ctx.meta.clone(), ctx.engine.clone());
-    let batches = engine
+    let mut batches = engine
         .execute_sql(
             "SELECT robot_id, count(*) AS episodes, avg(reward) AS avg_reward FROM \
              lake.robots.episodes GROUP BY robot_id ORDER BY robot_id",
         )
         .await?;
-    println!(
-        "{}",
-        datafusion::arrow::util::pretty::pretty_format_batches(&batches)?
-    );
-
-    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    let mut rows = 0;
+    while let Some(batch) = batches.try_next().await? {
+        rows += batch.num_rows();
+        println!(
+            "{}",
+            datafusion::arrow::util::pretty::pretty_format_batches(&[batch])?
+        );
+    }
     anyhow::ensure!(rows >= 2, "expected at least one row per robot, got {rows}");
     println!("self-check ok");
     Ok(())

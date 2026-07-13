@@ -2749,17 +2749,18 @@ mod tests {
             .unwrap();
 
         let query = QueryEngine::new(meta, engine);
-        let batches = query
+        let mut batches = query
             .execute_sql("SELECT episode_id, video FROM lake.robots.episodes")
             .await
             .unwrap();
-        let episode_ids = batches[0]
+        let batch = batches.try_next().await.unwrap().expect("result batch");
+        let episode_ids = batch
             .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(episode_ids.value(0), "episode-42");
-        let locations = batches[0]
+        let locations = batch
             .column(1)
             .as_any()
             .downcast_ref::<StructArray>()
