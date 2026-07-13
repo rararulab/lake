@@ -41,11 +41,11 @@ use std::{
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use datafusion::{
-    arrow::array::RecordBatch,
     catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider},
     dataframe::DataFrame,
     error::DataFusionError,
     execution::{memory_pool::FairSpillPool, runtime_env::RuntimeEnvBuilder},
+    physical_plan::SendableRecordBatchStream,
     prelude::{SQLOptions, SessionConfig, SessionContext},
 };
 use lake_catalog::{
@@ -782,10 +782,10 @@ impl QueryEngine {
         self.catalog.cached_generation()
     }
 
-    /// Execute a SQL statement and collect the results.
-    pub async fn execute_sql(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+    /// Execute a SQL statement as a backpressured record-batch stream.
+    pub async fn execute_sql(&self, sql: &str) -> Result<SendableRecordBatchStream> {
         let df = self.plan_sql(sql).await?;
-        df.collect().await.context(ExecuteSnafu)
+        df.execute_stream().await.context(ExecuteSnafu)
     }
 
     /// Validate and plan a statement through the public read-only SQL surface.
@@ -1475,6 +1475,51 @@ mod tests {
         Arc::new(QueryEngine::new(meta, storage))
     }
 
+    #[tokio::test]
+    async fn direct_sql_results_stream_before_source_completion() {
+        let release = Arc::new(Notify::new());
+        let engine = shutdown_query_engine(release.clone());
+
+        let mut batches = tokio::time::timeout(
+            Duration::from_millis(25),
+            engine.execute_sql("SELECT * FROM lake.robots.shutdown_stream"),
+        )
+        .await
+        .expect("opening a direct SQL result must not wait for its source to finish")
+        .expect("plan direct SQL query");
+        let first = tokio::time::timeout(Duration::from_secs(1), batches.try_next())
+            .await
+            .expect("first batch should not wait for the source to finish")
+            .expect("read first batch")
+            .expect("first batch");
+        let first_values = first
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value column");
+        assert_eq!(first_values.value(0), 1);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), batches.try_next())
+                .await
+                .is_err(),
+            "the next batch must remain blocked until its source is released"
+        );
+
+        release.notify_one();
+        let second = batches
+            .try_next()
+            .await
+            .expect("read second batch")
+            .expect("second batch");
+        let second_values = second
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value column");
+        assert_eq!(second_values.value(0), 2);
+    }
+
     fn free_addr() -> std::net::SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
         listener.local_addr().expect("listen address")
@@ -1604,22 +1649,25 @@ mod tests {
             .collect()
             .await
             .unwrap();
-        let dml = query
-            .execute_sql("INSERT INTO sink VALUES (1)")
-            .await
-            .unwrap_err();
+        let dml = match query.execute_sql("INSERT INTO sink VALUES (1)").await {
+            Ok(_) => panic!("public SQL must reject data mutation"),
+            Err(error) => error,
+        };
         assert!(
             dml.to_string().contains("DML not supported"),
             "public SQL must reject data mutation: {dml}"
         );
 
-        let ddl = query
+        let ddl = match query
             .execute_sql(
                 "CREATE EXTERNAL TABLE arbitrary STORED AS PARQUET LOCATION \
                  's3://untrusted-bucket/private/'",
             )
             .await
-            .unwrap_err();
+        {
+            Ok(_) => panic!("public SQL must reject arbitrary object-store registration"),
+            Err(error) => error,
+        };
         assert!(
             ddl.to_string().contains("DDL not supported"),
             "public SQL must reject arbitrary object-store registration: {ddl}"

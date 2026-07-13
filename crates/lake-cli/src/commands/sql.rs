@@ -14,16 +14,19 @@
 
 //! `lake sql` — run a SQL statement through the query engine.
 
+use futures::TryStreamExt;
 use lake_query::QueryEngine;
 
 use super::Context;
 
 pub async fn run(ctx: &Context, query: &str) -> anyhow::Result<()> {
     let engine = QueryEngine::new(ctx.meta.clone(), ctx.engine.clone());
-    let batches = engine.execute_sql(query).await?;
-    println!(
-        "{}",
-        datafusion::arrow::util::pretty::pretty_format_batches(&batches)?
-    );
+    let mut batches = engine.execute_sql(query).await?;
+    while let Some(batch) = batches.try_next().await? {
+        println!(
+            "{}",
+            datafusion::arrow::util::pretty::pretty_format_batches(&[batch])?
+        );
+    }
     Ok(())
 }
