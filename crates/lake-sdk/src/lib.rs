@@ -35,7 +35,6 @@ use arrow::{
 use arrow_flight::{
     Action, CancelFlightInfoRequest, CancelStatus, FlightClient, FlightData, FlightDescriptor,
     FlightInfo, PollInfo, PutResult, Ticket,
-    decode::FlightRecordBatchStream,
     encode::FlightDataEncoderBuilder,
     error::FlightError,
     sql::{CommandStatementQuery, ProstMessageExt, client::FlightSqlServiceClient},
@@ -77,6 +76,11 @@ const MAX_PENDING_APPEND_CHECKPOINTS: usize = 1_024;
 const ASYNC_QUERY_HANDLE_VERSION: u8 = 1;
 const MAX_ASYNC_QUERY_HANDLE_BYTES: usize = 16 * 1024;
 const MAX_ASYNC_RESULT_ENDPOINTS: usize = 4_096;
+const MAX_QUERY_RESULT_ENDPOINTS: usize = 256;
+const MAX_QUERY_RESULT_TICKET_BYTES: usize = 512 * 1024;
+const MAX_QUERY_RESULT_TICKET_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_QUERY_RESULT_FLIGHT_INFO_BYTES: usize = MAX_QUERY_RESULT_TICKET_TOTAL_BYTES + 1024 * 1024;
+const FLIGHT_REUSE_CONNECTION_LOCATION: &str = "arrow-flight-reuse-connection://?";
 const ASYNC_SUBMIT_RETRY_WINDOW: Duration = Duration::from_secs(30);
 const ASYNC_POLL_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const ASYNC_POLL_MAX_BACKOFF: Duration = Duration::from_secs(2);
@@ -301,6 +305,12 @@ pub enum SdkError {
 
     #[snafu(display("query returned a Flight endpoint without a ticket"))]
     MissingQueryTicket,
+
+    #[snafu(display("query returned invalid Flight endpoint metadata"))]
+    InvalidQueryResultEndpoint,
+
+    #[snafu(display("query returned an unsupported Flight endpoint location"))]
+    UnsupportedQueryResultLocation,
 
     #[snafu(display("asynchronous query did not complete within {timeout:?}"))]
     AsyncQueryTimeout { timeout: Duration },
@@ -698,9 +708,25 @@ pub struct LakeClient {
     upload_checkpoint_dir: Option<PathBuf>,
 }
 
-/// Ordered Arrow batches materialized by one durable asynchronous SQL query.
-pub type AsyncQueryResultStream =
+/// Type-erased stream for the complete result of one synchronous SQL query.
+///
+/// Consume its [`Stream`] items with `futures::TryStreamExt`, such as
+/// `try_next` or `try_collect`. The SDK redeems every validated local result
+/// endpoint in declared order without collecting the complete result.
+///
+/// This deliberately replaces Arrow's `FlightRecordBatchStream` as the
+/// synchronous query return type. Per-`DoGet` headers and trailers have no
+/// well-defined whole-result meaning, so this stream exposes only
+/// [`RecordBatch`] values and terminal [`FlightError`]s.
+pub type QueryResultStream =
     Pin<Box<dyn Stream<Item = std::result::Result<RecordBatch, FlightError>> + Send>>;
+
+/// Ordered Arrow batches materialized from a durable asynchronous-query result
+/// manifest.
+///
+/// This alias and its asynchronous manifest API retain their existing behavior;
+/// the synchronous [`QueryResultStream`] migration does not change them.
+pub type AsyncQueryResultStream = QueryResultStream;
 
 /// Result of one non-blocking durable query poll.
 pub enum AsyncQueryPoll {
@@ -1146,22 +1172,33 @@ impl LakeClient {
             .context(MissingAppendResultSnafu)
     }
 
-    /// Execute read-only SQL through the query endpoint and stream Arrow
-    /// record batches as they arrive.
-    pub async fn query(&self, sql: &str) -> Result<FlightRecordBatchStream> {
-        let mut client = FlightSqlServiceClient::new(self.query.clone());
+    /// Execute read-only SQL through the query endpoint and stream its complete
+    /// Arrow result.
+    ///
+    /// Before the first `DoGet`, validates every endpoint in the returned
+    /// `FlightInfo`: each must have a bounded non-empty ticket and may have no
+    /// locations or only the exact `arrow-flight-reuse-connection://?`
+    /// location. The SDK then consumes the validated endpoints sequentially
+    /// in declared order. An invalid endpoint returns a typed, redacted
+    /// [`SdkError`] before any result stream is redeemed; the SDK neither
+    /// follows external endpoint locations nor forwards credentials to
+    /// them.
+    ///
+    /// The returned [`QueryResultStream`] is the deliberate semver migration
+    /// from Arrow's `FlightRecordBatchStream`: callers keep normal
+    /// `futures::TryStreamExt` consumption, while per-`DoGet` headers and
+    /// trailers are not exposed because they have no whole-result meaning.
+    pub async fn query(&self, sql: &str) -> Result<QueryResultStream> {
+        let client =
+            arrow_flight::flight_service_client::FlightServiceClient::new(self.query.clone())
+                .max_decoding_message_size(MAX_QUERY_RESULT_FLIGHT_INFO_BYTES);
+        let mut client = FlightSqlServiceClient::new_from_inner(client);
         self.security.apply_to_sql_client(&mut client);
         let info = client
             .execute(sql.to_owned(), None)
             .await
             .context(FlightSnafu)?;
-        let endpoint = info
-            .endpoint
-            .into_iter()
-            .next()
-            .context(MissingQueryEndpointSnafu)?;
-        let ticket = endpoint.ticket.context(MissingQueryTicketSnafu)?;
-        client.do_get(ticket).await.context(FlightSnafu)
+        self.open_query_result(Self::query_result_tickets(info)?)
     }
 
     /// Submit read-only SQL through standard Flight `PollFlightInfo`, wait for
@@ -1321,6 +1358,52 @@ impl LakeClient {
         let streams = futures::stream::iter(requests)
             .then(|(mut client, ticket)| async move { client.do_get(ticket).await });
         Ok(Box::pin(streams.try_flatten()))
+    }
+
+    fn open_query_result(&self, tickets: Vec<Ticket>) -> Result<QueryResultStream> {
+        let mut requests = Vec::with_capacity(tickets.len());
+        for ticket in tickets {
+            let mut client = FlightClient::new(self.query.clone());
+            self.security
+                .apply_to_flight_client(&mut client)
+                .context(SecuritySnafu)?;
+            requests.push((client, ticket));
+        }
+        let streams = futures::stream::iter(requests)
+            .then(|(mut client, ticket)| async move { client.do_get(ticket).await });
+        Ok(Box::pin(streams.try_flatten()))
+    }
+
+    fn query_result_tickets(info: FlightInfo) -> Result<Vec<Ticket>> {
+        if info.endpoint.is_empty() {
+            return Err(SdkError::MissingQueryEndpoint);
+        }
+        if info.endpoint.len() > MAX_QUERY_RESULT_ENDPOINTS {
+            return Err(SdkError::InvalidQueryResultEndpoint);
+        }
+        let mut tickets = Vec::with_capacity(info.endpoint.len());
+        let mut ticket_bytes = 0usize;
+        for endpoint in info.endpoint {
+            if endpoint
+                .location
+                .iter()
+                .any(|location| location.uri != FLIGHT_REUSE_CONNECTION_LOCATION)
+            {
+                return Err(SdkError::UnsupportedQueryResultLocation);
+            }
+            let ticket = endpoint.ticket.context(MissingQueryTicketSnafu)?;
+            if ticket.ticket.is_empty()
+                || ticket.ticket.len() > MAX_QUERY_RESULT_TICKET_BYTES
+                || ticket_bytes
+                    .checked_add(ticket.ticket.len())
+                    .is_none_or(|total| total > MAX_QUERY_RESULT_TICKET_TOTAL_BYTES)
+            {
+                return Err(SdkError::InvalidQueryResultEndpoint);
+            }
+            ticket_bytes += ticket.ticket.len();
+            tickets.push(ticket);
+        }
+        Ok(tickets)
     }
 
     fn async_result_tickets(info: FlightInfo) -> Result<Vec<Ticket>> {
@@ -1738,12 +1821,17 @@ mod tests {
     use arrow::{
         array::{Array, StringArray, StructArray},
         datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
     };
     use arrow_flight::{
-        CancelStatus, FlightData, FlightDescriptor, FlightInfo,
+        CancelStatus, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
+        encode::FlightDataEncoderBuilder,
         error::FlightError,
-        flight_service_server::FlightServiceServer,
-        sql::{CommandStatementQuery, SqlInfo, server::FlightSqlService},
+        flight_service_server::{FlightService, FlightServiceServer},
+        sql::{
+            CommandStatementQuery, ProstMessageExt, SqlInfo, TicketStatementQuery,
+            server::FlightSqlService,
+        },
     };
     use aws_config::BehaviorVersion;
     use aws_sdk_s3::config::{Credentials, Region};
@@ -1858,6 +1946,261 @@ mod tests {
             .await
             .expect("connected client");
         (client, calls)
+    }
+
+    #[derive(Clone)]
+    struct EndpointQueryService {
+        do_get_calls: Arc<AtomicUsize>,
+        redeemed:     Arc<StdMutex<Vec<String>>>,
+        schema:       Arc<Schema>,
+    }
+
+    impl EndpointQueryService {
+        fn ticket(handle: impl Into<Vec<u8>>) -> Ticket {
+            let ticket = TicketStatementQuery {
+                statement_handle: handle.into().into(),
+            };
+            Ticket::new(ticket.as_any().encode_to_vec())
+        }
+
+        fn endpoint(handle: impl Into<Vec<u8>>) -> FlightEndpoint {
+            FlightEndpoint::new().with_ticket(Self::ticket(handle))
+        }
+
+        fn response(&self, query: &str, descriptor: FlightDescriptor) -> FlightInfo {
+            let endpoints = match query {
+                "single" => vec![Self::endpoint(b"single")],
+                "ordered" => vec![
+                    Self::endpoint(b"first"),
+                    Self::endpoint(b"second").with_location("arrow-flight-reuse-connection://?"),
+                ],
+                "missing-ticket" => vec![Self::endpoint(b"first"), FlightEndpoint::new()],
+                "too-many-endpoints" => (0..257).map(|_| Self::endpoint(b"endpoint")).collect(),
+                "oversized-ticket" => {
+                    vec![FlightEndpoint::new().with_ticket(Ticket::new(vec![0_u8; 512 * 1024 + 1]))]
+                }
+                "too-many-ticket-bytes" => (0..17)
+                    .map(|_| FlightEndpoint::new().with_ticket(Ticket::new(vec![0_u8; 512 * 1024])))
+                    .collect(),
+                "external-location" => vec![
+                    Self::endpoint(b"first")
+                        .with_location("arrow-flight-reuse-connection://?")
+                        .with_location("https://capability.example.invalid/credential=secret"),
+                ],
+                "terminal-error" => vec![Self::endpoint(b"terminal-error")],
+                _ => vec![Self::endpoint(b"single")],
+            };
+            FlightInfo::new()
+                .try_with_schema(&self.schema)
+                .expect("test schema encodes")
+                .with_descriptor(descriptor)
+                .with_endpoints(endpoints)
+                .with_ordered(query == "ordered")
+        }
+    }
+
+    #[tonic::async_trait]
+    impl FlightSqlService for EndpointQueryService {
+        type FlightService = Self;
+
+        async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
+
+        async fn get_flight_info_statement(
+            &self,
+            query: CommandStatementQuery,
+            request: Request<FlightDescriptor>,
+        ) -> std::result::Result<Response<FlightInfo>, Status> {
+            Ok(Response::new(
+                self.response(&query.query, request.into_inner()),
+            ))
+        }
+
+        async fn do_get_statement(
+            &self,
+            ticket: TicketStatementQuery,
+            _request: Request<Ticket>,
+        ) -> std::result::Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+            self.do_get_calls.fetch_add(1, Ordering::SeqCst);
+            let handle = String::from_utf8(ticket.statement_handle.to_vec())
+                .map_err(|_| Status::invalid_argument("test ticket must be UTF-8"))?;
+            self.redeemed
+                .lock()
+                .expect("test redemption log lock")
+                .push(handle.clone());
+            let value = match handle.as_str() {
+                "single" => 1,
+                "first" => 2,
+                "second" => 3,
+                "terminal-error" => 4,
+                _ => return Err(Status::invalid_argument("unknown test ticket")),
+            };
+            let batch = RecordBatch::try_from_iter(vec![(
+                "value",
+                Arc::new(arrow::array::Int64Array::from(vec![value])) as arrow::array::ArrayRef,
+            )])
+            .map_err(|error| Status::internal(error.to_string()))?;
+            let schema = batch.schema();
+            let mut batches = vec![Ok(batch)];
+            if handle == "terminal-error" {
+                batches.push(Err(FlightError::Tonic(Box::new(Status::internal(
+                    "test terminal stream error",
+                )))));
+            }
+            let stream = FlightDataEncoderBuilder::new()
+                .with_schema(schema)
+                .build(futures::stream::iter(batches))
+                .map_err(Status::from);
+            Ok(Response::new(Box::pin(stream)))
+        }
+    }
+
+    async fn setup_endpoint_query_client(
+        root: &std::path::Path,
+    ) -> (LakeClient, Arc<AtomicUsize>, Arc<StdMutex<Vec<String>>>) {
+        let do_get_calls = Arc::new(AtomicUsize::new(0));
+        let redeemed = Arc::new(StdMutex::new(Vec::new()));
+        let query_addr = free_addr();
+        let service = EndpointQueryService {
+            do_get_calls: do_get_calls.clone(),
+            redeemed:     redeemed.clone(),
+            schema:       Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
+        };
+        let socket = query_addr.parse().expect("query socket");
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(FlightServiceServer::new(service))
+                .serve(socket)
+                .await
+                .expect("endpoint Flight SQL server");
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let objects = LocalObjectStore::open(root.join("objects"))
+            .await
+            .expect("object store");
+        let client = LakeClient::builder(format!("http://{query_addr}"))
+            .connect_with_store(objects)
+            .await
+            .expect("connected client");
+        (client, do_get_calls, redeemed)
+    }
+
+    fn batch_value(batch: &RecordBatch) -> i64 {
+        batch
+            .column_by_name("value")
+            .expect("test value column")
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("test value array")
+            .value(0)
+    }
+
+    #[tokio::test]
+    async fn sdk_query_consumes_single_and_ordered_local_reuse_endpoints() {
+        let root = tempdir().expect("fixture root");
+        let (client, do_get_calls, redeemed) = setup_endpoint_query_client(root.path()).await;
+
+        let single = client.query("single").await.expect("single endpoint query");
+        let single = single
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("single endpoint stream");
+        assert_eq!(single.iter().map(batch_value).collect::<Vec<_>>(), vec![1]);
+
+        let ordered = client
+            .query("ordered")
+            .await
+            .expect("ordered endpoint query");
+        let ordered = ordered
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("ordered endpoint stream");
+        assert_eq!(
+            ordered.iter().map(batch_value).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(do_get_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            redeemed
+                .lock()
+                .expect("test redemption log lock")
+                .as_slice(),
+            ["single", "first", "second"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_query_rejects_missing_ticket_before_doget() {
+        let root = tempdir().expect("fixture root");
+        let (client, do_get_calls, _redeemed) = setup_endpoint_query_client(root.path()).await;
+
+        assert!(matches!(
+            client.query("missing-ticket").await,
+            Err(SdkError::MissingQueryTicket)
+        ));
+        assert_eq!(do_get_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sdk_query_rejects_excessive_endpoint_metadata_before_doget() {
+        let root = tempdir().expect("fixture root");
+        let (client, do_get_calls, _redeemed) = setup_endpoint_query_client(root.path()).await;
+
+        for query in [
+            "too-many-endpoints",
+            "oversized-ticket",
+            "too-many-ticket-bytes",
+        ] {
+            assert!(matches!(
+                client.query(query).await,
+                Err(SdkError::InvalidQueryResultEndpoint)
+            ));
+            assert_eq!(do_get_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_query_rejects_external_location_before_doget() {
+        let root = tempdir().expect("fixture root");
+        let (client, do_get_calls, _redeemed) = setup_endpoint_query_client(root.path()).await;
+
+        let Err(error) = client.query("external-location").await else {
+            panic!("external endpoint location must fail");
+        };
+        assert!(matches!(error, SdkError::UnsupportedQueryResultLocation));
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(!display.contains("capability.example.invalid"));
+        assert!(!display.contains("credential=secret"));
+        assert!(!debug.contains("capability.example.invalid"));
+        assert!(!debug.contains("credential=secret"));
+        assert_eq!(do_get_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sdk_query_result_stream_supports_try_stream_consumption() {
+        let root = tempdir().expect("fixture root");
+        let (client, _do_get_calls, _redeemed) = setup_endpoint_query_client(root.path()).await;
+
+        let stream: crate::QueryResultStream =
+            client.query("single").await.expect("single endpoint query");
+        let batches = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("normal stream consumption");
+        assert_eq!(batches.iter().map(batch_value).collect::<Vec<_>>(), vec![1]);
+
+        let stream: crate::QueryResultStream = client
+            .query("terminal-error")
+            .await
+            .expect("terminal-error query starts");
+        assert!(matches!(
+            stream.try_collect::<Vec<_>>().await,
+            Err(FlightError::Tonic(_))
+        ));
     }
 
     #[tokio::test]
