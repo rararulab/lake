@@ -19,10 +19,13 @@ use std::{future::Future, sync::Arc};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
 use lake_common::ManagedStageBackend;
+use lake_flight::ClientSecurity;
 use lake_meta::{DynamoMeta, MetaStoreRef, RocksMeta};
 use lake_metasrv::MetasrvServerConfig;
 use lake_objects::{LocalObjectStore, ManagedObjectStore, S3ObjectStore};
-use lake_query::{AsyncQueryConfig, QueryEngine, QueryServerConfig};
+use lake_query::{
+    AsyncQueryConfig, QueryEngine, QueryResources, QueryServerConfig, connect_remote_catalog_source,
+};
 
 use super::{
     Context,
@@ -51,13 +54,16 @@ async fn query_with_shutdown<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let engine = Arc::new(QueryEngine::try_with_resources(
-        ctx.meta.clone(),
-        ctx.engine.clone(),
+    let metadata_security = metadata_client_security_from_env()?;
+    let (engine, metadata_endpoint) = query_engine_for_server(
+        ctx,
+        metadata_addr,
+        metadata_security.clone(),
         query_resources_from_env()?,
-    )?);
+    )
+    .await?;
     let mut config = QueryServerConfig::new()
-        .with_metadata(metadata_addr, metadata_client_security_from_env()?)
+        .with_metadata(metadata_endpoint, metadata_security)
         .with_managed_stage(ctx.managed_stage().clone())
         .with_server_security(server_security_from_env()?)
         .with_limits(query_limits_from_env()?)
@@ -82,6 +88,23 @@ where
         Ok(())
     })
     .await
+}
+
+async fn query_engine_for_server(
+    ctx: &Context,
+    metadata_addr: &str,
+    security: ClientSecurity,
+    resources: QueryResources,
+) -> anyhow::Result<(Arc<QueryEngine>, String)> {
+    let endpoint = if metadata_addr.contains("://") {
+        metadata_addr.to_owned()
+    } else {
+        security.endpoint_for_authority(metadata_addr)
+    };
+    let source = connect_remote_catalog_source(endpoint.clone(), security).await?;
+    let engine =
+        QueryEngine::try_with_catalog_source_and_resources(source, ctx.engine.clone(), resources)?;
+    Ok((Arc::new(engine), endpoint))
 }
 
 fn async_queries_enabled_from_env() -> anyhow::Result<bool> {
@@ -210,6 +233,13 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use lake_engine_lance::LanceMaintenancePolicy;
+    use lake_flight::ClientSecurity;
+    use lake_query::QueryResources;
+
+    use super::query_engine_for_server;
+    use crate::commands::Context;
+
     #[test]
     fn server_commands_use_injected_shutdown_path() {
         let source = include_str!("serve.rs");
@@ -219,5 +249,32 @@ mod tests {
         assert!(source.contains("meta_with_shutdown(ctx, addr, shutdown_signal())"));
         assert!(source.contains("lake_query::serve_with_config_and_shutdown"));
         assert!(source.contains("lake_metasrv::serve_with_config_and_shutdown"));
+    }
+
+    #[tokio::test]
+    async fn query_catalog_wiring_requires_remote_metadata_source() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Context::open_local(
+            root.path().to_str().unwrap(),
+            LanceMaintenancePolicy::default(),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unavailable = listener.local_addr().unwrap();
+        drop(listener);
+
+        let result = query_engine_for_server(
+            &ctx,
+            &unavailable.to_string(),
+            ClientSecurity::new(),
+            QueryResources::default(),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("served Query must not fall back to its directly available registry"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("catalog authority"));
     }
 }

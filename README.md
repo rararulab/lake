@@ -69,11 +69,18 @@ prefix. Discovery happens once per client, not per query or object read.
 
 Flight SQL catalog discovery is also cache-only. New table registrations carry
 the table's Arrow IPC schema, and each Query replica loads names, versions, and
-schemas in one paginated registry scan. `GetTables(include_schema=true)` returns
-the real schema without a request-path Metasrv lookup. Registrations created by
-older Lake versions remain queryable and listable; schema-inclusive discovery
-for such a table fails explicitly until it is recreated or migrated, rather
-than claiming the table has an empty schema.
+schemas through one authenticated, conditional `catalog_snapshot` action. The
+Metasrv authority scans in 64-entry pages, accounts each entry before retaining
+it, admits only one full snapshot per process until its response is dropped,
+and returns either `not_modified` or one directory fenced by matching opaque
+generation reads. Remote snapshots fail closed until the monotonic directory
+authority marker exists. `GetTables(include_schema=true)` returns the real schema
+without request-path metadata I/O; warm listing and registration cache hits
+issue zero RPCs. Served `lake query` connects this remote source before binding
+and never falls back to direct registry reads. Registrations created by older
+Lake versions remain queryable and listable; schema-inclusive discovery for
+such a table fails explicitly until it is recreated or migrated, rather than
+claiming the table has an empty schema.
 
 For production S3, configure the query process instead of constructing a stage
 in application code:

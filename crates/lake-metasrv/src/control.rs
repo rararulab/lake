@@ -30,7 +30,7 @@
 //! (`resolve`, `list_*`) are always served locally, matching the HA model in
 //! `docs/architecture.md`.
 
-use std::{pin::Pin, sync::Arc};
+use std::{io, pin::Pin, sync::Arc};
 
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightClient, FlightData, FlightDescriptor, FlightInfo,
@@ -38,12 +38,16 @@ use arrow_flight::{
     Ticket, decode::FlightRecordBatchStream, flight_service_client::FlightServiceClient,
     flight_service_server::FlightService,
 };
+use bytes::Bytes;
 use datafusion::{
     arrow::datatypes::{DataType, Field, Schema, SchemaRef},
     error::DataFusionError,
     physical_plan::stream::RecordBatchStreamAdapter,
 };
 use futures::{Stream, StreamExt};
+use lake_catalog::{
+    CATALOG_SOURCE_SCHEMA_VERSION, CatalogDirectoryRequest, CatalogDirectoryResponse,
+};
 use lake_common::{
     AppendOperation, FILE_APPEND_TYPE_URL, FileAppendRequest, Namespace, Principal, PrincipalRole,
     TableRef, TenantId, Version,
@@ -52,6 +56,7 @@ use lake_flight::{
     ClientSecurity, DELEGATED_NAMESPACE_HEADER, DELEGATED_TENANT_HEADER, TracedFlightStream,
     append_flight_payload_digest, set_span_parent_from_request,
 };
+use lake_meta::{MetaStore, registry};
 use lake_objects::data_location_field;
 use prost::Message;
 use prost_types::Any;
@@ -64,6 +69,239 @@ use crate::{AppendLimits, Metasrv, TablePlacement, leadership::Leadership, telem
 
 /// The [`Status`] message returned by every unsupported Flight method.
 const UNSUPPORTED: &str = "metasrv control plane only serves actions and FILE append do_put";
+const CATALOG_SNAPSHOT_ATTEMPTS: usize = 3;
+pub(crate) const CATALOG_SNAPSHOT_CONCURRENCY: usize = 1;
+const CATALOG_SNAPSHOT_PAGE_ENTRIES: usize = 64;
+const MAX_CATALOG_GENERATION_BYTES: usize = 256;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CatalogSnapshotLimits {
+    entries:        usize,
+    schema_bytes:   usize,
+    response_bytes: usize,
+}
+
+impl CatalogSnapshotLimits {
+    const MAX_ENTRIES: usize = 100_000;
+    const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+    const MAX_SCHEMA_BYTES: usize = 1024 * 1024;
+
+    pub(crate) fn try_new(
+        max_entries: usize,
+        max_schema_bytes: usize,
+        max_response_bytes: usize,
+    ) -> Result<Self, &'static str> {
+        if max_entries == 0
+            || max_entries > Self::MAX_ENTRIES
+            || max_schema_bytes == 0
+            || max_schema_bytes > Self::MAX_SCHEMA_BYTES
+            || max_response_bytes == 0
+            || max_response_bytes > Self::MAX_RESPONSE_BYTES
+        {
+            return Err("invalid catalog snapshot limits");
+        }
+        Ok(Self {
+            entries:        max_entries,
+            schema_bytes:   max_schema_bytes,
+            response_bytes: max_response_bytes,
+        })
+    }
+}
+
+impl Default for CatalogSnapshotLimits {
+    fn default() -> Self {
+        Self::try_new(
+            Self::MAX_ENTRIES,
+            Self::MAX_SCHEMA_BYTES,
+            Self::MAX_RESPONSE_BYTES,
+        )
+        .expect("production catalog snapshot limits are bounded")
+    }
+}
+
+struct BoundedCounter {
+    written: usize,
+    limit:   usize,
+}
+
+impl io::Write for BoundedCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let next = self
+            .written
+            .checked_add(buffer.len())
+            .ok_or_else(|| io::Error::other("catalog snapshot response exceeds byte limit"))?;
+        if next > self.limit {
+            return Err(io::Error::other(
+                "catalog snapshot response exceeds byte limit",
+            ));
+        }
+        self.written = next;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+impl BoundedCounter {
+    const fn written(&self) -> usize { self.written }
+}
+
+fn validate_catalog_snapshot(
+    response: &CatalogDirectoryResponse,
+    limits: CatalogSnapshotLimits,
+) -> Result<(), Status> {
+    if let CatalogDirectoryResponse::Snapshot { registrations, .. } = response {
+        if registrations.len() > limits.entries
+            || registrations.iter().any(|(_, registration)| {
+                registration
+                    .schema_ipc()
+                    .is_some_and(|schema| schema.len() > limits.schema_bytes)
+            })
+        {
+            return Err(Status::resource_exhausted(
+                "catalog snapshot exceeds configured limits",
+            ));
+        }
+    }
+    serde_json::to_writer(
+        BoundedCounter {
+            written: 0,
+            limit:   limits.response_bytes,
+        },
+        response,
+    )
+    .map_err(|_| Status::resource_exhausted("catalog snapshot exceeds configured limits"))
+}
+
+async fn scan_catalog_tables_bounded(
+    meta: &dyn MetaStore,
+    generation: &[u8],
+    limits: CatalogSnapshotLimits,
+) -> Result<Vec<(TableRef, lake_meta::registry::TableRegistration)>, Status> {
+    let empty = CatalogDirectoryResponse::Snapshot {
+        schema_version: CATALOG_SOURCE_SCHEMA_VERSION,
+        generation:     Some(generation.to_vec()),
+        registrations:  Vec::new(),
+    };
+    let mut base = BoundedCounter {
+        written: 0,
+        limit:   limits.response_bytes,
+    };
+    serde_json::to_writer(&mut base, &empty)
+        .map_err(|_| Status::resource_exhausted("catalog snapshot exceeds configured limits"))?;
+    let mut encoded_bytes = base.written();
+    let mut tables = Vec::with_capacity(limits.entries.min(CATALOG_SNAPSHOT_PAGE_ENTRIES));
+    let mut continuation = None;
+    loop {
+        let remaining = limits
+            .entries
+            .saturating_add(1)
+            .saturating_sub(tables.len());
+        let page = registry::scan_tables_page(
+            meta,
+            continuation.as_deref(),
+            remaining.min(CATALOG_SNAPSHOT_PAGE_ENTRIES),
+        )
+        .await
+        .map_err(|_| Status::unavailable("catalog snapshot unavailable"))?;
+        let (page_tables, next) = page.into_parts();
+        for entry in page_tables {
+            let registration = &entry.1;
+            if tables.len() == limits.entries
+                || registration
+                    .schema_ipc()
+                    .is_some_and(|schema| schema.len() > limits.schema_bytes)
+            {
+                return Err(Status::resource_exhausted(
+                    "catalog snapshot exceeds configured limits",
+                ));
+            }
+            let separator = usize::from(!tables.is_empty());
+            let remaining_bytes = limits
+                .response_bytes
+                .saturating_sub(encoded_bytes)
+                .saturating_sub(separator);
+            let mut counter = BoundedCounter {
+                written: 0,
+                limit:   remaining_bytes,
+            };
+            serde_json::to_writer(&mut counter, &entry).map_err(|_| {
+                Status::resource_exhausted("catalog snapshot exceeds configured limits")
+            })?;
+            encoded_bytes = encoded_bytes
+                .checked_add(separator)
+                .and_then(|bytes| bytes.checked_add(counter.written()))
+                .filter(|bytes| *bytes <= limits.response_bytes)
+                .ok_or_else(|| {
+                    Status::resource_exhausted("catalog snapshot exceeds configured limits")
+                })?;
+            tables.push(entry);
+        }
+        let Some(next) = next else { break };
+        continuation = Some(next);
+    }
+    Ok(tables)
+}
+
+pub(crate) async fn build_catalog_snapshot(
+    meta: &dyn MetaStore,
+    request: CatalogDirectoryRequest,
+    limits: CatalogSnapshotLimits,
+) -> Result<CatalogDirectoryResponse, Status> {
+    if request.schema_version != CATALOG_SOURCE_SCHEMA_VERSION
+        || request
+            .known_generation
+            .as_ref()
+            .is_some_and(|generation| generation.len() > MAX_CATALOG_GENERATION_BYTES)
+    {
+        return Err(Status::invalid_argument("invalid catalog snapshot request"));
+    }
+    let state = registry::directory_state(meta)
+        .await
+        .map_err(|_| Status::unavailable("catalog snapshot unavailable"))?;
+    if !state.authoritative() {
+        return Err(Status::failed_precondition(
+            "catalog directory generation is not authoritative",
+        ));
+    }
+    let mut generation = state.generation().map(<[u8]>::to_vec);
+    if request.known_generation.as_deref() == generation.as_deref() {
+        let response = CatalogDirectoryResponse::NotModified {
+            schema_version: CATALOG_SOURCE_SCHEMA_VERSION,
+            generation:     generation.expect("authoritative state has generation"),
+        };
+        validate_catalog_snapshot(&response, limits)?;
+        return Ok(response);
+    }
+
+    for attempt in 0..CATALOG_SNAPSHOT_ATTEMPTS {
+        let before = generation
+            .as_deref()
+            .expect("authoritative state has generation");
+        let mut registrations = scan_catalog_tables_bounded(meta, before, limits).await?;
+        let after = registry::directory_generation(meta)
+            .await
+            .map_err(|_| Status::unavailable("catalog snapshot unavailable"))?;
+        if generation.as_deref() != Some(after.as_slice()) {
+            generation = Some(after);
+            if attempt + 1 == CATALOG_SNAPSHOT_ATTEMPTS {
+                return Err(Status::unavailable("catalog snapshot changed"));
+            }
+            continue;
+        }
+        registrations.sort_by(|left, right| {
+            (&left.0.namespace.0, &left.0.name.0).cmp(&(&right.0.namespace.0, &right.0.name.0))
+        });
+        let response = CatalogDirectoryResponse::Snapshot {
+            schema_version: CATALOG_SOURCE_SCHEMA_VERSION,
+            generation,
+            registrations,
+        };
+        validate_catalog_snapshot(&response, limits)?;
+        return Ok(response);
+    }
+    unreachable!("catalog snapshot attempts are non-zero")
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct AppendAdmission {
@@ -357,20 +595,23 @@ where
 /// [`Leadership`] flag it gates writes on.
 pub(crate) struct MetasrvFlightService {
     /// The registry authority every action dispatches to.
-    pub(crate) metasrv:            Arc<Metasrv>,
+    pub(crate) metasrv:                    Arc<Metasrv>,
     /// The shared leadership state consulted before serving a write.
-    pub(crate) leadership:         Arc<Leadership>,
+    pub(crate) leadership:                 Arc<Leadership>,
     /// This node's own Flight address, used to tell "the leader is me" apart
     /// from "forward to another node" when the leader flag is briefly stale.
-    pub(crate) own_addr:           String,
+    pub(crate) own_addr:                   String,
     /// TLS and service identity for forwarding writes to the elected leader.
-    pub(crate) peer_security:      ClientSecurity,
+    pub(crate) peer_security:              ClientSecurity,
     /// Trusted policy used to derive every remotely-created table location.
-    pub(crate) table_placement:    Option<TablePlacement>,
+    pub(crate) table_placement:            Option<TablePlacement>,
     /// Process-local admission shared by direct and forwarded FILE appends.
-    pub(crate) append_admission:   AppendAdmission,
+    pub(crate) append_admission:           AppendAdmission,
+    /// Bound full-directory construction and retain admission through
+    /// transport.
+    pub(crate) catalog_snapshot_admission: Arc<Semaphore>,
     #[cfg(feature = "test")]
-    pub(crate) append_result_gate: Option<Arc<crate::AppendResultGate>>,
+    pub(crate) append_result_gate:         Option<Arc<crate::AppendResultGate>>,
 }
 
 /// `create_table` action body: the table to materialize and register.
@@ -432,6 +673,30 @@ fn build_schema(columns: &[String]) -> Result<SchemaRef, Status> {
 fn respond_json<T: Serialize>(value: &T) -> Result<Response<ActionStream>, Status> {
     let body = serde_json::to_vec(value).map_err(|e| Status::internal(e.to_string()))?;
     let result = FlightResult { body: body.into() };
+    let stream: ActionStream = Box::pin(futures::stream::once(async move { Ok(result) }));
+    Ok(Response::new(stream))
+}
+
+struct AdmittedCatalogBody {
+    body:    Vec<u8>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for AdmittedCatalogBody {
+    fn as_ref(&self) -> &[u8] { &self.body }
+}
+
+fn respond_catalog_snapshot(
+    value: &CatalogDirectoryResponse,
+    permit: OwnedSemaphorePermit,
+) -> Result<Response<ActionStream>, Status> {
+    let body = serde_json::to_vec(value).map_err(|_| Status::internal("serialization failed"))?;
+    let result = FlightResult {
+        body: Bytes::from_owner(AdmittedCatalogBody {
+            body,
+            _permit: permit,
+        }),
+    };
     let stream: ActionStream = Box::pin(futures::stream::once(async move { Ok(result) }));
     Ok(Response::new(stream))
 }
@@ -624,6 +889,23 @@ impl MetasrvFlightService {
             .collect();
         respond_json(&namespaces)
     }
+
+    /// Return one conditional, generation-coherent catalog directory.
+    async fn action_catalog_snapshot(&self, body: &[u8]) -> Result<Response<ActionStream>, Status> {
+        let permit = self
+            .catalog_snapshot_admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("catalog snapshot is busy"))?;
+        let request: CatalogDirectoryRequest = parse_body(body)?;
+        let response = build_catalog_snapshot(
+            self.metasrv.meta().as_ref(),
+            request,
+            CatalogSnapshotLimits::default(),
+        )
+        .await?;
+        respond_catalog_snapshot(&response, permit)
+    }
 }
 
 #[tonic::async_trait]
@@ -798,6 +1080,16 @@ impl FlightService for MetasrvFlightService {
                     self.action_list_namespaces(&principal, delegated.as_deref())
                         .await
                 }
+                "catalog_snapshot" => match principal.role() {
+                    PrincipalRole::QueryService
+                    | PrincipalRole::MetadataPeer
+                    | PrincipalRole::Admin
+                        if delegated.is_none() =>
+                    {
+                        self.action_catalog_snapshot(&action.body).await
+                    }
+                    _ => Err(Status::permission_denied(RESOURCE_UNAVAILABLE)),
+                },
                 other => Err(Status::unimplemented(format!(
                     "unknown action type '{other}'"
                 ))),
@@ -838,6 +1130,11 @@ impl FlightService for MetasrvFlightService {
             ActionType {
                 r#type:      "list_namespaces".to_string(),
                 description: "List all namespaces. No body.".to_string(),
+            },
+            ActionType {
+                r#type:      "catalog_snapshot".to_string(),
+                description: "Conditionally read one bounded coherent catalog generation."
+                    .to_string(),
             },
         ];
         let stream: Self::ListActionsStream = Box::pin(futures::stream::iter(
@@ -1981,6 +2278,258 @@ mod file_append_tests {
 }
 
 #[cfg(test)]
+mod catalog_snapshot_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use arrow_flight::{Action, flight_service_server::FlightService};
+    use async_trait::async_trait;
+    use lake_catalog::{CatalogDirectoryRequest, CatalogDirectoryResponse};
+    use lake_common::{
+        Principal, PrincipalId, PrincipalRole, TableLocation, TableRef, TenantId, Version,
+    };
+    use lake_engine::TableEngineRef;
+    use lake_engine_lance::LanceEngine;
+    use lake_flight::ClientSecurity;
+    use lake_meta::{
+        MetaStore, MetaStoreRef, RocksMeta, SignaledMutation, registry, registry::TableRegistration,
+    };
+    use tokio::sync::Semaphore;
+
+    use super::{
+        AppendAdmission, CATALOG_SNAPSHOT_CONCURRENCY, CatalogSnapshotLimits, MetasrvFlightService,
+        build_catalog_snapshot,
+    };
+    use crate::{AppendLimits, Metasrv, leadership::Leadership};
+
+    struct MutateDuringCatalogScanMeta {
+        inner:   MetaStoreRef,
+        mutated: AtomicBool,
+    }
+
+    #[async_trait]
+    impl MetaStore for MutateDuringCatalogScanMeta {
+        async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+
+        async fn cas(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            self.inner.cas(key, expected, new).await
+        }
+
+        async fn signaled_mutate(&self, mutation: SignaledMutation<'_>) -> lake_meta::Result<bool> {
+            self.inner.signaled_mutate(mutation).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn scan_prefix(&self, prefix: &str) -> lake_meta::Result<Vec<(String, Vec<u8>)>> {
+            let entries = self.inner.scan_prefix(prefix).await?;
+            if prefix == "tbl/" && !self.mutated.swap(true, Ordering::SeqCst) {
+                registry::register(
+                    self.inner.as_ref(),
+                    &TableRef::new("robots", "late"),
+                    &registration("mem://late"),
+                )
+                .await?;
+            }
+            Ok(entries)
+        }
+
+        async fn delete(&self, key: &str, expected: &[u8]) -> lake_meta::Result<bool> {
+            self.inner.delete(key, expected).await
+        }
+    }
+
+    fn registration(location: &str) -> TableRegistration {
+        TableRegistration::new(
+            TableLocation::new(location),
+            "lance",
+            Version(1),
+            Vec::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn remote_catalog_snapshot_is_generation_coherent_and_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let inner: MetaStoreRef = Arc::new(RocksMeta::open(root.path()).unwrap());
+        registry::register(
+            inner.as_ref(),
+            &TableRef::new("robots", "early"),
+            &registration("mem://early"),
+        )
+        .await
+        .unwrap();
+        registry::finalize_directory_generation(inner.as_ref())
+            .await
+            .unwrap();
+        let meta: MetaStoreRef = Arc::new(MutateDuringCatalogScanMeta {
+            inner,
+            mutated: AtomicBool::new(false),
+        });
+        let limits = CatalogSnapshotLimits::try_new(10, 1024, 16 * 1024).unwrap();
+
+        let response =
+            build_catalog_snapshot(meta.as_ref(), CatalogDirectoryRequest::default(), limits)
+                .await
+                .unwrap();
+        let generation = match response {
+            CatalogDirectoryResponse::Snapshot {
+                generation: Some(generation),
+                registrations,
+                ..
+            } => {
+                assert_eq!(registrations.len(), 2, "mixed first scan must be retried");
+                generation
+            }
+            _ => panic!("initial request must return a coherent snapshot"),
+        };
+        assert!(matches!(
+            build_catalog_snapshot(
+                meta.as_ref(),
+                CatalogDirectoryRequest::new(Some(generation.clone())),
+                limits,
+            )
+            .await
+            .unwrap(),
+            CatalogDirectoryResponse::NotModified { generation: current, .. }
+                if current == generation
+        ));
+
+        let error = build_catalog_snapshot(
+            meta.as_ref(),
+            CatalogDirectoryRequest::default(),
+            CatalogSnapshotLimits::try_new(1, 1024, 16 * 1024).unwrap(),
+        )
+        .await
+        .expect_err("entry limit must reject before response publication");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+
+        let error = build_catalog_snapshot(
+            meta.as_ref(),
+            CatalogDirectoryRequest::default(),
+            CatalogSnapshotLimits::try_new(10, 1024, 16).unwrap(),
+        )
+        .await
+        .expect_err("response byte limit must reject during bounded construction");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+
+        let legacy_root = tempfile::tempdir().unwrap();
+        let legacy: MetaStoreRef = Arc::new(RocksMeta::open(legacy_root.path()).unwrap());
+        registry::register(
+            legacy.as_ref(),
+            &TableRef::new("robots", "legacy"),
+            &registration("mem://legacy"),
+        )
+        .await
+        .unwrap();
+        let error = build_catalog_snapshot(
+            legacy.as_ref(),
+            CatalogDirectoryRequest::default(),
+            CatalogSnapshotLimits::default(),
+        )
+        .await
+        .expect_err("remote snapshots require an authoritative generation");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+        let schema_root = tempfile::tempdir().unwrap();
+        let schema_meta: MetaStoreRef = Arc::new(RocksMeta::open(schema_root.path()).unwrap());
+        registry::register(
+            schema_meta.as_ref(),
+            &TableRef::new("robots", "wide"),
+            &TableRegistration::new(
+                TableLocation::new("mem://wide"),
+                "lance",
+                Version(1),
+                vec![0; 2],
+            ),
+        )
+        .await
+        .unwrap();
+        registry::finalize_directory_generation(schema_meta.as_ref())
+            .await
+            .unwrap();
+        let error = build_catalog_snapshot(
+            schema_meta.as_ref(),
+            CatalogDirectoryRequest::default(),
+            CatalogSnapshotLimits::try_new(10, 1, 16 * 1024).unwrap(),
+        )
+        .await
+        .expect_err("schema limit must reject before retaining the registration");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let service = MetasrvFlightService {
+            metasrv: Arc::new(Metasrv::new(meta, engine)),
+            leadership: Arc::new(Leadership::new()),
+            own_addr: "127.0.0.1:50052".to_owned(),
+            peer_security: ClientSecurity::new(),
+            table_placement: None,
+            append_admission: AppendAdmission::new(AppendLimits::default()),
+            catalog_snapshot_admission: Arc::new(Semaphore::new(CATALOG_SNAPSHOT_CONCURRENCY)),
+            #[cfg(feature = "test")]
+            append_result_gate: None,
+        };
+        let action = Action {
+            r#type: "catalog_snapshot".to_owned(),
+            body:   serde_json::to_vec(&CatalogDirectoryRequest::default())
+                .unwrap()
+                .into(),
+        };
+        let user = Principal::try_new(
+            PrincipalId::try_new("user-a").unwrap(),
+            TenantId::try_new("tenant-a").unwrap(),
+            PrincipalRole::User,
+            ["robots"],
+        )
+        .unwrap();
+        let mut request = tonic::Request::new(action.clone());
+        request.extensions_mut().insert(user);
+        let error = match FlightService::do_action(&service, request).await {
+            Ok(_) => panic!("user principals must not read the full catalog"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+        let query = Principal::try_new(
+            PrincipalId::try_new("query-a").unwrap(),
+            TenantId::try_new("service").unwrap(),
+            PrincipalRole::QueryService,
+            std::iter::empty::<&str>(),
+        )
+        .unwrap();
+        let mut request = tonic::Request::new(action.clone());
+        request.extensions_mut().insert(query.clone());
+        let first = FlightService::do_action(&service, request)
+            .await
+            .expect("first catalog snapshot is admitted");
+
+        let mut request = tonic::Request::new(action.clone());
+        request.extensions_mut().insert(query.clone());
+        let error = match FlightService::do_action(&service, request).await {
+            Ok(_) => panic!("second catalog snapshot must be rejected while the first is held"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        drop(first);
+
+        let mut request = tonic::Request::new(action);
+        request.extensions_mut().insert(query);
+        assert!(FlightService::do_action(&service, request).await.is_ok());
+    }
+}
+
+#[cfg(test)]
 mod schema_tests {
     use lake_objects::data_location_field;
 
@@ -2005,9 +2554,10 @@ mod table_placement_tests {
     use lake_flight::ClientSecurity;
     use lake_meta::{MetaStoreRef, RocksMeta};
     use serde_json::json;
+    use tokio::sync::Semaphore;
     use tonic::Code;
 
-    use super::{AppendAdmission, MetasrvFlightService};
+    use super::{AppendAdmission, CATALOG_SNAPSHOT_CONCURRENCY, MetasrvFlightService};
     use crate::{AppendLimits, Metasrv, TablePlacement, leadership::Leadership};
 
     fn service(root: &tempfile::TempDir) -> MetasrvFlightService {
@@ -2023,6 +2573,7 @@ mod table_placement_tests {
             peer_security: ClientSecurity::new(),
             table_placement: Some(TablePlacement::local(root.path().join("tables"))),
             append_admission: AppendAdmission::new(AppendLimits::default()),
+            catalog_snapshot_admission: Arc::new(Semaphore::new(CATALOG_SNAPSHOT_CONCURRENCY)),
             #[cfg(feature = "test")]
             append_result_gate: None,
         }

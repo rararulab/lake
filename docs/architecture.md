@@ -46,6 +46,19 @@ so catalog reads are served locally and the metadata authority sees only
 cache-miss and write traffic. That is why the metadata tier being hard to
 fan out is acceptable — it is not on the hot read path.
 
+Production Query does not program against the registry KV interface. Its
+read-only `CatalogSource` is an authenticated Metasrv Flight client exposing
+only delegated point resolution and a versioned conditional directory
+snapshot—no CAS, raw key, prefix scan, or delete. `catalog_snapshot` accepts
+the last opaque generation and returns `not_modified` or one canonical
+directory assembled between matching generation reads. Metasrv retries a
+racing generation at most three times, scans in 64-entry pages, accounts each
+entry before retaining it, and caps entries, individual schema IPC, generation
+tokens, and the serialized response. One process admits at most one full
+snapshot construction and retains that admission until the response is dropped.
+Only QueryService, MetadataPeer, and Admin identities may read the full
+directory. User principals remain namespace-scoped.
+
 Each query replica also keeps a capacity-bounded DataFusion provider cache.
 The key includes table name, engine, physical location, incarnation, and
 registry version. Concurrent SQL planning for one generation coalesces into
@@ -55,24 +68,32 @@ providers remain safe for in-flight readers and disappear through normal
 eviction. Missing or failed loads are never cached.
 
 Catalog listing refresh is startup-strict and runtime-available. A replica
-must synchronously publish its first complete registry generation before it is
-ready. After that, an expired request-path check serves the immutable
+must connect to Metasrv and synchronously publish its first complete catalog
+generation before it is ready. After that, an expired request-path check serves the immutable
 last-good generation immediately and admits at most one tracked background
 revalidation. A failed scan records bounded process-local health without
 replacing the snapshot; a later successful scan atomically publishes the
 replacement and clears failure state. Query shutdown aborts and joins the
 tracked request-triggered task, while the scheduled server refresher is owned
 directly by the server cancellation token. All fallible address/security/TLS
-setup precedes task creation; a drop guard also cancels and aborts both refresh
+configuration and the first catalog connection fail before Query binds. Warm
+directory checks usually return `not_modified`; warm registration and listing
+hits perform no metadata RPC. The Lance engine may still use physical manifest
+KV while opening object-store datasets; separating that storage metadata into
+a least-privilege table/credential is distinct from catalog authority and is
+not implied by this boundary.
+All of that setup precedes task creation; a drop guard also cancels and aborts both refresh
 paths if the serve future itself is cancelled.
 
 Steady refresh is generation-gated after an explicit mixed-writer rollout
 finalization. Registry create/delete atomically move an opaque directory
 generation; append version changes do not. An unchanged generation costs one
-point read and skips the `tbl/` scan. A changed generation is read again after
-the scan, and a moving candidate is discarded with bounded retry while the
-last-good snapshot remains published. Before the monotonic authority marker
-exists, replicas retain full-scan compatibility for legacy writers. See
+conditional RPC whose Metasrv handler performs one generation point read and
+skips the `tbl/` scan. A changed generation is read again after the paged scan,
+and a moving candidate is discarded with bounded retry while the last-good
+snapshot remains published. Before the monotonic authority marker exists, the
+remote action fails closed; only the explicitly local development adapter
+retains legacy full-scan compatibility. See
 [Catalog directory generations](design/catalog-directory-generation.md).
 
 The published listing is an immutable `Arc<CatalogGeneration>` containing both

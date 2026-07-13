@@ -32,21 +32,21 @@ use datafusion::{
 };
 use lake_common::{Namespace, TableLocation, TableName, TableRef, Version};
 use lake_engine::TableEngineRef;
-use lake_meta::{MetaStoreRef, registry, registry::TableRegistration};
+use lake_meta::{MetaStoreRef, registry::TableRegistration};
 use moka::future::Cache;
 use snafu::Snafu;
 use tokio::{sync::Mutex, time::Instant};
 
-use crate::schema::LakeSchema;
+use crate::{
+    CATALOG_SOURCE_SCHEMA_VERSION, CatalogDirectoryRequest, CatalogDirectoryResponse,
+    CatalogSourceError, CatalogSourceRef, LocalCatalogSource, schema::LakeSchema,
+};
 
 /// Bound how long a resolved registration can hide a registry version update.
 const REGISTRATION_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// One provider per catalog table at the target deployment scale.
 const PROVIDER_CACHE_CAPACITY: u64 = 100_000;
-
-/// Bound authority scans when DDL keeps moving the directory under refresh.
-const DIRECTORY_REFRESH_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RegistrationCacheKey {
@@ -179,11 +179,11 @@ impl CatalogRefreshHealth {
     pub const fn last_failure_age(&self) -> Option<Duration> { self.last_failure_age }
 }
 
-/// Shared state behind the catalog: the metastore (registry authority), the
-/// storage engine, a cached listing snapshot, and a per-table registration
+/// Shared state behind the catalog: the read-only metadata authority source,
+/// the storage engine, a cached listing snapshot, and a per-table registration
 /// cache.
 pub struct CatalogState {
-    pub(crate) meta:      MetaStoreRef,
+    pub(crate) source:    CatalogSourceRef,
     pub(crate) engine:    TableEngineRef,
     /// namespace -> table names. Read by DataFusion's sync listing methods,
     /// so it must never require I/O. Refreshed by [`LakeCatalog::refresh`].
@@ -198,8 +198,6 @@ pub struct CatalogState {
     providers:            Cache<ProviderGeneration, Arc<dyn TableProvider>>,
     /// Serializes authority scans without blocking snapshot readers.
     refresh_lock:         Mutex<()>,
-    /// Monotonic local observation of the rollout authority marker.
-    directory_authority:  AtomicBool,
     /// Generation represented by the published snapshot.
     directory_generation: RwLock<Option<Vec<u8>>>,
     /// Last complete generation publication. A missing value means startup
@@ -234,7 +232,7 @@ impl CatalogState {
     pub(crate) async fn registration(
         &self,
         table: &TableRef,
-    ) -> lake_meta::Result<Option<Arc<TableRegistration>>> {
+    ) -> Result<Option<Arc<TableRegistration>>, CatalogSourceError> {
         let epoch = self
             .registration_epochs
             .read()
@@ -249,7 +247,7 @@ impl CatalogState {
         if let Some(hit) = self.regs.get(&key).await {
             return Ok(Some(hit));
         }
-        let Some(reg) = registry::get(self.meta.as_ref(), table).await? else {
+        let Some(reg) = self.source.resolve(table).await? else {
             return Ok(None);
         };
         let reg = Arc::new(reg);
@@ -329,17 +327,21 @@ impl std::fmt::Debug for LakeCatalog {
 
 impl LakeCatalog {
     pub fn new(meta: MetaStoreRef, engine: TableEngineRef) -> Self {
-        Self::with_provider_cache_capacity(meta, engine, PROVIDER_CACHE_CAPACITY)
+        Self::with_source(Arc::new(LocalCatalogSource::new(meta)), engine)
+    }
+
+    pub fn with_source(source: CatalogSourceRef, engine: TableEngineRef) -> Self {
+        Self::with_provider_cache_capacity(source, engine, PROVIDER_CACHE_CAPACITY)
     }
 
     fn with_provider_cache_capacity(
-        meta: MetaStoreRef,
+        source: CatalogSourceRef,
         engine: TableEngineRef,
         provider_cache_capacity: u64,
     ) -> Self {
         Self {
             state: Arc::new(CatalogState {
-                meta,
+                source,
                 engine,
                 snapshot: RwLock::new(Arc::new(CatalogGeneration::default())),
                 regs: Cache::builder()
@@ -351,7 +353,6 @@ impl LakeCatalog {
                     .max_capacity(provider_cache_capacity)
                     .build(),
                 refresh_lock: Mutex::new(()),
-                directory_authority: AtomicBool::new(false),
                 directory_generation: RwLock::new(None),
                 refreshed_at: RwLock::new(None),
                 refresh_in_flight: AtomicBool::new(false),
@@ -369,7 +370,11 @@ impl LakeCatalog {
         engine: TableEngineRef,
         capacity: u64,
     ) -> Self {
-        Self::with_provider_cache_capacity(meta, engine, capacity)
+        Self::with_provider_cache_capacity(
+            Arc::new(LocalCatalogSource::new(meta)),
+            engine,
+            capacity,
+        )
     }
 
     #[cfg(test)]
@@ -390,7 +395,7 @@ impl LakeCatalog {
     pub async fn resolve_snapshot(
         &self,
         table: &TableRef,
-    ) -> lake_meta::Result<Option<TableSnapshot>> {
+    ) -> Result<Option<TableSnapshot>, CatalogSourceError> {
         Ok(self
             .state
             .registration(table)
@@ -465,13 +470,13 @@ impl LakeCatalog {
     /// Reload the listing snapshot from the registry. Call on startup and on
     /// a timer; DataFusion's sync `schema_names`/`table_names` read what this
     /// leaves behind, so they never block on the metastore.
-    pub async fn refresh(&self) -> lake_meta::Result<()> { self.refresh_inner(None).await }
+    pub async fn refresh(&self) -> Result<(), CatalogSourceError> { self.refresh_inner(None).await }
 
     /// Reload the listing snapshot only when it is older than `max_age`.
     /// The first warm is synchronous and fail-closed. Once a last-good
     /// generation exists, stale callers trigger one detached revalidation and
     /// return immediately so metadata I/O never blocks SQL planning.
-    pub async fn refresh_if_stale(&self, max_age: Duration) -> lake_meta::Result<()> {
+    pub async fn refresh_if_stale(&self, max_age: Duration) -> Result<(), CatalogSourceError> {
         if self.state.refresh_shutdown.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -539,7 +544,7 @@ impl LakeCatalog {
             .take()
     }
 
-    async fn refresh_inner(&self, max_age: Option<Duration>) -> lake_meta::Result<()> {
+    async fn refresh_inner(&self, max_age: Option<Duration>) -> Result<(), CatalogSourceError> {
         let _refresh = self.state.refresh_lock.lock().await;
         let refreshed_at = *self
             .state
@@ -550,57 +555,44 @@ impl LakeCatalog {
             return Ok(());
         }
 
-        let mut generation = match self.observe_directory_generation().await {
-            Ok(generation) => generation,
+        let known_generation = self
+            .state
+            .directory_generation
+            .read()
+            .expect("directory generation lock poisoned")
+            .clone();
+        let response = match self
+            .state
+            .source
+            .directory(CatalogDirectoryRequest::new(known_generation.clone()))
+            .await
+        {
+            Ok(response) => response,
             Err(error) => {
                 self.record_refresh_failure();
                 return Err(error);
             }
         };
-        if generation.as_deref()
-            == self
-                .state
-                .directory_generation
-                .read()
-                .expect("directory generation lock poisoned")
-                .as_deref()
-            && refreshed_at.is_some()
-            && generation.is_some()
-        {
-            self.record_refresh_success();
-            return Ok(());
-        }
-
-        let registrations = 'attempts: {
-            for attempt in 0..DIRECTORY_REFRESH_ATTEMPTS {
-                let registrations = match registry::scan_tables(self.state.meta.as_ref()).await {
-                    Ok(registrations) => registrations,
-                    Err(error) => {
-                        self.record_refresh_failure();
-                        return Err(error);
-                    }
-                };
-                if let Some(before) = generation.as_deref() {
-                    let after = match registry::directory_generation(self.state.meta.as_ref()).await
-                    {
-                        Ok(after) => after,
-                        Err(error) => {
-                            self.record_refresh_failure();
-                            return Err(error);
-                        }
-                    };
-                    if after != before {
-                        generation = Some(after);
-                        if attempt + 1 == DIRECTORY_REFRESH_ATTEMPTS {
-                            self.record_refresh_failure();
-                            return Err(lake_meta::MetaError::DirectoryGenerationChanged);
-                        }
-                        continue;
-                    }
-                }
-                break 'attempts registrations;
+        let (generation, registrations) = match response {
+            CatalogDirectoryResponse::NotModified {
+                schema_version,
+                generation,
+            } if schema_version == CATALOG_SOURCE_SCHEMA_VERSION
+                && refreshed_at.is_some()
+                && known_generation.as_deref() == Some(generation.as_slice()) =>
+            {
+                self.record_refresh_success();
+                return Ok(());
             }
-            unreachable!("directory refresh attempts are non-zero")
+            CatalogDirectoryResponse::Snapshot {
+                schema_version,
+                generation,
+                registrations,
+            } if schema_version == CATALOG_SOURCE_SCHEMA_VERSION => (generation, registrations),
+            _ => {
+                self.record_refresh_failure();
+                return Err(CatalogSourceError::InvalidResponse);
+            }
         };
         let mut snapshot = CatalogGeneration::default();
         for (table, registration) in registrations {
@@ -623,27 +615,6 @@ impl LakeCatalog {
             .expect("directory generation lock poisoned") = generation;
         self.record_refresh_success();
         Ok(())
-    }
-
-    async fn observe_directory_generation(&self) -> lake_meta::Result<Option<Vec<u8>>> {
-        if self.state.directory_authority.load(Ordering::Acquire) {
-            return registry::directory_generation(self.state.meta.as_ref())
-                .await
-                .map(Some);
-        }
-        let directory = registry::directory_state(self.state.meta.as_ref()).await?;
-        if !directory.authoritative() {
-            return Ok(None);
-        }
-        self.state
-            .directory_authority
-            .store(true, Ordering::Release);
-        Ok(Some(
-            directory
-                .generation()
-                .expect("authoritative directory state has a generation")
-                .to_vec(),
-        ))
     }
 
     fn record_refresh_success(&self) {
@@ -717,12 +688,63 @@ mod tests {
         TableHandleRef,
     };
     use lake_engine_lance::LanceEngine;
-    use lake_meta::{MetaError, MetaStore, RocksMeta};
+    use lake_meta::{MetaError, MetaStore, RocksMeta, registry};
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::{
+        CatalogDirectoryRequest, CatalogDirectoryResponse, CatalogSource, LocalCatalogSource,
+    };
 
     struct FailingGetMeta;
+
+    #[tokio::test]
+    async fn catalog_source_local_adapter_returns_conditional_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path()).unwrap());
+        let table = TableRef::new("robots", "episodes");
+        let registration = TableRegistration::new(
+            TableLocation::new("mem://episodes"),
+            "lance",
+            Version(7),
+            Vec::new(),
+        );
+        registry::register(meta.as_ref(), &table, &registration)
+            .await
+            .unwrap();
+        registry::finalize_directory_generation(meta.as_ref())
+            .await
+            .unwrap();
+        let source = LocalCatalogSource::new(meta);
+
+        let first = source
+            .directory(CatalogDirectoryRequest::default())
+            .await
+            .unwrap();
+        let generation = match first {
+            CatalogDirectoryResponse::Snapshot {
+                generation: Some(generation),
+                registrations,
+                ..
+            } => {
+                assert_eq!(registrations, vec![(table.clone(), registration.clone())]);
+                generation
+            }
+            _ => panic!("first conditional request must return a full snapshot"),
+        };
+        assert_eq!(source.resolve(&table).await.unwrap(), Some(registration));
+        assert!(matches!(
+            source
+                .directory(CatalogDirectoryRequest::new(Some(generation.clone())))
+                .await
+                .unwrap(),
+            CatalogDirectoryResponse::NotModified {
+                generation: current,
+                ..
+            }
+                if current == generation
+        ));
+    }
 
     struct SnapshotProbeEngine {
         location: TableLocation,
