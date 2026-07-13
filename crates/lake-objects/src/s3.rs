@@ -44,6 +44,7 @@ use crate::{
     checkpoint::{
         CheckpointBinding, CheckpointLock, CheckpointPart, SourceIdentity, UploadCheckpointV1,
     },
+    integrity::exact_range_reader,
     validate_presign_expiration, validate_range,
 };
 
@@ -443,7 +444,7 @@ impl S3ObjectStore {
         location: &DataLocation,
         range: Range<u64>,
     ) -> Result<ObjectReader> {
-        validate_range(location, &range)?;
+        let length = validate_range(location, &range)?;
         let key = self.managed_key(&location.uri)?;
         let inclusive_end = range.end - 1;
         let output = self
@@ -458,7 +459,10 @@ impl S3ObjectStore {
                 action:  "get_object_range",
                 message: error.to_string(),
             })?;
-        Ok(Box::pin(output.body.into_async_read()))
+        Ok(exact_range_reader(
+            Box::pin(output.body.into_async_read()),
+            length,
+        ))
     }
 
     /// Mint a bounded GET capability without issuing an object request.

@@ -54,10 +54,13 @@ integrity failures are `InvalidData` I/O errors with a public typed source.
 For random-access consumers, `LakeClient::open_range(&location, start..end)`
 uses Rust half-open byte ranges. The managed stage rejects empty, reversed, or
 out-of-bounds intervals against `DataLocation.size_bytes` before opening the
-object. Local storage seeks once and limits the returned stream to
-`end - start`; S3 sends one `Range: bytes=start-(end-1)` request. The returned
-type is still a streaming `AsyncRead`, so callers can feed a decoder without
-allocating the interval or downloading the object prefix.
+object. Local storage seeks once and S3 sends one
+`Range: bytes=start-(end-1)` request. Both the stage and SDK cap the returned
+stream at `end - start`; draining it either yields exactly that many bytes or
+ends with `InvalidData` carrying `ObjectIntegrityError::PrematureEof` with the
+range's expected and observed byte counts. The returned type is still a
+streaming `AsyncRead`, so callers can feed a decoder without allocating the
+interval or downloading the object prefix.
 
 Range and presigned reads do not claim the full-object SHA-256. A partial
 interval cannot establish the identity of bytes it did not read; per-range

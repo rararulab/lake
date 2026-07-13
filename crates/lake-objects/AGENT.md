@@ -17,14 +17,16 @@ Managed large-object values and direct storage access for the Rust SDK.
   exact size plus SHA-256 only at EOF, using constant memory. An early drop is
   not a successful verification.
 - Byte ranges are non-empty half-open intervals checked against immutable
-  `DataLocation.size_bytes` before local or S3 I/O.
+  `DataLocation.size_bytes` before local or S3 I/O. A drained range reader
+  yields exactly the requested byte count or a typed early-EOF error, without
+  reading beyond the interval or buffering it.
 - GC never scans table rows, never trusts draft output, and never deletes
   without a fully verified immutable plan plus page checkpoint.
 
 ## Layout
 
 - `lib.rs` — public object value, Arrow conversion, and storage interfaces.
-- `integrity.rs` — bounded full-read size/SHA-256 verification and typed errors.
+- `integrity.rs` — bounded full-read SHA-256 and exact-range length verification.
 - `local.rs` — local-development managed-object implementation.
 - `s3.rs` — production managed-prefix validation, multipart upload/abort, and
   direct S3 reads, bounded GET presigning, inventory, and deletion.

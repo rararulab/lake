@@ -30,7 +30,8 @@ The Rust SDK's typed write and direct-read surface.
 - `query` streams Flight RecordBatches; `data_location` decodes a logical
   `FILE`, and `open` reads directly while verifying size/SHA-256 at EOF.
 - `open_range` delegates one validated half-open interval directly to the
-  configured stage; query and metasrv never proxy range bytes.
+  configured stage and independently rejects a short stream; query and metasrv
+  never proxy range bytes.
 - `open_via_query` and `open_range_via_query` are the credentialless direct-read
   paths: they obtain one Query-issued capability and stream directly from
   object storage without constructing a managed-stage client. Full reads retain

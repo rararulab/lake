@@ -595,8 +595,9 @@ design-level ones:
   half-open byte-range readers share the same SDK/storage boundary. Full opens
   validate the DataLocation hash before I/O and incrementally verify declared
   size plus SHA-256 at EOF with constant memory; malformed, short, long, and
-  same-size corrupt identities fail closed. Local ranges seek + limit and S3
-  ranges issue one bounded GET, but partial intervals make no whole-object
+  same-size corrupt identities fail closed. Local ranges seek and S3 ranges
+  issue one bounded GET; both stage and SDK readers cap the interval and fail
+  closed on a short range stream, but partial intervals make no whole-object
   integrity claim. The
   SDK can group 1..=10,000 fully validated rows into one Arrow batch and one
   append operation. FILE uploads remain sequential and directly target the
