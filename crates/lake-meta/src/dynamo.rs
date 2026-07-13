@@ -22,6 +22,7 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -29,12 +30,11 @@ use std::{
 use async_trait::async_trait;
 use aws_sdk_dynamodb::{
     Client,
-    client::Waiters as _,
     operation::transact_write_items::TransactWriteItemsError,
     primitives::Blob,
     types::{
         AttributeDefinition, AttributeValue, BillingMode, ConditionCheck, Delete, KeySchemaElement,
-        KeyType, Put, ScalarAttributeType, TransactWriteItem,
+        KeyType, Put, ScalarAttributeType, TableStatus, TransactWriteItem,
     },
 };
 use snafu::IntoError;
@@ -56,6 +56,72 @@ const V2_BACKFILL_CURSOR_KEY: &str = "__lake_internal/dynamo-prefix-v2-backfill-
 const MIGRATION_PAGE_LIMIT_MAX: usize = 10_000;
 const METRICS_BARRIER_REFRESH_SECS: u64 = 30;
 const METRICS_BARRIER_REFRESH_TIMEOUT: Duration = Duration::from_millis(100);
+const DYNAMO_TABLE_READY_MAX_ATTEMPTS: usize = 120;
+const DYNAMO_TABLE_READY_RETRY: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Eq, PartialEq)]
+enum TableReadiness {
+    Active,
+    Pending(String),
+    Unavailable(String),
+}
+
+impl TableReadiness {
+    const fn active() -> Self { Self::Active }
+
+    fn pending(status: impl Into<String>) -> Self { Self::Pending(status.into()) }
+
+    fn unavailable(status: impl Into<String>) -> Self { Self::Unavailable(status.into()) }
+}
+
+fn table_readiness(status: Option<&TableStatus>) -> TableReadiness {
+    let status = status.map_or("MISSING", TableStatus::as_str);
+    match status {
+        "ACTIVE" => TableReadiness::active(),
+        "CREATING" | "UPDATING" => TableReadiness::pending(status),
+        _ => TableReadiness::unavailable(status),
+    }
+}
+
+async fn wait_for_table_active<Observe, ObserveFuture, Sleep, SleepFuture>(
+    table: &str,
+    max_attempts: usize,
+    mut observe: Observe,
+    mut sleep: Sleep,
+) -> Result<()>
+where
+    Observe: FnMut() -> ObserveFuture,
+    ObserveFuture: Future<Output = Result<TableReadiness>>,
+    Sleep: FnMut(Duration) -> SleepFuture,
+    SleepFuture: Future<Output = ()>,
+{
+    debug_assert!(
+        max_attempts > 0,
+        "table readiness needs at least one observation"
+    );
+
+    for attempt in 1..=max_attempts {
+        match observe().await? {
+            TableReadiness::Active => return Ok(()),
+            TableReadiness::Pending(last_status) if attempt == max_attempts => {
+                return Err(MetaError::DynamoTableReadinessTimeout {
+                    table: table.to_owned(),
+                    last_status,
+                    attempts: max_attempts,
+                });
+            }
+            TableReadiness::Pending(_) => sleep(DYNAMO_TABLE_READY_RETRY).await,
+            TableReadiness::Unavailable(status) => {
+                return Err(MetaError::DynamoTableUnavailable {
+                    table: table.to_owned(),
+                    status,
+                });
+            }
+        }
+    }
+
+    unreachable!("the observation bound is non-zero")
+}
 
 /// Wrap any AWS SDK error into a [`MetaError::Dynamo`] carrying `message`.
 fn dynamo_err<E>(message: impl Into<String>) -> impl FnOnce(E) -> MetaError
@@ -208,22 +274,40 @@ impl DynamoMeta {
         self.open_tables().await
     }
 
+    async fn describe_table_readiness(&self, table: &str) -> Result<TableReadiness> {
+        match self.client.describe_table().table_name(table).send().await {
+            Ok(response) => Ok(table_readiness(
+                response.table().and_then(|table| table.table_status()),
+            )),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|error| error.is_resource_not_found_exception()) =>
+            {
+                Ok(TableReadiness::pending("NOT_FOUND"))
+            }
+            Err(error) => Err(dynamo_err(format!("describe DynamoDB table '{table}'"))(
+                error,
+            )),
+        }
+    }
+
+    async fn wait_for_table_active(&self, table: &str) -> Result<()> {
+        wait_for_table_active(
+            table,
+            DYNAMO_TABLE_READY_MAX_ATTEMPTS,
+            || self.describe_table_readiness(table),
+            tokio::time::sleep,
+        )
+        .await
+    }
+
     /// Open pre-provisioned tables using only `DescribeTable` plus normal
     /// data-plane read permissions. Runtime Query/Metasrv identities use this
     /// path and do not need `CreateTable`.
     pub async fn open_tables(&self) -> Result<()> {
-        self.client
-            .wait_until_table_exists()
-            .table_name(&self.table)
-            .wait(Duration::from_mins(2))
-            .await
-            .map_err(dynamo_err("wait for legacy table to become active"))?;
-        self.client
-            .wait_until_table_exists()
-            .table_name(&self.v2_table)
-            .wait(Duration::from_mins(2))
-            .await
-            .map_err(dynamo_err("wait for v2 table to become active"))?;
+        self.wait_for_table_active(&self.table).await?;
+        self.wait_for_table_active(&self.v2_table).await?;
         self.refresh_authority().await
     }
 
@@ -1443,6 +1527,82 @@ mod tests {
             .behavior_version_latest()
             .build();
         DynamoMeta::new(Client::from_conf(config), "meta")
+    }
+
+    #[tokio::test]
+    async fn dynamo_table_readiness_retries_transitional_statuses_until_active() {
+        let mut observations = [
+            TableStatus::Creating,
+            TableStatus::Updating,
+            TableStatus::Active,
+        ]
+        .into_iter();
+        let mut pauses = Vec::new();
+
+        wait_for_table_active(
+            "meta_prefix_v2",
+            3,
+            || {
+                std::future::ready(Ok(table_readiness(Some(
+                    &observations.next().expect("queued observation"),
+                ))))
+            },
+            |delay| {
+                pauses.push(delay);
+                std::future::ready(())
+            },
+        )
+        .await
+        .expect("ACTIVE observation makes the table ready");
+
+        assert_eq!(
+            pauses,
+            vec![DYNAMO_TABLE_READY_RETRY, DYNAMO_TABLE_READY_RETRY]
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamo_table_readiness_times_out_with_last_status() {
+        let mut observations = 0;
+        let error = wait_for_table_active(
+            "meta",
+            2,
+            || {
+                observations += 1;
+                std::future::ready(Ok(table_readiness(Some(&TableStatus::Creating))))
+            },
+            |_| std::future::ready(()),
+        )
+        .await
+        .expect_err("perpetually CREATING table must not wait forever");
+
+        assert_eq!(observations, 2);
+        assert!(matches!(
+            error,
+            MetaError::DynamoTableReadinessTimeout {
+                table,
+                last_status,
+                attempts: 2,
+            } if table == "meta" && last_status == "CREATING"
+        ));
+    }
+
+    #[tokio::test]
+    async fn dynamo_table_readiness_rejects_unavailable_status() {
+        let error = wait_for_table_active(
+            "meta_prefix_v2",
+            3,
+            || std::future::ready(Ok(table_readiness(Some(&TableStatus::Deleting)))),
+            |_| std::future::ready(()),
+        )
+        .await
+        .expect_err("unavailable DynamoDB table must fail before data-plane use");
+
+        assert!(matches!(
+            error,
+            MetaError::DynamoTableUnavailable { table, status }
+                if table == "meta_prefix_v2" && status == "DELETING"
+        ));
     }
 
     #[test]
