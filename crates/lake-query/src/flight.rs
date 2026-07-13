@@ -62,6 +62,10 @@ use lake_flight::{
     ClientSecurity, DELEGATED_NAMESPACE_HEADER, DELEGATED_TENANT_HEADER, TracedFlightStream,
     set_span_parent_from_request,
 };
+use lake_objects::{
+    MANAGED_READ_CAPABILITY_ACTION, ManagedReadCapabilityIssuerRef, ManagedReadCapabilityRequest,
+    ManagedReadCapabilityResponse,
+};
 use prost::Message;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
@@ -630,6 +634,8 @@ pub struct FlightSqlServiceImpl {
     pub metadata_security:       ClientSecurity,
     /// Immutable, credential-free stage metadata advertised to SDK clients.
     pub managed_stage:           Option<ManagedStageDescriptor>,
+    /// Query-owned signer for tenant-scoped managed S3 GET capabilities.
+    pub read_capability_issuer:  Option<ManagedReadCapabilityIssuerRef>,
     /// Process-local admission shared by SQL statement RPCs.
     pub(crate) admission:        QueryAdmission,
     /// Process-local row and batch bounds for metadata discovery.
@@ -734,6 +740,43 @@ impl FlightSqlServiceImpl {
             }
         }
         Ok(tables.into_iter().collect())
+    }
+
+    async fn managed_read_capability_action(
+        &self,
+        principal: &Principal,
+        body: &[u8],
+    ) -> std::result::Result<FlightResult, Status> {
+        let request = ManagedReadCapabilityRequest::from_wire(body)
+            .map_err(|_| Status::invalid_argument("invalid managed read capability request"))?;
+        let stage = self
+            .managed_stage
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("managed FILE stage is not configured"))?
+            .scope_to_tenant(principal.tenant());
+        let issuer = self.read_capability_issuer.as_ref().ok_or_else(|| {
+            Status::failed_precondition("managed read capabilities are not configured")
+        })?;
+        issuer
+            .validate(&stage, request.location())
+            .map_err(|_| Status::permission_denied("managed object is not available"))?;
+        let capability = issuer
+            .issue(&stage, request.location(), request.expires_in())
+            .await
+            .map_err(|_| Status::internal("could not issue managed read capability"))?;
+        let now = std::time::SystemTime::now();
+        let maximum = now
+            .checked_add(request.expires_in())
+            .expect("validated one-hour expiration fits SystemTime");
+        if capability.expires_at() <= now || capability.expires_at() > maximum {
+            return Err(Status::internal(
+                "managed read capability issuer returned invalid lifetime",
+            ));
+        }
+        let body = ManagedReadCapabilityResponse::new(capability)
+            .to_wire()
+            .map_err(|_| Status::internal("could not encode managed read capability"))?;
+        Ok(FlightResult { body: body.into() })
     }
 }
 
@@ -1557,26 +1600,34 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let result = async move {
             let principal = self.principal(&request)?;
             let action = request.into_inner();
-            if action.r#type != MANAGED_STAGE_DISCOVERY_ACTION {
-                return Err(Status::invalid_argument(format!(
-                    "unknown query action '{}'",
-                    action.r#type
-                )));
-            }
-            if !action.body.is_empty() {
-                return Err(Status::invalid_argument(
-                    "managed-stage discovery action body must be empty",
-                ));
-            }
-            let descriptor = self.managed_stage.as_ref().ok_or_else(|| {
-                Status::failed_precondition("managed FILE stage is not configured")
-            })?;
-            let body = descriptor
-                .scope_to_tenant(principal.tenant())
-                .to_wire()
-                .map_err(|error| Status::internal(error.to_string()))?;
-            let stream =
-                futures::stream::once(async move { Ok(FlightResult { body: body.into() }) });
+            let result = match action.r#type.as_str() {
+                MANAGED_STAGE_DISCOVERY_ACTION => {
+                    if !action.body.is_empty() {
+                        return Err(Status::invalid_argument(
+                            "managed-stage discovery action body must be empty",
+                        ));
+                    }
+                    let descriptor = self.managed_stage.as_ref().ok_or_else(|| {
+                        Status::failed_precondition("managed FILE stage is not configured")
+                    })?;
+                    let body = descriptor
+                        .scope_to_tenant(principal.tenant())
+                        .to_wire()
+                        .map_err(|_| Status::internal("could not encode managed FILE stage"))?;
+                    FlightResult { body: body.into() }
+                }
+                MANAGED_READ_CAPABILITY_ACTION => {
+                    self.managed_read_capability_action(&principal, &action.body)
+                        .await?
+                }
+                _ => {
+                    return Err(Status::invalid_argument(format!(
+                        "unknown query action '{}'",
+                        action.r#type
+                    )));
+                }
+            };
+            let stream = futures::stream::once(async move { Ok(result) });
             let stream: <Self as FlightService>::DoActionStream = Box::pin(stream);
             Ok(Response::new(stream))
         }
@@ -1586,10 +1637,16 @@ impl FlightSqlService for FlightSqlServiceImpl {
     }
 
     async fn list_custom_actions(&self) -> Option<Vec<std::result::Result<ActionType, Status>>> {
-        Some(vec![Ok(ActionType {
-            r#type:      MANAGED_STAGE_DISCOVERY_ACTION.to_owned(),
-            description: "Return the versioned credential-free managed FILE stage".to_owned(),
-        })])
+        Some(vec![
+            Ok(ActionType {
+                r#type:      MANAGED_STAGE_DISCOVERY_ACTION.to_owned(),
+                description: "Return the versioned credential-free managed FILE stage".to_owned(),
+            }),
+            Ok(ActionType {
+                r#type:      MANAGED_READ_CAPABILITY_ACTION.to_owned(),
+                description: "Issue a bounded tenant-scoped managed FILE GET capability".to_owned(),
+            }),
+        ])
     }
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
@@ -1603,7 +1660,7 @@ mod tests {
             Mutex as StdMutex, RwLock,
             atomic::{AtomicUsize, Ordering},
         },
-        time::Duration,
+        time::{Duration, SystemTime},
     };
 
     use arrow_flight::{
@@ -1629,8 +1686,8 @@ mod tests {
     };
     use futures::{StreamExt, TryStreamExt};
     use lake_common::{
-        MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor, Principal, PrincipalId,
-        PrincipalRole, TableLocation, TableRef, TenantId, Version,
+        DataLocation, MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor, Principal,
+        PrincipalId, PrincipalRole, TableLocation, TableRef, TenantId, Version,
     };
     use lake_engine::{
         EngineError, ObjectReferencePage, ObjectReferenceRequest, TableEngine, TableEngineRef,
@@ -1638,7 +1695,10 @@ mod tests {
     };
     use lake_engine_lance::LanceEngine;
     use lake_meta::{MetaStore, MetaStoreRef, RocksMeta, registry, registry::TableRegistration};
-    use lake_objects::LocalObjectStore;
+    use lake_objects::{
+        LocalObjectStore, ManagedReadCapabilityIssuer, ManagedReadCapabilityRequest,
+        ManagedReadCapabilityResponse, ObjectError, PresignedRead,
+    };
     use tokio::{io::AsyncWriteExt, sync::Notify};
 
     use super::*;
@@ -1672,6 +1732,49 @@ mod tests {
     }
 
     struct EmptyMeta;
+
+    #[derive(Clone, Default)]
+    struct RecordingReadCapabilityIssuer {
+        seen: Arc<StdMutex<Vec<(ManagedStageDescriptor, DataLocation, Duration)>>>,
+    }
+
+    #[async_trait]
+    impl ManagedReadCapabilityIssuer for RecordingReadCapabilityIssuer {
+        fn validate(
+            &self,
+            stage: &ManagedStageDescriptor,
+            location: &DataLocation,
+        ) -> lake_objects::Result<()> {
+            let lake_common::ManagedStageBackend::S3 { bucket, prefix, .. } = stage.backend()
+            else {
+                return Err(ObjectError::PresignUnsupported);
+            };
+            let expected = format!("s3://{bucket}/{prefix}/");
+            if location.uri.starts_with(&expected) {
+                Ok(())
+            } else {
+                Err(ObjectError::PresignUnsupported)
+            }
+        }
+
+        async fn issue(
+            &self,
+            stage: &ManagedStageDescriptor,
+            location: &DataLocation,
+            expires_in: Duration,
+        ) -> lake_objects::Result<PresignedRead> {
+            self.seen.lock().expect("recording issuer lock").push((
+                stage.clone(),
+                location.clone(),
+                expires_in,
+            ));
+            Ok(PresignedRead::new(
+                "https://objects.example/episode?X-Amz-Signature=server-secret",
+                vec![("x-amz-security-token".to_owned(), "server-token".to_owned())],
+                SystemTime::now() + expires_in,
+            ))
+        }
+    }
 
     type TestProviders = Arc<StdMutex<HashMap<(TableLocation, u64), Arc<dyn TableProvider>>>>;
 
@@ -1928,6 +2031,7 @@ mod tests {
             metadata_addr: None,
             metadata_security: ClientSecurity::new(),
             managed_stage: None,
+            read_capability_issuer: None,
             admission: QueryAdmission::new(QueryLimits::default()),
             discovery_limits: DiscoveryLimits::default(),
             ticket_codec,
@@ -2014,6 +2118,7 @@ mod tests {
             metadata_addr: None,
             metadata_security: ClientSecurity::new(),
             managed_stage: None,
+            read_capability_issuer: None,
             admission: QueryAdmission::new(QueryLimits::default()),
             discovery_limits,
             ticket_codec: test_ticket_codec(),
@@ -2130,13 +2235,14 @@ mod tests {
             false,
         );
         let service = FlightSqlServiceImpl {
-            engine:            Arc::new(QueryEngine::new(meta, storage)),
-            metadata_addr:     None,
-            metadata_security: ClientSecurity::new(),
-            managed_stage:     Some(descriptor.clone()),
-            admission:         QueryAdmission::new(QueryLimits::default()),
-            discovery_limits:  DiscoveryLimits::default(),
-            ticket_codec:      test_ticket_codec(),
+            engine:                 Arc::new(QueryEngine::new(meta, storage)),
+            metadata_addr:          None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          Some(descriptor.clone()),
+            read_capability_issuer: None,
+            admission:              QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_codec:           test_ticket_codec(),
         };
         let action = arrow_flight::Action {
             r#type: MANAGED_STAGE_DISCOVERY_ACTION.to_owned(),
@@ -2169,19 +2275,198 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn managed_read_capability_action_scopes_tenant_and_redacts_response() {
+        let meta: MetaStoreRef = Arc::new(EmptyMeta);
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let descriptor = ManagedStageDescriptor::s3(
+            "lake-managed",
+            "managed-objects",
+            Some("us-east-1".to_owned()),
+            None,
+            false,
+        );
+        let issuer = Arc::new(RecordingReadCapabilityIssuer::default());
+        let service = FlightSqlServiceImpl {
+            engine:                 Arc::new(QueryEngine::new(meta, storage)),
+            metadata_addr:          None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          Some(descriptor.clone()),
+            read_capability_issuer: Some(issuer.clone()),
+            admission:              QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_codec:           test_ticket_codec(),
+        };
+        let location = DataLocation::builder()
+            .uri("s3://lake-managed/managed-objects/tenants/tenant-a/episode.mp4")
+            .content_type("video/mp4")
+            .size_bytes(4_294_967_296)
+            .sha256("f00d")
+            .build();
+        let action = Action {
+            r#type: MANAGED_READ_CAPABILITY_ACTION.to_owned(),
+            body:   ManagedReadCapabilityRequest::try_new(
+                location.clone(),
+                Duration::from_secs(60),
+            )
+            .expect("bounded request")
+            .to_wire()
+            .expect("encoded request")
+            .into(),
+        };
+        let principal = Principal::try_new(
+            PrincipalId::try_new("tenant-a-reader").expect("principal id"),
+            TenantId::try_new("tenant-a").expect("tenant id"),
+            PrincipalRole::User,
+            ["robots"],
+        )
+        .expect("principal");
+        let mut request = Request::new(action);
+        request.extensions_mut().insert(principal.clone());
+
+        let results = service
+            .do_action_fallback(request)
+            .await
+            .expect("capability action")
+            .into_inner()
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("capability result");
+        let response =
+            ManagedReadCapabilityResponse::from_wire(&results[0].body).expect("decode response");
+        let debug = format!("{response:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("server-secret"));
+        assert!(!debug.contains("server-token"));
+
+        let seen = issuer.seen.lock().expect("recorded capability request");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, descriptor.scope_to_tenant(principal.tenant()));
+        assert_eq!(seen[0].1, location);
+        assert_eq!(seen[0].2, Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn managed_read_capability_action_fails_closed_before_signing() {
+        let descriptor = ManagedStageDescriptor::s3(
+            "lake-managed",
+            "managed-objects",
+            Some("us-east-1".to_owned()),
+            None,
+            false,
+        );
+        let issuer = Arc::new(RecordingReadCapabilityIssuer::default());
+        let service = FlightSqlServiceImpl {
+            engine:                 Arc::new(QueryEngine::new(
+                Arc::new(EmptyMeta),
+                Arc::new(LanceEngine::new()),
+            )),
+            metadata_addr:          None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          Some(descriptor),
+            read_capability_issuer: Some(issuer.clone()),
+            admission:              QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_codec:           test_ticket_codec(),
+        };
+        let principal = Principal::try_new(
+            PrincipalId::try_new("tenant-a-reader").expect("principal id"),
+            TenantId::try_new("tenant-a").expect("tenant id"),
+            PrincipalRole::User,
+            ["robots"],
+        )
+        .expect("principal");
+        let foreign = DataLocation::builder()
+            .uri("s3://lake-managed/managed-objects/tenants/tenant-b/episode.mp4")
+            .content_type("video/mp4")
+            .size_bytes(42)
+            .sha256("f00d")
+            .build();
+        let mut invalid_expiry: serde_json::Value = serde_json::from_slice(
+            &ManagedReadCapabilityRequest::try_new(foreign.clone(), Duration::from_secs(60))
+                .expect("bounded request")
+                .to_wire()
+                .expect("encoded request"),
+        )
+        .expect("request wire JSON");
+        invalid_expiry["expires_in_ms"] = serde_json::Value::from(0_u64);
+        let requests = [
+            (vec![b'{', b'}'].into(), tonic::Code::InvalidArgument),
+            (
+                serde_json::to_vec(&invalid_expiry)
+                    .expect("invalid expiry wire")
+                    .into(),
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                ManagedReadCapabilityRequest::try_new(foreign, Duration::from_secs(60))
+                    .expect("bounded request")
+                    .to_wire()
+                    .expect("encoded request")
+                    .into(),
+                tonic::Code::PermissionDenied,
+            ),
+        ];
+        for (body, expected_code) in requests {
+            let mut request = Request::new(Action {
+                r#type: MANAGED_READ_CAPABILITY_ACTION.to_owned(),
+                body,
+            });
+            request.extensions_mut().insert(principal.clone());
+            let error = match service.do_action_fallback(request).await {
+                Ok(_) => panic!("unsafe capability request must fail"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), expected_code);
+        }
+        assert!(issuer.seen.lock().expect("recorded requests").is_empty());
+
+        let unconfigured = FlightSqlServiceImpl {
+            engine:                 service.engine.clone(),
+            metadata_addr:          None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          service.managed_stage.clone(),
+            read_capability_issuer: None,
+            admission:              QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_codec:           test_ticket_codec(),
+        };
+        let location = DataLocation::builder()
+            .uri("s3://lake-managed/managed-objects/tenants/tenant-a/episode.mp4")
+            .content_type("video/mp4")
+            .size_bytes(42)
+            .sha256("f00d")
+            .build();
+        let mut request = Request::new(Action {
+            r#type: MANAGED_READ_CAPABILITY_ACTION.to_owned(),
+            body:   ManagedReadCapabilityRequest::try_new(location, Duration::from_secs(60))
+                .expect("bounded request")
+                .to_wire()
+                .expect("encoded request")
+                .into(),
+        });
+        request.extensions_mut().insert(principal);
+        let error = match unconfigured.do_action_fallback(request).await {
+            Ok(_) => panic!("unconfigured signer must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
     #[test]
     fn query_tenant_policy_denies_cross_namespace_before_execution() {
         let meta = Arc::new(PlanningMeta::default());
         let meta_ref: MetaStoreRef = meta.clone();
         let storage: TableEngineRef = Arc::new(LanceEngine::new());
         let service = FlightSqlServiceImpl {
-            engine:            Arc::new(QueryEngine::new(meta_ref, storage)),
-            metadata_addr:     None,
-            metadata_security: ClientSecurity::new(),
-            managed_stage:     None,
-            admission:         QueryAdmission::new(QueryLimits::default()),
-            discovery_limits:  DiscoveryLimits::default(),
-            ticket_codec:      test_ticket_codec(),
+            engine:                 Arc::new(QueryEngine::new(meta_ref, storage)),
+            metadata_addr:          None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          None,
+            read_capability_issuer: None,
+            admission:              QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_codec:           test_ticket_codec(),
         };
         let principal = Principal::try_new(
             PrincipalId::try_new("alpha-reader").unwrap(),
@@ -2219,13 +2504,14 @@ mod tests {
         let meta_ref: MetaStoreRef = meta.clone();
         let storage: TableEngineRef = Arc::new(LanceEngine::new());
         let service = FlightSqlServiceImpl {
-            engine:            Arc::new(QueryEngine::new(meta_ref, storage)),
-            metadata_addr:     None,
-            metadata_security: ClientSecurity::new(),
-            managed_stage:     None,
-            admission:         QueryAdmission::new(QueryLimits::default()),
-            discovery_limits:  DiscoveryLimits::default(),
-            ticket_codec:      test_ticket_codec(),
+            engine:                 Arc::new(QueryEngine::new(meta_ref, storage)),
+            metadata_addr:          None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          None,
+            read_capability_issuer: None,
+            admission:              QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_codec:           test_ticket_codec(),
         };
 
         let error = service
@@ -2249,13 +2535,14 @@ mod tests {
         let meta: MetaStoreRef = Arc::new(EmptyMeta);
         let storage: TableEngineRef = Arc::new(LanceEngine::new());
         let service = FlightSqlServiceImpl {
-            engine:            Arc::new(QueryEngine::new(meta, storage)),
-            metadata_addr:     None,
-            metadata_security: ClientSecurity::new(),
-            managed_stage:     None,
-            admission:         QueryAdmission::new(QueryLimits::default()),
-            discovery_limits:  DiscoveryLimits::default(),
-            ticket_codec:      test_ticket_codec(),
+            engine:                 Arc::new(QueryEngine::new(meta, storage)),
+            metadata_addr:          None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          None,
+            read_capability_issuer: None,
+            admission:              QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_codec:           test_ticket_codec(),
         };
         let principal = Principal::try_new(
             PrincipalId::try_new("alpha-reader").unwrap(),
@@ -2787,13 +3074,14 @@ mod tests {
         )
         .unwrap();
         let service = FlightSqlServiceImpl {
-            engine:            Arc::new(QueryEngine::new(meta_ref, storage)),
-            metadata_addr:     None,
-            metadata_security: ClientSecurity::new(),
-            managed_stage:     None,
-            admission:         QueryAdmission::new(QueryLimits::default()),
-            discovery_limits:  DiscoveryLimits::default(),
-            ticket_codec:      codec.clone(),
+            engine:                 Arc::new(QueryEngine::new(meta_ref, storage)),
+            metadata_addr:          None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          None,
+            read_capability_issuer: None,
+            admission:              QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_codec:           codec.clone(),
         };
         let principal = |id: &str| {
             Principal::try_new(
@@ -2845,6 +3133,7 @@ mod tests {
             metadata_addr: None,
             metadata_security: ClientSecurity::new(),
             managed_stage: None,
+            read_capability_issuer: None,
             admission: QueryAdmission::new(QueryLimits::default()),
             discovery_limits: DiscoveryLimits::default(),
             ticket_codec: test_ticket_codec(),
@@ -3342,6 +3631,7 @@ mod tests {
             metadata_addr: None,
             metadata_security: ClientSecurity::new(),
             managed_stage: None,
+            read_capability_issuer: None,
             admission: QueryAdmission::new(QueryLimits::default()),
             discovery_limits: DiscoveryLimits::default(),
             ticket_codec: test_ticket_codec(),
@@ -3510,6 +3800,7 @@ mod tests {
             metadata_addr: None,
             metadata_security: ClientSecurity::new(),
             managed_stage: None,
+            read_capability_issuer: None,
             admission: QueryAdmission::new(QueryLimits::default()),
             discovery_limits: DiscoveryLimits::default(),
             ticket_codec: test_ticket_codec(),
@@ -3574,13 +3865,14 @@ mod tests {
         let storage: TableEngineRef = Arc::new(storage);
 
         let service = FlightSqlServiceImpl {
-            engine:            Arc::new(QueryEngine::new(meta, storage)),
-            metadata_addr:     None,
-            metadata_security: ClientSecurity::new(),
-            managed_stage:     None,
-            admission:         QueryAdmission::new(QueryLimits::default()),
-            discovery_limits:  DiscoveryLimits::default(),
-            ticket_codec:      test_ticket_codec(),
+            engine:                 Arc::new(QueryEngine::new(meta, storage)),
+            metadata_addr:          None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          None,
+            read_capability_issuer: None,
+            admission:              QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_codec:           test_ticket_codec(),
         };
         let principal = robots_reader();
         let ticket = TicketStatementQuery {
@@ -3654,13 +3946,14 @@ mod tests {
             QueryLimits::try_new(1, Duration::from_millis(20), Duration::from_secs(5), 1024)
                 .expect("limits");
         let service = FlightSqlServiceImpl {
-            engine:            Arc::new(QueryEngine::new(meta, storage)),
-            metadata_addr:     None,
-            metadata_security: ClientSecurity::new(),
-            managed_stage:     None,
-            admission:         QueryAdmission::new(limits),
-            discovery_limits:  DiscoveryLimits::default(),
-            ticket_codec:      test_ticket_codec(),
+            engine:                 Arc::new(QueryEngine::new(meta, storage)),
+            metadata_addr:          None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          None,
+            read_capability_issuer: None,
+            admission:              QueryAdmission::new(limits),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_codec:           test_ticket_codec(),
         };
         let principal = robots_reader();
         let statement_handle = service
@@ -3712,13 +4005,14 @@ mod tests {
             QueryLimits::try_new(1, Duration::from_millis(20), Duration::from_secs(5), 1024)
                 .expect("limits");
         let service = FlightSqlServiceImpl {
-            engine:            Arc::new(QueryEngine::new(meta, storage)),
-            metadata_addr:     None,
-            metadata_security: ClientSecurity::new(),
-            managed_stage:     None,
-            admission:         QueryAdmission::new(limits),
-            discovery_limits:  DiscoveryLimits::default(),
-            ticket_codec:      test_ticket_codec(),
+            engine:                 Arc::new(QueryEngine::new(meta, storage)),
+            metadata_addr:          None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          None,
+            read_capability_issuer: None,
+            admission:              QueryAdmission::new(limits),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_codec:           test_ticket_codec(),
         };
         let query = || CommandGetDbSchemas {
             catalog:                  None,
@@ -3777,13 +4071,14 @@ mod tests {
         )
         .expect("limits");
         let service = FlightSqlServiceImpl {
-            engine:            Arc::new(QueryEngine::new(meta, storage)),
-            metadata_addr:     None,
-            metadata_security: ClientSecurity::new(),
-            managed_stage:     None,
-            admission:         QueryAdmission::new(limits),
-            discovery_limits:  DiscoveryLimits::default(),
-            ticket_codec:      test_ticket_codec(),
+            engine:                 Arc::new(QueryEngine::new(meta, storage)),
+            metadata_addr:          None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          None,
+            read_capability_issuer: None,
+            admission:              QueryAdmission::new(limits),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_codec:           test_ticket_codec(),
         };
         let principal = robots_reader();
         let statement_handle = service
@@ -3846,13 +4141,14 @@ mod tests {
         let limits = QueryLimits::try_new(1, Duration::from_millis(20), Duration::from_secs(1), 4)
             .expect("limits");
         let service = FlightSqlServiceImpl {
-            engine:            Arc::new(QueryEngine::new(meta_ref, storage)),
-            metadata_addr:     None,
-            metadata_security: ClientSecurity::new(),
-            managed_stage:     None,
-            admission:         QueryAdmission::new(limits),
-            discovery_limits:  DiscoveryLimits::default(),
-            ticket_codec:      test_ticket_codec(),
+            engine:                 Arc::new(QueryEngine::new(meta_ref, storage)),
+            metadata_addr:          None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          None,
+            read_capability_issuer: None,
+            admission:              QueryAdmission::new(limits),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_codec:           test_ticket_codec(),
         };
         let query = CommandStatementQuery {
             query:          "SELECT 1".to_owned(),

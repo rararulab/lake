@@ -107,10 +107,12 @@ lake query --addr 0.0.0.0:50051 \
   --metadata-addr https://lake-meta.internal:50052
 ```
 
-Lake stores the stable `s3://` identity. AWS credentials come from the SDK
-process's default credential chain or workload identity; they never enter SQL,
-table rows, or the discovery descriptor. Embedders and tests that need a custom
-backend can use the explicit `LakeClient::connect_with_store` constructor.
+Lake stores the stable `s3://` identity. In the standard direct-stage SDK mode,
+AWS credentials come from the SDK process's default credential chain or
+workload identity; they never enter SQL, table rows, or the discovery
+descriptor. Embedders and tests that need a custom backend can use the explicit
+`LakeClient::connect_with_store` constructor. The credentialless read-capability
+path below instead gives the SDK only a Query connection.
 
 The principal map is immutable for the process lifetime and must be a regular
 file with no group/other permissions on Unix (`chmod 600`). Restart replicas to
@@ -389,9 +391,9 @@ before storage I/O. A partial range cannot prove the full-object SHA-256, so
 `open_range` intentionally makes no full-object integrity claim.
 
 A credentialed Rust process can delegate one S3 read without handing its AWS
-credentials to the consumer. The capability is valid for 1 second through 1
-hour, is scoped to the already validated tenant child-prefix, and performs no
-object GET while being minted:
+credentials to the eventual HTTP consumer. This local-IAM path is valid for 1
+second through 1 hour, is scoped to the already validated tenant child-prefix,
+and performs no object GET while being minted:
 
 ```rust
 let capability = client
@@ -406,6 +408,28 @@ header for video/model seeking while also sending `capability.headers()`.
 Local stages and custom stores without signing support return a typed error.
 External presigned-URL consumers own their own integrity policy; minting a
 capability does not imply that its eventual body was drained and verified.
+
+For an SDK process with no cloud-storage credentials, use a Query-only
+connection and ask Query to issue the capability instead. `connect_query_only`
+does not discover a stage, construct an S3 client, or permit local object I/O;
+it sends only the authenticated Flight action below. A production `lake query`
+installs this issuer only for its configured S3 managed stage. Query scopes the
+requested `DataLocation` to `tenants/<tenant-id>` before signing with its own
+AWS identity, returns one bounded 1-second-through-1-hour capability, and
+never proxies video/model bytes or exposes the URL/header values in logs,
+Arrow rows, or metadata.
+
+```rust
+let client = LakeClient::builder("https://query.internal:50051")
+    .with_bearer_token(std::fs::read_to_string("/run/secrets/query-token")?.trim())?
+    .with_ca_certificate_pem(std::fs::read("/run/tls/ca.crt")?)
+    .connect_query_only()
+    .await?;
+let capability = client
+    .presign_read_via_query(&location, std::time::Duration::from_secs(300))
+    .await?;
+// `capability.url()` and `capability.headers()` are sensitive bearer values.
+```
 
 The example performs a multi-row insert, query, `DataLocation` decoding, and
 direct open through `LakeClient`. Local development discovers a `file://`

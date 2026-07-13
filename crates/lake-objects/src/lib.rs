@@ -20,7 +20,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -28,7 +28,8 @@ use datafusion::arrow::{
     array::{Array, ArrayRef, StringArray, StructArray, UInt64Array},
     datatypes::{DataType, Field, Fields},
 };
-use lake_common::DataLocation;
+use lake_common::{DataLocation, ManagedStageDescriptor};
+use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, Snafu};
 use tokio::io::AsyncRead;
 
@@ -48,7 +49,15 @@ pub use inventory::{InventoryPage, InventoryRequest, ManagedObjectInventory};
 pub use local::LocalObjectStore;
 pub use reference_index::{LiveReferenceIndex, LiveReferenceIndexBuild, LiveReferenceIndexBuilder};
 mod s3;
-pub use s3::S3ObjectStore;
+pub use s3::{S3ObjectStore, S3ReadCapabilityIssuer};
+
+/// Flight action used to request a server-issued managed-object GET capability.
+pub const MANAGED_READ_CAPABILITY_ACTION: &str = "lake.managed_read_capability.v1";
+
+/// Wire protocol version for managed-read capability actions.
+pub const MANAGED_READ_CAPABILITY_PROTOCOL_VERSION: u16 = 1;
+
+const MAX_MANAGED_READ_CAPABILITY_WIRE_BYTES: usize = 16 * 1024;
 
 /// Errors converting managed-object values at the Arrow boundary.
 #[derive(Debug, Snafu)]
@@ -128,11 +137,31 @@ pub enum ObjectError {
     #[snafu(display("this managed object store does not support presigned reads"))]
     PresignUnsupported,
 
+    #[snafu(display("direct managed-object access is unavailable on this SDK client"))]
+    DirectObjectAccessUnavailable,
+
     #[snafu(display("presigned read expiration {expires_in:?} is outside 1s..=1h"))]
     InvalidPresignExpiration { expires_in: Duration },
 
     #[snafu(display("managed object store returned an invalid presigned capability lifetime"))]
     InvalidPresignedCapabilityLifetime,
+
+    #[snafu(display("managed-read capability wire is invalid"))]
+    ManagedReadCapabilityWire { source: serde_json::Error },
+
+    #[snafu(display(
+        "managed-read capability wire has {actual} bytes, exceeding the {maximum}-byte limit"
+    ))]
+    ManagedReadCapabilityWireTooLarge { actual: usize, maximum: usize },
+
+    #[snafu(display(
+        "managed-read capability protocol version {version} is unsupported; this release supports \
+         {supported}"
+    ))]
+    UnsupportedManagedReadCapabilityVersion { version: u16, supported: u16 },
+
+    #[snafu(display("managed-read capability has an invalid expiration timestamp"))]
+    InvalidManagedReadCapabilityExpiration,
 
     #[snafu(display("managed object scope is invalid"))]
     InvalidManagedObjectScope,
@@ -230,6 +259,178 @@ pub type Result<T> = std::result::Result<T, ObjectError>;
 
 /// A bounded-memory direct object stream returned by a managed stage.
 pub type ObjectReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
+
+/// Capability signer owned by a Query server, never by its SDK clients.
+///
+/// Query passes the exact stage already scoped to the authenticated tenant.
+/// Implementations must reject a location outside that stage in
+/// [`Self::validate`] before [`Self::issue`] can construct a signed URL.
+#[async_trait]
+pub trait ManagedReadCapabilityIssuer: Send + Sync {
+    /// Reject an object identity outside the supplied tenant-scoped stage.
+    fn validate(&self, stage: &ManagedStageDescriptor, location: &DataLocation) -> Result<()>;
+
+    /// Mint one short-lived GET capability after successful validation.
+    async fn issue(
+        &self,
+        stage: &ManagedStageDescriptor,
+        location: &DataLocation,
+        expires_in: Duration,
+    ) -> Result<PresignedRead>;
+}
+
+/// Shared dynamic signer configured only in an S3 Query deployment.
+pub type ManagedReadCapabilityIssuerRef = Arc<dyn ManagedReadCapabilityIssuer>;
+
+/// One bounded request for a Query-issued managed-object GET capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedReadCapabilityRequest {
+    location:   DataLocation,
+    expires_in: Duration,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedReadCapabilityRequestWire {
+    version:       u16,
+    location:      DataLocation,
+    expires_in_ms: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedReadCapabilityResponseWire {
+    version:            u16,
+    url:                String,
+    headers:            Vec<(String, String)>,
+    expires_at_unix_ms: u64,
+}
+
+impl ManagedReadCapabilityRequest {
+    /// Validate one immutable object identity and requested capability
+    /// lifetime.
+    pub fn try_new(location: DataLocation, expires_in: Duration) -> Result<Self> {
+        validate_presign_expiration(expires_in)?;
+        Ok(Self {
+            location,
+            expires_in,
+        })
+    }
+
+    /// Return the immutable object identity to authorize and sign.
+    #[must_use]
+    pub fn location(&self) -> &DataLocation { &self.location }
+
+    /// Return the caller-selected bounded capability lifetime.
+    #[must_use]
+    pub const fn expires_in(&self) -> Duration { self.expires_in }
+
+    /// Encode this request for one Flight action body.
+    pub fn to_wire(&self) -> Result<Vec<u8>> {
+        let wire = serde_json::to_vec(&ManagedReadCapabilityRequestWire {
+            version:       MANAGED_READ_CAPABILITY_PROTOCOL_VERSION,
+            location:      self.location.clone(),
+            expires_in_ms: self.expires_in.as_millis() as u64,
+        })
+        .map_err(|source| ObjectError::ManagedReadCapabilityWire { source })?;
+        validate_managed_read_capability_wire_len(wire.len())?;
+        Ok(wire)
+    }
+
+    /// Decode, size-bound, version-check, and validate one action body.
+    pub fn from_wire(wire: &[u8]) -> Result<Self> {
+        validate_managed_read_capability_wire_len(wire.len())?;
+        let request: ManagedReadCapabilityRequestWire = serde_json::from_slice(wire)
+            .map_err(|source| ObjectError::ManagedReadCapabilityWire { source })?;
+        if request.version != MANAGED_READ_CAPABILITY_PROTOCOL_VERSION {
+            return Err(ObjectError::UnsupportedManagedReadCapabilityVersion {
+                version:   request.version,
+                supported: MANAGED_READ_CAPABILITY_PROTOCOL_VERSION,
+            });
+        }
+        Self::try_new(
+            request.location,
+            Duration::from_millis(request.expires_in_ms),
+        )
+    }
+}
+
+fn validate_managed_read_capability_wire_len(actual: usize) -> Result<()> {
+    if actual > MAX_MANAGED_READ_CAPABILITY_WIRE_BYTES {
+        return Err(ObjectError::ManagedReadCapabilityWireTooLarge {
+            actual,
+            maximum: MAX_MANAGED_READ_CAPABILITY_WIRE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// One opaque response to a managed-read capability action.
+///
+/// The contained URL and headers are bearer credentials. Its [`Debug`] output
+/// deliberately delegates to [`PresignedRead`] so neither value is exposed.
+pub struct ManagedReadCapabilityResponse {
+    capability: PresignedRead,
+}
+
+impl ManagedReadCapabilityResponse {
+    /// Wrap a capability created by an authorized Query issuer.
+    #[must_use]
+    pub fn new(capability: PresignedRead) -> Self { Self { capability } }
+
+    /// Encode this response for one Flight result body.
+    pub fn to_wire(&self) -> Result<Vec<u8>> {
+        let expires_at_unix_ms = self
+            .capability
+            .expires_at()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ObjectError::InvalidManagedReadCapabilityExpiration)?
+            .as_millis() as u64;
+        let wire = serde_json::to_vec(&ManagedReadCapabilityResponseWire {
+            version: MANAGED_READ_CAPABILITY_PROTOCOL_VERSION,
+            url: self.capability.url.clone(),
+            headers: self.capability.headers.clone(),
+            expires_at_unix_ms,
+        })
+        .map_err(|source| ObjectError::ManagedReadCapabilityWire { source })?;
+        validate_managed_read_capability_wire_len(wire.len())?;
+        Ok(wire)
+    }
+
+    /// Decode, size-bound, and version-check one action response body.
+    pub fn from_wire(wire: &[u8]) -> Result<Self> {
+        validate_managed_read_capability_wire_len(wire.len())?;
+        let response: ManagedReadCapabilityResponseWire = serde_json::from_slice(wire)
+            .map_err(|source| ObjectError::ManagedReadCapabilityWire { source })?;
+        if response.version != MANAGED_READ_CAPABILITY_PROTOCOL_VERSION {
+            return Err(ObjectError::UnsupportedManagedReadCapabilityVersion {
+                version:   response.version,
+                supported: MANAGED_READ_CAPABILITY_PROTOCOL_VERSION,
+            });
+        }
+        let expires_at = UNIX_EPOCH
+            .checked_add(Duration::from_millis(response.expires_at_unix_ms))
+            .ok_or(ObjectError::InvalidManagedReadCapabilityExpiration)?;
+        Ok(Self::new(PresignedRead::new(
+            response.url,
+            response.headers,
+            expires_at,
+        )))
+    }
+
+    /// Consume the response and reveal the opaque capability explicitly.
+    #[must_use]
+    pub fn into_capability(self) -> PresignedRead { self.capability }
+}
+
+impl fmt::Debug for ManagedReadCapabilityResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedReadCapabilityResponse")
+            .field("capability", &self.capability)
+            .finish()
+    }
+}
 
 /// A short-lived HTTP GET capability for one immutable managed object.
 ///
@@ -515,9 +716,9 @@ mod tests {
 
     use crate::{
         InventoryRequest, LocalObjectStore, ManagedObjectInventory, ManagedObjectScope,
-        ManagedObjectStore, ObjectError, ObjectIntegrityError, ObjectReader,
-        Result as ObjectResult, S3ObjectStore, data_location_array, data_location_from_array,
-        open_verified,
+        ManagedObjectStore, ManagedReadCapabilityRequest, ManagedReadCapabilityResponse,
+        ObjectError, ObjectIntegrityError, ObjectReader, PresignedRead, Result as ObjectResult,
+        S3ObjectStore, data_location_array, data_location_from_array, open_verified,
     };
 
     struct StaticReadStore {
@@ -1009,5 +1210,46 @@ mod tests {
             local.presign_read(&valid, Duration::from_mins(1)).await,
             Err(ObjectError::PresignUnsupported)
         ));
+    }
+
+    #[test]
+    fn managed_read_capability_request_roundtrips_with_bounded_expiration() {
+        let location = s3_location("s3://lake-managed/tenants/tenant-a/objects/episode");
+        let request =
+            ManagedReadCapabilityRequest::try_new(location.clone(), Duration::from_secs(60))
+                .expect("bounded request");
+
+        let decoded =
+            ManagedReadCapabilityRequest::from_wire(&request.to_wire().expect("encode request"))
+                .expect("decode request");
+
+        assert_eq!(decoded.location(), &location);
+        assert_eq!(decoded.expires_in(), Duration::from_secs(60));
+        assert!(matches!(
+            ManagedReadCapabilityRequest::try_new(location, Duration::ZERO),
+            Err(ObjectError::InvalidPresignExpiration { .. })
+        ));
+    }
+
+    #[test]
+    fn managed_read_capability_response_roundtrips_without_debug_secret_leak() {
+        let secret_url = "https://objects.example/episode?X-Amz-Signature=secret-signature";
+        let response = ManagedReadCapabilityResponse::new(PresignedRead::new(
+            secret_url,
+            vec![("x-amz-security-token".to_owned(), "secret-token".to_owned())],
+            SystemTime::now() + Duration::from_secs(60),
+        ));
+
+        let decoded =
+            ManagedReadCapabilityResponse::from_wire(&response.to_wire().expect("encode response"))
+                .expect("decode response")
+                .into_capability();
+
+        assert_eq!(decoded.url(), secret_url);
+        assert_eq!(decoded.headers()[0].1, "secret-token");
+        let debug = format!("{response:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("secret-signature"));
+        assert!(!debug.contains("secret-token"));
     }
 }

@@ -58,7 +58,7 @@ use lake_common::{ManagedStageDescriptor, TableRef};
 use lake_engine::TableEngineRef;
 use lake_flight::{ClientSecurity, ServerSecurity};
 use lake_meta::MetaStoreRef;
-use lake_objects::ManagedObjectStore;
+use lake_objects::{ManagedObjectStore, ManagedReadCapabilityIssuerRef};
 use snafu::{ResultExt, Snafu};
 pub use ticket::{QueryTicketError, QueryTicketKeyRing};
 use tokio_util::sync::CancellationToken;
@@ -530,19 +530,43 @@ impl std::fmt::Debug for AsyncQueryConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct QueryServerConfig {
-    metadata_endpoint: Option<String>,
-    metadata_security: ClientSecurity,
-    managed_stage:     Option<ManagedStageDescriptor>,
-    server_security:   ServerSecurity,
-    allow_insecure:    bool,
-    limits:            QueryLimits,
-    discovery_limits:  DiscoveryLimits,
-    ticket_keys:       Option<QueryTicketKeyRing>,
-    ticket_ttl:        Duration,
-    shutdown_grace:    Duration,
-    async_queries:     Option<AsyncQueryConfig>,
+    metadata_endpoint:      Option<String>,
+    metadata_security:      ClientSecurity,
+    managed_stage:          Option<ManagedStageDescriptor>,
+    read_capability_issuer: Option<ManagedReadCapabilityIssuerRef>,
+    server_security:        ServerSecurity,
+    allow_insecure:         bool,
+    limits:                 QueryLimits,
+    discovery_limits:       DiscoveryLimits,
+    ticket_keys:            Option<QueryTicketKeyRing>,
+    ticket_ttl:             Duration,
+    shutdown_grace:         Duration,
+    async_queries:          Option<AsyncQueryConfig>,
+}
+
+impl std::fmt::Debug for QueryServerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QueryServerConfig")
+            .field("metadata_endpoint", &self.metadata_endpoint)
+            .field("metadata_security", &self.metadata_security)
+            .field("managed_stage", &self.managed_stage)
+            .field(
+                "read_capability_issuer",
+                &self.read_capability_issuer.as_ref().map(|_| "<configured>"),
+            )
+            .field("server_security", &self.server_security)
+            .field("allow_insecure", &self.allow_insecure)
+            .field("limits", &self.limits)
+            .field("discovery_limits", &self.discovery_limits)
+            .field("ticket_keys", &self.ticket_keys)
+            .field("ticket_ttl", &self.ticket_ttl)
+            .field("shutdown_grace", &self.shutdown_grace)
+            .field("async_queries", &self.async_queries)
+            .finish()
+    }
 }
 
 impl QueryServerConfig {
@@ -550,17 +574,18 @@ impl QueryServerConfig {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            metadata_endpoint: None,
-            metadata_security: ClientSecurity::new(),
-            managed_stage:     None,
-            server_security:   ServerSecurity::insecure(),
-            allow_insecure:    false,
-            limits:            QueryLimits::default(),
-            discovery_limits:  DiscoveryLimits::default(),
-            ticket_keys:       None,
-            ticket_ttl:        DEFAULT_STATEMENT_TICKET_TTL,
-            shutdown_grace:    Duration::from_secs(30),
-            async_queries:     None,
+            metadata_endpoint:      None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          None,
+            read_capability_issuer: None,
+            server_security:        ServerSecurity::insecure(),
+            allow_insecure:         false,
+            limits:                 QueryLimits::default(),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_keys:            None,
+            ticket_ttl:             DEFAULT_STATEMENT_TICKET_TTL,
+            shutdown_grace:         Duration::from_secs(30),
+            async_queries:          None,
         }
     }
 
@@ -576,6 +601,13 @@ impl QueryServerConfig {
     #[must_use]
     pub fn with_managed_stage(mut self, stage: ManagedStageDescriptor) -> Self {
         self.managed_stage = Some(stage);
+        self
+    }
+
+    /// Install the Query-owned signer for tenant-scoped managed S3 reads.
+    #[must_use]
+    pub fn with_read_capability_issuer(mut self, issuer: ManagedReadCapabilityIssuerRef) -> Self {
+        self.read_capability_issuer = Some(issuer);
         self
     }
 
@@ -955,6 +987,7 @@ where
         metadata_addr: config.metadata_endpoint,
         metadata_security: config.metadata_security,
         managed_stage: config.managed_stage,
+        read_capability_issuer: config.read_capability_issuer,
         admission: flight::QueryAdmission::new(config.limits),
         discovery_limits: config.discovery_limits,
         ticket_codec,

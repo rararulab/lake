@@ -48,8 +48,10 @@ use lake_common::{
 };
 use lake_flight::{ClientSecurity, append_flight_payload_digest};
 use lake_objects::{
-    LocalObjectStore, ManagedObjectStore, ObjectReader, S3ObjectStore, data_location_array,
-    data_location_field, data_location_from_array, open_verified, validate_presign_expiration,
+    LocalObjectStore, MANAGED_READ_CAPABILITY_ACTION, ManagedObjectStore,
+    ManagedReadCapabilityRequest, ManagedReadCapabilityResponse, ObjectReader, S3ObjectStore,
+    data_location_array, data_location_field, data_location_from_array, open_verified,
+    validate_presign_expiration,
 };
 pub use lake_objects::{ObjectIntegrityError, PresignedRead};
 use moka::{future::Cache, ops::compute::Op};
@@ -296,6 +298,15 @@ pub enum SdkError {
     InvalidManagedStage {
         source: lake_common::ManagedStageError,
     },
+
+    #[snafu(display("query returned no managed read capability"))]
+    MissingManagedReadCapability,
+
+    #[snafu(display("query returned more than one managed read capability"))]
+    MultipleManagedReadCapabilities,
+
+    #[snafu(display("query returned an invalid managed read capability"))]
+    InvalidManagedReadCapability { source: lake_objects::ObjectError },
 
     #[snafu(display("query returned no FILE append result"))]
     MissingAppendResult,
@@ -708,6 +719,51 @@ pub struct LakeClient {
     upload_checkpoint_dir: Option<PathBuf>,
 }
 
+/// A Query-only SDK connection must never fall back to a caller-local stage.
+struct QueryOnlyObjectStore;
+
+#[tonic::async_trait]
+impl ManagedObjectStore for QueryOnlyObjectStore {
+    fn stage_identity(&self) -> String { "query-only".to_owned() }
+
+    async fn put_reader(
+        &self,
+        _input: ObjectReader,
+        _content_type: String,
+    ) -> lake_objects::Result<DataLocation> {
+        Err(lake_objects::ObjectError::DirectObjectAccessUnavailable)
+    }
+
+    async fn put_path(
+        &self,
+        _path: PathBuf,
+        _content_type: String,
+        _checkpoint: Option<PathBuf>,
+    ) -> lake_objects::Result<DataLocation> {
+        Err(lake_objects::ObjectError::DirectObjectAccessUnavailable)
+    }
+
+    async fn open_reader(&self, _location: &DataLocation) -> lake_objects::Result<ObjectReader> {
+        Err(lake_objects::ObjectError::DirectObjectAccessUnavailable)
+    }
+
+    async fn open_range(
+        &self,
+        _location: &DataLocation,
+        _range: Range<u64>,
+    ) -> lake_objects::Result<ObjectReader> {
+        Err(lake_objects::ObjectError::DirectObjectAccessUnavailable)
+    }
+
+    async fn presign_read(
+        &self,
+        _location: &DataLocation,
+        _expires_in: Duration,
+    ) -> lake_objects::Result<PresignedRead> {
+        Err(lake_objects::ObjectError::DirectObjectAccessUnavailable)
+    }
+}
+
 /// Type-erased stream for the complete result of one synchronous SQL query.
 ///
 /// Consume its [`Stream`] items with `futures::TryStreamExt`, such as
@@ -932,6 +988,26 @@ impl LakeClientBuilder {
         })
     }
 
+    /// Connect only to Query without discovering or opening a managed stage.
+    ///
+    /// Use this mode with [`LakeClient::presign_read_via_query`] when the SDK
+    /// process has no cloud-storage credentials. Direct `open`, `open_range`,
+    /// `insert`, and local-IAM [`LakeClient::presign_read`] calls fail closed.
+    pub async fn connect_query_only(self) -> Result<LakeClient> {
+        let query = self
+            .security
+            .connect(self.query_endpoint)
+            .await
+            .context(SecuritySnafu)?;
+        Ok(LakeClient {
+            query,
+            objects: Arc::new(QueryOnlyObjectStore),
+            security: self.security,
+            schema_cache: SchemaCache::new(self.schema_cache),
+            upload_checkpoint_dir: self.upload_checkpoint_dir,
+        })
+    }
+
     /// Connect with an explicitly injected stage while retaining TLS/auth.
     pub async fn connect_with_store<S>(self, objects: S) -> Result<LakeClient>
     where
@@ -968,6 +1044,17 @@ impl LakeClient {
     pub async fn connect(query_endpoint: impl AsRef<str>) -> Result<Self> {
         Self::builder(query_endpoint.as_ref().to_owned())
             .connect()
+            .await
+    }
+
+    /// Connect only to Query for server-issued managed-read capabilities.
+    ///
+    /// This does not perform managed-stage discovery or require SDK-process
+    /// cloud credentials. Use [`Self::presign_read_via_query`] to receive a
+    /// direct storage capability; direct object I/O remains unavailable.
+    pub async fn connect_query_only(query_endpoint: impl AsRef<str>) -> Result<Self> {
+        Self::builder(query_endpoint.as_ref().to_owned())
+            .connect_query_only()
             .await
     }
 
@@ -1456,15 +1543,53 @@ impl LakeClient {
             .presign_read(location, expires_in)
             .await
             .context(ObjectSnafu)?;
-        let now = SystemTime::now();
-        let maximum = now
-            .checked_add(expires_in)
-            .expect("validated one-hour expiration fits SystemTime");
-        if capability.expires_at() <= now || capability.expires_at() > maximum {
-            return Err(SdkError::Object {
-                source: lake_objects::ObjectError::InvalidPresignedCapabilityLifetime,
-            });
+        validate_presigned_capability_lifetime(&capability, expires_in)?;
+        Ok(capability)
+    }
+
+    /// Ask Query to mint a short-lived direct HTTP GET capability.
+    ///
+    /// This is the credentialless SDK path for managed S3 stages: Query
+    /// authorizes the authenticated tenant and uses only its own AWS identity
+    /// to sign one object URL. It never proxies object bytes. Use the returned
+    /// URL together with every required header before
+    /// [`PresignedRead::expires_at`].
+    ///
+    /// Unlike [`Self::presign_read`], this method performs exactly one Flight
+    /// action and never discovers or opens a client-side managed object store.
+    pub async fn presign_read_via_query(
+        &self,
+        location: &DataLocation,
+        expires_in: Duration,
+    ) -> Result<PresignedRead> {
+        let request = ManagedReadCapabilityRequest::try_new(location.clone(), expires_in)
+            .context(InvalidManagedReadCapabilitySnafu)?;
+        let body = request
+            .to_wire()
+            .context(InvalidManagedReadCapabilitySnafu)?;
+        let mut client = FlightClient::new(self.query.clone());
+        self.security
+            .apply_to_flight_client(&mut client)
+            .context(SecuritySnafu)?;
+        let mut results = client
+            .do_action(Action {
+                r#type: MANAGED_READ_CAPABILITY_ACTION.to_owned(),
+                body:   body.into(),
+            })
+            .await
+            .context(FlightSnafu)?;
+        let wire = results
+            .try_next()
+            .await
+            .context(FlightSnafu)?
+            .context(MissingManagedReadCapabilitySnafu)?;
+        if results.try_next().await.context(FlightSnafu)?.is_some() {
+            return Err(SdkError::MultipleManagedReadCapabilities);
         }
+        let capability = ManagedReadCapabilityResponse::from_wire(&wire)
+            .context(InvalidManagedReadCapabilitySnafu)?
+            .into_capability();
+        validate_presigned_capability_lifetime(&capability, expires_in)?;
         Ok(capability)
     }
 
@@ -1572,6 +1697,22 @@ async fn prepare_checkpoint_dir(directory: Option<&Path>) -> Result<()> {
                 path: directory.to_path_buf(),
                 source,
             })?;
+    }
+    Ok(())
+}
+
+fn validate_presigned_capability_lifetime(
+    capability: &PresignedRead,
+    expires_in: Duration,
+) -> Result<()> {
+    let now = SystemTime::now();
+    let maximum = now
+        .checked_add(expires_in)
+        .expect("validated one-hour expiration fits SystemTime");
+    if capability.expires_at() <= now || capability.expires_at() > maximum {
+        return Err(SdkError::Object {
+            source: lake_objects::ObjectError::InvalidPresignedCapabilityLifetime,
+        });
     }
     Ok(())
 }
@@ -1824,7 +1965,8 @@ mod tests {
         record_batch::RecordBatch,
     };
     use arrow_flight::{
-        CancelStatus, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
+        Action, CancelStatus, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
+        Result as FlightResult, Ticket,
         encode::FlightDataEncoderBuilder,
         error::FlightError,
         flight_service_server::{FlightService, FlightServiceServer},
@@ -1849,7 +1991,8 @@ mod tests {
         serve_with_config_and_crash,
     };
     use lake_objects::{
-        LocalObjectStore, ManagedObjectStore, ObjectReader, Result as ObjectResult, S3ObjectStore,
+        LocalObjectStore, ManagedObjectStore, ManagedReadCapabilityRequest,
+        ManagedReadCapabilityResponse, ObjectReader, Result as ObjectResult, S3ObjectStore,
         data_location_field, data_location_from_array,
     };
     use lake_query::{AsyncQueryConfig, QueryEngine, QueryServerConfig, QueryTicketKeyRing};
@@ -3855,6 +3998,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sdk_remote_read_capability_uses_query_action_without_stage_store() {
+        let actions = Arc::new(StdMutex::new(Vec::new()));
+        let address = free_addr();
+        let server = tokio::spawn({
+            let service = RecordingReadCapabilityService {
+                actions: actions.clone(),
+            };
+            let socket = address.parse().expect("capability service socket");
+            async move {
+                tonic::transport::Server::builder()
+                    .add_service(FlightServiceServer::new(service))
+                    .serve(socket)
+                    .await
+                    .expect("capability service")
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let client = LakeClient::connect_query_only(format!("http://{address}"))
+            .await
+            .expect("SDK connects without managed-stage discovery");
+        let location = lake_common::DataLocation::builder()
+            .uri("s3://lake-managed/managed-objects/tenants/acme/episode.mp4")
+            .content_type("video/mp4")
+            .size_bytes(4 * 1024 * 1024 * 1024)
+            .sha256("0".repeat(64))
+            .build();
+
+        let capability = client
+            .presign_read_via_query(&location, Duration::from_secs(60))
+            .await
+            .expect("Query returns a remote read capability");
+
+        assert_eq!(
+            capability.url(),
+            "https://objects.example/episode?X-Amz-Signature=server-secret"
+        );
+        assert_eq!(
+            capability.headers(),
+            [("x-amz-security-token".to_owned(), "server-token".to_owned())]
+        );
+        let debug = format!("{capability:?}");
+        assert!(!debug.contains("server-secret"));
+        assert!(!debug.contains("server-token"));
+        assert!(matches!(
+            client.open(&location).await,
+            Err(SdkError::Object {
+                source: lake_objects::ObjectError::DirectObjectAccessUnavailable,
+            })
+        ));
+
+        let actions = actions.lock().expect("recorded actions");
+        assert_eq!(actions.len(), 1, "SDK sends exactly one Flight action");
+        let action = &actions[0];
+        assert_eq!(action.r#type, lake_objects::MANAGED_READ_CAPABILITY_ACTION);
+        let request = ManagedReadCapabilityRequest::from_wire(&action.body)
+            .expect("SDK sends a bounded capability request");
+        assert_eq!(request.location(), &location);
+        assert_eq!(request.expires_in(), Duration::from_secs(60));
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn sdk_open_verifies_datalocation_identity_without_query() {
         let expected = b"immutable managed object bytes";
         let opens = Arc::new(AtomicUsize::new(0));
@@ -4321,6 +4528,48 @@ mod tests {
     struct SigningStore {
         seen:     Arc<StdMutex<Option<(String, Duration)>>>,
         overlong: Arc<AtomicBool>,
+    }
+
+    #[derive(Clone)]
+    struct RecordingReadCapabilityService {
+        actions: Arc<StdMutex<Vec<Action>>>,
+    }
+
+    #[tonic::async_trait]
+    impl FlightSqlService for RecordingReadCapabilityService {
+        type FlightService = Self;
+
+        async fn do_action_fallback(
+            &self,
+            request: Request<Action>,
+        ) -> std::result::Result<
+            Response<<Self as arrow_flight::flight_service_server::FlightService>::DoActionStream>,
+            Status,
+        > {
+            let action = request.into_inner();
+            if action.r#type != lake_objects::MANAGED_READ_CAPABILITY_ACTION {
+                return Err(Status::invalid_argument("unexpected Flight action"));
+            }
+            let capability_request = ManagedReadCapabilityRequest::from_wire(&action.body)
+                .map_err(|_| Status::invalid_argument("invalid capability request"))?;
+            self.actions
+                .lock()
+                .expect("recording action mutex")
+                .push(action);
+            let capability = ManagedReadCapabilityResponse::new(PresignedRead::new(
+                "https://objects.example/episode?X-Amz-Signature=server-secret",
+                vec![("x-amz-security-token".to_owned(), "server-token".to_owned())],
+                SystemTime::now() + capability_request.expires_in(),
+            ));
+            let body = capability
+                .to_wire()
+                .map_err(|_| Status::internal("could not encode capability"))?;
+            let stream =
+                futures::stream::once(async move { Ok(FlightResult { body: body.into() }) });
+            Ok(Response::new(Box::pin(stream)))
+        }
+
+        async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
     }
 
     struct StaticReadStore {

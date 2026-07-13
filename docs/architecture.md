@@ -604,15 +604,20 @@ design-level ones:
   one another. Caller metadata and accumulated returned locations each have a
   16 MiB ceiling, and the final 64 MiB Flight ceiling uses protobuf encoded
   lengths identical to Metasrv admission. The SDK receives only the query
-  endpoint, discovers a credential-free managed
-  stage descriptor once, and constructs local/S3 access using process
-  credentials; query forwards metadata to the leader-aware metasrv. A
-  credentialed SDK process can mint a 1s..=1h S3 GET capability only after the
-  same tenant child-prefix validation used by direct reads. The opaque result
-  redacts URL/header values from Debug, signing performs no GET, and consumers
-  may add Range while retaining any required signed headers. Server-issued
-  capabilities for credentialless SDK processes and codec indexes are
-  deferred.
+  endpoint, discovers a credential-free managed stage descriptor once, and
+  constructs local/S3 access using process credentials; query forwards metadata
+  to the leader-aware metasrv. A credentialed SDK process can mint a 1s..=1h
+  S3 GET capability only after the same tenant child-prefix validation used by
+  direct reads. The opaque result redacts URL/header values from Debug, signing
+  performs no GET, and consumers may add Range while retaining any required
+  signed headers. A credentialless SDK process uses `connect_query_only` plus
+  the explicit `presign_read_via_query` action instead: it neither discovers a
+  managed stage nor creates an object-store client. Query authenticates first,
+  derives the exact `tenants/<tenant-id>` S3 stage, validates the
+  `DataLocation`, and then delegates the bounded signing operation to its
+  optional S3-only issuer. No signed URL, header value, credential, or object
+  bytes reaches Arrow, Query persistence, or Metasrv. Local Query deployments
+  install no issuer and fail the action closed. Codec indexes remain deferred.
   When the operator configures the SDK checkpoint directory, the exact append
   operation also becomes restart-durable before its first RPC: UUIDv7 identity,
   encoded metadata, stage identity, and integrity digest are atomically fsynced

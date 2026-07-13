@@ -18,11 +18,14 @@ use std::{future::Future, sync::Arc};
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
-use lake_common::ManagedStageBackend;
+use lake_common::{ManagedStageBackend, ManagedStageDescriptor};
 use lake_flight::ClientSecurity;
 use lake_meta::{DynamoMeta, MetaStoreRef, RocksMeta};
 use lake_metasrv::MetasrvServerConfig;
-use lake_objects::{LocalObjectStore, ManagedObjectStore, S3ObjectStore};
+use lake_objects::{
+    LocalObjectStore, ManagedObjectStore, ManagedReadCapabilityIssuerRef, S3ObjectStore,
+    S3ReadCapabilityIssuer,
+};
 use lake_query::{
     AsyncQueryConfig, QueryEngine, QueryResources, QueryServerConfig, connect_remote_catalog_source,
 };
@@ -74,6 +77,9 @@ where
     if let Some(keys) = query_ticket_keys_from_env()? {
         config = config.with_ticket_keys(keys);
     }
+    if let Some(issuer) = read_capability_issuer(ctx.managed_stage()).await? {
+        config = config.with_read_capability_issuer(issuer);
+    }
     if ctx.async_enabled() {
         config = config.with_async_queries(async_query_config(ctx).await?);
     }
@@ -88,6 +94,59 @@ where
         Ok(())
     })
     .await
+}
+
+/// Construct a server-side read-capability issuer only for an S3 managed stage.
+///
+/// The client and its AWS credentials stay in the Query process; the SDK sees
+/// only the bounded result of the Query Flight action.
+async fn read_capability_issuer(
+    stage: &ManagedStageDescriptor,
+) -> anyhow::Result<Option<ManagedReadCapabilityIssuerRef>> {
+    match stage.backend() {
+        ManagedStageBackend::Local { .. } => Ok(None),
+        ManagedStageBackend::S3 { .. } => {
+            let client = s3_client_for_stage(stage).await?;
+            read_capability_issuer_for_stage(stage, Some(client))
+        }
+    }
+}
+
+fn read_capability_issuer_for_stage(
+    stage: &ManagedStageDescriptor,
+    s3_client: Option<aws_sdk_s3::Client>,
+) -> anyhow::Result<Option<ManagedReadCapabilityIssuerRef>> {
+    match stage.backend() {
+        ManagedStageBackend::Local { .. } => Ok(None),
+        ManagedStageBackend::S3 { .. } => {
+            let client = s3_client.ok_or_else(|| {
+                anyhow::anyhow!("S3 managed stage requires a Query-owned S3 client")
+            })?;
+            Ok(Some(Arc::new(S3ReadCapabilityIssuer::new(client))))
+        }
+    }
+}
+
+async fn s3_client_for_stage(stage: &ManagedStageDescriptor) -> anyhow::Result<aws_sdk_s3::Client> {
+    let ManagedStageBackend::S3 {
+        region,
+        endpoint,
+        force_path_style,
+        ..
+    } = stage.backend()
+    else {
+        anyhow::bail!("local managed stage cannot construct an S3 client");
+    };
+    let mut loader = aws_config::defaults(BehaviorVersion::latest());
+    if let Some(region) = region {
+        loader = loader.region(Region::new(region.clone()));
+    }
+    let shared = loader.load().await;
+    let mut config = aws_sdk_s3::config::Builder::from(&shared).force_path_style(*force_path_style);
+    if let Some(endpoint) = endpoint {
+        config = config.endpoint_url(endpoint);
+    }
+    Ok(aws_sdk_s3::Client::from_conf(config.build()))
 }
 
 async fn query_engine_for_server(
@@ -224,11 +283,12 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use lake_common::ManagedStageDescriptor;
     use lake_engine_lance::LanceMaintenancePolicy;
     use lake_flight::ClientSecurity;
     use lake_query::QueryResources;
 
-    use super::query_engine_for_server;
+    use super::{query_engine_for_server, read_capability_issuer_for_stage};
     use crate::commands::QueryContext;
 
     #[test]
@@ -240,6 +300,36 @@ mod tests {
         assert!(source.contains("meta_with_shutdown(ctx, addr, shutdown_signal())"));
         assert!(source.contains("lake_query::serve_with_config_and_shutdown"));
         assert!(source.contains("lake_metasrv::serve_with_config_and_shutdown"));
+    }
+
+    #[test]
+    fn query_server_capability_issuer_is_s3_only() {
+        let local = ManagedStageDescriptor::local("/var/lib/lake/managed-objects");
+        assert!(
+            read_capability_issuer_for_stage(&local, None)
+                .expect("local Query does not need an S3 client")
+                .is_none()
+        );
+
+        let s3 = ManagedStageDescriptor::s3(
+            "lake-managed",
+            "managed-objects",
+            Some("us-east-1".to_owned()),
+            None,
+            true,
+        );
+        let client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .build(),
+        );
+        assert!(
+            read_capability_issuer_for_stage(&s3, Some(client))
+                .expect("S3 Query owns the issuer")
+                .is_some()
+        );
+        assert!(read_capability_issuer_for_stage(&s3, None).is_err());
     }
 
     #[tokio::test]
