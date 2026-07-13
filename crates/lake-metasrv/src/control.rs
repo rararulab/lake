@@ -981,6 +981,12 @@ impl MetasrvFlightService {
     }
 
     /// `list_tables`: return one legacy bounded namespace listing.
+    ///
+    /// A continuation means the backend has not proved that this one scan is
+    /// namespace-complete. In particular, a Dynamo v1 `Scan` can return a
+    /// continuation after filtering unrelated physical rows. The legacy wire
+    /// contract cannot return a partial list, so it rejects every such result
+    /// instead of mistaking a filtered scan boundary for a name-count limit.
     async fn action_list_tables(&self, body: &[u8]) -> Result<Response<ActionStream>, Status> {
         let req: NamespaceIdent = parse_body(body)?;
         req.validate()?;
@@ -997,7 +1003,8 @@ impl MetasrvFlightService {
         let (names, continuation) = page.into_parts();
         if continuation.is_some() {
             return Err(Status::resource_exhausted(
-                "legacy table enumeration exceeds its page limit; use list_tables_page",
+                "legacy table enumeration cannot prove a complete bounded result; use \
+                 list_tables_page",
             ));
         }
         let names: Vec<String> = names.into_iter().map(|name| name.0).collect();
@@ -2817,6 +2824,65 @@ mod enumeration_tests {
         scan_pages:    AtomicUsize,
     }
 
+    /// Models Dynamo v1 `Scan` pagination: `Limit` and `LastEvaluatedKey`
+    /// count physical rows before `FilterExpression`, so a page may contain
+    /// fewer matching registry entries while still requiring a continuation.
+    struct DynamoV1FilteredPageMeta;
+
+    #[async_trait]
+    impl MetaStore for DynamoV1FilteredPageMeta {
+        async fn get(&self, _key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
+            unreachable!("enumeration reads only a bounded prefix page")
+        }
+
+        async fn cas(
+            &self,
+            _key: &str,
+            _expected: Option<&[u8]>,
+            _new: &[u8],
+        ) -> lake_meta::Result<bool> {
+            unreachable!("enumeration is read-only")
+        }
+
+        async fn signaled_mutate(
+            &self,
+            _mutation: SignaledMutation<'_>,
+        ) -> lake_meta::Result<bool> {
+            unreachable!("enumeration is read-only")
+        }
+
+        async fn guarded_mutate(&self, _mutation: GuardedMutation<'_>) -> lake_meta::Result<bool> {
+            unreachable!("enumeration is read-only")
+        }
+
+        async fn list_prefix(&self, _prefix: &str) -> lake_meta::Result<Vec<String>> {
+            unreachable!("bounded enumeration must not materialize a prefix")
+        }
+
+        async fn scan_prefix(&self, _prefix: &str) -> lake_meta::Result<Vec<(String, Vec<u8>)>> {
+            unreachable!("bounded enumeration must not materialize registry values")
+        }
+
+        async fn scan_prefix_page(
+            &self,
+            prefix: &str,
+            continuation: Option<&str>,
+            limit: usize,
+        ) -> lake_meta::Result<MetaScanPage> {
+            assert_eq!(prefix, "tbl/robots/");
+            assert!(continuation.is_none());
+            assert_eq!(limit, MAX_ENUMERATION_PAGE_ENTRIES);
+            Ok(MetaScanPage::new(
+                vec![("only-table".to_owned(), Vec::new())],
+                Some("unrelated-physical-key".to_owned()),
+            ))
+        }
+
+        async fn delete(&self, _key: &str, _expected: &[u8]) -> lake_meta::Result<bool> {
+            unreachable!("enumeration is read-only")
+        }
+    }
+
     #[async_trait]
     impl MetaStore for CountingPageMeta {
         async fn get(&self, key: &str) -> lake_meta::Result<Option<Vec<u8>>> {
@@ -3061,7 +3127,7 @@ mod enumeration_tests {
     }
 
     #[tokio::test]
-    async fn legacy_control_enumeration_rejects_over_limit() {
+    async fn legacy_table_enumeration_fails_closed_at_page_boundary() {
         let root = tempfile::tempdir().expect("temporary root");
         let meta: MetaStoreRef =
             Arc::new(RocksMeta::open(root.path().join("meta")).expect("open metastore"));
@@ -3094,6 +3160,27 @@ mod enumeration_tests {
             error.message().contains("list_tables_page"),
             "migration error names the bounded action"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_table_enumeration_fails_closed_on_dynamo_v1_filtered_scan() {
+        let service = service(Arc::new(DynamoV1FilteredPageMeta));
+        let action = Action {
+            r#type: "list_tables".to_owned(),
+            body:   serde_json::to_vec(&json!({ "namespace": "robots" }))
+                .expect("serialize action body")
+                .into(),
+        };
+        let mut request = tonic::Request::new(action);
+        request.extensions_mut().insert(admin());
+
+        let error = match FlightService::do_action(&service, request).await {
+            Ok(_) => panic!("legacy action must not return an incomplete filtered scan"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert!(error.message().contains("complete bounded result"));
+        assert!(error.message().contains("list_tables_page"));
     }
 
     #[tokio::test]

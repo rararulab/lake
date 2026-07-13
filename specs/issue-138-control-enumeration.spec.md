@@ -33,13 +33,17 @@ to the stateful tier, contradicting the bounded-authority design.
   namespace grants. They do not read or filter the global registry. This is
   the control-plane meaning of an accessible namespace; an empty granted
   namespace remains visible.
-- Preserve the legacy `list_tables` action type for small callers, but serve
-  no more than one fixed, bounded page. If more data exists, fail with
-  `resource_exhausted` rather than return a partial catalog. Global namespace
-  enumeration (legacy or paged) fails with `failed_precondition` until a
-  durable namespace index is introduced; it must never return duplicate or
-  incomplete names. Update lake's CLI to use the paged actions where the
-  caller has a namespace or User grants.
+- Preserve the legacy `list_tables` action type only when one bounded backend
+  page proves the namespace is complete. Any backend continuation fails with
+  `resource_exhausted` rather than returning a partial catalog. This is
+  deliberately fail-closed during the legacy Dynamo v1 transition: its
+  filtered `Scan` can continue after unrelated physical rows even when fewer
+  than the caller's name limit matched. Legacy callers must migrate to the
+  paged action until the backend can prove a complete one-page result. Global
+  namespace enumeration (legacy or paged) fails with `failed_precondition`
+  until a durable namespace index is introduced; it must never return
+  duplicate or incomplete names. Update lake's CLI to use the paged actions
+  where the caller has a namespace or User grants.
 - Bound page input, page output serialization, and concurrent direct
   enumeration independently of the remote Query catalog snapshot admission.
   The response-held permit prevents slow control clients from accumulating
@@ -113,14 +117,16 @@ Scenario: global namespace enumeration fails closed without an index
   Then Metasrv returns `failed_precondition` explaining that a durable
   namespace index is required, with no partial or duplicate catalog response
 
-Scenario: legacy enumeration fails closed at its fixed page boundary
+Scenario: legacy enumeration fails closed when one backend page is incomplete
   Test:
     Package: lake-metasrv
-    Filter: legacy_control_enumeration_rejects_over_limit
-  Given more names than the legacy one-page ceiling
+    Filter: legacy_table_enumeration_fails_closed
+  Given either more names than the legacy one-page ceiling or a legacy Dynamo
+  v1 filtered scan whose continuation follows unrelated physical rows
   When a client invokes the existing `list_tables` or `list_namespaces` action
   Then Metasrv returns `resource_exhausted` with no partial JSON catalog and
-  directs callers to the paged action
+  directs callers to the paged action; `list_tables` never treats a backend
+  scan continuation as evidence that a matching-name count exceeded the limit
 
 Scenario: CLI prints paged metadata enumeration without collecting it
   Test:

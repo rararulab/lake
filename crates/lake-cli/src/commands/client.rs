@@ -26,6 +26,7 @@
 
 use anyhow::Context as _;
 use arrow_flight::{Action, Result as FlightResult, flight_service_client::FlightServiceClient};
+use async_trait::async_trait;
 use clap::Subcommand;
 use futures::TryStreamExt;
 use lake_flight::ClientSecurity;
@@ -39,9 +40,34 @@ struct MetasrvClient {
     security: ClientSecurity,
 }
 
+/// The small control-plane surface needed by commands that follow an action
+/// continuation. Keeping it separate from connection setup lets the page walk
+/// be verified against real action bodies without starting a local metasrv.
+#[async_trait]
+trait ControlActionClient {
+    async fn do_action(&mut self, action: Action) -> anyhow::Result<Vec<FlightResult>>;
+}
+
+#[async_trait]
+impl ControlActionClient for MetasrvClient {
+    async fn do_action(&mut self, action: Action) -> anyhow::Result<Vec<FlightResult>> {
+        let request = self.security.authorize_request(Request::new(action));
+        let response = self
+            .inner
+            .do_action(request)
+            .await
+            .map_err(|status| map_status(&status))?;
+        response
+            .into_inner()
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|status| map_status(&status))
+    }
+}
+
 const CONTROL_ENUMERATION_PAGE_ENTRIES: usize = 128;
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 struct NamePage {
     names:        Vec<String>,
     continuation: Option<String>,
@@ -123,24 +149,6 @@ fn map_status(status: &Status) -> anyhow::Error {
     }
 }
 
-/// Issue `action` and collect its (usually empty or one-shot) result stream.
-async fn do_action(
-    client: &mut MetasrvClient,
-    action: Action,
-) -> anyhow::Result<Vec<FlightResult>> {
-    let request = client.security.authorize_request(Request::new(action));
-    let response = client
-        .inner
-        .do_action(request)
-        .await
-        .map_err(|s| map_status(&s))?;
-    response
-        .into_inner()
-        .try_collect::<Vec<_>>()
-        .await
-        .map_err(|s| map_status(&s))
-}
-
 /// Build an [`Action`] from a type tag and a JSON body value.
 fn action(r#type: &str, body: &serde_json::Value) -> anyhow::Result<Action> {
     Ok(Action {
@@ -160,7 +168,7 @@ async fn create_table(
         "name": table.name.0,
         "columns": columns,
     });
-    do_action(client, action("create_table", &body)?).await?;
+    client.do_action(action("create_table", &body)?).await?;
     println!("created {table}");
     Ok(())
 }
@@ -168,7 +176,7 @@ async fn create_table(
 async fn drop_table(client: &mut MetasrvClient, table: &str) -> anyhow::Result<()> {
     let table = parse_table_ref(table)?;
     let body = json!({ "namespace": table.namespace.0, "name": table.name.0 });
-    do_action(client, action("drop_table", &body)?).await?;
+    client.do_action(action("drop_table", &body)?).await?;
     println!("dropped {table}");
     Ok(())
 }
@@ -203,6 +211,21 @@ async fn resolve(client: &mut MetasrvClient, table: &str) -> anyhow::Result<()> 
 }
 
 async fn list(client: &mut MetasrvClient, namespace: Option<&str>) -> anyhow::Result<()> {
+    list_with_writer(client, namespace, |name| println!("{name}")).await
+}
+
+/// Follow remote control-plane name pages, handing each decoded name to
+/// `write` before requesting the next page. This deliberately keeps no
+/// complete catalog in the CLI process.
+async fn list_with_writer<C, W>(
+    client: &mut C,
+    namespace: Option<&str>,
+    mut write: W,
+) -> anyhow::Result<()>
+where
+    C: ControlActionClient,
+    W: FnMut(&str),
+{
     let mut continuation = None;
     loop {
         let (action_type, body) = match namespace {
@@ -222,14 +245,14 @@ async fn list(client: &mut MetasrvClient, namespace: Option<&str>) -> anyhow::Re
                 }),
             ),
         };
-        let results = do_action(client, action(action_type, &body)?).await?;
+        let results = client.do_action(action(action_type, &body)?).await?;
         let first = results.first().context("list page returned no result")?;
         let page: NamePage = serde_json::from_slice(&first.body)?;
         if results.len() != 1 {
             anyhow::bail!("list page returned more than one result");
         }
         for name in page.names {
-            println!("{name}");
+            write(&name);
         }
         let Some(next) = page.continuation else {
             return Ok(());
@@ -240,26 +263,118 @@ async fn list(client: &mut MetasrvClient, namespace: Option<&str>) -> anyhow::Re
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn client_list_follows_control_enumeration_pages() {
-        let source = include_str!("client.rs");
-        let (_, list) = source
-            .split_once("async fn list(client: &mut MetasrvClient, namespace: Option<&str>)")
-            .expect("client list function exists");
-        let (list, _) = list
-            .split_once("\n#[cfg(test)]")
-            .expect("client list is followed by its test module");
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
 
-        assert!(list.contains("list_tables_page"));
-        assert!(list.contains("list_namespaces_page"));
-        assert!(list.contains("loop {"));
-        assert!(
-            !list.contains("\"list_tables\""),
-            "remote list must not use the legacy whole-namespace action"
+    use arrow_flight::{Action, Result as FlightResult};
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    use super::{ControlActionClient, NamePage, list_with_writer};
+
+    struct ExpectedPage {
+        names_written_before_request: Vec<String>,
+        results: Vec<FlightResult>,
+    }
+
+    struct RecordingControlClient {
+        pages:   VecDeque<ExpectedPage>,
+        actions: Vec<Action>,
+        written: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ControlActionClient for RecordingControlClient {
+        async fn do_action(&mut self, action: Action) -> anyhow::Result<Vec<FlightResult>> {
+            let expected = self.pages.pop_front().expect("unexpected action request");
+            assert_eq!(
+                *self.written.lock().expect("written names lock"),
+                expected.names_written_before_request,
+                "the next page must not be requested before the prior page is written"
+            );
+            self.actions.push(action);
+            Ok(expected.results)
+        }
+    }
+
+    fn page_result(names: &[&str], continuation: Option<&str>) -> FlightResult {
+        FlightResult {
+            body: serde_json::to_vec(&NamePage {
+                names:        names.iter().map(ToString::to_string).collect(),
+                continuation: continuation.map(ToString::to_string),
+            })
+            .expect("serialize page")
+            .into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn client_list_follows_control_enumeration_pages() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut client = RecordingControlClient {
+            pages:   VecDeque::from([
+                ExpectedPage {
+                    names_written_before_request: Vec::new(),
+                    results: vec![page_result(&["alpha"], Some("cursor-a"))],
+                },
+                ExpectedPage {
+                    names_written_before_request: vec!["alpha".to_owned()],
+                    results: vec![page_result(&["beta"], None)],
+                },
+            ]),
+            actions: Vec::new(),
+            written: written.clone(),
+        };
+
+        list_with_writer(&mut client, Some("robots"), {
+            let written = written.clone();
+            move |name| {
+                written
+                    .lock()
+                    .expect("written names lock")
+                    .push(name.to_owned())
+            }
+        })
+        .await
+        .expect("all action continuations succeed");
+
+        assert!(client.pages.is_empty(), "every response page is consumed");
+        assert_eq!(
+            *written.lock().expect("written names lock"),
+            ["alpha", "beta"],
+            "names are written as each page is decoded"
         );
-        assert!(
-            !list.contains("\"list_namespaces\""),
-            "remote list must not use the legacy whole-catalog action"
+        assert_eq!(
+            client
+                .actions
+                .iter()
+                .map(|action| action.r#type.as_str())
+                .collect::<Vec<_>>(),
+            ["list_tables_page", "list_tables_page"],
+            "remote CLI enumeration must not use legacy whole-catalog actions"
+        );
+        let bodies = client
+            .actions
+            .iter()
+            .map(|action| serde_json::from_slice::<serde_json::Value>(&action.body).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bodies,
+            [
+                json!({
+                    "namespace": "robots",
+                    "limit": super::CONTROL_ENUMERATION_PAGE_ENTRIES,
+                    "continuation": null,
+                }),
+                json!({
+                    "namespace": "robots",
+                    "limit": super::CONTROL_ENUMERATION_PAGE_ENTRIES,
+                    "continuation": "cursor-a",
+                }),
+            ],
+            "each action carries the continuation returned by its prior page"
         );
     }
 }
