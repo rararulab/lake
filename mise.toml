@@ -18,6 +18,8 @@ bun  = "1.3.14"        # runs scripts/*.ts
 uv   = "0.11.26"       # uvx runs the code-review-graph MCP server (.mcp.json)
 "ubi:j178/prek" = "0.4.8"     # quality gate runner (.pre-commit-config.yaml)
 "cargo:agent-spec" = "0.3.0"  # lane-1 BDD gate (spec-lint / spec-lifecycle)
+"cargo:cargo-deny" = "0.19.0" # dependency advisories, bans, licenses, and sources
+"cargo:cargo-shear" = "1.13.1" # unused Cargo dependency detection
 # Prebuilt LocalStack integration test runner.
 "github:nextest-rs/nextest" = "cargo-nextest-0.9.140"
 # Protocol Buffer compiler required by Lance build scripts.
@@ -68,6 +70,14 @@ run = "cargo +nightly fmt --all -- --check"
 [tasks.clippy]
 description = "cargo clippy with -D warnings"
 run = "cargo clippy --workspace --all-targets --all-features --no-deps -- -D warnings"
+
+[tasks.dependency-deny]
+description = "enforce Cargo advisory, ban, license, and source policy"
+run = "cargo deny check"
+
+[tasks.dependency-shear]
+description = "reject unused dependencies declared in Cargo.toml files"
+run = "cargo shear"
 
 [tasks.hooks]
 description = "run all pre-commit hooks against all files"
@@ -124,8 +134,8 @@ description = "strictly validate the checked-in Kubernetes reference against Kub
 run = "kubeconform -strict -summary -kubernetes-version 1.32.0 deploy/kubernetes/lake.yaml"
 
 # ponytail: gate = the FAST local loop (hooks, cargo test, e2e, marketing site).
-# Slow passes (cargo doc warnings, spec-selftest tooling lock) run in CI
-# via `mise run ci`.
+# Dependency policy plus slow passes (cargo doc warnings, spec-selftest tooling
+# lock) run in the comprehensive local gate via `mise run ci`.
 [tasks.gate]
 description = "fast local quality gate: hooks + Rust tests + e2e + marketing site"
 depends = ["hooks", "test", "test-adbc", "e2e", "site-check"]
@@ -139,8 +149,8 @@ run = 'env RUSTDOCFLAGS="-D warnings" cargo +nightly doc --workspace --no-deps -
 # a constrained ephemeral runner. Local-first: this is the real gate; CI is a
 # post-merge backstop on `main`. Ship via `mise run ship`.
 [tasks.ci]
-description = "comprehensive local gate: gate + doc + spec-selftest + integration (needs Docker)"
-depends = ["gate", "doc", "spec-selftest", "test-integration"]
+description = "comprehensive local gate: gate + dependency policy + doc + spec-selftest + integration (needs Docker)"
+depends = ["gate", "dependency-deny", "dependency-shear", "doc", "spec-selftest", "test-integration"]
 
 # One command to ship: full local gate + Conventional Commit check, then push
 # through the jj-pre-push gate. Local-first replacement for CI-catches-problems.

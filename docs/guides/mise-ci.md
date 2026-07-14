@@ -14,11 +14,12 @@ first.
 - Rust stays under `rustup` and `rust-toolchain.toml`; mise does not manage
   Rust for this repo.
 - **Local-first**: the comprehensive gate runs LOCALLY (`mise run ship`, which
-  runs `mise run ci` — gate + doc + spec-selftest + LocalStack integration —
-  then a conventional-commit check, then push through the jj-pre-push fmt/clippy
-  gate). CI (`ci.yml`) triggers on `push: [main]` + `workflow_dispatch` only; it
-  is a post-merge Linux backstop, NOT run on PRs and NOT the first place checks
-  run. Local covers *more* than CI (Docker, no ephemeral limits).
+  runs `mise run ci` — gate + dependency policy + doc + spec-selftest +
+  LocalStack integration — then a conventional-commit check, then push through
+  the jj-pre-push fmt/clippy gate). CI (`ci.yml`) triggers on `push: [main]` +
+  `workflow_dispatch` only; it is a post-merge Linux backstop, NOT run on PRs
+  and NOT the first place checks run. Local covers *more* than CI (Docker, no
+  ephemeral limits).
 - TypeScript scripts use Bun Shell deliberately: safe interpolation, explicit
   error handling, and structured parsing instead of fragile text pipelines.
 
@@ -36,9 +37,9 @@ first.
 ## Tool Version Rules
 
 - Pin CI-critical tools to concrete versions in `mise.toml`. Do not use
-  `latest` for `bun`, `uv`, `jj`, `gh`, `prek`, `agent-spec`,
-  `cargo-nextest`, or `protoc` unless the PR is explicitly a toolchain refresh
-  and records the reason.
+  `latest` for `bun`, `uv`, `jj`, `gh`, `prek`, `agent-spec`, `cargo-deny`,
+  `cargo-shear`, `cargo-nextest`, or `protoc` unless the PR is explicitly a
+  toolchain refresh and records the reason.
 - Top-level `[tools]` is the base developer environment. Do not put deploy-only
   tools (cloud emulators, load-test tools) there; attach them to the deploy tasks
   that need them.
@@ -58,8 +59,8 @@ first.
 - `mise run test-integration` owns checkout-scoped LocalStack lifecycle;
   `mise run test-integration-external` runs the identical ignored-only package
   suite against a caller-managed endpoint and is the GitHub CI entry point.
-- `mise run ci` is the full CI gate. It must include `gate`, Rustdoc warnings,
-  and spec tooling self-tests.
+- `mise run ci` is the full CI gate. It must include `gate`, both dependency
+  policy tasks, Rustdoc warnings, and spec tooling self-tests.
 - If a CI check protects a repo invariant, expose it as a `mise` task and run
   it from `ci`; include it in `gate` only when it belongs in the fast local
   loop.
