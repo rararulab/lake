@@ -89,12 +89,20 @@ const ASYNC_POLL_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const ASYNC_POLL_MAX_BACKOFF: Duration = Duration::from_secs(2);
 
 static DIRECT_READ_HTTP_CLIENT: LazyLock<std::result::Result<reqwest::Client, ()>> =
-    LazyLock::new(|| {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| ())
-    });
+    LazyLock::new(|| build_direct_read_http_client(reqwest::Client::builder()));
+
+fn build_direct_read_http_client(
+    builder: reqwest::ClientBuilder,
+) -> std::result::Result<reqwest::Client, ()> {
+    // A managed-read capability is a short-lived credential. Its request must
+    // travel directly to its authority, never through a caller or environment
+    // proxy that could receive the URL or signed headers.
+    builder
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| ())
+}
 
 fn ambiguous_append_error(error: &SdkError) -> bool {
     match error {
@@ -2115,7 +2123,7 @@ mod tests {
         body::Body,
         extract::State,
         http::{HeaderMap, StatusCode, header},
-        routing::get,
+        routing::{any, get},
     };
     use bytes::Bytes;
     use futures::TryStreamExt;
@@ -4240,6 +4248,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_read_client_bypasses_configured_proxy() {
+        let object_requests = Arc::new(AtomicUsize::new(0));
+        let observed_headers = Arc::new(StdMutex::new(Vec::new()));
+        let (object_url, object_server) = spawn_recording_object_server(
+            b"direct".to_vec(),
+            object_requests.clone(),
+            observed_headers.clone(),
+        )
+        .await;
+        let proxy_requests = Arc::new(AtomicUsize::new(0));
+        let (proxy_url, proxy_server) = spawn_recording_proxy(proxy_requests.clone()).await;
+        let capability = PresignedRead::new(
+            object_url,
+            vec![("x-object-token".to_owned(), "header-secret".to_owned())],
+            SystemTime::now() + Duration::from_mins(1),
+        );
+        let client = super::build_direct_read_http_client(
+            reqwest::Client::builder()
+                .proxy(reqwest::Proxy::all(proxy_url).expect("valid proxy URL")),
+        )
+        .expect("direct-read test client");
+
+        let response = client
+            .get(capability.url())
+            .header("x-object-token", "header-secret")
+            .send()
+            .await
+            .expect("direct request completes");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response
+                .bytes()
+                .await
+                .expect("direct response body")
+                .as_ref(),
+            b"direct"
+        );
+        assert_eq!(proxy_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(object_requests.load(Ordering::SeqCst), 1);
+        let headers = observed_headers.lock().expect("recorded object headers");
+        assert_eq!(
+            headers[0]
+                .get("x-object-token")
+                .expect("required signed header")
+                .to_str()
+                .expect("ASCII test header"),
+            "header-secret"
+        );
+
+        proxy_server.abort();
+        object_server.abort();
+    }
+
+    #[tokio::test]
     async fn query_only_full_read_streams_and_verifies_without_stage_access() {
         let bytes = b"first-stream";
         let state = StreamingObjectState {
@@ -5147,6 +5209,89 @@ mod tests {
             format!("http://{address}/object?X-Amz-Signature=http-secret"),
             server,
         )
+    }
+
+    #[derive(Clone)]
+    struct RecordingObjectState {
+        body:     Vec<u8>,
+        requests: Arc<AtomicUsize>,
+        headers:  Arc<StdMutex<Vec<HeaderMap>>>,
+    }
+
+    async fn recording_object(
+        State(state): State<RecordingObjectState>,
+        headers: HeaderMap,
+    ) -> axum::response::Response {
+        state.requests.fetch_add(1, Ordering::SeqCst);
+        state
+            .headers
+            .lock()
+            .expect("record object headers")
+            .push(headers);
+        static_object(State(StaticObjectState { body: state.body })).await
+    }
+
+    async fn spawn_recording_object_server(
+        body: Vec<u8>,
+        requests: Arc<AtomicUsize>,
+        headers: Arc<StdMutex<Vec<HeaderMap>>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind recording object server");
+        let address = listener
+            .local_addr()
+            .expect("recording object server address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/object", get(recording_object))
+                    .with_state(RecordingObjectState {
+                        body,
+                        requests,
+                        headers,
+                    }),
+            )
+            .await
+            .expect("recording object server");
+        });
+        (
+            format!("http://{address}/object?X-Amz-Signature=http-secret"),
+            server,
+        )
+    }
+
+    #[derive(Clone)]
+    struct RecordingProxyState(Arc<AtomicUsize>);
+
+    async fn recording_proxy(
+        State(RecordingProxyState(requests)): State<RecordingProxyState>,
+    ) -> axum::response::Response {
+        requests.fetch_add(1, Ordering::SeqCst);
+        let mut response = axum::response::Response::new(Body::empty());
+        *response.status_mut() = StatusCode::BAD_GATEWAY;
+        response
+    }
+
+    async fn spawn_recording_proxy(
+        requests: Arc<AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind recording proxy");
+        let address = listener.local_addr().expect("recording proxy address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .fallback(any(recording_proxy))
+                    .with_state(RecordingProxyState(requests)),
+            )
+            .await
+            .expect("recording proxy");
+        });
+        (format!("http://{address}"), server)
     }
 
     #[derive(Clone)]
