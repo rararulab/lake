@@ -1355,7 +1355,7 @@ mod tests {
     fn managed_read_capability_request_roundtrips_with_bounded_expiration() {
         let location = s3_location("s3://lake-managed/tenants/tenant-a/objects/episode");
         let request =
-            ManagedReadCapabilityRequest::try_new(location.clone(), Duration::from_secs(60))
+            ManagedReadCapabilityRequest::try_new(location.clone(), Duration::from_mins(1))
                 .expect("bounded request");
 
         let decoded =
@@ -1363,7 +1363,7 @@ mod tests {
                 .expect("decode request");
 
         assert_eq!(decoded.location(), &location);
-        assert_eq!(decoded.expires_in(), Duration::from_secs(60));
+        assert_eq!(decoded.expires_in(), Duration::from_mins(1));
         assert!(matches!(
             ManagedReadCapabilityRequest::try_new(location, Duration::ZERO),
             Err(ObjectError::InvalidPresignExpiration { .. })
@@ -1376,7 +1376,7 @@ mod tests {
         let response = ManagedReadCapabilityResponse::new(PresignedRead::new(
             secret_url,
             vec![("x-amz-security-token".to_owned(), "secret-token".to_owned())],
-            SystemTime::now() + Duration::from_secs(60),
+            SystemTime::now() + Duration::from_mins(1),
         ));
 
         let decoded =

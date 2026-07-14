@@ -4,13 +4,12 @@ Date: 2026-07-14
 
 ## TDD boundary
 
-Before the implementation, the required focused test failed to compile because
-`checked_multipart_part_number` and
-`ObjectError::S3MultipartPartLimit` did not exist. After the implementation:
+Before this implementation was replayed onto the current main baseline, its
+three BDD selectors resolved to zero tests. After the implementation:
 
 ```text
-cargo test -p lake-objects multipart_part_number_limit_rejects_10001st_part
-test result: ok. 1 passed; 0 failed; 0 ignored
+cargo nextest run -p lake-objects -E 'test(multipart_part_number_limit_rejects_10001st_part) | test(resumable_checkpoint_accepts_legacy_part_size_when_default_grows) | test(resumable_pipeline_keeps_legacy_checkpoint_part_size_for_remaining_input)'
+Summary: 3 tests run: 3 passed, 0 skipped
 ```
 
 The small-chunk pipeline regression also passed: it uploads part 10,000, then
@@ -18,23 +17,15 @@ observes one more non-empty one-byte chunk. That 10,001st chunk returns the
 typed error before the uploader is called, so the test covers the real
 cross-boundary pipeline sequence without a large fixture.
 
-```text
-cargo test -p lake-objects multipart_pipeline_accepts_10000th_part_and_rejects_10001st_before_upload
-test result: ok. 1 passed; 0 failed; 0 ignored
-```
-
 ## V1 checkpoint compatibility
 
-The two focused regressions were red before the migration: a valid 5 MiB V1
-checkpoint was rejected against the new 64 MiB default, while a one-byte
-checkpoint size was accepted. After the change, only the explicit legacy 5
-MiB and current 64 MiB sizes validate; restore uses the checkpoint's accepted
-size to rehash completed parts, read the first remaining part, and configure
-the rest of the pipeline.
+Only the explicit legacy 5 MiB and current 64 MiB sizes validate; restore uses
+the checkpoint's accepted size to rehash completed parts, read the first
+remaining part, and configure the rest of the pipeline.
 
 ```text
-cargo test -p lake-objects resumable_checkpoint_
-test result: ok. 3 passed; 0 failed; 0 ignored
+cargo nextest run -p lake-objects
+Summary: 51 tests run: 51 passed, 15 skipped (LocalStack-only)
 ```
 
 The LocalStack integration regression
@@ -50,20 +41,14 @@ one byte remaining and asserts the uploader receives exactly `[5 MiB, 1 B]`.
 This would fail if either resumed first-read or pipeline refill reverted to the
 64 MiB default.
 
-```text
-cargo test -p lake-objects resumable_pipeline_keeps_legacy_checkpoint_part_size_for_remaining_input
-test result: ok. 1 passed; 0 failed; 0 ignored
-```
-
 ## Required checks
 
 ```text
-mise run fmt
-exit 0
+cargo clippy -p lake-objects --all-targets -- -D warnings
+PASS
 
-cargo test -p lake-objects
-unit tests: 32 passed; 0 failed
-s3_localstack wiring tests: 14 passed; 15 ignored
+cargo +nightly fmt --all -- --check
+PASS
 
 mise run spec-lifecycle specs/issue-150-s3-multipart-scale.spec.md
 [PASS] The 10,001st multipart part is rejected before S3 I/O
@@ -71,11 +56,8 @@ mise run spec-lifecycle specs/issue-150-s3-multipart-scale.spec.md
 [PASS] A legacy V1 checkpoint partitions its remaining pipeline at 5 MiB
 spec-lifecycle-guard: OK — every Test selector executed >=1 test
 
-mise run test-integration
-Summary: 20 tests run: 20 passed, 170 skipped
-
 mise run gate
-exit 0
+PASS
 ```
 
 The LocalStack run includes multipart round-trip, interrupted and cancelled
