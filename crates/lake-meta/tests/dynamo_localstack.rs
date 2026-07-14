@@ -362,3 +362,10 @@ fn dynamo_catalog_generation_atomicity_localstack_is_wired() {
     assert!(source.contains("exercise_atomic_directory_signal(&meta, \"v1\")"));
     assert!(source.contains("exercise_atomic_directory_signal(&meta, \"v2\")"));
 }
+
+#[test]
+fn dynamo_bootstrap_readiness_localstack_is_wired() {
+    let source = include_str!("dynamo_localstack.rs");
+    assert!(source.contains("meta.ensure_table().await.expect(\"create test table\")"));
+    assert!(source.contains("stale_dual\n        .open_tables()"));
+}

@@ -43,6 +43,19 @@ pub enum MetaError {
         source:  Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display(
+        "DynamoDB table '{table}' did not become ACTIVE after {attempts} observations; last \
+         status: {last_status}"
+    ))]
+    DynamoTableReadinessTimeout {
+        table:       String,
+        last_status: String,
+        attempts:    usize,
+    },
+
+    #[snafu(display("DynamoDB table '{table}' is unavailable; observed status: {status}"))]
+    DynamoTableUnavailable { table: String, status: String },
+
     #[snafu(display("invalid guarded mutation: guard and target keys must differ"))]
     InvalidGuardedMutation,
 
