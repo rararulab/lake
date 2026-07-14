@@ -98,7 +98,7 @@ run = "uv sync --project interop/adbc --frozen"
 [tasks.test-adbc]
 description = "run pinned upstream ADBC Flight SQL interoperability checks"
 depends = ["adbc-install"]
-run = "cargo test -p lake-query --test adbc_interop -- --ignored"
+run = "cargo test -p lake-query --test adbc_interop -- --ignored --test-threads=1"
 
 [tasks.e2e]
 description = "end-to-end self-check: create -> ingest -> SQL query"
