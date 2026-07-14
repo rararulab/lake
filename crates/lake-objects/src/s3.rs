@@ -32,14 +32,15 @@ use aws_sdk_s3::{
     types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart},
 };
 use futures::{StreamExt, stream::FuturesUnordered};
-use lake_common::DataLocation;
+use lake_common::{DataLocation, ManagedStageBackend, ManagedStageDescriptor};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use url::Url;
 
 use crate::{
     DeleteOutcome, InventoryPage, InventoryRequest, ManagedObjectDeleter, ManagedObjectInventory,
-    ManagedObjectStore, ObjectCandidate, ObjectError, ObjectReader, PresignedRead, Result,
+    ManagedObjectStore, ManagedReadCapabilityIssuer, ObjectCandidate, ObjectError, ObjectReader,
+    PresignedRead, Result,
     checkpoint::{
         CheckpointBinding, CheckpointLock, CheckpointPart, SourceIdentity, UploadCheckpointV1,
     },
@@ -313,6 +314,34 @@ pub struct S3ObjectStore {
     upload_concurrency: usize,
 }
 
+/// Query-owned S3 signer that derives one store from each tenant-scoped stage.
+#[derive(Clone)]
+pub struct S3ReadCapabilityIssuer {
+    client: Client,
+}
+
+impl S3ReadCapabilityIssuer {
+    /// Build an issuer from the Query process's existing S3 client.
+    #[must_use]
+    pub fn new(client: Client) -> Self { Self { client } }
+
+    fn store_for(&self, stage: &ManagedStageDescriptor) -> Result<S3ObjectStore> {
+        let ManagedStageBackend::S3 { bucket, prefix, .. } = stage.backend() else {
+            return Err(ObjectError::PresignUnsupported);
+        };
+        S3ObjectStore::new(self.client.clone(), bucket, prefix)
+    }
+}
+
+impl std::fmt::Debug for S3ReadCapabilityIssuer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("S3ReadCapabilityIssuer")
+            .field("client", &"<redacted>")
+            .finish()
+    }
+}
+
 impl S3ObjectStore {
     /// Bind a client to one non-empty, URI-safe Lake-owned bucket prefix.
     pub fn new(
@@ -426,6 +455,11 @@ impl S3ObjectStore {
             headers,
             start_time + expires_in,
         ))
+    }
+
+    /// Validate an immutable identity without issuing a network request.
+    pub fn validate_location(&self, location: &DataLocation) -> Result<()> {
+        self.managed_key(&location.uri).map(drop)
     }
 
     fn managed_key(&self, uri: &str) -> Result<String> {
@@ -958,6 +992,24 @@ impl S3ObjectStore {
     }
 }
 
+#[async_trait]
+impl ManagedReadCapabilityIssuer for S3ReadCapabilityIssuer {
+    fn validate(&self, stage: &ManagedStageDescriptor, location: &DataLocation) -> Result<()> {
+        self.store_for(stage)?.validate_location(location)
+    }
+
+    async fn issue(
+        &self,
+        stage: &ManagedStageDescriptor,
+        location: &DataLocation,
+        expires_in: Duration,
+    ) -> Result<PresignedRead> {
+        self.store_for(stage)?
+            .presign_read(location, expires_in)
+            .await
+    }
+}
+
 fn redacted_s3_identity(uri: &str) -> String {
     let Ok(parsed) = Url::parse(uri) else {
         return "<redacted-invalid-s3-uri>".to_owned();
@@ -1273,15 +1325,16 @@ mod pipeline_tests {
         config::{Credentials, Region},
         types::CompletedPart,
     };
+    use lake_common::{DataLocation, ManagedStageDescriptor};
     use sha2::{Digest, Sha256};
     use tokio::sync::{Notify, Semaphore};
 
     use super::{
         MAX_UPLOAD_CONCURRENCY, MULTIPART_PART_BYTES, MultipartCleanupOwner, PartUploadPipeline,
-        S3ObjectStore, read_part,
+        S3ObjectStore, S3ReadCapabilityIssuer, read_part,
     };
     use crate::{
-        ManagedObjectStore, ObjectError, ObjectReader,
+        ManagedObjectStore, ManagedReadCapabilityIssuer, ObjectError, ObjectReader,
         checkpoint::{CheckpointBinding, CheckpointPart, SourceIdentity, UploadCheckpointV1},
     };
 
@@ -1364,6 +1417,29 @@ mod pipeline_tests {
                 .with_upload_concurrency(MAX_UPLOAD_CONCURRENCY + 1)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn s3_read_capability_issuer_rejects_unsafe_identity_before_signing() {
+        let issuer = S3ReadCapabilityIssuer::new(test_store().client.clone());
+        let stage = ManagedStageDescriptor::s3(
+            "lake-managed",
+            "managed/objects",
+            Some("us-east-1".to_owned()),
+            None,
+            true,
+        );
+        let location = DataLocation::builder()
+            .uri("s3://lake-managed/managed/objects/tenants/tenant-a/episode.mp4?leak=1")
+            .content_type("video/mp4")
+            .size_bytes(42)
+            .sha256("f00d")
+            .build();
+
+        assert!(matches!(
+            issuer.validate(&stage, &location),
+            Err(ObjectError::InvalidS3Uri { .. })
+        ));
     }
 
     #[tokio::test]
