@@ -65,6 +65,9 @@ first.
   it from `ci`; include it in `gate` only when it belongs in the fast local
   loop.
 - Lane-1 work also runs `mise run spec-lifecycle <spec>`.
+- `spec-lifecycle` discovers changed paths through `jj diff`, not Git's
+  worktree view, so its boundary check is scoped to the current colocated
+  Jujutsu workspace.
 - `site-check` must start from `bun install --frozen-lockfile`, then typecheck,
   test, and build the production artifact. This keeps local and Pages builds
   on the same dependency graph.

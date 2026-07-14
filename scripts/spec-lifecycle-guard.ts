@@ -47,7 +47,9 @@ if (!spec || process.argv.length !== 3) {
 }
 
 const proc = Bun.spawn(
-  ["agent-spec", "lifecycle", spec, "--code", ".", "--change-scope", "worktree", "--format", "json"],
+  // Lake uses colocated Jujutsu workspaces. Git's worktree view can point at
+  // another checkout, while `jj` resolves paths for this workspace exactly.
+  ["agent-spec", "lifecycle", spec, "--code", ".", "--change-scope", "jj", "--format", "json"],
   { stdout: "pipe", stderr: "inherit" },
 );
 const raw = await new Response(proc.stdout).text();
