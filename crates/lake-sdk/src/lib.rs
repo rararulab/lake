@@ -1497,15 +1497,20 @@ impl LakeClient {
         if info.endpoint.is_empty() || info.endpoint.len() > MAX_ASYNC_RESULT_ENDPOINTS {
             return Err(SdkError::MissingQueryEndpoint);
         }
-        let tickets = info
-            .endpoint
-            .into_iter()
-            .map(|endpoint| endpoint.ticket.context(MissingQueryTicketSnafu))
-            .collect::<Result<Vec<_>>>()?;
-        if tickets.iter().any(|ticket| {
-            ticket.ticket.is_empty() || ticket.ticket.len() > MAX_ASYNC_QUERY_HANDLE_BYTES
-        }) {
-            return Err(SdkError::InvalidAsyncQueryResult);
+        let mut tickets = Vec::with_capacity(info.endpoint.len());
+        let mut ticket_bytes = 0usize;
+        for endpoint in info.endpoint {
+            let ticket = endpoint.ticket.context(MissingQueryTicketSnafu)?;
+            if ticket.ticket.is_empty()
+                || ticket.ticket.len() > MAX_ASYNC_QUERY_HANDLE_BYTES
+                || ticket_bytes
+                    .checked_add(ticket.ticket.len())
+                    .is_none_or(|total| total > MAX_QUERY_RESULT_TICKET_TOTAL_BYTES)
+            {
+                return Err(SdkError::InvalidAsyncQueryResult);
+            }
+            ticket_bytes += ticket.ticket.len();
+            tickets.push(ticket);
         }
         Ok(tickets)
     }
@@ -2303,6 +2308,43 @@ mod tests {
             ));
             assert_eq!(do_get_calls.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[test]
+    fn async_result_tickets_rejects_oversized_aggregate() {
+        let endpoint_count =
+            crate::MAX_QUERY_RESULT_TICKET_TOTAL_BYTES / crate::MAX_ASYNC_QUERY_HANDLE_BYTES + 1;
+        let info = FlightInfo::new().with_endpoints(
+            (0..endpoint_count)
+                .map(|_| {
+                    FlightEndpoint::new()
+                        .with_ticket(Ticket::new(vec![0_u8; crate::MAX_ASYNC_QUERY_HANDLE_BYTES]))
+                })
+                .collect(),
+        );
+
+        assert!(matches!(
+            LakeClient::async_result_tickets(info),
+            Err(SdkError::InvalidAsyncQueryResult)
+        ));
+    }
+
+    #[test]
+    fn async_result_tickets_preserves_order_within_aggregate_budget() {
+        let info = FlightInfo::new().with_endpoints(vec![
+            FlightEndpoint::new().with_ticket(Ticket::new(b"first".to_vec())),
+            FlightEndpoint::new().with_ticket(Ticket::new(b"second".to_vec())),
+        ]);
+
+        let tickets = LakeClient::async_result_tickets(info).expect("bounded result tickets");
+
+        assert_eq!(
+            tickets
+                .iter()
+                .map(|ticket| ticket.ticket.as_ref())
+                .collect::<Vec<_>>(),
+            [b"first".as_slice(), b"second".as_slice()]
+        );
     }
 
     #[tokio::test]
