@@ -5,6 +5,15 @@
 // exit 1. Exit 0 means the false-green is back; exit 2 means the gate could
 // not even run (agent-spec missing, malformed report) — both are failures.
 
+const scopeTest = Bun.spawn(["bun", "test", "scripts/spec-lifecycle-guard.test.ts"], {
+  stdout: "inherit",
+  stderr: "inherit",
+});
+if ((await scopeTest.exited) !== 0) {
+  console.log("spec-selftest: FAIL — lifecycle guard Jujutsu scope regression test failed");
+  process.exit(1);
+}
+
 const proc = Bun.spawn(
   ["bun", "scripts/spec-lifecycle-guard.ts", "specs/fixtures/zero-match.spec.md"],
   { stdout: "inherit", stderr: "inherit" },
