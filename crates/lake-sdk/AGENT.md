@@ -36,9 +36,10 @@ The Rust SDK's typed write and direct-read surface.
   object storage without constructing a managed-stage client. Full reads retain
   EOF size/SHA-256 verification; range reads require an exact `206`
   `Content-Range` response and make no whole-object integrity claim.
-- Query-only direct-read HTTP follows no redirects, keeps capability URL/header
-  values out of public errors, and drops an unfinished response on reader drop;
-  it never buffers or proxies an object through a Lake service.
+- Query-only direct-read HTTP follows no redirects or caller/system proxies,
+  keeps capability URL/header values out of public errors, and drops an
+  unfinished response on reader drop; it never buffers or proxies an object
+  through a Lake service.
 - `presign_read` delegates a bounded S3 GET capability only after the same
   managed-prefix validation; capability URLs and headers are redacted by
   default and never enter SQL rows or Flight services.

@@ -619,8 +619,9 @@ design-level ones:
   bytes reaches Arrow, Query persistence, or Metasrv. Local Query deployments
   install no issuer and fail the action closed. `open_via_query` and
   `open_range_via_query` consume that capability internally with one shared
-  Rustls HTTP client whose redirects are disabled; their response bodies stream
-  directly between the SDK and object storage. A full read retains the
+  Rustls HTTP client whose redirects and caller/system proxies are disabled;
+  their response bodies stream directly between the SDK and object storage. A
+  full read retains the
   constant-memory SHA-256-at-EOF check; a range read sends the exact bounded
   interval and requires an exact `206 Content-Range` plus content length before
   it exposes a reader. Signed URL/header-bearing transport failures map to
