@@ -1011,9 +1011,10 @@ impl LakeClientBuilder {
 
     /// Connect only to Query without discovering or opening a managed stage.
     ///
-    /// Use this mode with [`LakeClient::presign_read_via_query`] when the SDK
-    /// process has no cloud-storage credentials. Direct `open`, `open_range`,
-    /// `insert`, and local-IAM [`LakeClient::presign_read`] calls fail closed.
+    /// Use this mode with [`LakeClient::open_via_query`] or
+    /// [`LakeClient::open_range_via_query`] when the SDK process has no
+    /// cloud-storage credentials. The legacy `open`, `open_range`, `insert`,
+    /// and local-IAM [`LakeClient::presign_read`] calls fail closed.
     pub async fn connect_query_only(self) -> Result<LakeClient> {
         let query = self
             .security
@@ -1071,8 +1072,9 @@ impl LakeClient {
     /// Connect only to Query for server-issued managed-read capabilities.
     ///
     /// This does not perform managed-stage discovery or require SDK-process
-    /// cloud credentials. Use [`Self::presign_read_via_query`] to receive a
-    /// direct storage capability; direct object I/O remains unavailable.
+    /// cloud credentials. Use [`Self::open_via_query`] or
+    /// [`Self::open_range_via_query`] to stream one Query-issued direct storage
+    /// capability. The legacy direct-stage methods remain unavailable.
     pub async fn connect_query_only(query_endpoint: impl AsRef<str>) -> Result<Self> {
         Self::builder(query_endpoint.as_ref().to_owned())
             .connect_query_only()
