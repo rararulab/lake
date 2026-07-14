@@ -18,12 +18,13 @@ use std::{
 };
 
 use arrow_flight::{
-    Empty, FlightClient, FlightDescriptor, encode::FlightDataEncoderBuilder,
+    Empty, FlightClient, FlightDescriptor, encode::FlightDataEncoderBuilder, error::FlightError,
     flight_service_client::FlightServiceClient, sql::client::FlightSqlServiceClient,
 };
 use datafusion::arrow::{
     array::StringArray,
     datatypes::{DataType, Field, Schema},
+    ipc::{CompressionType, writer::IpcWriteOptions},
     record_batch::RecordBatch,
 };
 use futures::TryStreamExt;
@@ -357,4 +358,139 @@ async fn query_trace_context_reaches_metasrv_without_data_attributes() {
             ["rpc.system", "rpc.service", "rpc.method", "rpc.outcome"]
         );
     }
+}
+
+#[tokio::test]
+async fn query_forwarded_file_append_rejects_compressed_ipc() {
+    let root = tempfile::tempdir().unwrap();
+    let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+    let engine: TableEngineRef = Arc::new(LanceEngine::new());
+    let metasrv = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
+    let table = TableRef::new("robots", "episodes");
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "episode_id",
+        DataType::Utf8,
+        false,
+    )]));
+    metasrv
+        .create_table(
+            &table,
+            TableLocation::new(root.path().join("episodes.lance").to_string_lossy()),
+            schema.clone(),
+        )
+        .await
+        .unwrap();
+    let initial_version = metasrv
+        .resolve(&table)
+        .await
+        .unwrap()
+        .unwrap()
+        .current_version;
+    let meta_addr = free_addr();
+    let query_addr = free_addr();
+    let query_service = Principal::try_new(
+        PrincipalId::try_new("query-service").unwrap(),
+        TenantId::try_new("service").unwrap(),
+        PrincipalRole::QueryService,
+        std::iter::empty::<&str>(),
+    )
+    .unwrap();
+    let meta_security = ServerSecurity::with_bearer_principals([BearerPrincipalBinding::new(
+        "query-token",
+        query_service,
+    )
+    .unwrap()])
+    .unwrap();
+    let metadata_client = ClientSecurity::new()
+        .with_bearer_token("query-token")
+        .unwrap();
+    tokio::spawn({
+        let metasrv = metasrv.clone();
+        let addr = meta_addr.clone();
+        let config = MetasrvServerConfig::new().with_server_security(meta_security);
+        async move { lake_metasrv::serve_with_config(metasrv, &addr, config).await }
+    });
+    let user = Principal::try_new(
+        PrincipalId::try_new("alpha-user").unwrap(),
+        TenantId::try_new("tenant-a").unwrap(),
+        PrincipalRole::User,
+        ["robots"],
+    )
+    .unwrap();
+    let query_security =
+        ServerSecurity::with_bearer_principals([
+            BearerPrincipalBinding::new("alpha-token", user).unwrap()
+        ])
+        .unwrap();
+    tokio::spawn({
+        let query = Arc::new(QueryEngine::new(meta, engine));
+        let addr = query_addr.clone();
+        let metadata = format!("http://{meta_addr}");
+        let config = QueryServerConfig::new()
+            .with_metadata(metadata, metadata_client)
+            .with_server_security(query_security);
+        async move { lake_query::serve_with_config(query, &addr, config).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec![
+            "episode-42".repeat(1_024),
+        ]))],
+    )
+    .unwrap();
+    let options = IpcWriteOptions::default()
+        .try_with_compression(Some(CompressionType::ZSTD))
+        .unwrap();
+    let mut messages = FlightDataEncoderBuilder::new()
+        .with_schema(schema)
+        .with_options(options)
+        .build(futures::stream::iter(vec![Ok(batch)]))
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let append = FileAppendRequest::new(
+        table.clone(),
+        AppendOperationId::generate(),
+        append_flight_payload_digest(&messages),
+    );
+    messages[0].flight_descriptor = Some(FlightDescriptor::new_cmd(
+        Any {
+            type_url: FILE_APPEND_TYPE_URL.to_owned(),
+            value:    append.command_payload(),
+        }
+        .encode_to_vec(),
+    ));
+    let channel = Channel::from_shared(format!("http://{query_addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = FlightClient::new(channel);
+    ClientSecurity::new()
+        .with_bearer_token("alpha-token")
+        .unwrap()
+        .apply_to_flight_client(&mut client)
+        .unwrap();
+
+    let error = match client
+        .do_put(futures::stream::iter(messages.into_iter().map(Ok)))
+        .await
+    {
+        Err(FlightError::Tonic(status)) => status,
+        Err(error) => panic!("Query must return a tonic status: {error}"),
+        Ok(_) => panic!("Query must relay Metasrv's compressed-IPC rejection"),
+    };
+
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert_eq!(
+        metasrv
+            .resolve(&table)
+            .await
+            .unwrap()
+            .unwrap()
+            .current_version,
+        initial_version
+    );
 }

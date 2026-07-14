@@ -40,7 +40,10 @@ use arrow_flight::{
 };
 use bytes::Bytes;
 use datafusion::{
-    arrow::datatypes::{DataType, Field, Schema, SchemaRef},
+    arrow::{
+        datatypes::{DataType, Field, Schema, SchemaRef},
+        ipc::{MessageHeader, root_as_message},
+    },
     error::DataFusionError,
     physical_plan::stream::RecordBatchStreamAdapter,
 };
@@ -78,6 +81,8 @@ const MAX_ENUMERATION_PAGE_ENTRIES: usize = 256;
 const MAX_ENUMERATION_CONTINUATION_BYTES: usize = 4096;
 const MAX_ENUMERATION_NAMESPACE_BYTES: usize = 128;
 const MAX_ENUMERATION_RESPONSE_BYTES: usize = 1024 * 1024;
+const INVALID_FILE_APPEND_IPC: &str = "invalid FILE append IPC";
+const COMPRESSED_FILE_APPEND_IPC: &str = "compressed FILE append IPC is unsupported";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CatalogSnapshotLimits {
@@ -533,6 +538,7 @@ where
             "FILE append control payload exceeds the server limit",
         ));
     }
+    validate_file_append_ipc(&first)?;
     let mut messages = vec![first];
     while let Some(item) = input.next().await {
         let item = item.map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -546,6 +552,7 @@ where
                 "FILE append control payload exceeds the server limit",
             ));
         }
+        validate_file_append_ipc(&item)?;
         messages.push(item);
     }
     let actual_digest = append_flight_payload_digest(&messages);
@@ -592,6 +599,32 @@ where
             }
             _ => Status::internal(error.to_string()),
         })
+}
+
+fn validate_file_append_ipc(flight_data: &FlightData) -> Result<(), Status> {
+    let message = root_as_message(&flight_data.data_header)
+        .map_err(|_| Status::invalid_argument(INVALID_FILE_APPEND_IPC))?;
+    let body_length = usize::try_from(message.bodyLength())
+        .map_err(|_| Status::invalid_argument(INVALID_FILE_APPEND_IPC))?;
+    if body_length != flight_data.data_body.len() {
+        return Err(Status::invalid_argument(INVALID_FILE_APPEND_IPC));
+    }
+    let compressed = match message.header_type() {
+        MessageHeader::RecordBatch => message
+            .header_as_record_batch()
+            .map(|batch| batch.compression().is_some())
+            .ok_or_else(|| Status::invalid_argument(INVALID_FILE_APPEND_IPC))?,
+        MessageHeader::DictionaryBatch => message
+            .header_as_dictionary_batch()
+            .and_then(|dictionary| dictionary.data())
+            .map(|batch| batch.compression().is_some())
+            .ok_or_else(|| Status::invalid_argument(INVALID_FILE_APPEND_IPC))?,
+        _ => false,
+    };
+    if compressed {
+        return Err(Status::invalid_argument(COMPRESSED_FILE_APPEND_IPC));
+    }
+    Ok(())
 }
 
 /// The metadata-layer control-plane Flight service.
@@ -1414,6 +1447,7 @@ mod file_append_tests {
     use datafusion::arrow::{
         array::StringArray,
         datatypes::{DataType, Field, Schema},
+        ipc::{CompressionType, writer::IpcWriteOptions},
         record_batch::RecordBatch,
     };
     use futures::TryStreamExt;
@@ -1781,6 +1815,168 @@ mod file_append_tests {
                 .unwrap()
                 .current_version,
             version
+        );
+    }
+
+    #[tokio::test]
+    async fn file_append_rejects_compressed_ipc_before_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::new(meta, engine);
+        let table = TableRef::new("robots", "episodes");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        metasrv
+            .create_table(
+                &table,
+                TableLocation::new(root.path().join("episodes.lance").to_string_lossy()),
+                schema.clone(),
+            )
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![
+                "episode-42".repeat(1_024),
+            ]))],
+        )
+        .unwrap();
+        let options = IpcWriteOptions::default()
+            .try_with_compression(Some(CompressionType::ZSTD))
+            .unwrap();
+        let mut messages = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .with_options(options)
+            .build(futures::stream::iter(vec![Ok(batch)]))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let append = FileAppendRequest::new(
+            table.clone(),
+            AppendOperationId::generate(),
+            append_flight_payload_digest(&messages),
+        );
+        messages[0].flight_descriptor = Some(FlightDescriptor::new_cmd(
+            Any {
+                type_url: FILE_APPEND_TYPE_URL.to_owned(),
+                value:    append.command_payload(),
+            }
+            .encode_to_vec(),
+        ));
+        let initial_version = metasrv
+            .resolve(&table)
+            .await
+            .unwrap()
+            .unwrap()
+            .current_version;
+
+        let error = append_file_stream(
+            &metasrv,
+            TenantId::try_new("tenant-a").unwrap(),
+            futures::stream::iter(messages.into_iter().map(Ok::<_, String>)),
+        )
+        .await
+        .expect_err("compressed FILE append IPC must be rejected before decoding");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            initial_version
+        );
+    }
+
+    #[tokio::test]
+    async fn file_append_rejects_declared_body_mismatch_before_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Metasrv::new(meta, engine);
+        let table = TableRef::new("robots", "episodes");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        metasrv
+            .create_table(
+                &table,
+                TableLocation::new(root.path().join("episodes.lance").to_string_lossy()),
+                schema.clone(),
+            )
+            .await
+            .unwrap();
+        let first_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["episode-42"]))],
+        )
+        .unwrap();
+        let second_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["episode-99"]))],
+        )
+        .unwrap();
+        let mut messages = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(futures::stream::iter(vec![
+                Ok(first_batch),
+                Ok(second_batch),
+            ]))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        messages
+            .iter_mut()
+            .filter(|message| !message.data_body.is_empty())
+            .nth(1)
+            .expect("two record batches produce two IPC bodies")
+            .data_body
+            .clear();
+        let append = FileAppendRequest::new(
+            table.clone(),
+            AppendOperationId::generate(),
+            append_flight_payload_digest(&messages),
+        );
+        messages[0].flight_descriptor = Some(FlightDescriptor::new_cmd(
+            Any {
+                type_url: FILE_APPEND_TYPE_URL.to_owned(),
+                value:    append.command_payload(),
+            }
+            .encode_to_vec(),
+        ));
+        let initial_version = metasrv
+            .resolve(&table)
+            .await
+            .unwrap()
+            .unwrap()
+            .current_version;
+
+        let error = append_file_stream(
+            &metasrv,
+            TenantId::try_new("tenant-a").unwrap(),
+            futures::stream::iter(messages.into_iter().map(Ok::<_, String>)),
+        )
+        .await
+        .expect_err("a mismatched IPC body must be rejected before append");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.message(), super::INVALID_FILE_APPEND_IPC);
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            initial_version
         );
     }
 
