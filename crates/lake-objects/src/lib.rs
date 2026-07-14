@@ -699,10 +699,15 @@ fn u64_value(array: &StructArray, column: &'static str, row: usize) -> Result<u6
 #[cfg(test)]
 mod tests {
     use std::{
+        ffi::OsString,
+        io,
+        path::Path,
+        pin::Pin,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
+        task::{Context, Poll},
         time::{Duration, SystemTime},
     };
 
@@ -712,7 +717,10 @@ mod tests {
     use lake_common::DataLocation;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
-    use tokio::io::AsyncReadExt;
+    use tokio::{
+        io::{AsyncRead, AsyncReadExt, ReadBuf},
+        sync::oneshot,
+    };
 
     use crate::{
         InventoryRequest, LocalObjectStore, ManagedObjectInventory, ManagedObjectScope,
@@ -724,6 +732,62 @@ mod tests {
     struct StaticReadStore {
         bytes: Vec<u8>,
         opens: Arc<AtomicUsize>,
+    }
+
+    /// Returns one copy chunk, then signals that the upload is blocked before
+    /// it can observe EOF.
+    struct BlockedLocalUploadReader {
+        emitted: bool,
+        blocked: Option<oneshot::Sender<()>>,
+    }
+
+    impl AsyncRead for BlockedLocalUploadReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let reader = self.get_mut();
+            if !reader.emitted {
+                reader.emitted = true;
+                output.put_slice(b"partial local upload");
+                return Poll::Ready(Ok(()));
+            }
+            if let Some(blocked) = reader.blocked.take() {
+                let _ = blocked.send(());
+            }
+            Poll::Pending
+        }
+    }
+
+    /// Returns one copy chunk, then injects a source I/O failure.
+    struct FailingLocalUploadReader {
+        emitted: bool,
+    }
+
+    impl AsyncRead for FailingLocalUploadReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let reader = self.get_mut();
+            if !reader.emitted {
+                reader.emitted = true;
+                output.put_slice(b"partial local upload");
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Ready(Err(io::Error::other("injected source failure")))
+        }
+    }
+
+    async fn stage_entries(root: &Path) -> Vec<OsString> {
+        let mut entries = tokio::fs::read_dir(root).await.expect("read managed stage");
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await.expect("read stage entry") {
+            names.push(entry.file_name());
+        }
+        names
     }
 
     #[async_trait]
@@ -908,6 +972,76 @@ mod tests {
         assert!(location.uri.starts_with("file://"));
         let path = location.uri.strip_prefix("file://").unwrap();
         assert_eq!(tokio::fs::read(path).await.unwrap(), bytes);
+        assert!(
+            stage_entries(destination_dir.path())
+                .await
+                .iter()
+                .all(|name| !name.to_string_lossy().ends_with(".uploading"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_local_upload_removes_unpublished_staging_file() {
+        let destination_dir = tempdir().unwrap();
+        let store = LocalObjectStore::open(destination_dir.path())
+            .await
+            .unwrap();
+        let (blocked, entered_blocked_read) = oneshot::channel();
+        let upload = tokio::spawn(async move {
+            store
+                .put_reader(
+                    BlockedLocalUploadReader {
+                        emitted: false,
+                        blocked: Some(blocked),
+                    },
+                    "video/mp4",
+                )
+                .await
+        });
+
+        entered_blocked_read
+            .await
+            .expect("reader blocks after staging receives bytes");
+        assert!(
+            stage_entries(destination_dir.path())
+                .await
+                .iter()
+                .any(|name| name.to_string_lossy().ends_with(".uploading"))
+        );
+
+        upload.abort();
+        assert!(
+            upload
+                .await
+                .expect_err("upload task is cancelled")
+                .is_cancelled()
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if stage_entries(destination_dir.path()).await.is_empty() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled upload cleanup removes staging");
+    }
+
+    #[tokio::test]
+    async fn local_upload_source_error_removes_unpublished_staging_file() {
+        let destination_dir = tempdir().unwrap();
+        let store = LocalObjectStore::open(destination_dir.path())
+            .await
+            .unwrap();
+        let error = store
+            .put_reader(FailingLocalUploadReader { emitted: false }, "video/mp4")
+            .await
+            .expect_err("injected source failure must fail the upload");
+
+        assert!(matches!(error, ObjectError::Read { .. }));
+        assert!(stage_entries(destination_dir.path()).await.is_empty());
     }
 
     #[tokio::test]

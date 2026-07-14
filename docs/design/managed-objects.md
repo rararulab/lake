@@ -75,8 +75,12 @@ table's cached registration so the same SDK connection observes its write;
 other query nodes retain the normal bounded-staleness contract.
 
 `ManagedObjectStore` is the SDK's object-safe storage boundary. The local
-backend publishes `file://` locations after an atomic rename. The production
-S3 backend uses the discovered Lake-owned bucket/prefix and an AWS SDK client
+backend publishes `file://` locations after an atomic rename. From staging
+creation until that rename, a path-only cleanup task owns an unpublished local
+upload: caller-task cancellation removes the `.uploading` file without
+retaining source bytes, while a published final object is never removed by
+that cleanup. The production S3 backend uses the discovered Lake-owned
+bucket/prefix and an AWS SDK client
 configured from the descriptor plus the process credential chain. It uses
 multipart upload for non-empty objects. It reads and hashes source bytes in
 order while polling four `UploadPart` requests concurrently by default. Each
