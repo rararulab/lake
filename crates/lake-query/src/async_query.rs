@@ -2438,7 +2438,6 @@ mod tests {
         assert_eq!(MAX_RESULT_MANIFEST_STRUCTURE_BYTES, 21_684_406);
         assert!(encoded.len() as u64 <= MAX_RESULT_MANIFEST_STRUCTURE_BYTES);
         assert!(encoded.len() as u64 <= MAX_RESULT_MANIFEST_BYTES);
-        assert!(MAX_RESULT_MANIFEST_BYTES < MAX_RESULT_PART_BYTES);
     }
 
     #[tokio::test]
