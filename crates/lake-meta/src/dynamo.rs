@@ -30,7 +30,10 @@ use std::{
 use async_trait::async_trait;
 use aws_sdk_dynamodb::{
     Client,
-    operation::transact_write_items::TransactWriteItemsError,
+    error::SdkError,
+    operation::{
+        describe_table::DescribeTableError, transact_write_items::TransactWriteItemsError,
+    },
     primitives::Blob,
     types::{
         AttributeDefinition, AttributeValue, BillingMode, ConditionCheck, Delete, KeySchemaElement,
@@ -81,6 +84,15 @@ fn table_readiness(status: Option<&TableStatus>) -> TableReadiness {
         "CREATING" | "UPDATING" => TableReadiness::pending(status),
         _ => TableReadiness::unavailable(status),
     }
+}
+
+fn describe_table_error_readiness<Response>(
+    error: &SdkError<DescribeTableError, Response>,
+) -> Option<TableReadiness> {
+    error
+        .as_service_error()
+        .filter(|error| error.is_resource_not_found_exception())
+        .map(|_| TableReadiness::pending("NOT_FOUND"))
 }
 
 async fn wait_for_table_active<Observe, ObserveFuture, Sleep, SleepFuture>(
@@ -279,12 +291,8 @@ impl DynamoMeta {
             Ok(response) => Ok(table_readiness(
                 response.table().and_then(|table| table.table_status()),
             )),
-            Err(error)
-                if error
-                    .as_service_error()
-                    .is_some_and(|error| error.is_resource_not_found_exception()) =>
-            {
-                Ok(TableReadiness::pending("NOT_FOUND"))
+            Err(error) if let Some(readiness) = describe_table_error_readiness(&error) => {
+                Ok(readiness)
             }
             Err(error) => Err(dynamo_err(format!("describe DynamoDB table '{table}'"))(
                 error,
@@ -1527,6 +1535,54 @@ mod tests {
             .behavior_version_latest()
             .build();
         DynamoMeta::new(Client::from_conf(config), "meta")
+    }
+
+    #[tokio::test]
+    async fn dynamo_not_found_readiness_retries() {
+        let error = aws_sdk_dynamodb::error::SdkError::service_error(
+            aws_sdk_dynamodb::operation::describe_table::DescribeTableError::ResourceNotFoundException(
+                aws_sdk_dynamodb::types::error::ResourceNotFoundException::builder().build(),
+            ),
+            (),
+        );
+        let readiness =
+            describe_table_error_readiness(&error).expect("not-found error is retryable");
+        assert_eq!(readiness, TableReadiness::Pending("NOT_FOUND".to_owned()));
+
+        let mut observations = [readiness, TableReadiness::Active].into_iter();
+        let mut pauses = 0;
+
+        wait_for_table_active(
+            "meta_prefix_v2",
+            2,
+            || std::future::ready(Ok(observations.next().expect("queued observation"))),
+            |_| {
+                pauses += 1;
+                std::future::ready(())
+            },
+        )
+        .await
+        .expect("not-found error retries until the table is ACTIVE");
+
+        assert_eq!(pauses, 1);
+    }
+
+    #[tokio::test]
+    async fn dynamo_table_readiness_rejects_missing_status() {
+        let error = wait_for_table_active(
+            "meta_prefix_v2",
+            3,
+            || std::future::ready(Ok(table_readiness(None))),
+            |_| std::future::ready(()),
+        )
+        .await
+        .expect_err("missing table status must fail before data-plane use");
+
+        assert!(matches!(
+            error,
+            MetaError::DynamoTableUnavailable { table, status }
+                if table == "meta_prefix_v2" && status == "MISSING"
+        ));
     }
 
     #[tokio::test]
