@@ -4134,7 +4134,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lake-catalog"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -4154,7 +4154,7 @@ dependencies = [
 
 [[package]]
 name = "lake-cli"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arrow-flight",
@@ -4195,7 +4195,7 @@ dependencies = [
 
 [[package]]
 name = "lake-common"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "bon",
  "serde",
@@ -4206,7 +4206,7 @@ dependencies = [
 
 [[package]]
 name = "lake-engine"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -4216,7 +4216,7 @@ dependencies = [
 
 [[package]]
 name = "lake-engine-lance"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4240,7 +4240,7 @@ dependencies = [
 
 [[package]]
 name = "lake-flight"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "arrow-flight",
  "futures",
@@ -4260,7 +4260,7 @@ dependencies = [
 
 [[package]]
 name = "lake-meta"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4280,7 +4280,7 @@ dependencies = [
 
 [[package]]
 name = "lake-metasrv"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -4317,7 +4317,7 @@ dependencies = [
 
 [[package]]
 name = "lake-objects"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4338,7 +4338,7 @@ dependencies = [
 
 [[package]]
 name = "lake-query"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -4378,7 +4378,7 @@ dependencies = [
 
 [[package]]
 name = "lake-sdk"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "arrow",
  "arrow-flight",
