@@ -58,6 +58,7 @@ jobs:
           filters: |
             rust:
               - 'crates/**'
+              - '.cargo/**'
               - 'harness/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -76,6 +77,7 @@ jobs:
             cargo_deps:
               - 'Cargo.toml'
               - 'crates/**/Cargo.toml'
+              - '.cargo/**'
               - 'Cargo.lock'
               - 'deny.toml'
               - 'mise.toml'
