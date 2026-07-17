@@ -206,7 +206,7 @@ client.insert(
 ```
 
 The checkpoint directory makes path-backed S3 uploads restart-resumable. Lake
-stores a credential-free, versioned checkpoint after every completed 5 MiB
+stores a credential-free, versioned checkpoint after every completed 64 MiB
 part. A retry locks and validates the checkpoint, reconciles it with S3,
 rehashes the completed local prefix, and uploads only missing parts. Changed
 source files or stage identities fail closed. Checkpoints disappear only after
@@ -214,9 +214,15 @@ verified multipart completion; `ManagedObjectStore::cancel_upload` explicitly
 aborts an abandoned upload. Reader-backed uploads remain one-shot because an
 arbitrary stream cannot be replayed after process restart.
 
+V1 checkpoints created before this default used 5 MiB parts. A current store
+resumes those uploads using the checkpoint's recorded 5 MiB size for both
+prefix rehashing and the remaining pipeline; newly created checkpoints still
+record 64 MiB. Resume accepts only those two explicit V1 sizes, so a tampered
+or unknown size fails closed before source or S3 progress.
+
 S3 uploads overlap four parts by default while hashing and checkpointing in
-source order. That is an exact 20 MiB request-body bound per object at Lake's
-5 MiB part size. Advanced embedders using `S3ObjectStore` directly may set
+source order. That is an exact 256 MiB request-body bound per object at Lake's
+64 MiB part size. Advanced embedders using `S3ObjectStore` directly may set
 `with_upload_concurrency(1..=16)`; zero and larger values fail before S3 I/O.
 On restart, any remote responses ahead of the durable contiguous checkpoint
 are treated as untrusted and overwritten from the verified source.
@@ -434,7 +440,11 @@ let capability = client
 The example performs a multi-row insert, query, `DataLocation` decoding, and
 direct open through `LakeClient`. Local development discovers a `file://`
 stage; production discovers an `s3://` stage. Non-empty S3 objects stream through
-bounded 5 MiB multipart parts, with incremental SHA-256 and abort-on-error.
+bounded 64 MiB multipart parts, with incremental SHA-256 and abort-on-error.
+An unknown-length input may contain at most 10,000 non-empty parts (roughly
+625 GiB with full default parts); a 10,001st part returns a typed local error
+before an invalid S3 request. This is a stream ceiling, not a claim to support
+the full S3 maximum-object range.
 The query service forwards only the Arrow row to the metadata leader;
 video/model bytes travel directly between the SDK and the managed stage.
 Tenant child-prefix authorization is enforced by Query, Metasrv, and the SDK;

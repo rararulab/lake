@@ -47,13 +47,35 @@ use crate::{
     validate_presign_expiration, validate_range,
 };
 
-const MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024;
+pub(crate) const LEGACY_MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024;
+pub(crate) const MULTIPART_PART_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MULTIPART_PART_NUMBER: i32 = 10_000;
 const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
 pub(crate) const MAX_UPLOAD_CONCURRENCY: usize = 16;
 const MULTIPART_ABORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SCOPED_DELETE_OBJECTS: usize = 4_100;
 
 type PartFuture<'a> = Pin<Box<dyn Future<Output = Result<UploadedPipelinePart>> + Send + 'a>>;
+
+fn checked_multipart_part_number(part_number: i32) -> Result<i32> {
+    if (1..=MAX_MULTIPART_PART_NUMBER).contains(&part_number) {
+        return Ok(part_number);
+    }
+    Err(ObjectError::S3MultipartPartLimit {
+        part_number,
+        maximum: MAX_MULTIPART_PART_NUMBER,
+    })
+}
+
+pub(crate) const fn is_supported_resumable_part_size(part_size_bytes: usize) -> bool {
+    matches!(
+        part_size_bytes,
+        LEGACY_MULTIPART_PART_BYTES | MULTIPART_PART_BYTES
+    )
+}
+
+/// Preserve an accepted checkpoint's source partitioning during resume.
+fn resumable_part_size(checkpoint: &UploadCheckpointV1) -> usize { checkpoint.part_size_bytes() }
 
 fn is_dns_safe_bucket(bucket: &str) -> bool {
     bucket.split('.').all(|label| {
@@ -199,18 +221,19 @@ where
     U: Fn(i32, Vec<u8>) -> Fut,
     Fut: Future<Output = Result<CompletedPart>> + Send + 'a,
 {
-    input:         &'a mut R,
-    first:         Option<Vec<u8>>,
-    next_number:   i32,
-    concurrency:   usize,
-    exhausted:     bool,
-    pending:       FuturesUnordered<PartFuture<'a>>,
-    ready:         BTreeMap<i32, UploadedPipelinePart>,
-    next_yield:    i32,
-    uploader:      U,
-    hasher:        Sha256,
-    size_bytes:    u64,
-    future_marker: PhantomData<fn() -> Fut>,
+    input:           &'a mut R,
+    first:           Option<Vec<u8>>,
+    next_number:     i32,
+    part_size_bytes: usize,
+    concurrency:     usize,
+    exhausted:       bool,
+    pending:         FuturesUnordered<PartFuture<'a>>,
+    ready:           BTreeMap<i32, UploadedPipelinePart>,
+    next_yield:      i32,
+    uploader:        U,
+    hasher:          Sha256,
+    size_bytes:      u64,
+    future_marker:   PhantomData<fn() -> Fut>,
 }
 
 impl<'a, R, U, Fut> PartUploadPipeline<'a, R, U, Fut>
@@ -223,6 +246,7 @@ where
         input: &'a mut R,
         first: Vec<u8>,
         first_number: i32,
+        part_size_bytes: usize,
         concurrency: usize,
         uploader: U,
         hasher: Sha256,
@@ -232,6 +256,7 @@ where
             input,
             first: Some(first),
             next_number: first_number,
+            part_size_bytes,
             concurrency,
             exhausted: false,
             pending: FuturesUnordered::new(),
@@ -244,21 +269,40 @@ where
         }
     }
 
+    fn new_resumable(
+        input: &'a mut R,
+        first: Vec<u8>,
+        first_number: i32,
+        checkpoint: &UploadCheckpointV1,
+        concurrency: usize,
+        uploader: U,
+        hasher: Sha256,
+        size_bytes: u64,
+    ) -> Self {
+        Self::new(
+            input,
+            first,
+            first_number,
+            resumable_part_size(checkpoint),
+            concurrency,
+            uploader,
+            hasher,
+            size_bytes,
+        )
+    }
+
     async fn fill(&mut self) -> Result<()> {
         while self.pending.len() + self.ready.len() < self.concurrency && !self.exhausted {
             let bytes = match self.first.take() {
                 Some(first) => first,
-                None => read_part(self.input).await?,
+                None => read_part_with_size(self.input, self.part_size_bytes).await?,
             };
             if bytes.is_empty() {
                 self.exhausted = true;
                 break;
             }
-            let number = self.next_number;
-            self.next_number = number.checked_add(1).ok_or_else(|| ObjectError::S3 {
-                action:  "upload_part",
-                message: "multipart upload exceeded the S3 part limit".to_owned(),
-            })?;
+            let number = checked_multipart_part_number(self.next_number)?;
+            self.next_number = number + 1;
             let size_bytes = bytes.len();
             let sha256 = format!("{:x}", Sha256::digest(&bytes));
             self.hasher.update(&bytes);
@@ -363,7 +407,7 @@ impl S3ObjectStore {
     }
 
     /// Set the finite number of S3 UploadPart requests one object may keep in
-    /// flight. Each request owns at most one 5 MiB part buffer.
+    /// flight. Each request owns at most one 64 MiB part buffer.
     pub fn with_upload_concurrency(mut self, value: usize) -> Result<Self> {
         if !(1..=MAX_UPLOAD_CONCURRENCY).contains(&value) {
             return Err(ObjectError::InvalidS3UploadConcurrency {
@@ -561,6 +605,7 @@ impl S3ObjectStore {
             input,
             first_part,
             1,
+            MULTIPART_PART_BYTES,
             self.upload_concurrency,
             uploader,
             Sha256::new(),
@@ -724,11 +769,10 @@ impl S3ObjectStore {
             }
             checkpoint
         };
-
         let mut hasher = Sha256::new();
         let mut completed_size = 0_u64;
         for completed in checkpoint.parts() {
-            let part = read_part(&mut input).await?;
+            let part = read_resumable_part(&mut input, &checkpoint).await?;
             if part.len() != completed.size_bytes
                 || format!("{:x}", Sha256::digest(&part)) != completed.sha256
             {
@@ -767,7 +811,7 @@ impl S3ObjectStore {
             checkpoint.save_atomic(checkpoint_path).await?;
         }
 
-        let first = read_part(&mut input).await?;
+        let first = read_resumable_part(&mut input, &checkpoint).await?;
         let first_number =
             i32::try_from(checkpoint.parts().len() + 1).map_err(|_| ObjectError::S3 {
                 action:  "upload_part",
@@ -807,31 +851,45 @@ impl S3ObjectStore {
                     .build())
             }
         };
-        let mut pipeline = PartUploadPipeline::new(
+        let mut pipeline = PartUploadPipeline::new_resumable(
             &mut input,
             first,
             first_number,
+            &checkpoint,
             self.upload_concurrency,
             uploader,
             hasher,
             completed_size,
         );
-        while let Some(part) = pipeline.next().await? {
-            checkpoint.push_part(CheckpointPart {
-                number:         part.number,
-                size_bytes:     part.size_bytes,
-                e_tag:          part
-                    .completed
-                    .e_tag()
-                    .ok_or_else(|| ObjectError::S3 {
-                        action:  "upload_part",
-                        message: "S3 response omitted ETag".to_owned(),
-                    })?
-                    .to_owned(),
-                checksum_crc32: part.completed.checksum_crc32().map(ToOwned::to_owned),
-                sha256:         part.sha256,
-            });
-            checkpoint.save_atomic(checkpoint_path).await?;
+        loop {
+            match pipeline.next().await {
+                Ok(Some(part)) => {
+                    checkpoint.push_part(CheckpointPart {
+                        number:         part.number,
+                        size_bytes:     part.size_bytes,
+                        e_tag:          part
+                            .completed
+                            .e_tag()
+                            .ok_or_else(|| ObjectError::S3 {
+                                action:  "upload_part",
+                                message: "S3 response omitted ETag".to_owned(),
+                            })?
+                            .to_owned(),
+                        checksum_crc32: part.completed.checksum_crc32().map(ToOwned::to_owned),
+                        sha256:         part.sha256,
+                    });
+                    checkpoint.save_atomic(checkpoint_path).await?;
+                }
+                Ok(None) => break,
+                Err(error @ ObjectError::S3MultipartPartLimit { .. }) => {
+                    drop(pipeline);
+                    self.abort(checkpoint.object_key(), checkpoint.upload_id())
+                        .await;
+                    let _ = tokio::fs::remove_file(checkpoint_path).await;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
         }
         let summary = pipeline.finish();
         if summary.size_bytes != metadata.len() {
@@ -1296,10 +1354,24 @@ async fn read_part<R>(input: &mut R) -> Result<Vec<u8>>
 where
     R: AsyncRead + Unpin + ?Sized,
 {
-    let mut part = Vec::with_capacity(MULTIPART_PART_BYTES);
+    read_part_with_size(input, MULTIPART_PART_BYTES).await
+}
+
+async fn read_resumable_part<R>(input: &mut R, checkpoint: &UploadCheckpointV1) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    read_part_with_size(input, resumable_part_size(checkpoint)).await
+}
+
+async fn read_part_with_size<R>(input: &mut R, part_size_bytes: usize) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    let mut part = Vec::with_capacity(part_size_bytes);
     let mut buffer = vec![0_u8; 64 * 1024];
-    while part.len() < MULTIPART_PART_BYTES {
-        let remaining = MULTIPART_PART_BYTES - part.len();
+    while part.len() < part_size_bytes {
+        let remaining = part_size_bytes - part.len();
         let chunk = remaining.min(buffer.len());
         let read = input
             .read(&mut buffer[..chunk])
@@ -1316,7 +1388,7 @@ where
 #[cfg(test)]
 mod pipeline_tests {
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
@@ -1330,13 +1402,16 @@ mod pipeline_tests {
     use tokio::sync::{Notify, Semaphore};
 
     use super::{
-        MAX_UPLOAD_CONCURRENCY, MULTIPART_PART_BYTES, MultipartCleanupOwner, PartUploadPipeline,
-        S3ObjectStore, S3ReadCapabilityIssuer, read_part,
+        LEGACY_MULTIPART_PART_BYTES, MAX_UPLOAD_CONCURRENCY, MULTIPART_PART_BYTES,
+        MultipartCleanupOwner, PartUploadPipeline, S3ObjectStore, S3ReadCapabilityIssuer,
+        checked_multipart_part_number, read_part_with_size, read_resumable_part,
     };
     use crate::{
         ManagedObjectStore, ManagedReadCapabilityIssuer, ObjectError, ObjectReader,
         checkpoint::{CheckpointBinding, CheckpointPart, SourceIdentity, UploadCheckpointV1},
     };
+
+    const TEST_MULTIPART_PART_BYTES: usize = 1024;
 
     fn update_peak(peak: &AtomicUsize, value: usize) {
         let mut observed = peak.load(Ordering::SeqCst);
@@ -1442,6 +1517,57 @@ mod pipeline_tests {
         ));
     }
 
+    #[test]
+    fn multipart_part_number_limit_rejects_10001st_part() {
+        assert_eq!(checked_multipart_part_number(10_000).unwrap(), 10_000);
+        assert!(matches!(
+            checked_multipart_part_number(10_001),
+            Err(ObjectError::S3MultipartPartLimit {
+                part_number: 10_001,
+                maximum:     10_000,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn multipart_pipeline_accepts_10000th_part_and_rejects_10001st_before_upload() {
+        let accepted_uploads = Arc::new(AtomicUsize::new(0));
+        let mut input: ObjectReader = Box::pin(std::io::Cursor::new(vec![8]));
+        let uploader = {
+            let accepted_uploads = accepted_uploads.clone();
+            move |number, _bytes: Vec<u8>| {
+                let accepted_uploads = accepted_uploads.clone();
+                Box::pin(async move {
+                    accepted_uploads.fetch_add(1, Ordering::SeqCst);
+                    Ok(CompletedPart::builder()
+                        .part_number(number)
+                        .e_tag(format!("part-{number}"))
+                        .build())
+                })
+            }
+        };
+        let mut pipeline = PartUploadPipeline::new(
+            &mut input,
+            vec![7],
+            10_000,
+            1,
+            1,
+            uploader,
+            Sha256::new(),
+            0,
+        );
+        assert_eq!(pipeline.next().await.unwrap().unwrap().number, 10_000);
+        assert_eq!(accepted_uploads.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            pipeline.next().await,
+            Err(ObjectError::S3MultipartPartLimit {
+                part_number: 10_001,
+                maximum:     10_000,
+            })
+        ));
+        assert_eq!(accepted_uploads.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn multipart_cleanup_owner_state_transitions() {
         let aborts = Arc::new(AtomicUsize::new(0));
@@ -1482,7 +1608,7 @@ mod pipeline_tests {
     #[tokio::test]
     async fn bounded_multipart_pipeline_overlaps_with_exact_resource_cap() {
         let concurrency = 3;
-        let source = (0..(MULTIPART_PART_BYTES * 5 + 17))
+        let source = (0..(TEST_MULTIPART_PART_BYTES * 5 + 17))
             .map(|index| u8::try_from(index % 251).unwrap())
             .collect::<Vec<_>>();
         let live_requests = Arc::new(AtomicUsize::new(0));
@@ -1501,7 +1627,9 @@ mod pipeline_tests {
             let release = release.clone();
             async move {
                 let mut input: ObjectReader = Box::pin(std::io::Cursor::new(source));
-                let first = read_part(&mut input).await.unwrap();
+                let first = read_part_with_size(&mut input, TEST_MULTIPART_PART_BYTES)
+                    .await
+                    .unwrap();
                 let uploader = move |number, bytes: Vec<u8>| {
                     let live_requests = live_requests.clone();
                     let peak_requests = peak_requests.clone();
@@ -1529,6 +1657,7 @@ mod pipeline_tests {
                     &mut input,
                     first,
                     1,
+                    TEST_MULTIPART_PART_BYTES,
                     concurrency,
                     uploader,
                     Sha256::new(),
@@ -1552,22 +1681,27 @@ mod pipeline_tests {
         assert_eq!(peak_requests.load(Ordering::SeqCst), concurrency);
         assert_eq!(
             peak_bytes.load(Ordering::SeqCst),
-            concurrency * MULTIPART_PART_BYTES
+            concurrency * TEST_MULTIPART_PART_BYTES
         );
         release.add_permits(6);
         let (parts, summary) = task.await.unwrap();
         assert_eq!(parts.len(), 6);
-        assert_eq!(summary.size_bytes, (MULTIPART_PART_BYTES * 5 + 17) as u64);
+        assert_eq!(
+            summary.size_bytes,
+            (TEST_MULTIPART_PART_BYTES * 5 + 17) as u64
+        );
     }
 
     #[tokio::test]
     async fn multipart_pipeline_orders_parts_and_source_hash() {
-        let source = (0..(MULTIPART_PART_BYTES * 3 + 11))
+        let source = (0..(TEST_MULTIPART_PART_BYTES * 3 + 11))
             .map(|index| u8::try_from(index % 239).unwrap())
             .collect::<Vec<_>>();
         let expected_hash = format!("{:x}", Sha256::digest(&source));
         let mut input: ObjectReader = Box::pin(std::io::Cursor::new(source.clone()));
-        let first = read_part(&mut input).await.unwrap();
+        let first = read_part_with_size(&mut input, TEST_MULTIPART_PART_BYTES)
+            .await
+            .unwrap();
         let uploader = |number, _bytes: Vec<u8>| {
             Box::pin(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(
@@ -1580,8 +1714,16 @@ mod pipeline_tests {
                     .build())
             })
         };
-        let mut pipeline =
-            PartUploadPipeline::new(&mut input, first, 1, 4, uploader, Sha256::new(), 0);
+        let mut pipeline = PartUploadPipeline::new(
+            &mut input,
+            first,
+            1,
+            TEST_MULTIPART_PART_BYTES,
+            4,
+            uploader,
+            Sha256::new(),
+            0,
+        );
         let mut numbers = Vec::new();
         while let Some(part) = pipeline.next().await.unwrap() {
             numbers.push(part.number);
@@ -1596,11 +1738,13 @@ mod pipeline_tests {
     #[tokio::test]
     async fn multipart_pipeline_failure_stops_admission() {
         let concurrency = 3;
-        let source = vec![7_u8; MULTIPART_PART_BYTES * 6];
+        let source = vec![7_u8; TEST_MULTIPART_PART_BYTES * 6];
         let admitted = Arc::new(AtomicUsize::new(0));
         let hold_first = Arc::new(Semaphore::new(0));
         let mut input: ObjectReader = Box::pin(std::io::Cursor::new(source));
-        let first = read_part(&mut input).await.unwrap();
+        let first = read_part_with_size(&mut input, TEST_MULTIPART_PART_BYTES)
+            .await
+            .unwrap();
         let uploader = {
             let admitted = admitted.clone();
             let hold_first = hold_first.clone();
@@ -1629,6 +1773,7 @@ mod pipeline_tests {
             &mut input,
             first,
             1,
+            TEST_MULTIPART_PART_BYTES,
             concurrency,
             uploader,
             Sha256::new(),
@@ -1649,9 +1794,11 @@ mod pipeline_tests {
 
     #[tokio::test]
     async fn resumable_pipeline_checkpoint_stays_contiguous() {
-        let source = vec![3_u8; MULTIPART_PART_BYTES * 4];
+        let source = vec![3_u8; TEST_MULTIPART_PART_BYTES * 4];
         let mut input: ObjectReader = Box::pin(std::io::Cursor::new(source.clone()));
-        let first = read_part(&mut input).await.unwrap();
+        let first = read_part_with_size(&mut input, TEST_MULTIPART_PART_BYTES)
+            .await
+            .unwrap();
         let uploader = |number, _bytes: Vec<u8>| {
             Box::pin(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(
@@ -1664,14 +1811,22 @@ mod pipeline_tests {
                     .build())
             })
         };
-        let mut pipeline =
-            PartUploadPipeline::new(&mut input, first, 1, 4, uploader, Sha256::new(), 0);
+        let mut pipeline = PartUploadPipeline::new(
+            &mut input,
+            first,
+            1,
+            TEST_MULTIPART_PART_BYTES,
+            4,
+            uploader,
+            Sha256::new(),
+            0,
+        );
         let mut checkpoint = UploadCheckpointV1::new(
             CheckpointBinding {
                 bucket:             "lake-managed".to_owned(),
                 prefix:             "objects".to_owned(),
                 content_type:       "video/mp4".to_owned(),
-                part_size_bytes:    MULTIPART_PART_BYTES,
+                part_size_bytes:    TEST_MULTIPART_PART_BYTES,
                 upload_concurrency: 4,
                 source:             SourceIdentity {
                     size_bytes:          source.len() as u64,
@@ -1700,6 +1855,69 @@ mod pipeline_tests {
                 .map(|part| part.number)
                 .collect::<Vec<_>>(),
             vec![1, 2, 3, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn resumable_pipeline_keeps_legacy_checkpoint_part_size_for_remaining_input() {
+        let legacy_binding = CheckpointBinding {
+            bucket:             "lake-managed".to_owned(),
+            prefix:             "objects".to_owned(),
+            content_type:       "video/mp4".to_owned(),
+            part_size_bytes:    LEGACY_MULTIPART_PART_BYTES,
+            upload_concurrency: 1,
+            source:             SourceIdentity {
+                size_bytes:          (LEGACY_MULTIPART_PART_BYTES * 3 + 1) as u64,
+                modified_unix_nanos: 42,
+            },
+        };
+        let checkpoint = UploadCheckpointV1::new(
+            legacy_binding.clone(),
+            "objects/random".to_owned(),
+            "upload-id".to_owned(),
+        );
+        let mut default_binding = legacy_binding;
+        default_binding.part_size_bytes = MULTIPART_PART_BYTES;
+        checkpoint.validate(&default_binding).unwrap();
+
+        // The completed prefix has already been rehashed. This is the source
+        // remaining for the first resumed upload and its pipeline successor.
+        let mut input: ObjectReader = Box::pin(std::io::Cursor::new(vec![
+            7_u8;
+            LEGACY_MULTIPART_PART_BYTES
+                + 1
+        ]));
+        let first = read_resumable_part(&mut input, &checkpoint).await.unwrap();
+        let uploaded_sizes = Arc::new(Mutex::new(Vec::new()));
+        let uploader = {
+            let uploaded_sizes = uploaded_sizes.clone();
+            move |number, bytes: Vec<u8>| {
+                let uploaded_sizes = uploaded_sizes.clone();
+                Box::pin(async move {
+                    uploaded_sizes.lock().unwrap().push((number, bytes.len()));
+                    Ok(CompletedPart::builder()
+                        .part_number(number)
+                        .e_tag(format!("part-{number}"))
+                        .build())
+                })
+            }
+        };
+        let mut pipeline = PartUploadPipeline::new_resumable(
+            &mut input,
+            first,
+            2,
+            &checkpoint,
+            1,
+            uploader,
+            Sha256::new(),
+            LEGACY_MULTIPART_PART_BYTES as u64,
+        );
+
+        while pipeline.next().await.unwrap().is_some() {}
+
+        assert_eq!(
+            *uploaded_sizes.lock().unwrap(),
+            vec![(2, LEGACY_MULTIPART_PART_BYTES), (3, 1)]
         );
     }
 }
