@@ -4069,7 +4069,7 @@ mod tests {
             .build();
 
         let capability = client
-            .presign_read_via_query(&location, Duration::from_secs(60))
+            .presign_read_via_query(&location, Duration::from_mins(1))
             .await
             .expect("Query returns a remote read capability");
 
@@ -4098,7 +4098,7 @@ mod tests {
         let request = ManagedReadCapabilityRequest::from_wire(&action.body)
             .expect("SDK sends a bounded capability request");
         assert_eq!(request.location(), &location);
-        assert_eq!(request.expires_in(), Duration::from_secs(60));
+        assert_eq!(request.expires_in(), Duration::from_mins(1));
 
         server.abort();
     }
