@@ -2146,7 +2146,7 @@ mod tests {
     use lake_objects::{
         LocalObjectStore, ManagedObjectStore, ManagedReadCapabilityRequest,
         ManagedReadCapabilityResponse, ObjectReader, Result as ObjectResult, S3ObjectStore,
-        data_location_field, data_location_from_array,
+        S3ReadCapabilityIssuer, data_location_field, data_location_from_array,
     };
     use lake_query::{AsyncQueryConfig, QueryEngine, QueryServerConfig, QueryTicketKeyRing};
     use prost::Message;
@@ -3962,6 +3962,101 @@ mod tests {
 
         assert_eq!(full, expected);
         assert_eq!(range, expected[1024..2048]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LocalStack S3; set LAKE_S3_ENDPOINT and run with --ignored"]
+    async fn query_only_sdk_streams_query_signed_s3_object_localstack() {
+        let Ok(endpoint) = std::env::var("LAKE_S3_ENDPOINT") else {
+            return;
+        };
+        let s3 = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Builder::new()
+                .behavior_version(BehaviorVersion::latest())
+                .endpoint_url(&endpoint)
+                .region(Region::new("us-east-1"))
+                .credentials_provider(Credentials::new(
+                    "test",
+                    "test",
+                    None,
+                    None,
+                    "localstack-query-signer",
+                ))
+                .force_path_style(true)
+                .build(),
+        );
+        let bucket = format!("lake-sdk-query-only-{}", uuid::Uuid::now_v7());
+        s3.create_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .expect("create LocalStack bucket");
+        let expected = (0..4096)
+            .map(|index| u8::try_from(index % 251).expect("bounded byte"))
+            .collect::<Vec<_>>();
+        let key = format!(
+            "managed/query-only/tenants/development/{}.mp4",
+            uuid::Uuid::now_v7()
+        );
+        s3.put_object()
+            .bucket(&bucket)
+            .key(&key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(expected.clone()))
+            .send()
+            .await
+            .expect("upload managed object for Query signer");
+        let location = lake_common::DataLocation::builder()
+            .uri(format!("s3://{bucket}/{key}"))
+            .content_type("video/mp4")
+            .size_bytes(expected.len() as u64)
+            .sha256(format!("{:x}", Sha256::digest(&expected)))
+            .build();
+        let root = tempdir().expect("temporary Query catalog");
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.path().join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let address = free_addr();
+        let server = tokio::spawn({
+            let query = Arc::new(QueryEngine::new(meta, engine));
+            let stage = ManagedStageDescriptor::s3(
+                &bucket,
+                "managed/query-only",
+                Some("us-east-1".to_owned()),
+                Some(endpoint),
+                true,
+            );
+            let config = QueryServerConfig::new()
+                .with_managed_stage(stage)
+                .with_read_capability_issuer(Arc::new(S3ReadCapabilityIssuer::new(s3)));
+            let address = address.clone();
+            async move { lake_query::serve_with_config(query, &address, config).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let client = LakeClient::connect_query_only(format!("http://{address}"))
+            .await
+            .expect("Query-only SDK connects without a managed store");
+
+        let mut full_reader = client
+            .open_via_query(&location, Duration::from_mins(1))
+            .await
+            .expect("Query signs and SDK streams the complete S3 object");
+        let mut full = Vec::new();
+        full_reader
+            .read_to_end(&mut full)
+            .await
+            .expect("full reader verifies immutable S3 bytes at EOF");
+        let mut range_reader = client
+            .open_range_via_query(&location, 1024..2048, Duration::from_mins(1))
+            .await
+            .expect("Query signs and SDK streams the exact S3 byte range");
+        let mut range = Vec::new();
+        range_reader
+            .read_to_end(&mut range)
+            .await
+            .expect("range reader streams bounded S3 bytes");
+
+        assert_eq!(full, expected);
+        assert_eq!(range, expected[1024..2048]);
+        server.abort();
     }
 
     #[test]
