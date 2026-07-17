@@ -26,6 +26,7 @@ wall-clock second.
 ### Allowed Changes
 crates/lake-metasrv/src/lib.rs
 specs/issue-185-guarded-operation-gc-test.spec.md
+verification/issue-185-guarded-operation-gc-test.md
 
 ### Forbidden
 production operation-GC semantics
