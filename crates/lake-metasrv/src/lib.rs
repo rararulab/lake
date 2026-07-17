@@ -1965,7 +1965,7 @@ mod tests {
         let authority = Metasrv::with_operation_policy(
             raw.clone(),
             engine,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             DEFAULT_OPERATION_GC_PAGE_SIZE,
         )
         .fenced_for_server(leadership);
