@@ -56,6 +56,9 @@ first.
   a broken Rust build.
 - `mise run gate` is the fast local push gate. It must include hooks, Rust
   tests, the e2e self-check, and `site-check` for the marketing site.
+- `mise run test-adbc` serializes its test functions because each launches a
+  bounded upstream-driver subprocess and Query fixture. This preserves the
+  ADBC deadline while `gate` continues running independent tasks in parallel.
 - `mise run test-integration` owns checkout-scoped LocalStack lifecycle;
   `mise run test-integration-external` runs the identical ignored-only package
   suite against a caller-managed endpoint and is the GitHub CI entry point.
