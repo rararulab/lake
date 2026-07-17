@@ -1,5 +1,6 @@
 use std::{
     io,
+    ops::Range,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -9,7 +10,7 @@ use sha2::{Digest, Sha256};
 use snafu::Snafu;
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf, Take};
 
-use crate::{ManagedObjectStore, ObjectError, ObjectReader, Result};
+use crate::{ManagedObjectStore, ObjectError, ObjectReader, Result, validate_range};
 
 /// A typed reason why streamed bytes did not match their immutable identity.
 #[derive(Clone, Debug, Snafu)]
@@ -18,7 +19,7 @@ pub enum ObjectIntegrityError {
     #[snafu(display("DataLocation SHA-256 is not exactly 64 hexadecimal characters"))]
     InvalidSha256,
 
-    #[snafu(display("object ended at {actual} bytes; DataLocation declares {expected}"))]
+    #[snafu(display("object stream ended at {actual} bytes; expected {expected}"))]
     PrematureEof { expected: u64, actual: u64 },
 
     #[snafu(display("object exceeds the {expected}-byte size declared by DataLocation"))]
@@ -63,6 +64,13 @@ struct IntegrityReader {
     terminal:   TerminalState,
 }
 
+struct ExactRangeReader {
+    inner:      Take<ObjectReader>,
+    expected:   u64,
+    bytes_read: u64,
+    terminal:   TerminalState,
+}
+
 impl IntegrityReader {
     fn new(inner: ObjectReader, expected: ExpectedIntegrity) -> Self {
         let size_bytes = expected.size_bytes;
@@ -90,6 +98,22 @@ impl IntegrityReader {
         }
         self.terminal = TerminalState::Verified;
         Poll::Ready(Ok(()))
+    }
+}
+
+impl ExactRangeReader {
+    fn new(inner: ObjectReader, expected: u64) -> Self {
+        Self {
+            inner: inner.take(expected),
+            expected,
+            bytes_read: 0,
+            terminal: TerminalState::Reading,
+        }
+    }
+
+    fn fail(&mut self, error: ObjectIntegrityError) -> Poll<io::Result<()>> {
+        self.terminal = TerminalState::Failed(error.clone());
+        Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, error)))
     }
 }
 
@@ -176,6 +200,57 @@ pub fn verify_reader(reader: ObjectReader, location: &DataLocation) -> Result<Ob
     Ok(Box::pin(IntegrityReader::new(reader, expected)))
 }
 
+impl AsyncRead for ExactRangeReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match &this.terminal {
+            TerminalState::Verified => return Poll::Ready(Ok(())),
+            TerminalState::Failed(error) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    error.clone(),
+                )));
+            }
+            TerminalState::Reading => {}
+        }
+
+        if this.inner.limit() == 0 {
+            this.terminal = TerminalState::Verified;
+            return Poll::Ready(Ok(()));
+        }
+        if output.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let before = output.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, output) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) => {
+                let bytes = &output.filled()[before..];
+                if bytes.is_empty() {
+                    return this.fail(ObjectIntegrityError::PrematureEof {
+                        expected: this.expected,
+                        actual:   this.bytes_read,
+                    });
+                }
+                this.bytes_read = this
+                    .bytes_read
+                    .checked_add(bytes.len() as u64)
+                    .expect("Tokio Take caps bytes at the requested range size");
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+}
+
+pub(crate) fn exact_range_reader(inner: ObjectReader, expected: u64) -> ObjectReader {
+    Box::pin(ExactRangeReader::new(inner, expected))
+}
+
 /// Open a managed object and verify its declared size and SHA-256 at EOF.
 ///
 /// The expected identity is validated before storage I/O. The wrapper keeps
@@ -187,4 +262,45 @@ pub async fn open_verified(
     validate_integrity(location)?;
     let inner = store.open_reader(location).await?;
     verify_reader(inner, location)
+}
+
+/// Open one managed byte range and require the backend stream to fill it
+/// exactly.
+///
+/// The interval is validated before storage I/O. The returned reader keeps
+/// constant memory, caps returned bytes at the interval, and reports an
+/// `InvalidData` error with `ObjectIntegrityError::PrematureEof` if the backend
+/// ends early. It does not verify the full-object SHA-256.
+pub async fn open_exact_range(
+    store: &dyn ManagedObjectStore,
+    location: &DataLocation,
+    range: Range<u64>,
+) -> Result<ObjectReader> {
+    let expected = validate_range(location, &range)?;
+    let inner = store.open_range(location, range).await?;
+    Ok(exact_range_reader(inner, expected))
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncReadExt;
+
+    use super::exact_range_reader;
+
+    #[tokio::test]
+    async fn exact_range_reader_returns_requested_bytes() {
+        let mut reader =
+            exact_range_reader(Box::pin(std::io::Cursor::new(b"0123456789".to_vec())), 6);
+        let mut actual = Vec::new();
+        let mut buffer = [0_u8; 2];
+        loop {
+            let read = reader.read(&mut buffer).await.expect("read exact range");
+            if read == 0 {
+                break;
+            }
+            actual.extend_from_slice(&buffer[..read]);
+        }
+
+        assert_eq!(actual, b"012345");
+    }
 }

@@ -393,8 +393,16 @@ let reader = client
 ```
 
 Empty, reversed, and out-of-bounds ranges return a typed SDK object error
-before storage I/O. A partial range cannot prove the full-object SHA-256, so
-`open_range` intentionally makes no full-object integrity claim.
+before storage I/O. Draining a valid range either yields exactly `end - start`
+bytes or returns `InvalidData` with a typed `ObjectIntegrityError::PrematureEof`
+source; the reader never exposes bytes beyond the requested interval. A partial
+range cannot prove the full-object SHA-256, so `open_range` intentionally makes
+no full-object integrity claim.
+
+For S3, Lake also rejects the one Range GET response before yielding its body
+unless `Content-Range` is exactly `bytes start-(end-1)/size_bytes` and
+`Content-Length` is exactly `end-start`. This rejects a proxy that ignores a
+Range header without issuing a HEAD request or buffering the payload.
 
 A credentialed Rust process can delegate one S3 read without handing its AWS
 credentials to the eventual HTTP consumer. This local-IAM path is valid for 1

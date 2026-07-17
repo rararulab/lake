@@ -44,7 +44,9 @@ mod reference_index;
 pub use gc::{GcPlanPage, GcPlanner, ObjectCandidate};
 pub use gc_apply::{DeleteOutcome, GcApplyProgress, GcPlanApplier, ManagedObjectDeleter};
 pub use gc_plan::{GcPlan, GcPlanWriter};
-pub use integrity::{ObjectIntegrityError, open_verified, validate_integrity, verify_reader};
+pub use integrity::{
+    ObjectIntegrityError, open_exact_range, open_verified, validate_integrity, verify_reader,
+};
 pub use inventory::{InventoryPage, InventoryRequest, ManagedObjectInventory};
 pub use local::LocalObjectStore;
 pub use reference_index::{LiveReferenceIndex, LiveReferenceIndexBuild, LiveReferenceIndexBuilder};
@@ -107,6 +109,9 @@ pub enum ObjectError {
         bucket: String,
         prefix: String,
     },
+
+    #[snafu(display("S3 Range GET response metadata does not match the requested interval"))]
+    InvalidS3RangeResponse,
 
     #[snafu(display("S3 operation '{action}' failed: {message}"))]
     S3 {
@@ -1139,6 +1144,44 @@ mod tests {
         reader.read_to_end(&mut actual).await.unwrap();
 
         assert_eq!(actual, b"23456");
+    }
+
+    #[tokio::test]
+    async fn local_range_reader_rejects_truncated_object() {
+        let managed_dir = tempdir().unwrap();
+        let store = LocalObjectStore::open(managed_dir.path()).await.unwrap();
+        let location = store
+            .put_reader(
+                std::io::Cursor::new(b"0123456789"),
+                "application/octet-stream",
+            )
+            .await
+            .unwrap();
+        let path = url::Url::parse(&location.uri)
+            .expect("local DataLocation URI")
+            .to_file_path()
+            .expect("local DataLocation file path");
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .await
+            .expect("open managed object for truncation")
+            .set_len(7)
+            .await
+            .expect("truncate managed object");
+
+        let mut reader = store.open_range(&location, 4..10).await.unwrap();
+        let mut actual = Vec::new();
+        let error = reader.read_to_end(&mut actual).await.unwrap_err();
+
+        assert_eq!(actual, b"456");
+        assert!(matches!(
+            terminal_integrity_error(&error),
+            ObjectIntegrityError::PrematureEof {
+                expected: 6,
+                actual:   3,
+            }
+        ));
     }
 
     #[tokio::test]

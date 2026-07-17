@@ -50,8 +50,8 @@ use lake_flight::{ClientSecurity, append_flight_payload_digest};
 use lake_objects::{
     LocalObjectStore, MANAGED_READ_CAPABILITY_ACTION, ManagedObjectStore,
     ManagedReadCapabilityRequest, ManagedReadCapabilityResponse, ObjectReader, S3ObjectStore,
-    data_location_array, data_location_field, data_location_from_array, open_verified,
-    validate_integrity, validate_presign_expiration, validate_range, verify_reader,
+    data_location_array, data_location_field, data_location_from_array, open_exact_range,
+    open_verified, validate_integrity, validate_presign_expiration, validate_range, verify_reader,
 };
 pub use lake_objects::{ObjectIntegrityError, PresignedRead};
 use moka::{future::Cache, ops::compute::Op};
@@ -1556,13 +1556,17 @@ impl LakeClient {
     }
 
     /// Open exactly one non-empty half-open byte range directly from storage.
+    ///
+    /// A successful reader yields exactly the requested byte count. Draining a
+    /// short backend stream returns `InvalidData` with an
+    /// `ObjectIntegrityError::PrematureEof` source; this is not a full-object
+    /// SHA-256 verification.
     pub async fn open_range(
         &self,
         location: &DataLocation,
         range: Range<u64>,
     ) -> Result<ObjectReader> {
-        self.objects
-            .open_range(location, range)
+        open_exact_range(self.objects.as_ref(), location, range)
             .await
             .context(ObjectSnafu)
     }
@@ -4554,6 +4558,44 @@ mod tests {
         assert_eq!(opens.load(Ordering::SeqCst), 2);
     }
 
+    #[tokio::test]
+    async fn sdk_open_range_rejects_truncated_stage_without_query() {
+        let range_opens = Arc::new(AtomicUsize::new(0));
+        let client = LakeClient {
+            query:                 tonic::transport::Endpoint::from_static("http://127.0.0.1:9")
+                .connect_lazy(),
+            objects:               Arc::new(StaticRangeStore {
+                bytes:       b"456".to_vec(),
+                range_opens: range_opens.clone(),
+            }),
+            security:              ClientSecurity::new(),
+            schema_cache:          SchemaCache::new(SchemaCacheConfig::default()),
+            upload_checkpoint_dir: None,
+        };
+        let location = lake_common::DataLocation::builder()
+            .uri("s3://managed/tenant/object")
+            .content_type("application/octet-stream")
+            .size_bytes(10)
+            .sha256("unused")
+            .build();
+
+        let mut reader = client.open_range(&location, 4..10).await.unwrap();
+        let mut actual = Vec::new();
+        let error = reader.read_to_end(&mut actual).await.unwrap_err();
+
+        assert_eq!(actual, b"456");
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<crate::ObjectIntegrityError>()),
+            Some(crate::ObjectIntegrityError::PrematureEof {
+                expected: 6,
+                actual:   3,
+            })
+        ));
+        assert_eq!(range_opens.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn sdk_batch_insert_flight_bound_uses_protobuf_size() {
         let within = FlightData {
@@ -5399,6 +5441,11 @@ mod tests {
         opens: Arc<AtomicUsize>,
     }
 
+    struct StaticRangeStore {
+        bytes:       Vec<u8>,
+        range_opens: Arc<AtomicUsize>,
+    }
+
     #[async_trait::async_trait]
     impl ManagedObjectStore for StaticReadStore {
         async fn put_reader(
@@ -5423,6 +5470,33 @@ mod tests {
             _range: std::ops::Range<u64>,
         ) -> ObjectResult<ObjectReader> {
             panic!("verified full reads must not use range I/O")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ManagedObjectStore for StaticRangeStore {
+        async fn put_reader(
+            &self,
+            _input: ObjectReader,
+            _content_type: String,
+        ) -> ObjectResult<lake_common::DataLocation> {
+            panic!("range reads must not upload")
+        }
+
+        async fn open_reader(
+            &self,
+            _location: &lake_common::DataLocation,
+        ) -> ObjectResult<ObjectReader> {
+            panic!("range reads must not perform a full object GET")
+        }
+
+        async fn open_range(
+            &self,
+            _location: &lake_common::DataLocation,
+            _range: std::ops::Range<u64>,
+        ) -> ObjectResult<ObjectReader> {
+            self.range_opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(std::io::Cursor::new(self.bytes.clone())))
         }
     }
 

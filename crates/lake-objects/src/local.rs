@@ -27,13 +27,14 @@ use lake_common::DataLocation;
 use sha2::{Digest, Sha256};
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, Take},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
 };
 use url::Url;
 
 use crate::{
     DeleteOutcome, InventoryPage, InventoryRequest, ManagedObjectDeleter, ManagedObjectInventory,
-    ManagedObjectStore, ObjectCandidate, ObjectError, ObjectReader, Result, validate_range,
+    ManagedObjectStore, ObjectCandidate, ObjectError, ObjectReader, Result,
+    integrity::exact_range_reader, validate_range,
 };
 
 /// Bounded copy chunk, chosen to keep multi-gigabyte uploads off the heap.
@@ -295,7 +296,7 @@ impl LocalObjectStore {
         &self,
         location: &DataLocation,
         range: Range<u64>,
-    ) -> Result<Take<File>> {
+    ) -> Result<ObjectReader> {
         let length = validate_range(location, &range)?;
         let mut file = self.open_reader(location).await?;
         file.seek(SeekFrom::Start(range.start))
@@ -305,7 +306,7 @@ impl LocalObjectStore {
                 path: PathBuf::from(&location.uri),
                 source,
             })?;
-        Ok(file.take(length))
+        Ok(exact_range_reader(Box::pin(file), length))
     }
 }
 
@@ -348,9 +349,7 @@ impl ManagedObjectStore for LocalObjectStore {
     }
 
     async fn open_range(&self, location: &DataLocation, range: Range<u64>) -> Result<ObjectReader> {
-        Ok(Box::pin(
-            LocalObjectStore::open_range(self, location, range).await?,
-        ))
+        LocalObjectStore::open_range(self, location, range).await
     }
 }
 

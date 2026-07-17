@@ -44,6 +44,7 @@ use crate::{
     checkpoint::{
         CheckpointBinding, CheckpointLock, CheckpointPart, SourceIdentity, UploadCheckpointV1,
     },
+    integrity::exact_range_reader,
     validate_presign_expiration, validate_range,
 };
 
@@ -76,6 +77,28 @@ pub(crate) const fn is_supported_resumable_part_size(part_size_bytes: usize) -> 
 
 /// Preserve an accepted checkpoint's source partitioning during resume.
 fn resumable_part_size(checkpoint: &UploadCheckpointV1) -> usize { checkpoint.part_size_bytes() }
+
+fn validate_range_response(
+    range: &Range<u64>,
+    size_bytes: u64,
+    length: u64,
+    content_range: Option<&str>,
+    content_length: Option<i64>,
+) -> Result<()> {
+    let inclusive_end = range
+        .end
+        .checked_sub(1)
+        .ok_or(ObjectError::InvalidS3RangeResponse)?;
+    let expected_content_range = format!("bytes {}-{inclusive_end}/{size_bytes}", range.start);
+    let expected_content_length =
+        i64::try_from(length).map_err(|_| ObjectError::InvalidS3RangeResponse)?;
+    if content_range != Some(expected_content_range.as_str())
+        || content_length != Some(expected_content_length)
+    {
+        return Err(ObjectError::InvalidS3RangeResponse);
+    }
+    Ok(())
+}
 
 fn is_dns_safe_bucket(bucket: &str) -> bool {
     bucket.split('.').all(|label| {
@@ -443,7 +466,7 @@ impl S3ObjectStore {
         location: &DataLocation,
         range: Range<u64>,
     ) -> Result<ObjectReader> {
-        validate_range(location, &range)?;
+        let length = validate_range(location, &range)?;
         let key = self.managed_key(&location.uri)?;
         let inclusive_end = range.end - 1;
         let output = self
@@ -458,7 +481,17 @@ impl S3ObjectStore {
                 action:  "get_object_range",
                 message: error.to_string(),
             })?;
-        Ok(Box::pin(output.body.into_async_read()))
+        validate_range_response(
+            &range,
+            location.size_bytes,
+            length,
+            output.content_range(),
+            output.content_length(),
+        )?;
+        Ok(exact_range_reader(
+            Box::pin(output.body.into_async_read()),
+            length,
+        ))
     }
 
     /// Mint a bounded GET capability without issuing an object request.
@@ -1405,6 +1438,7 @@ mod pipeline_tests {
         LEGACY_MULTIPART_PART_BYTES, MAX_UPLOAD_CONCURRENCY, MULTIPART_PART_BYTES,
         MultipartCleanupOwner, PartUploadPipeline, S3ObjectStore, S3ReadCapabilityIssuer,
         checked_multipart_part_number, read_part_with_size, read_resumable_part,
+        validate_range_response,
     };
     use crate::{
         ManagedObjectStore, ManagedReadCapabilityIssuer, ObjectError, ObjectReader,
@@ -1436,6 +1470,27 @@ mod pipeline_tests {
 
     fn test_store() -> S3ObjectStore {
         S3ObjectStore::new(test_client(), "lake-managed", "managed/objects").unwrap()
+    }
+
+    #[test]
+    fn s3_range_response_requires_exact_interval() {
+        let requested = 3..7;
+        validate_range_response(&requested, 10, 4, Some("bytes 3-6/10"), Some(4))
+            .expect("exact S3 range response");
+
+        for (content_range, content_length) in [
+            (None, Some(4)),
+            (Some("bytes 0-3/10"), Some(4)),
+            (Some("bytes 3-5/10"), Some(4)),
+            (Some("bytes 3-6/11"), Some(4)),
+            (Some("bytes 3-6/10"), None),
+            (Some("bytes 3-6/10"), Some(3)),
+        ] {
+            assert!(matches!(
+                validate_range_response(&requested, 10, 4, content_range, content_length),
+                Err(ObjectError::InvalidS3RangeResponse)
+            ));
+        }
     }
 
     #[test]
