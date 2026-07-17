@@ -1965,7 +1965,7 @@ mod tests {
         let authority = Metasrv::with_operation_policy(
             raw.clone(),
             engine,
-            Duration::ZERO,
+            Duration::from_secs(60),
             DEFAULT_OPERATION_GC_PAGE_SIZE,
         )
         .fenced_for_server(leadership);
@@ -2017,6 +2017,14 @@ mod tests {
         assert!(
             after_maintenance > after_append,
             "maintenance version publication must be guarded"
+        );
+        assert_eq!(
+            raw.scan_prefix(operation::OPERATION_PREFIX)
+                .await
+                .unwrap()
+                .len(),
+            3,
+            "ordinary maintenance must not consume records reserved for the explicit GC assertion"
         );
         let gc = maintenance::sweep_operations_at(&authority, u64::MAX).await;
         assert!(gc.deleted > 0, "operation GC must exercise guarded deletes");
