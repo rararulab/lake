@@ -1397,7 +1397,10 @@ impl LakeClient {
                 expires_at: handle.expires_at_secs,
             });
         }
-        let mut client = FlightClient::new(self.query.clone());
+        let client =
+            arrow_flight::flight_service_client::FlightServiceClient::new(self.query.clone())
+                .max_decoding_message_size(MAX_QUERY_RESULT_FLIGHT_INFO_BYTES);
+        let mut client = FlightClient::new_from_inner(client);
         self.security
             .apply_to_flight_client(&mut client)
             .context(SecuritySnafu)?;
@@ -2110,8 +2113,9 @@ mod tests {
         record_batch::RecordBatch,
     };
     use arrow_flight::{
-        Action, CancelStatus, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
-        Result as FlightResult, Ticket,
+        Action, ActionType, CancelStatus, Criteria, Empty, FlightData, FlightDescriptor,
+        FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, PollInfo, PutResult,
+        Result as FlightResult, SchemaResult, Ticket,
         encode::FlightDataEncoderBuilder,
         error::FlightError,
         flight_service_server::{FlightService, FlightServiceServer},
@@ -2384,6 +2388,151 @@ mod tests {
         (client, do_get_calls, redeemed)
     }
 
+    #[derive(Clone)]
+    struct CompletedPollService {
+        response: PollInfo,
+    }
+
+    #[tonic::async_trait]
+    impl FlightService for CompletedPollService {
+        type DoActionStream =
+            futures::stream::BoxStream<'static, std::result::Result<FlightResult, Status>>;
+        type DoExchangeStream =
+            futures::stream::BoxStream<'static, std::result::Result<FlightData, Status>>;
+        type DoGetStream =
+            futures::stream::BoxStream<'static, std::result::Result<FlightData, Status>>;
+        type DoPutStream =
+            futures::stream::BoxStream<'static, std::result::Result<PutResult, Status>>;
+        type HandshakeStream =
+            futures::stream::BoxStream<'static, std::result::Result<HandshakeResponse, Status>>;
+        type ListActionsStream =
+            futures::stream::BoxStream<'static, std::result::Result<ActionType, Status>>;
+        type ListFlightsStream =
+            futures::stream::BoxStream<'static, std::result::Result<FlightInfo, Status>>;
+
+        async fn handshake(
+            &self,
+            _request: Request<tonic::Streaming<HandshakeRequest>>,
+        ) -> std::result::Result<Response<Self::HandshakeStream>, Status> {
+            Err(Status::unimplemented("test only supports PollFlightInfo"))
+        }
+
+        async fn list_flights(
+            &self,
+            _request: Request<Criteria>,
+        ) -> std::result::Result<Response<Self::ListFlightsStream>, Status> {
+            Err(Status::unimplemented("test only supports PollFlightInfo"))
+        }
+
+        async fn get_flight_info(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> std::result::Result<Response<FlightInfo>, Status> {
+            Err(Status::unimplemented("test only supports PollFlightInfo"))
+        }
+
+        async fn poll_flight_info(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> std::result::Result<Response<PollInfo>, Status> {
+            Ok(Response::new(self.response.clone()))
+        }
+
+        async fn get_schema(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> std::result::Result<Response<SchemaResult>, Status> {
+            Err(Status::unimplemented("test only supports PollFlightInfo"))
+        }
+
+        async fn do_get(
+            &self,
+            _request: Request<Ticket>,
+        ) -> std::result::Result<Response<Self::DoGetStream>, Status> {
+            Err(Status::unimplemented("test only supports PollFlightInfo"))
+        }
+
+        async fn do_put(
+            &self,
+            _request: Request<tonic::Streaming<FlightData>>,
+        ) -> std::result::Result<Response<Self::DoPutStream>, Status> {
+            Err(Status::unimplemented("test only supports PollFlightInfo"))
+        }
+
+        async fn do_exchange(
+            &self,
+            _request: Request<tonic::Streaming<FlightData>>,
+        ) -> std::result::Result<Response<Self::DoExchangeStream>, Status> {
+            Err(Status::unimplemented("test only supports PollFlightInfo"))
+        }
+
+        async fn do_action(
+            &self,
+            _request: Request<Action>,
+        ) -> std::result::Result<Response<Self::DoActionStream>, Status> {
+            Err(Status::unimplemented("test only supports PollFlightInfo"))
+        }
+
+        async fn list_actions(
+            &self,
+            _request: Request<Empty>,
+        ) -> std::result::Result<Response<Self::ListActionsStream>, Status> {
+            Err(Status::unimplemented("test only supports PollFlightInfo"))
+        }
+    }
+
+    fn completed_poll_info(endpoint_count: usize) -> FlightInfo {
+        FlightInfo::new().with_endpoints(
+            (0..endpoint_count)
+                .map(|_| {
+                    FlightEndpoint::new()
+                        .with_ticket(Ticket::new(vec![0_u8; crate::MAX_ASYNC_QUERY_HANDLE_BYTES]))
+                })
+                .collect(),
+        )
+    }
+
+    async fn setup_completed_poll_client(root: &std::path::Path, info: FlightInfo) -> LakeClient {
+        let query_addr = free_addr();
+        let service = CompletedPollService {
+            response: PollInfo {
+                info:              Some(info),
+                flight_descriptor: None,
+                progress:          Some(1.0),
+                expiration_time:   None,
+            },
+        };
+        let socket = query_addr.parse().expect("query socket");
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    FlightServiceServer::new(service)
+                        .max_encoding_message_size(crate::MAX_QUERY_RESULT_FLIGHT_INFO_BYTES),
+                )
+                .serve(socket)
+                .await
+                .expect("completed poll Flight SQL server");
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let objects = LocalObjectStore::open(root.join("objects"))
+            .await
+            .expect("object store");
+        LakeClient::builder(format!("http://{query_addr}"))
+            .connect_with_store(objects)
+            .await
+            .expect("connected client")
+    }
+
+    fn unexpired_async_handle() -> crate::AsyncQueryHandle {
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("current time")
+            .as_secs()
+            .saturating_add(60);
+        crate::AsyncQueryHandle::try_new(b"completed-poll".to_vec(), expires_at)
+            .expect("valid async query handle")
+    }
+
     fn batch_value(batch: &RecordBatch) -> i64 {
         batch
             .column_by_name("value")
@@ -2493,6 +2642,49 @@ mod tests {
                 .collect::<Vec<_>>(),
             [b"first".as_slice(), b"second".as_slice()]
         );
+    }
+
+    #[tokio::test]
+    async fn sdk_poll_async_decodes_completed_metadata_above_default_grpc_limit() {
+        let root = tempdir().expect("fixture root");
+        let info = completed_poll_info(257);
+        assert!(
+            info.encoded_len() > 4 * 1024 * 1024,
+            "fixture must exceed Arrow Flight's default gRPC decoder limit"
+        );
+        assert!(
+            info.encoded_len() < crate::MAX_QUERY_RESULT_FLIGHT_INFO_BYTES,
+            "fixture must remain within the SDK FlightInfo ceiling"
+        );
+        let client = setup_completed_poll_client(root.path(), info).await;
+
+        let poll = client
+            .poll_async(&unexpired_async_handle())
+            .await
+            .expect("completed bounded poll metadata decodes");
+
+        let crate::AsyncQueryPoll::Complete(result) = poll else {
+            panic!("completed poll must return a result manifest");
+        };
+        assert_eq!(result.part_count(), 257);
+    }
+
+    #[tokio::test]
+    async fn sdk_poll_async_rejects_completed_metadata_above_ticket_budget() {
+        let root = tempdir().expect("fixture root");
+        let info = completed_poll_info(
+            crate::MAX_QUERY_RESULT_TICKET_TOTAL_BYTES / crate::MAX_ASYNC_QUERY_HANDLE_BYTES + 1,
+        );
+        assert!(
+            info.encoded_len() < crate::MAX_QUERY_RESULT_FLIGHT_INFO_BYTES,
+            "fixture must decode before async result validation rejects it"
+        );
+        let client = setup_completed_poll_client(root.path(), info).await;
+
+        assert!(matches!(
+            client.poll_async(&unexpired_async_handle()).await,
+            Err(SdkError::InvalidAsyncQueryResult)
+        ));
     }
 
     #[tokio::test]
