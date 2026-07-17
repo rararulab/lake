@@ -10,15 +10,15 @@ into Kubernetes.
 
 The root `Dockerfile` is multi-stage and runs the final process as numeric user
 `65532`. It also copies the versioned `grpc_health_probe` binary used for TLS
-and bearer-authenticated exec probes. Build for the target platforms, publish
-to your registry, then replace both `ghcr.io/rararulab/lake:0.1.0` references
-with an immutable digest:
+and bearer-authenticated exec probes. Publishing a GitHub release creates the
+official `ghcr.io/rararulab/lake:vX.Y.Z` and `ghcr.io/rararulab/lake:X.Y.Z`
+multi-platform image tags. Resolve the published manifest-list digest, then
+replace every image reference in this deployment with that immutable digest:
 
 ```bash
-docker buildx build \
-  --platform linux/amd64,linux/arm64 \
-  --tag registry.example/lake@sha256:<digest> \
-  --push .
+docker buildx imagetools inspect ghcr.io/rararulab/lake:v1.0.0
+# Copy the manifest-list digest, then set every image to
+# ghcr.io/rararulab/lake@sha256:<digest>
 ```
 
 Do not deploy a mutable tag in production. The health-probe stage is version
