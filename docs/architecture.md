@@ -14,6 +14,37 @@ stateful tier the query layer shields behind a cache. Compute and storage
 are disaggregated: throughput scales by adding query nodes, not by growing a
 central store.
 
+## At a glance
+
+Open the source-controlled [architecture overview](assets/architecture-overview.html)
+when a rendered systems diagram is more useful than a text walkthrough. The
+diagram deliberately separates control-plane metadata from object bytes; it is
+an implementation map, not an aspirational product diagram.
+
+```mermaid
+flowchart LR
+    client["Fleet node / SDK"] -->|"Flight SQL"| query["Query replicas\nlake-query\nstateless"]
+    query -->|"cache miss / bounded refresh"| meta["Metasrv\nstateful authority"]
+    meta -->|"registry + operation records"| kv["DynamoDB / RocksDB\nHA KV"]
+    query -->|"direct snapshot scan"| dataset["Lance datasets\nobject storage"]
+    sdk["SDK FILE upload / direct read"] -. "large-object bytes" .-> objects["managed object stage\nobject storage"]
+    query -->|"metadata-only append proxy"| meta
+    meta -->|"commit / version pointer"| dataset
+```
+
+Two rules make this diagram useful in practice:
+
+| Plane | Carries | Does not carry | Scaling boundary |
+|---|---|---|---|
+| SQL/control | Flight SQL, catalog generations, schemas, table versions, `DataLocation` metadata | video/model bytes, storage credentials, mutable file lists | Query cache shields Metasrv from read fan-out |
+| object data | immutable table files and managed large objects | registry CAS, append coordination, user SQL | SDK and Query stream directly to object storage |
+
+The planned external-Iceberg connector follows the same boundary: its catalog
+remains the authority for Iceberg metadata and snapshots, while Lake Query
+caches and reads it as a distinct, read-only SQL catalog. It does not put
+external Iceberg metadata in Lake's registry. See
+[Iceberg federation](design/iceberg-federation.md).
+
 ## Three tiers
 
 ```
@@ -687,6 +718,10 @@ design-level ones:
   is cluster-global async fairness. A
   self-built engine slots in behind `TableEngine`
   if/when Lance's ceiling is hit.
+- **v3 (external Iceberg federation)** — planned: one read-only Iceberg REST
+  catalog exposed as a separate SQL catalog. It retains Iceberg's own metadata
+  and commit authority; no external write path or registry mirroring is part
+  of this phase. See [Iceberg federation](design/iceberg-federation.md).
 
 Invariant across all phases: fleet reads go through the stateless query
 layer, never directly at the metadata authority.

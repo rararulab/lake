@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>lake architecture overview</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { min-height: 100vh; padding: 2rem; background: #020617; color: #f8fafc; font-family: "JetBrains Mono", monospace; }
+    .container { max-width: 1200px; margin: 0 auto; }
+    .header { margin-bottom: 1.5rem; }
+    .header-row { display: flex; align-items: center; gap: 0.8rem; margin-bottom: 0.45rem; }
+    .pulse-dot { width: 12px; height: 12px; border-radius: 50%; background: #22d3ee; animation: pulse 2s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+    h1 { font-size: 1.45rem; letter-spacing: -0.03em; }
+    .subtitle { margin-left: 1.75rem; color: #94a3b8; font-size: 0.82rem; line-height: 1.55; }
+    .diagram { overflow-x: auto; padding: 1.1rem; border: 1px solid #1e293b; border-radius: 1rem; background: rgba(15, 23, 42, 0.5); }
+    svg { display: block; width: 100%; min-width: 960px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 1rem; margin-top: 1rem; }
+    .card { padding: 1.1rem; border: 1px solid #1e293b; border-radius: 0.75rem; background: rgba(15, 23, 42, 0.5); }
+    .card-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.65rem; }
+    .card-dot { width: 8px; height: 8px; border-radius: 50%; }
+    .cyan { background: #22d3ee; } .emerald { background: #34d399; } .violet { background: #a78bfa; }
+    .card h2 { font-size: 0.82rem; } .card ul { list-style: none; color: #94a3b8; font-size: 0.74rem; line-height: 1.6; }
+    footer { margin-top: 1rem; text-align: center; color: #475569; font-size: 0.7rem; }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <header class="header">
+      <div class="header-row"><span class="pulse-dot"></span><h1>lake architecture</h1></div>
+      <p class="subtitle">Stateless SQL fan-out, a bounded metadata authority, and direct immutable-object reads.</p>
+    </header>
+
+    <section class="diagram" aria-label="lake architecture diagram">
+      <svg viewBox="0 0 1000 720" role="img" aria-labelledby="diagram-title diagram-desc">
+        <title id="diagram-title">Lake control and object-data paths</title>
+        <desc id="diagram-desc">SDKs and clients use Query replicas for SQL. Query caches metadata from Metasrv and reads immutable data directly from object storage. Large objects go directly from the SDK to its managed stage. A future dashed path shows read-only external Iceberg federation.</desc>
+        <defs>
+          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/></pattern>
+          <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#64748b"/></marker>
+          <marker id="cyan-arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#22d3ee"/></marker>
+          <marker id="emerald-arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#34d399"/></marker>
+          <marker id="amber-arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#fbbf24"/></marker>
+        </defs>
+        <rect width="1000" height="720" fill="url(#grid)"/>
+
+        <!-- Connection arrows are deliberately behind component masks. -->
+        <line x1="170" y1="254" x2="250" y2="254" stroke="#22d3ee" stroke-width="1.6" marker-end="url(#cyan-arrow)"/>
+        <text x="210" y="245" fill="#94a3b8" font-size="8" text-anchor="middle">Flight SQL</text>
+        <path d="M 170 438 C 205 438, 215 310, 250 280" fill="none" stroke="#64748b" stroke-width="1.35" marker-end="url(#arrow)"/>
+        <text x="197" y="357" fill="#94a3b8" font-size="8" text-anchor="middle">FILE metadata only</text>
+        <path d="M 170 456 C 330 560, 605 565, 748 520" fill="none" stroke="#22d3ee" stroke-width="1.55" stroke-dasharray="6,4" marker-end="url(#cyan-arrow)"/>
+        <text x="450" y="575" fill="#22d3ee" font-size="8" text-anchor="middle">large video / model bytes — direct, streaming</text>
+        <line x1="430" y1="255" x2="505" y2="255" stroke="#fbbf24" stroke-width="1.45" marker-end="url(#amber-arrow)"/>
+        <text x="468" y="245" fill="#94a3b8" font-size="8" text-anchor="middle">direct scans</text>
+        <path d="M 340 305 L 340 372" fill="none" stroke="#34d399" stroke-width="1.5" marker-end="url(#emerald-arrow)"/>
+        <text x="350" y="345" fill="#94a3b8" font-size="8">cache miss / refresh</text>
+        <path d="M 430 420 L 505 420" fill="none" stroke="#34d399" stroke-width="1.45" marker-end="url(#emerald-arrow)"/>
+        <text x="468" y="411" fill="#94a3b8" font-size="8" text-anchor="middle">commit pointer</text>
+        <line x1="340" y1="470" x2="340" y2="520" stroke="#a78bfa" stroke-width="1.45" marker-end="url(#arrow)"/>
+        <text x="350" y="500" fill="#94a3b8" font-size="8">registry / operations</text>
+        <path d="M 430 285 C 530 195, 640 195, 748 235" fill="none" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="6,4" marker-end="url(#arrow)"/>
+        <text x="586" y="182" fill="#94a3b8" font-size="8" text-anchor="middle">planned: bounded read-only catalog refresh</text>
+        <line x1="835" y1="280" x2="835" y2="350" stroke="#94a3b8" stroke-width="1.3" stroke-dasharray="6,4" marker-end="url(#arrow)"/>
+        <text x="850" y="321" fill="#94a3b8" font-size="8">planned direct Parquet scan</text>
+
+        <!-- Boundaries -->
+        <rect x="215" y="95" width="270" height="465" rx="12" fill="rgba(6, 78, 59, 0.05)" stroke="#34d399" stroke-width="1" stroke-dasharray="8,4"/>
+        <text x="230" y="116" fill="#34d399" font-size="9" font-weight="600">Lake query / metadata deployment</text>
+        <rect x="728" y="170" width="230" height="400" rx="12" fill="rgba(120, 53, 15, 0.05)" stroke="#fbbf24" stroke-width="1" stroke-dasharray="8,4"/>
+        <text x="742" y="191" fill="#fbbf24" font-size="9" font-weight="600">Object storage and external authority</text>
+
+        <!-- Opaque masks and component boxes -->
+        <rect x="35" y="220" width="135" height="68" rx="6" fill="#0f172a"/>
+        <rect x="35" y="220" width="135" height="68" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="102" y="246" fill="#f8fafc" font-size="12" font-weight="600" text-anchor="middle">Fleet / clients</text>
+        <text x="102" y="265" fill="#94a3b8" font-size="9" text-anchor="middle">Flight SQL readers</text>
+
+        <rect x="35" y="405" width="135" height="68" rx="6" fill="#0f172a"/>
+        <rect x="35" y="405" width="135" height="68" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="102" y="431" fill="#f8fafc" font-size="12" font-weight="600" text-anchor="middle">Rust SDK</text>
+        <text x="102" y="450" fill="#94a3b8" font-size="9" text-anchor="middle">FILE upload / direct read</text>
+
+        <rect x="250" y="220" width="180" height="88" rx="6" fill="#0f172a"/>
+        <rect x="250" y="220" width="180" height="88" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="340" y="247" fill="#f8fafc" font-size="12" font-weight="600" text-anchor="middle">Query replicas</text>
+        <text x="340" y="267" fill="#94a3b8" font-size="9" text-anchor="middle">DataFusion + Flight SQL</text>
+        <text x="340" y="286" fill="#34d399" font-size="8" text-anchor="middle">stateless / catalog cache</text>
+
+        <rect x="250" y="372" width="180" height="98" rx="6" fill="#0f172a"/>
+        <rect x="250" y="372" width="180" height="98" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="340" y="401" fill="#f8fafc" font-size="12" font-weight="600" text-anchor="middle">Metasrv</text>
+        <text x="340" y="421" fill="#94a3b8" font-size="9" text-anchor="middle">registry + write coordination</text>
+        <text x="340" y="441" fill="#34d399" font-size="8" text-anchor="middle">bounded / leader-elected</text>
+
+        <rect x="250" y="520" width="180" height="58" rx="6" fill="#0f172a"/>
+        <rect x="250" y="520" width="180" height="58" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="340" y="544" fill="#f8fafc" font-size="11" font-weight="600" text-anchor="middle">DynamoDB / RocksDB</text>
+        <text x="340" y="561" fill="#94a3b8" font-size="8" text-anchor="middle">compact durable authority</text>
+
+        <rect x="505" y="215" width="160" height="82" rx="6" fill="#0f172a"/>
+        <rect x="505" y="215" width="160" height="82" rx="6" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="585" y="242" fill="#f8fafc" font-size="12" font-weight="600" text-anchor="middle">Lake datasets</text>
+        <text x="585" y="262" fill="#94a3b8" font-size="9" text-anchor="middle">immutable Lance snapshots</text>
+        <text x="585" y="280" fill="#fbbf24" font-size="8" text-anchor="middle">object-storage backed</text>
+
+        <rect x="505" y="385" width="160" height="70" rx="6" fill="#0f172a"/>
+        <rect x="505" y="385" width="160" height="70" rx="6" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="585" y="412" fill="#f8fafc" font-size="11" font-weight="600" text-anchor="middle">manifest authority</text>
+        <text x="585" y="431" fill="#94a3b8" font-size="8" text-anchor="middle">engine-private metadata</text>
+
+        <rect x="748" y="210" width="175" height="70" rx="6" fill="#0f172a"/>
+        <rect x="748" y="210" width="175" height="70" rx="6" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="835" y="237" fill="#f8fafc" font-size="11" font-weight="600" text-anchor="middle">Iceberg REST catalog</text>
+        <text x="835" y="257" fill="#94a3b8" font-size="8" text-anchor="middle">planned external authority</text>
+
+        <rect x="748" y="350" width="175" height="70" rx="6" fill="#0f172a"/>
+        <rect x="748" y="350" width="175" height="70" rx="6" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="835" y="377" fill="#f8fafc" font-size="11" font-weight="600" text-anchor="middle">Iceberg table files</text>
+        <text x="835" y="397" fill="#94a3b8" font-size="8" text-anchor="middle">planned external Parquet data</text>
+
+        <rect x="748" y="485" width="175" height="70" rx="6" fill="#0f172a"/>
+        <rect x="748" y="485" width="175" height="70" rx="6" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="835" y="512" fill="#f8fafc" font-size="11" font-weight="600" text-anchor="middle">managed object stage</text>
+        <text x="835" y="532" fill="#94a3b8" font-size="8" text-anchor="middle">SDK-owned video / model bytes</text>
+
+        <!-- Legend intentionally lives outside both boundaries. -->
+        <text x="35" y="630" fill="#f8fafc" font-size="10" font-weight="600">Legend</text>
+        <rect x="35" y="643" width="16" height="10" rx="2" fill="rgba(6,78,59,0.4)" stroke="#34d399"/>
+        <text x="58" y="652" fill="#94a3b8" font-size="8">Lake service</text>
+        <rect x="170" y="643" width="16" height="10" rx="2" fill="rgba(76,29,149,0.4)" stroke="#a78bfa"/>
+        <text x="193" y="652" fill="#94a3b8" font-size="8">durable metadata</text>
+        <rect x="345" y="643" width="16" height="10" rx="2" fill="rgba(120,53,15,0.3)" stroke="#fbbf24"/>
+        <text x="368" y="652" fill="#94a3b8" font-size="8">object storage</text>
+        <line x1="500" y1="648" x2="522" y2="648" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="5,4"/>
+        <text x="530" y="652" fill="#94a3b8" font-size="8">planned Iceberg path</text>
+        <line x1="700" y1="648" x2="722" y2="648" stroke="#22d3ee" stroke-width="1.5" stroke-dasharray="5,4"/>
+        <text x="730" y="652" fill="#94a3b8" font-size="8">direct large-object bytes</text>
+        <text x="35" y="691" fill="#475569" font-size="8">Source: docs/architecture.md · planned Iceberg federation is intentionally dashed.</text>
+      </svg>
+    </section>
+
+    <section class="cards" aria-label="architecture invariants">
+      <article class="card"><div class="card-header"><span class="card-dot cyan"></span><h2>Read fan-out</h2></div><ul><li>• Query replicas scale horizontally.</li><li>• Catalog cache keeps routine reads off Metasrv.</li><li>• Queries read immutable snapshots directly.</li></ul></article>
+      <article class="card"><div class="card-header"><span class="card-dot emerald"></span><h2>Large objects</h2></div><ul><li>• FILE rows store metadata, not video/model bytes.</li><li>• SDK uploads and reads directly from its managed stage.</li><li>• Query and Metasrv never become data proxies.</li></ul></article>
+      <article class="card"><div class="card-header"><span class="card-dot violet"></span><h2>External Iceberg</h2></div><ul><li>• Planned as a separate read-only SQL catalog.</li><li>• The external catalog owns Iceberg snapshots and commits.</li><li>• Lake registry and Iceberg metadata never merge.</li></ul></article>
+    </section>
+    <footer>Lake architecture · source-controlled diagram · no runtime dependency</footer>
+  </main>
+</body>
+</html>
