@@ -18,7 +18,7 @@ use snafu::Snafu;
 use subtle::ConstantTimeEq;
 
 const TICKET_MAGIC: &[u8; 4] = b"LQTK";
-const TICKET_VERSION: u8 = 2;
+const TICKET_VERSION: u8 = 3;
 const KEY_ID_BYTES: usize = 16;
 const NONCE_BYTES: usize = 12;
 const NONCE_PREFIX_BYTES: usize = 8;
@@ -133,17 +133,19 @@ impl fmt::Debug for QueryTicketKeyRing {
 #[derive(Clone, PartialEq, Message)]
 struct StatementTicketPayload {
     #[prost(uint64, tag = "1")]
-    issued_at_secs:  u64,
+    issued_at_secs:    u64,
     #[prost(uint64, tag = "2")]
-    expires_at_secs: u64,
+    expires_at_secs:   u64,
     #[prost(string, tag = "3")]
-    principal_id:    String,
+    principal_id:      String,
     #[prost(string, tag = "4")]
-    tenant_id:       String,
+    tenant_id:         String,
     #[prost(string, tag = "5")]
-    sql:             String,
+    sql:               String,
     #[prost(message, repeated, tag = "6")]
-    snapshots:       Vec<StatementTableSnapshot>,
+    snapshots:         Vec<StatementTableSnapshot>,
+    #[prost(message, repeated, tag = "7")]
+    iceberg_snapshots: Vec<StatementIcebergSnapshot>,
 }
 
 /// One exact physical lake table generation carried inside an encrypted
@@ -164,11 +166,25 @@ pub(crate) struct StatementTableSnapshot {
     pub(crate) version:        u64,
 }
 
+/// One immutable external Iceberg table snapshot carried inside an encrypted
+/// statement ticket. Deployment endpoint, warehouse, and credentials never
+/// leave the server process.
+#[derive(Clone, Eq, PartialEq, Message)]
+pub(crate) struct StatementIcebergSnapshot {
+    #[prost(string, tag = "1")]
+    pub(crate) namespace:   String,
+    #[prost(string, tag = "2")]
+    pub(crate) table:       String,
+    #[prost(int64, tag = "3")]
+    pub(crate) snapshot_id: i64,
+}
+
 /// Authenticated statement and its complete immutable input set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StatementTicket {
-    pub(crate) sql:       String,
-    pub(crate) snapshots: Vec<StatementTableSnapshot>,
+    pub(crate) sql:               String,
+    pub(crate) snapshots:         Vec<StatementTableSnapshot>,
+    pub(crate) iceberg_snapshots: Vec<StatementIcebergSnapshot>,
 }
 
 #[derive(Clone)]
@@ -248,8 +264,9 @@ impl StatementTicketCodec {
     ) -> Result<Vec<u8>, QueryTicketError> {
         self.seal_statement_at(
             &StatementTicket {
-                sql:       sql.to_owned(),
-                snapshots: Vec::new(),
+                sql:               sql.to_owned(),
+                snapshots:         Vec::new(),
+                iceberg_snapshots: Vec::new(),
             },
             principal,
             now,
@@ -284,6 +301,7 @@ impl StatementTicketCodec {
             tenant_id: principal.tenant().as_str().to_owned(),
             sql: statement.sql.clone(),
             snapshots: statement.snapshots.clone(),
+            iceberg_snapshots: statement.iceberg_snapshots.clone(),
         };
         let mut plaintext = payload.encode_to_vec();
         let key = self.keys.active();
@@ -389,8 +407,9 @@ impl StatementTicketCodec {
             return Err(QueryTicketError::Invalid);
         }
         let statement = StatementTicket {
-            sql:       payload.sql,
-            snapshots: payload.snapshots,
+            sql:               payload.sql,
+            snapshots:         payload.snapshots,
+            iceberg_snapshots: payload.iceberg_snapshots,
         };
         validate_statement(&statement)?;
         Ok(statement)
@@ -418,7 +437,13 @@ impl StatementTicketCodec {
 }
 
 fn validate_statement(statement: &StatementTicket) -> Result<(), QueryTicketError> {
-    if statement.sql.is_empty() || statement.snapshots.len() > MAX_TABLE_SNAPSHOTS {
+    if statement.sql.is_empty()
+        || statement
+            .snapshots
+            .len()
+            .saturating_add(statement.iceberg_snapshots.len())
+            > MAX_TABLE_SNAPSHOTS
+    {
         return Err(QueryTicketError::Invalid);
     }
     let mut previous: Option<(&str, &str)> = None;
@@ -433,6 +458,22 @@ fn validate_statement(statement: &StatementTicket) -> Result<(), QueryTicketErro
             || snapshot.location.len() > MAX_LOCATION_BYTES
             || snapshot.incarnation_id.is_empty()
             || snapshot.incarnation_id.len() > MAX_INCARNATION_BYTES
+        {
+            return Err(QueryTicketError::Invalid);
+        }
+        let identity = (snapshot.namespace.as_str(), snapshot.table.as_str());
+        if previous.is_some_and(|previous| previous >= identity) {
+            return Err(QueryTicketError::Invalid);
+        }
+        previous = Some(identity);
+    }
+    let mut previous: Option<(&str, &str)> = None;
+    for snapshot in &statement.iceberg_snapshots {
+        if snapshot.namespace.is_empty()
+            || snapshot.namespace.len() > MAX_NAMESPACE_BYTES
+            || snapshot.table.is_empty()
+            || snapshot.table.len() > MAX_TABLE_BYTES
+            || snapshot.snapshot_id == 0
         {
             return Err(QueryTicketError::Invalid);
         }
@@ -474,7 +515,7 @@ mod tests {
 
     use super::{
         MAX_LOCATION_BYTES, MAX_TABLE_SNAPSHOTS, QueryTicketError, QueryTicketKeyRing,
-        StatementTableSnapshot, StatementTicket, StatementTicketCodec,
+        StatementIcebergSnapshot, StatementTableSnapshot, StatementTicket, StatementTicketCodec,
     };
 
     fn principal(id: &str, tenant: &str) -> Principal {
@@ -543,8 +584,9 @@ mod tests {
             version:        41,
         };
         let statement = StatementTicket {
-            sql:       "SELECT * FROM lake.alpha.episodes".to_owned(),
-            snapshots: vec![snapshot.clone()],
+            sql:               "SELECT * FROM lake.alpha.episodes".to_owned(),
+            snapshots:         vec![snapshot.clone()],
+            iceberg_snapshots: Vec::new(),
         };
 
         let encrypted = codec
@@ -569,16 +611,18 @@ mod tests {
         }
 
         let unbounded = StatementTicket {
-            sql:       "SELECT 1".to_owned(),
-            snapshots: vec![snapshot; MAX_TABLE_SNAPSHOTS + 1],
+            sql:               "SELECT 1".to_owned(),
+            snapshots:         vec![snapshot; MAX_TABLE_SNAPSHOTS + 1],
+            iceberg_snapshots: Vec::new(),
         };
         assert!(matches!(
             codec.seal_statement_at(&unbounded, &alice, now),
             Err(QueryTicketError::Invalid)
         ));
         let duplicate = StatementTicket {
-            sql:       "SELECT 1".to_owned(),
-            snapshots: vec![unbounded.snapshots[0].clone(); 2],
+            sql:               "SELECT 1".to_owned(),
+            snapshots:         vec![unbounded.snapshots[0].clone(); 2],
+            iceberg_snapshots: Vec::new(),
         };
         assert!(matches!(
             codec.seal_statement_at(&duplicate, &alice, now),
@@ -589,14 +633,54 @@ mod tests {
         assert!(matches!(
             codec.seal_statement_at(
                 &StatementTicket {
-                    sql:       "SELECT 1".to_owned(),
-                    snapshots: vec![oversized],
+                    sql:               "SELECT 1".to_owned(),
+                    snapshots:         vec![oversized],
+                    iceberg_snapshots: Vec::new(),
                 },
                 &alice,
                 now
             ),
             Err(QueryTicketError::Invalid)
         ));
+    }
+
+    #[test]
+    fn statement_ticket_roundtrips_snapshot_pinned_iceberg_inputs() {
+        let codec = StatementTicketCodec::try_new(
+            ring(b"iceberg-ticket-key-material-00000000001", &[]),
+            Duration::from_mins(5),
+            "lake-query",
+        )
+        .unwrap();
+        let alice = principal("alice@example", "alpha");
+        let now = UNIX_EPOCH + Duration::from_secs(10_000);
+        let statement = StatementTicket {
+            sql:               "SELECT * FROM iceberg.analytics.episodes".to_owned(),
+            snapshots:         Vec::new(),
+            iceberg_snapshots: vec![StatementIcebergSnapshot {
+                namespace:   "analytics".to_owned(),
+                table:       "episodes".to_owned(),
+                snapshot_id: 9_331,
+            }],
+        };
+
+        let encrypted = codec
+            .seal_statement_at(&statement, &alice, now)
+            .expect("seal external Iceberg snapshot");
+        assert_eq!(
+            codec
+                .open_statement_at(&encrypted, &alice, now)
+                .expect("open external Iceberg snapshot"),
+            statement
+        );
+        for forbidden in [b"catalog.example".as_slice(), b"s3://warehouse".as_slice()] {
+            assert!(
+                !encrypted
+                    .windows(forbidden.len())
+                    .any(|window| window == forbidden),
+                "ticket must not contain external catalog configuration"
+            );
+        }
     }
 
     #[test]
@@ -612,8 +696,9 @@ mod tests {
         let legacy = codec
             .seal_statement_at_version(
                 &StatementTicket {
-                    sql:       "SELECT * FROM lake.alpha.episodes".to_owned(),
-                    snapshots: Vec::new(),
+                    sql:               "SELECT * FROM lake.alpha.episodes".to_owned(),
+                    snapshots:         Vec::new(),
+                    iceberg_snapshots: Vec::new(),
                 },
                 &alice,
                 now,

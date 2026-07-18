@@ -279,6 +279,36 @@ snapshot fails explicitly and never falls forward to latest. Ticket protocol
 upgrades require blue/green or drained cutover because older replicas are
 intentionally unable to ignore new snapshot claims.
 
+## External Iceberg REST tables
+
+Query can expose one external Apache Iceberg REST catalog as the read-only SQL
+catalog `iceberg`; Lake-owned tables remain under `lake`. The external catalog
+keeps ownership of Iceberg metadata, commits, and retention. Lake never copies
+that metadata into Metasrv or proxies Parquet/video/model bytes through Flight.
+
+```bash
+LAKE_ICEBERG_REST_ENDPOINT=https://catalog.example.com \
+LAKE_ICEBERG_WAREHOUSE=s3://embodied-warehouse \
+LAKE_ICEBERG_NAMESPACES=analytics,models \
+lake query --metadata-addr https://metasrv.example.com:50052
+```
+
+All three variables are required together and are validated before Query binds.
+Cloud and catalog credentials stay in the Query deployment's normal runtime
+configuration. Query supports fully-qualified scans such as:
+
+```sql
+SELECT episode_id, reward
+FROM iceberg.analytics.episodes;
+```
+
+It does not enumerate external tables, issue Iceberg writes, or mirror catalog
+state into Lake. A Flight statement ticket pins the selected Iceberg snapshot,
+so a later upstream commit cannot change a result after `GetFlightInfo`; an
+expired upstream snapshot fails rather than silently reading latest. See the
+[Iceberg federation design](docs/design/iceberg-federation.md) for cache and
+availability bounds.
+
 ```rust
 let mut results = client
     .query("SELECT video FROM lake.robots.episodes")
@@ -657,7 +687,7 @@ window is reported as an error and makes the process exit non-zero.
 For the design and invariants, see [managed objects](docs/design/managed-objects.md),
 the [architecture](docs/architecture.md), its rendered
 [overview](docs/assets/architecture-overview.html), and the planned
-[Iceberg federation boundary](docs/design/iceberg-federation.md).
+[Iceberg federation design](docs/design/iceberg-federation.md).
 
 ## Kubernetes deployment
 

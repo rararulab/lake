@@ -1,17 +1,18 @@
 # Iceberg federation
 
-> **Status: planned.** This document defines the first implementation slice;
-> it is not a claim that a released Lake binary already queries Iceberg.
+> **Status: implemented (read-only REST federation).** One external catalog is
+> configured on each Query deployment. Iceberg writes remain deliberately out
+> of scope.
 
 Lake's native storage and commit protocol remain Lance-based. Iceberg is an
 external table format with an external catalog and its own snapshot/commit
 authority. Treating it as another `TableLocation` owned by Metasrv would merge
 two independent commit protocols and break both systems' visibility rules.
 
-## First slice: read-only REST catalog federation
+## Read-only REST catalog federation
 
-One configured Iceberg REST catalog will appear as a separate DataFusion/Flight
-SQL catalog:
+One configured Iceberg REST catalog appears as a separate DataFusion/Flight SQL
+catalog:
 
 ```sql
 SELECT episode_id, reward
@@ -27,35 +28,65 @@ registry.
 
 ```mermaid
 sequenceDiagram
+    participant F as Flight SQL client
     participant Q as Lake Query replica
     participant C as Iceberg REST catalog
     participant O as Iceberg object storage
-    participant F as Flight SQL client
 
-    F->>Q: SELECT from iceberg.namespace.table
-    Q->>C: bounded catalog/table refresh
+    F->>Q: GetFlightInfo(SELECT from iceberg.namespace.table)
+    Q->>C: exact table lookup / bounded refresh
     C-->>Q: immutable Iceberg metadata + snapshot
+    Q->>O: direct Parquet/manifest reads for schema
+    Q-->>F: encrypted ticket containing snapshot ID
+    F->>Q: DoGet(ticket)
+    Q->>C: exact table lookup at ticket snapshot ID
     Q->>O: direct Parquet/manifest reads
-    O-->>Q: Arrow scan input
-    Q-->>F: streamed Flight SQL batches
+    Q-->>F: streamed Arrow batches
 ```
 
 The catalog request is a metadata path. The query scan is a direct object-data
 path. Neither large objects nor Iceberg credentials pass through Flight SQL,
 Metasrv, or the Lake registry.
 
-## Compatibility and scope
+## Deployment configuration
 
-The adapter should use the Apache `iceberg-rust` DataFusion integration that
-matches Lake's DataFusion/Arrow major versions. The initial catalog type is
-Iceberg REST only. The catalog configuration and cloud credentials belong to
-the Query deployment; normal cloud-provider credential chains and the external
-catalog's authentication mechanism stay outside Lake's persisted metadata and
-wire payloads.
+Query enables federation only when all three values are set before the listener
+binds. A partial configuration is a startup error; an unset triple leaves
+Iceberg disabled.
 
-The first slice supports scans and Flight discovery only. Lake SQL remains
-read-only, so the following are deliberately rejected before an external
-mutation can begin:
+| Variable | Meaning |
+|---|---|
+| `LAKE_ICEBERG_REST_ENDPOINT` | Credential-free HTTP(S) REST catalog base URL |
+| `LAKE_ICEBERG_WAREHOUSE` | Iceberg warehouse identifier passed to the catalog |
+| `LAKE_ICEBERG_NAMESPACES` | Comma-separated, finite SQL namespace allowlist |
+
+For example:
+
+```bash
+LAKE_ICEBERG_REST_ENDPOINT=https://catalog.example.com \
+LAKE_ICEBERG_WAREHOUSE=s3://embodied-warehouse \
+LAKE_ICEBERG_NAMESPACES=analytics,models \
+lake query --metadata-addr https://metasrv.example.com:50052
+```
+
+The adapter uses Apache `iceberg-rust`'s DataFusion integration at the pinned
+Apache revision declared in the workspace. Its storage factory resolves the
+table-file URI at scan time. Cloud credentials and REST authentication are
+therefore deployment/runtime concerns (for example the normal cloud-provider
+credential chain), never Lake registry fields, SQL text, or ticket claims.
+
+Startup performs a bounded existence check for each configured namespace. It
+does not list external namespaces or tables. At query time a reference to
+`iceberg.analytics.episodes` performs one exact external table lookup; a
+namespace outside the allowlist is not visible. Flight table discovery likewise
+does not enumerate the external catalog, so clients must address a configured
+Iceberg table by its full three-part name.
+
+## Scope and write boundary
+
+The slice supports scans through direct SQL and standard Flight statement
+execution. Lake SQL is read-only, so the following are rejected before an
+external mutation can begin:
 
 - Iceberg `CREATE`, `DROP`, `ALTER`, `INSERT`, `UPDATE`, `DELETE`, and
   `MERGE` statements;
@@ -65,17 +96,19 @@ mutation can begin:
 
 ## Snapshot and availability rules
 
-An Iceberg table provider is bound to the Iceberg snapshot chosen while its
-statement is planned. A Flight statement ticket must retain that exact provider
-through `DoGet`; it must never re-resolve the current external snapshot after
-the ticket has been issued. A later request can refresh and plan against a
-newer Iceberg snapshot.
+An Iceberg table provider is bound to the snapshot chosen while a statement is
+planned. A Flight ticket records the namespace, table, and immutable Iceberg
+snapshot ID. `DoGet` point-loads that ID and reconstructs a request-local
+provider; it never adopts a newer current snapshot after ticket issue. A later
+statement can refresh and use a newer snapshot. If upstream retention has
+removed the ticketed snapshot, the request fails rather than falling forward.
 
-Iceberg metadata refresh is bounded and cache-coalesced per Query replica,
-just like Lake catalog refresh. A cold configured connector must validate its
-configuration before Query is marked ready. Once it has a last-good external
-snapshot, a transient Iceberg catalog outage may serve that snapshot until its
-documented staleness bound; it must not make Lake-owned catalog reads fail.
+Each Query replica has a bounded cache of at most 10,000 external table
+snapshots. A cache entry is fresh for 5 seconds. On refresh failure, a
+last-good entry may be used for up to 60 seconds from its successful load;
+after that, the external error is returned. Iceberg-only Flight planning does
+not refresh the Lake registry. The external catalog and the Lake catalog have
+separate metadata authorities and failure domains.
 
 ## Non-goals and the write gate
 

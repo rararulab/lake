@@ -1,0 +1,36 @@
+{
+  "metadata-location": "s3://warehouse/analytics/episodes/metadata/v1.metadata.json",
+  "metadata": {
+    "format-version": 2,
+    "table-uuid": "b55d9dda-6561-423a-8bfc-787980ce421f",
+    "location": "s3://warehouse/analytics/episodes",
+    "last-sequence-number": 1,
+    "last-updated-ms": 1646787054459,
+    "last-column-id": 1,
+    "schemas": [{
+      "type": "struct",
+      "schema-id": 0,
+      "fields": [{"id": 1, "name": "episode_id", "required": true, "type": "long"}]
+    }],
+    "current-schema-id": 0,
+    "partition-specs": [{"spec-id": 0, "fields": []}],
+    "default-spec-id": 0,
+    "last-partition-id": 999,
+    "default-sort-order-id": 0,
+    "sort-orders": [{"order-id": 0, "fields": []}],
+    "properties": {},
+    "current-snapshot-id": 3497810964824022504,
+    "refs": {"main": {"snapshot-id": 3497810964824022504, "type": "branch"}},
+    "snapshots": [{
+      "snapshot-id": 3497810964824022504,
+      "sequence-number": 1,
+      "timestamp-ms": 1646787054459,
+      "summary": {"operation": "append"},
+      "manifest-list": "s3://warehouse/analytics/episodes/metadata/snap.avro",
+      "schema-id": 0
+    }],
+    "snapshot-log": [{"timestamp-ms": 1646787054459, "snapshot-id": 3497810964824022504}],
+    "metadata-log": []
+  },
+  "config": {}
+}

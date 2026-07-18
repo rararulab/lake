@@ -26,6 +26,7 @@ lake-common = { workspace = true }
 lake-engine = { workspace = true }
 lake-engine-lance = { workspace = true }
 lake-flight.workspace = true
+lake-iceberg = { workspace = true }
 lake-meta = { workspace = true }
 lake-metasrv = { workspace = true }
 lake-objects.workspace = true

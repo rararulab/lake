@@ -14,12 +14,13 @@
 
 //! `lake query` / `lake meta` — run the tier servers.
 
-use std::{future::Future, sync::Arc};
+use std::{env, future::Future, sync::Arc};
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
 use lake_common::{ManagedStageBackend, ManagedStageDescriptor};
 use lake_flight::ClientSecurity;
+use lake_iceberg::{IcebergCatalog, IcebergCatalogConfig};
 use lake_meta::{DynamoMeta, MetaStoreRef, RocksMeta};
 use lake_metasrv::MetasrvServerConfig;
 use lake_objects::{
@@ -155,6 +156,10 @@ async fn query_engine_for_server(
     security: ClientSecurity,
     resources: QueryResources,
 ) -> anyhow::Result<(Arc<QueryEngine>, String)> {
+    let iceberg = match iceberg_catalog_config_from_env()? {
+        Some(config) => Some(IcebergCatalog::connect(config).await?),
+        None => None,
+    };
     let endpoint = if metadata_addr.contains("://") {
         metadata_addr.to_owned()
     } else {
@@ -163,7 +168,47 @@ async fn query_engine_for_server(
     let source = connect_remote_catalog_source(endpoint.clone(), security).await?;
     let engine =
         QueryEngine::try_with_catalog_source_and_resources(source, ctx.engine.clone(), resources)?;
+    let engine = match iceberg {
+        Some(catalog) => engine.with_iceberg_catalog(catalog),
+        None => engine,
+    };
     Ok((Arc::new(engine), endpoint))
+}
+
+fn iceberg_catalog_config_from_env() -> anyhow::Result<Option<IcebergCatalogConfig>> {
+    iceberg_catalog_config_from_values(
+        optional_env("LAKE_ICEBERG_REST_ENDPOINT")?.as_deref(),
+        optional_env("LAKE_ICEBERG_WAREHOUSE")?.as_deref(),
+        optional_env("LAKE_ICEBERG_NAMESPACES")?.as_deref(),
+    )
+}
+
+fn optional_env(name: &str) -> anyhow::Result<Option<String>> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn iceberg_catalog_config_from_values(
+    endpoint: Option<&str>,
+    warehouse: Option<&str>,
+    namespaces: Option<&str>,
+) -> anyhow::Result<Option<IcebergCatalogConfig>> {
+    match (endpoint, warehouse, namespaces) {
+        (None, None, None) => Ok(None),
+        (Some(endpoint), Some(warehouse), Some(namespaces)) => {
+            let namespaces = namespaces.split(',').map(str::trim);
+            Ok(Some(IcebergCatalogConfig::try_new(
+                endpoint, warehouse, namespaces,
+            )?))
+        }
+        _ => anyhow::bail!(
+            "LAKE_ICEBERG_REST_ENDPOINT, LAKE_ICEBERG_WAREHOUSE, and LAKE_ICEBERG_NAMESPACES must \
+             all be set together"
+        ),
+    }
 }
 
 async fn async_query_config(ctx: &QueryContext) -> anyhow::Result<AsyncQueryConfig> {
@@ -288,7 +333,10 @@ mod tests {
     use lake_flight::ClientSecurity;
     use lake_query::QueryResources;
 
-    use super::{query_engine_for_server, read_capability_issuer_for_stage};
+    use super::{
+        iceberg_catalog_config_from_values, query_engine_for_server,
+        read_capability_issuer_for_stage,
+    };
     use crate::commands::QueryContext;
 
     #[test]
@@ -330,6 +378,44 @@ mod tests {
                 .is_some()
         );
         assert!(read_capability_issuer_for_stage(&s3, None).is_err());
+    }
+
+    #[test]
+    fn iceberg_configuration_is_all_or_nothing_before_listener_bind() {
+        assert!(
+            iceberg_catalog_config_from_values(None, None, None)
+                .expect("Iceberg is optional")
+                .is_none()
+        );
+
+        let config = iceberg_catalog_config_from_values(
+            Some("https://catalog.example.test/"),
+            Some("s3://warehouse"),
+            Some("analytics,models"),
+        )
+        .expect("complete configuration is valid")
+        .expect("external catalog is configured");
+        assert_eq!(config.endpoint().as_str(), "https://catalog.example.test/");
+        assert_eq!(config.warehouse(), "s3://warehouse");
+        assert_eq!(config.namespaces(), ["analytics", "models"]);
+
+        for partial in [
+            (
+                Some("https://catalog.example.test"),
+                None,
+                Some("analytics"),
+            ),
+            (None, Some("s3://warehouse"), Some("analytics")),
+            (
+                Some("https://catalog.example.test"),
+                Some("s3://warehouse"),
+                None,
+            ),
+        ] {
+            let error = iceberg_catalog_config_from_values(partial.0, partial.1, partial.2)
+                .expect_err("partial configuration must fail before server bind");
+            assert!(error.to_string().contains("all be set"));
+        }
     }
 
     #[tokio::test]

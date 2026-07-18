@@ -655,8 +655,9 @@ impl AsyncQueryCoordinator {
             .poll_codec
             .seal_statement(
                 &StatementTicket {
-                    sql:       format!("{query_id}:{part}"),
-                    snapshots: Vec::new(),
+                    sql:               format!("{query_id}:{part}"),
+                    snapshots:         Vec::new(),
+                    iceberg_snapshots: Vec::new(),
                 },
                 principal,
             )
@@ -703,8 +704,9 @@ impl AsyncQueryCoordinator {
             .poll_codec
             .seal_statement(
                 &StatementTicket {
-                    sql:       query_id.to_owned(),
-                    snapshots: Vec::new(),
+                    sql:               query_id.to_owned(),
+                    snapshots:         Vec::new(),
+                    iceberg_snapshots: Vec::new(),
                 },
                 principal,
             )
@@ -1037,6 +1039,7 @@ impl AsyncQueryWorker {
             .snapshots
             .iter()
             .map(job_snapshot)
+            .map(crate::QueryTableSnapshot::Lake)
             .collect::<Vec<_>>();
         let dataframe = self
             .engine
@@ -2468,8 +2471,9 @@ mod tests {
         let job = coordinator
             .submit_statement(
                 &StatementTicket {
-                    sql:       "SELECT CAST(42 AS BIGINT) AS answer".to_owned(),
-                    snapshots: Vec::new(),
+                    sql:               "SELECT CAST(42 AS BIGINT) AS answer".to_owned(),
+                    snapshots:         Vec::new(),
+                    iceberg_snapshots: Vec::new(),
                 },
                 &owner,
             )
@@ -2866,8 +2870,9 @@ mod tests {
         let submission = first
             .submit_statement(
                 &StatementTicket {
-                    sql:       format!("SELECT repeat('x', {persisted_limit}) AS payload"),
-                    snapshots: Vec::new(),
+                    sql:               format!("SELECT repeat('x', {persisted_limit}) AS payload"),
+                    snapshots:         Vec::new(),
+                    iceberg_snapshots: Vec::new(),
                 },
                 &principal("restart-limit@example"),
             )
@@ -3259,8 +3264,9 @@ mod tests {
         let submission = coordinator
             .submit_statement(
                 &StatementTicket {
-                    sql:       "SELECT CAST(42 AS BIGINT) AS answer".to_owned(),
-                    snapshots: Vec::new(),
+                    sql:               "SELECT CAST(42 AS BIGINT) AS answer".to_owned(),
+                    snapshots:         Vec::new(),
+                    iceberg_snapshots: Vec::new(),
                 },
                 &principal("worker-test@example"),
             )
@@ -3349,8 +3355,9 @@ mod tests {
         let submission = coordinator
             .submit_statement(
                 &StatementTicket {
-                    sql:       "SELECT CAST(42 AS BIGINT) AS answer".to_owned(),
-                    snapshots: Vec::new(),
+                    sql:               "SELECT CAST(42 AS BIGINT) AS answer".to_owned(),
+                    snapshots:         Vec::new(),
+                    iceberg_snapshots: Vec::new(),
                 },
                 &principal("deadline@example"),
             )
@@ -3414,8 +3421,9 @@ mod tests {
         )
         .unwrap();
         let statement = StatementTicket {
-            sql:       "SELECT 1".to_owned(),
-            snapshots: Vec::new(),
+            sql:               "SELECT 1".to_owned(),
+            snapshots:         Vec::new(),
+            iceberg_snapshots: Vec::new(),
         };
         let alice = principal("restart-safe@example");
         let submission_id = [3_u8; 16];
@@ -3474,8 +3482,9 @@ mod tests {
         )
         .unwrap();
         let statement = StatementTicket {
-            sql:       "SELECT CAST(42 AS BIGINT) AS answer".to_owned(),
-            snapshots: Vec::new(),
+            sql:               "SELECT CAST(42 AS BIGINT) AS answer".to_owned(),
+            snapshots:         Vec::new(),
+            iceberg_snapshots: Vec::new(),
         };
         let owner = principal("v1-race@example");
         let submission_id = [5_u8; 16];
@@ -3530,12 +3539,14 @@ mod tests {
         )
         .unwrap();
         let original = StatementTicket {
-            sql:       "SELECT 1".to_owned(),
-            snapshots: Vec::new(),
+            sql:               "SELECT 1".to_owned(),
+            snapshots:         Vec::new(),
+            iceberg_snapshots: Vec::new(),
         };
         let replacement = StatementTicket {
-            sql:       "SELECT 2".to_owned(),
-            snapshots: Vec::new(),
+            sql:               "SELECT 2".to_owned(),
+            snapshots:         Vec::new(),
+            iceberg_snapshots: Vec::new(),
         };
         let alice = principal("alias-safe@example");
         let submission_id = [4_u8; 16];

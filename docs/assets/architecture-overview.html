@@ -36,7 +36,7 @@
     <section class="diagram" aria-label="lake architecture diagram">
       <svg viewBox="0 0 1000 720" role="img" aria-labelledby="diagram-title diagram-desc">
         <title id="diagram-title">Lake control and object-data paths</title>
-        <desc id="diagram-desc">SDKs and clients use Query replicas for SQL. Query caches metadata from Metasrv and reads immutable data directly from object storage. Large objects go directly from the SDK to its managed stage. A future dashed path shows read-only external Iceberg federation.</desc>
+        <desc id="diagram-desc">SDKs and clients use Query replicas for SQL. Query caches Lake metadata from Metasrv and reads immutable data directly from object storage. Large objects go directly from the SDK to its managed stage. A separate read-only path resolves Iceberg snapshots at an external REST catalog and reads its Parquet files directly.</desc>
         <defs>
           <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/></pattern>
           <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#64748b"/></marker>
@@ -61,10 +61,10 @@
         <text x="468" y="411" fill="#94a3b8" font-size="8" text-anchor="middle">commit pointer</text>
         <line x1="340" y1="470" x2="340" y2="520" stroke="#a78bfa" stroke-width="1.45" marker-end="url(#arrow)"/>
         <text x="350" y="500" fill="#94a3b8" font-size="8">registry / operations</text>
-        <path d="M 430 285 C 530 195, 640 195, 748 235" fill="none" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="6,4" marker-end="url(#arrow)"/>
-        <text x="586" y="182" fill="#94a3b8" font-size="8" text-anchor="middle">planned: bounded read-only catalog refresh</text>
-        <line x1="835" y1="280" x2="835" y2="350" stroke="#94a3b8" stroke-width="1.3" stroke-dasharray="6,4" marker-end="url(#arrow)"/>
-        <text x="850" y="321" fill="#94a3b8" font-size="8">planned direct Parquet scan</text>
+        <path d="M 430 285 C 530 195, 640 195, 748 235" fill="none" stroke="#94a3b8" stroke-width="1.4" marker-end="url(#arrow)"/>
+        <text x="586" y="182" fill="#94a3b8" font-size="8" text-anchor="middle">exact read-only catalog / snapshot lookup</text>
+        <line x1="835" y1="280" x2="835" y2="350" stroke="#94a3b8" stroke-width="1.3" marker-end="url(#arrow)"/>
+        <text x="850" y="321" fill="#94a3b8" font-size="8">direct Parquet + manifest scan</text>
 
         <!-- Boundaries -->
         <rect x="215" y="95" width="270" height="465" rx="12" fill="rgba(6, 78, 59, 0.05)" stroke="#34d399" stroke-width="1" stroke-dasharray="8,4"/>
@@ -114,12 +114,12 @@
         <rect x="748" y="210" width="175" height="70" rx="6" fill="#0f172a"/>
         <rect x="748" y="210" width="175" height="70" rx="6" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.5"/>
         <text x="835" y="237" fill="#f8fafc" font-size="11" font-weight="600" text-anchor="middle">Iceberg REST catalog</text>
-        <text x="835" y="257" fill="#94a3b8" font-size="8" text-anchor="middle">planned external authority</text>
+        <text x="835" y="257" fill="#94a3b8" font-size="8" text-anchor="middle">external snapshot authority</text>
 
         <rect x="748" y="350" width="175" height="70" rx="6" fill="#0f172a"/>
         <rect x="748" y="350" width="175" height="70" rx="6" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
         <text x="835" y="377" fill="#f8fafc" font-size="11" font-weight="600" text-anchor="middle">Iceberg table files</text>
-        <text x="835" y="397" fill="#94a3b8" font-size="8" text-anchor="middle">planned external Parquet data</text>
+        <text x="835" y="397" fill="#94a3b8" font-size="8" text-anchor="middle">external immutable Parquet data</text>
 
         <rect x="748" y="485" width="175" height="70" rx="6" fill="#0f172a"/>
         <rect x="748" y="485" width="175" height="70" rx="6" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
@@ -134,18 +134,18 @@
         <text x="193" y="652" fill="#94a3b8" font-size="8">durable metadata</text>
         <rect x="345" y="643" width="16" height="10" rx="2" fill="rgba(120,53,15,0.3)" stroke="#fbbf24"/>
         <text x="368" y="652" fill="#94a3b8" font-size="8">object storage</text>
-        <line x1="500" y1="648" x2="522" y2="648" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="5,4"/>
-        <text x="530" y="652" fill="#94a3b8" font-size="8">planned Iceberg path</text>
+        <line x1="500" y1="648" x2="522" y2="648" stroke="#94a3b8" stroke-width="1.4"/>
+        <text x="530" y="652" fill="#94a3b8" font-size="8">read-only Iceberg path</text>
         <line x1="700" y1="648" x2="722" y2="648" stroke="#22d3ee" stroke-width="1.5" stroke-dasharray="5,4"/>
         <text x="730" y="652" fill="#94a3b8" font-size="8">direct large-object bytes</text>
-        <text x="35" y="691" fill="#475569" font-size="8">Source: docs/architecture.md · planned Iceberg federation is intentionally dashed.</text>
+        <text x="35" y="691" fill="#475569" font-size="8">Source: docs/architecture.md · Iceberg remains an external read-only authority.</text>
       </svg>
     </section>
 
     <section class="cards" aria-label="architecture invariants">
       <article class="card"><div class="card-header"><span class="card-dot cyan"></span><h2>Read fan-out</h2></div><ul><li>• Query replicas scale horizontally.</li><li>• Catalog cache keeps routine reads off Metasrv.</li><li>• Queries read immutable snapshots directly.</li></ul></article>
       <article class="card"><div class="card-header"><span class="card-dot emerald"></span><h2>Large objects</h2></div><ul><li>• FILE rows store metadata, not video/model bytes.</li><li>• SDK uploads and reads directly from its managed stage.</li><li>• Query and Metasrv never become data proxies.</li></ul></article>
-      <article class="card"><div class="card-header"><span class="card-dot violet"></span><h2>External Iceberg</h2></div><ul><li>• Planned as a separate read-only SQL catalog.</li><li>• The external catalog owns Iceberg snapshots and commits.</li><li>• Lake registry and Iceberg metadata never merge.</li></ul></article>
+      <article class="card"><div class="card-header"><span class="card-dot violet"></span><h2>External Iceberg</h2></div><ul><li>• `iceberg` is a separate read-only SQL catalog.</li><li>• The external catalog owns Iceberg snapshots and commits.</li><li>• Lake registry and Iceberg metadata never merge.</li></ul></article>
     </section>
     <footer>Lake architecture · source-controlled diagram · no runtime dependency</footer>
   </main>
