@@ -167,6 +167,7 @@ jobs:
         with:
           github_token: ${{ github.token }}
           install: true
+          install_args: --jobs=1
       - run: mise run spec-selftest
 
   # Marketing site — a JS (bun) build, no Rust toolchain needed.
@@ -183,6 +184,7 @@ jobs:
         with:
           github_token: ${{ github.token }}
           install: true
+          install_args: --jobs=1
       - run: mise run site-check
 
   # Conventional Commits are enforced LOCALLY now (mise run ship runs
