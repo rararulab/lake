@@ -1,10 +1,13 @@
 # Kubernetes reference deployment
 
 [`deploy/kubernetes/lake.yaml`](../../deploy/kubernetes/lake.yaml) is a
-production-oriented reference, not a turnkey cluster installer. It keeps the
+production-oriented template, not a turnkey cluster installer. It keeps the
 stateless Query tier separate from the bounded metadata authority and maps the
 runtime's existing security, health, metrics, resource, and shutdown contracts
-into Kubernetes.
+into Kubernetes. It deliberately contains the invalid
+`REPLACE_WITH_RELEASE_MANIFEST_DIGEST` value, so applying it before all image
+references are replaced with one real manifest digest fails instead of silently
+deploying a mutable image tag.
 
 ## Build and pin the image
 
@@ -21,8 +24,10 @@ docker buildx imagetools inspect ghcr.io/rararulab/lake:v1.0.0
 # ghcr.io/rararulab/lake@sha256:<digest>
 ```
 
-Do not deploy a mutable tag in production. The health-probe stage is version
-pinned independently so its updates remain visible in review.
+Do not deploy a mutable tag in production. Replace every occurrence of
+`REPLACE_WITH_RELEASE_MANIFEST_DIGEST` before applying the template. The
+health-probe stage is version pinned independently so its updates remain
+visible in review.
 
 ## Supply cloud configuration
 

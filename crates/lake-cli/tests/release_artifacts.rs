@@ -82,6 +82,7 @@ fn release_image_workflow_is_tag_pinned_and_multiarch() {
         job["env"]["RELEASE_TAG"].as_str(),
         Some("${{ github.event.release.tag_name || inputs.tag }}")
     );
+    assert_eq!(job["env"]["GH_TOKEN"].as_str(), Some("${{ github.token }}"));
 
     let steps = steps(&workflow);
     for action in [
@@ -136,16 +137,30 @@ fn release_image_workflow_rejects_mismatched_tags_and_preserves_digest_pinning()
         .find_map(|step| step["run"].as_str())
         .filter(|run| run.contains("version.txt"))
         .expect("release source validation step");
-    assert!(validation.contains("git describe --exact-match --tags HEAD"));
+    assert!(validation.contains("GITHUB_EVENT_NAME"));
+    assert!(validation.contains("GITHUB_SHA"));
+    assert!(validation.contains("gh api"));
+    assert!(validation.contains("releases/tags/$RELEASE_TAG"));
+    assert!(validation.contains(".published_at"));
+    assert!(validation.contains(".target_commitish"));
+    assert!(validation.contains("refs/tags/$RELEASE_TAG^{commit}"));
     assert!(validation.contains("version.txt"));
     assert!(validation.contains("exit 1"));
 
     let deployment = read("deploy/kubernetes/lake.yaml");
+    let images = deployment
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("image: "))
+        .collect::<Vec<_>>();
     assert!(
-        !deployment.contains(":latest"),
-        "the checked-in deployment reference must not introduce latest"
+        !images.is_empty(),
+        "Kubernetes template must name its images"
     );
+    assert!(images.iter().all(|image| {
+        *image == "ghcr.io/rararulab/lake@sha256:REPLACE_WITH_RELEASE_MANIFEST_DIGEST"
+    }));
     let guide = read("docs/guides/kubernetes.md");
     assert!(guide.contains("Do not deploy a mutable tag in production."));
     assert!(guide.contains("@sha256:<digest>"));
+    assert!(guide.contains("REPLACE_WITH_RELEASE_MANIFEST_DIGEST"));
 }

@@ -12,19 +12,22 @@ immutable digest pinning; it needs a trustworthy release artifact to pin.
 
 ## Decisions
 
-- A published GitHub release triggers the image workflow. A guarded manual
-  dispatch accepts an explicit release tag so an already-published release can
-  be backfilled.
-- The workflow checks out the requested tag and rejects it unless it is the
-  checked-out commit's exact tag and matches `version.txt`.
+- A published GitHub release triggers the image workflow. Its `GITHUB_SHA` is
+  the trusted release commit. A guarded manual dispatch accepts an explicit
+  tag only after GitHub's release API proves it is already published and
+  provides an immutable `target_commitish` SHA for backfill.
+- The workflow checks out the requested tag and rejects it unless the tag,
+  checked-out commit, trusted release commit, and `version.txt` all agree.
 - The image is pushed to GHCR for `linux/amd64` and `linux/arm64`, with both
   `vX.Y.Z` and `X.Y.Z` immutable release tags plus OCI source, revision, and
   version labels. It publishes the resulting manifest digest in the run
   summary.
 - The workflow has only repository-read and package-write permissions. It uses
   the ephemeral GitHub Actions token and stores no credentials in the tree.
-- The Kubernetes guide continues to require operator-owned digest pinning. No
-  `latest` tag or mutable release tag is introduced into production YAML.
+- The Kubernetes guide continues to require operator-owned digest pinning. The
+  checked-in manifest is an intentionally invalid template placeholder, not a
+  deployable mutable image reference; applying it before a real digest
+  replacement fails closed.
 
 ## Boundaries
 
@@ -32,12 +35,13 @@ immutable digest pinning; it needs a trustworthy release artifact to pin.
 .github/workflows/release-image.yml
 crates/lake-cli/tests/release_artifacts.rs
 docs/guides/kubernetes.md
+deploy/kubernetes/lake.yaml
 specs/issue-184-release-image.spec.md
 
 ### Forbidden
 application protocol or runtime source changes
 credentials, secrets, or image digests committed to source
-mutable tags in deploy/kubernetes/lake.yaml
+deployable mutable tags in deploy/kubernetes/lake.yaml
 release version changes
 
 ## Completion Criteria
@@ -59,8 +63,10 @@ Scenario: Invalid release sources fail closed while deployment policy stays dige
     Filter: release_image_workflow_rejects_mismatched_tags_and_preserves_digest_pinning
   Given the checked-in release-image workflow and Kubernetes reference
   When the release validation and deployment image references are inspected
-  Then a tag that is not exactly checked out or does not match `version.txt`
-  fails before publication, and the guide rejects mutable deployment references
+  Then a tag that is not exactly checked out, is not bound to an immutable
+  published release revision, or does not match `version.txt` fails before
+  publication; the deployment template fails closed until operators provide a
+  real digest
 
 ## Out of Scope
 

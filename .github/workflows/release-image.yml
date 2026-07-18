@@ -24,6 +24,7 @@ jobs:
     env:
       IMAGE: ghcr.io/${{ github.repository }}
       RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out release tag
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -39,9 +40,27 @@ jobs:
             echo "release tag must be vX.Y.Z: $RELEASE_TAG" >&2
             exit 1
           fi
-          checked_out_tag="$(git describe --exact-match --tags HEAD 2>/dev/null || true)"
-          if [ "$checked_out_tag" != "$RELEASE_TAG" ]; then
-            echo "checked out commit is tagged $checked_out_tag, expected $RELEASE_TAG" >&2
+          if [ "$GITHUB_EVENT_NAME" = "release" ]; then
+            expected_revision="$GITHUB_SHA"
+          else
+            release="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")"
+            if [ "$(jq -r '.tag_name' <<<"$release")" != "$RELEASE_TAG" ] \
+              || [ "$(jq -r '.draft' <<<"$release")" != "false" ] \
+              || [ "$(jq -r '.published_at' <<<"$release")" = "null" ]; then
+              echo "manual dispatch requires an already-published release for $RELEASE_TAG" >&2
+              exit 1
+            fi
+            expected_revision="$(jq -r '.target_commitish' <<<"$release")"
+          fi
+          if ! [[ "$expected_revision" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "release must bind $RELEASE_TAG to an immutable commit SHA" >&2
+            exit 1
+          fi
+          checked_out_revision="$(git rev-parse HEAD)"
+          tag_revision="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
+          if [ "$checked_out_revision" != "$tag_revision" ] \
+            || [ "$checked_out_revision" != "$expected_revision" ]; then
+            echo "checked-out tag does not match the trusted release revision" >&2
             exit 1
           fi
           version="$(tr -d '\r\n' < version.txt)"
@@ -50,7 +69,7 @@ jobs:
             exit 1
           fi
           printf 'VERSION=%s\n' "$version" >> "$GITHUB_ENV"
-          printf 'RELEASE_REVISION=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          printf 'RELEASE_REVISION=%s\n' "$checked_out_revision" >> "$GITHUB_ENV"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0

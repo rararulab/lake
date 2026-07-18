@@ -154,7 +154,7 @@ spec:
               app.kubernetes.io/name: lake-query
       initContainers:
         - name: prepare-secrets
-          image: ghcr.io/rararulab/lake:0.1.0
+          image: ghcr.io/rararulab/lake@sha256:REPLACE_WITH_RELEASE_MANIFEST_DIGEST
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-ec"]
           args:
@@ -181,7 +181,7 @@ spec:
               mountPath: /prepared
       containers:
         - name: lake
-          image: ghcr.io/rararulab/lake:0.1.0
+          image: ghcr.io/rararulab/lake@sha256:REPLACE_WITH_RELEASE_MANIFEST_DIGEST
           imagePullPolicy: IfNotPresent
           args:
             - --data-dir
@@ -359,7 +359,7 @@ spec:
               app.kubernetes.io/name: lake-metasrv
       initContainers:
         - name: prepare-secrets
-          image: ghcr.io/rararulab/lake:0.1.0
+          image: ghcr.io/rararulab/lake@sha256:REPLACE_WITH_RELEASE_MANIFEST_DIGEST
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-ec"]
           args:
@@ -386,7 +386,7 @@ spec:
               mountPath: /prepared
       containers:
         - name: lake
-          image: ghcr.io/rararulab/lake:0.1.0
+          image: ghcr.io/rararulab/lake@sha256:REPLACE_WITH_RELEASE_MANIFEST_DIGEST
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-ec"]
           args:
