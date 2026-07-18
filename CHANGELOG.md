@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.1.0](https://github.com/rararulab/lake/compare/v1.0.0...v1.1.0) (2026-07-18)
+
+
+### Features
+
+* **iceberg:** federate REST catalog tables ([#188](https://github.com/rararulab/lake/issues/188)) ([#198](https://github.com/rararulab/lake/issues/198)) ([0519774](https://github.com/rararulab/lake/commit/05197742c20e30d6d22aeed90102edf64a6d0588))
+
+
+### Bug Fixes
+
+* **ci:** restore clippy green on main ([#196](https://github.com/rararulab/lake/issues/196)) ([#197](https://github.com/rararulab/lake/issues/197)) ([8f6bf24](https://github.com/rararulab/lake/commit/8f6bf24b5b3ef47ad0f721930216fb644ecfbd13))
+* **ci:** serialize direct mise bootstrap jobs ([#194](https://github.com/rararulab/lake/issues/194)) ([#195](https://github.com/rararulab/lake/issues/195)) ([9865ec5](https://github.com/rararulab/lake/commit/9865ec50cc61ed5d3e07c2d8688305577ed540a9))
+* **ci:** serialize mise tool bootstrap ([#191](https://github.com/rararulab/lake/issues/191)) ([#193](https://github.com/rararulab/lake/issues/193)) ([1d40c60](https://github.com/rararulab/lake/commit/1d40c60af55d7f1a23876e7cab6fb5a0cc5d7436))
+* **release:** publish multi-arch image for each release tag ([#184](https://github.com/rararulab/lake/issues/184)) ([#189](https://github.com/rararulab/lake/issues/189)) ([0d655a4](https://github.com/rararulab/lake/commit/0d655a4e156f65d3b9d291c00b3a1201d5d8c7e4))
+
 ## [1.0.0](https://github.com/rararulab/lake/compare/v0.0.1...v1.0.0) (2026-07-17)
 
 
