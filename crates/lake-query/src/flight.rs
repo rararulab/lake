@@ -75,11 +75,14 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{Instrument as _, Span, field};
 
 use crate::{
-    DiscoveryLimits, QueryEngine, QueryError, QueryLimits,
+    DiscoveryLimits, QueryEngine, QueryError, QueryLimits, QueryTableRef, QueryTableSnapshot,
     async_ipc::{IpcDecodeGuard, IpcPipelineLimits, PipelineProbe, decode_ipc_reader},
     async_query::{AsyncQueryCoordinator, MAX_RESULT_PART_BYTES},
     telemetry,
-    ticket::{MAX_TABLE_SNAPSHOTS, StatementTableSnapshot, StatementTicket, StatementTicketCodec},
+    ticket::{
+        MAX_TABLE_SNAPSHOTS, StatementIcebergSnapshot, StatementTableSnapshot, StatementTicket,
+        StatementTicketCodec,
+    },
 };
 
 const MAX_STATEMENT_TICKET_OVERHEAD: usize = 320 * 1024;
@@ -653,7 +656,7 @@ impl FlightSqlServiceImpl {
     async fn plan_schema(
         &self,
         sql: &str,
-        snapshots: &[TableSnapshot],
+        snapshots: &[QueryTableSnapshot],
     ) -> std::result::Result<Schema, Status> {
         let df = self
             .engine
@@ -691,7 +694,7 @@ impl FlightSqlServiceImpl {
         &self,
         principal: &Principal,
         sql: &str,
-    ) -> std::result::Result<Vec<TableRef>, Status> {
+    ) -> std::result::Result<Vec<QueryTableRef>, Status> {
         let state = self.engine.context().state();
         let statement = state
             .sql_to_statement(sql, &Dialect::Generic)
@@ -723,15 +726,25 @@ impl FlightSqlServiceImpl {
                     catalog,
                     schema,
                     table,
-                } if catalog.as_ref() == "lake" => TableRef::new(schema.as_ref(), table.as_ref()),
+                } if catalog.as_ref() == "lake" => {
+                    QueryTableRef::Lake(TableRef::new(schema.as_ref(), table.as_ref()))
+                }
+                TableReference::Full {
+                    catalog,
+                    schema,
+                    table,
+                } if catalog.as_ref() == "iceberg" => QueryTableRef::Iceberg {
+                    namespace: schema.to_string(),
+                    table:     table.to_string(),
+                },
                 TableReference::Partial { schema, table } => {
-                    TableRef::new(schema.as_ref(), table.as_ref())
+                    QueryTableRef::Lake(TableRef::new(schema.as_ref(), table.as_ref()))
                 }
                 TableReference::Full { .. } | TableReference::Bare { .. } => {
                     return Err(Status::permission_denied("resource is not available"));
                 }
             };
-            self.authorize_namespace(principal, &table.namespace.0)?;
+            self.authorize_namespace(principal, table.namespace())?;
             tables.insert(table);
             if tables.len() > MAX_TABLE_SNAPSHOTS {
                 return Err(Status::resource_exhausted(
@@ -790,6 +803,26 @@ fn ticket_snapshot(snapshot: &TableSnapshot) -> StatementTableSnapshot {
         incarnation_id: snapshot.incarnation_id().to_owned(),
         version:        snapshot.version().0,
     }
+}
+
+fn ticket_snapshots(
+    snapshots: &[QueryTableSnapshot],
+) -> std::result::Result<(Vec<StatementTableSnapshot>, Vec<StatementIcebergSnapshot>), Status> {
+    let mut lake = Vec::new();
+    let mut iceberg = Vec::new();
+    for snapshot in snapshots {
+        match snapshot {
+            QueryTableSnapshot::Lake(snapshot) => lake.push(ticket_snapshot(snapshot)),
+            QueryTableSnapshot::Iceberg(snapshot) => iceberg.push(StatementIcebergSnapshot {
+                namespace:   snapshot.namespace().to_owned(),
+                table:       snapshot.table().to_owned(),
+                snapshot_id: snapshot.snapshot_id().ok_or_else(|| {
+                    Status::failed_precondition("the external Iceberg snapshot is unavailable")
+                })?,
+            }),
+        }
+    }
+    Ok((lake, iceberg))
 }
 
 fn catalog_snapshot(snapshot: &StatementTableSnapshot) -> TableSnapshot {
@@ -1043,9 +1076,16 @@ impl TracedFlightSqlService {
         })
         .await
         .map_err(|_| Status::deadline_exceeded("query planning deadline exceeded"))??;
+        let (lake_snapshots, iceberg_snapshots) = ticket_snapshots(&snapshots)?;
+        if !iceberg_snapshots.is_empty() {
+            return Err(Status::failed_precondition(
+                "asynchronous Iceberg queries are not supported",
+            ));
+        }
         let statement = StatementTicket {
-            sql:       query.query,
-            snapshots: snapshots.iter().map(ticket_snapshot).collect(),
+            sql: query.query,
+            snapshots: lake_snapshots,
+            iceberg_snapshots,
         };
         let submission = match submission_id {
             Some(submission_id) => {
@@ -1357,9 +1397,11 @@ impl FlightSqlService for FlightSqlServiceImpl {
             .await
             .map_err(|_| Status::deadline_exceeded("query planning deadline exceeded"))??;
 
+            let (lake_snapshots, iceberg_snapshots) = ticket_snapshots(&snapshots)?;
             let statement = StatementTicket {
                 sql,
-                snapshots: snapshots.iter().map(ticket_snapshot).collect(),
+                snapshots: lake_snapshots,
+                iceberg_snapshots,
             };
             let statement_handle = self
                 .ticket_codec
@@ -1448,15 +1490,28 @@ impl FlightSqlService for FlightSqlServiceImpl {
                 let references = self
                     .authorized_table_references(&principal, &statement.sql)
                     .map_err(|_| invalid_statement_ticket())?;
-                let snapshots = statement
+                let mut snapshots = statement
                     .snapshots
                     .iter()
                     .map(catalog_snapshot)
+                    .map(QueryTableSnapshot::Lake)
                     .collect::<Vec<_>>();
+                for snapshot in &statement.iceberg_snapshots {
+                    snapshots.push(
+                        self.engine
+                            .resolve_iceberg_snapshot_at(
+                                &snapshot.namespace,
+                                &snapshot.table,
+                                snapshot.snapshot_id,
+                            )
+                            .await
+                            .map_err(query_status)?,
+                    );
+                }
                 if references
                     != snapshots
                         .iter()
-                        .map(|snapshot| snapshot.table().clone())
+                        .map(QueryTableSnapshot::table_ref)
                         .collect::<Vec<_>>()
                 {
                     return Err(invalid_statement_ticket());
@@ -2700,11 +2755,96 @@ mod tests {
         assert_eq!(
             references,
             vec![
-                TableRef::new("alpha", "annotations"),
-                TableRef::new("alpha", "events"),
-                TableRef::new("alpha", "labels"),
+                QueryTableRef::Lake(TableRef::new("alpha", "annotations")),
+                QueryTableRef::Lake(TableRef::new("alpha", "events")),
+                QueryTableRef::Lake(TableRef::new("alpha", "labels")),
             ]
         );
+    }
+
+    #[test]
+    fn flight_authorizes_iceberg_catalog_references_without_lake_catalog_aliasing() {
+        let meta: MetaStoreRef = Arc::new(EmptyMeta);
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let service = FlightSqlServiceImpl {
+            engine:                 Arc::new(QueryEngine::new(meta, storage)),
+            metadata_addr:          None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          None,
+            read_capability_issuer: None,
+            admission:              QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_codec:           test_ticket_codec(),
+        };
+        let principal = Principal::try_new(
+            PrincipalId::try_new("analytics-reader").unwrap(),
+            TenantId::try_new("tenant-analytics").unwrap(),
+            PrincipalRole::User,
+            ["analytics"],
+        )
+        .unwrap();
+
+        let references = service
+            .authorized_table_references(&principal, "SELECT * FROM iceberg.analytics.episodes")
+            .expect("configured Iceberg namespace is authorized");
+
+        assert_eq!(
+            references,
+            vec![QueryTableRef::Iceberg {
+                namespace: "analytics".to_owned(),
+                table:     "episodes".to_owned(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_ticket_keeps_iceberg_snapshot_after_catalog_advances() {
+        let (_warehouse, iceberg, catalog) = crate::tests::test_iceberg_catalog().await;
+        let meta: MetaStoreRef = Arc::new(EmptyMeta);
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let service = FlightSqlServiceImpl {
+            engine:                 Arc::new(
+                QueryEngine::new(meta, storage).with_iceberg_catalog(iceberg),
+            ),
+            metadata_addr:          None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          None,
+            read_capability_issuer: None,
+            admission:              QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_codec:           test_ticket_codec(),
+        };
+        let principal = Principal::try_new(
+            PrincipalId::try_new("analytics-reader").unwrap(),
+            TenantId::try_new("tenant-analytics").unwrap(),
+            PrincipalRole::User,
+            ["analytics"],
+        )
+        .unwrap();
+
+        let ticket = issue_statement_ticket(
+            &service,
+            "SELECT episode_id FROM iceberg.analytics.episodes",
+            &principal,
+        )
+        .await;
+        crate::tests::append_test_iceberg_episode(&catalog, 2).await;
+        let batches = execute_statement_ticket(&service, ticket, &principal)
+            .await
+            .expect("execute snapshot-pinned external table ticket");
+        let values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Iceberg episode ID column")
+                    .iter()
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![1]);
     }
 
     #[tokio::test]
@@ -4018,8 +4158,8 @@ mod tests {
                 .ticket_codec
                 .seal_statement(
                     &StatementTicket {
-                        sql:       "SELECT * FROM lake.robots.delayed".to_owned(),
-                        snapshots: vec![StatementTableSnapshot {
+                        sql:               "SELECT * FROM lake.robots.delayed".to_owned(),
+                        snapshots:         vec![StatementTableSnapshot {
                             namespace:      "robots".to_owned(),
                             table:          "delayed".to_owned(),
                             engine:         "versioned-test".to_owned(),
@@ -4027,6 +4167,7 @@ mod tests {
                             incarnation_id: "incarnation".to_owned(),
                             version:        1,
                         }],
+                        iceberg_snapshots: Vec::new(),
                     },
                     &principal,
                 )
@@ -4098,8 +4239,8 @@ mod tests {
             .ticket_codec
             .seal_statement(
                 &StatementTicket {
-                    sql:       "SELECT * FROM lake.robots.admitted".to_owned(),
-                    snapshots: vec![StatementTableSnapshot {
+                    sql:               "SELECT * FROM lake.robots.admitted".to_owned(),
+                    snapshots:         vec![StatementTableSnapshot {
                         namespace:      "robots".to_owned(),
                         table:          "admitted".to_owned(),
                         engine:         "versioned-test".to_owned(),
@@ -4107,6 +4248,7 @@ mod tests {
                         incarnation_id: "incarnation".to_owned(),
                         version:        1,
                     }],
+                    iceberg_snapshots: Vec::new(),
                 },
                 &principal,
             )
@@ -4223,8 +4365,8 @@ mod tests {
             .ticket_codec
             .seal_statement(
                 &StatementTicket {
-                    sql:       "SELECT * FROM lake.robots.deadline".to_owned(),
-                    snapshots: vec![StatementTableSnapshot {
+                    sql:               "SELECT * FROM lake.robots.deadline".to_owned(),
+                    snapshots:         vec![StatementTableSnapshot {
                         namespace:      "robots".to_owned(),
                         table:          "deadline".to_owned(),
                         engine:         "versioned-test".to_owned(),
@@ -4232,6 +4374,7 @@ mod tests {
                         incarnation_id: "incarnation".to_owned(),
                         version:        1,
                     }],
+                    iceberg_snapshots: Vec::new(),
                 },
                 &principal,
             )

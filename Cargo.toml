@@ -12,6 +12,7 @@ members = [
     "crates/lake-objects",
     "crates/lake-sdk",
     "crates/lake-flight",
+    "crates/lake-iceberg",
 ]
 exclude = ["third_party/datafusion-execution"]
 
@@ -47,6 +48,10 @@ bytes = "^1.12"
 aws-sdk-s3 = "^1.60"
 datafusion = "^53.0"
 futures = "^0.3"
+iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "b882e63652f4d4a172812994679a1dbc0c64cbd0" }
+iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "b882e63652f4d4a172812994679a1dbc0c64cbd0" }
+iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust", rev = "b882e63652f4d4a172812994679a1dbc0c64cbd0" }
+iceberg-storage-opendal = { git = "https://github.com/apache/iceberg-rust", rev = "b882e63652f4d4a172812994679a1dbc0c64cbd0" }
 lance = "^8.0"
 lance-table = "^8.0"
 libc = "^0.2"
@@ -91,6 +96,7 @@ lake-query = { path = "crates/lake-query" }
 lake-sdk = { path = "crates/lake-sdk" }
 lake-metasrv = { path = "crates/lake-metasrv" }
 lake-flight = { path = "crates/lake-flight" }
+lake-iceberg = { path = "crates/lake-iceberg" }
 
 [patch.crates-io]
 # DataFusion 53.1 increments global spill accounting before enforcing its disk

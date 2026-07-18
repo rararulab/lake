@@ -46,5 +46,9 @@ allow = [
 ]
 
 [sources]
+# Iceberg's official DataFusion 53 / Arrow 58 release is not on crates.io yet.
+# Keep this exact upstream repository allowlisted while Cargo.lock pins the
+# reviewed immutable revision declared in the workspace manifest.
+allow-git = ["https://github.com/apache/iceberg-rust"]
 unknown-registry = "warn"
 unknown-git = "warn"

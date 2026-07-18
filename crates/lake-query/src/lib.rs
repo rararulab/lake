@@ -57,6 +57,7 @@ use lake_catalog::{
 use lake_common::{ManagedStageDescriptor, TableRef};
 use lake_engine::TableEngineRef;
 use lake_flight::{ClientSecurity, ServerSecurity};
+use lake_iceberg::{IcebergCatalog, IcebergTableSnapshot};
 use lake_meta::MetaStoreRef;
 use lake_objects::{ManagedObjectStore, ManagedReadCapabilityIssuerRef};
 use snafu::{ResultExt, Snafu};
@@ -97,6 +98,22 @@ pub enum QueryError {
 
     #[snafu(display("table {table} has no pinnable incarnation"))]
     UnpinnableTable { table: TableRef },
+
+    #[snafu(display("external Iceberg catalog is not configured"))]
+    IcebergNotConfigured,
+
+    #[snafu(display("failed to resolve external Iceberg snapshot for {namespace}.{table}"))]
+    IcebergSnapshot {
+        namespace: String,
+        table:     String,
+        source:    lake_iceberg::IcebergError,
+    },
+
+    #[snafu(display("external Iceberg table {namespace}.{table} has no pinnable snapshot"))]
+    UnpinnableIcebergTable {
+        namespace: String,
+        table:     String,
+    },
 
     #[snafu(display("failed to load snapshot for {table}: {source}"))]
     SnapshotProvider {
@@ -157,6 +174,55 @@ pub type Result<T> = std::result::Result<T, QueryError>;
 /// A backpressured direct-SQL record-batch stream whose item errors retain
 /// Lake's public query-error boundary.
 pub type QueryRecordBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>;
+
+/// One logical table reference authorized for a query statement.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum QueryTableRef {
+    /// A Lake-native registered table.
+    Lake(TableRef),
+    /// A read-only external Iceberg table.
+    Iceberg {
+        namespace: String,
+        table:     String,
+    },
+}
+
+impl QueryTableRef {
+    pub(crate) fn namespace(&self) -> &str {
+        match self {
+            Self::Lake(table) => &table.namespace.0,
+            Self::Iceberg { namespace, .. } => namespace,
+        }
+    }
+
+    pub(crate) fn table(&self) -> &str {
+        match self {
+            Self::Lake(table) => &table.name.0,
+            Self::Iceberg { table, .. } => table,
+        }
+    }
+}
+
+/// One immutable physical input selected while planning a query statement.
+#[derive(Clone)]
+pub(crate) enum QueryTableSnapshot {
+    /// A Lake-native table generation.
+    Lake(TableSnapshot),
+    /// An external Iceberg table snapshot.
+    Iceberg(IcebergTableSnapshot),
+}
+
+impl QueryTableSnapshot {
+    pub(crate) fn table_ref(&self) -> QueryTableRef {
+        match self {
+            Self::Lake(snapshot) => QueryTableRef::Lake(snapshot.table().clone()),
+            Self::Iceberg(snapshot) => QueryTableRef::Iceberg {
+                namespace: snapshot.namespace().to_owned(),
+                table:     snapshot.table().to_owned(),
+            },
+        }
+    }
+}
 
 /// Connect the authenticated, read-only Metasrv catalog source used by served
 /// Query.
@@ -680,6 +746,7 @@ impl Default for QueryServerConfig {
 pub struct QueryEngine {
     ctx:     SessionContext,
     catalog: LakeCatalog,
+    iceberg: Option<IcebergCatalog>,
 }
 
 impl QueryEngine {
@@ -729,7 +796,21 @@ impl QueryEngine {
             SessionConfig::new().with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
         let ctx = SessionContext::new_with_config_rt(session, Arc::new(runtime));
         ctx.register_catalog("lake", Arc::new(catalog.clone()));
-        Ok(Self { ctx, catalog })
+        Ok(Self {
+            ctx,
+            catalog,
+            iceberg: None,
+        })
+    }
+
+    /// Register one external Iceberg catalog under the reserved `iceberg`
+    /// namespace. Its table providers are read-only and snapshot-pinned.
+    #[must_use]
+    pub fn with_iceberg_catalog(mut self, iceberg: IcebergCatalog) -> Self {
+        self.ctx
+            .register_catalog("iceberg", iceberg.datafusion_catalog());
+        self.iceberg = Some(iceberg);
+        self
     }
 
     /// Force a reload of the catalog's listing snapshot from the registry.
@@ -754,25 +835,77 @@ impl QueryEngine {
     /// Resolve each authorized SQL name to one immutable physical generation.
     pub(crate) async fn resolve_snapshots(
         &self,
-        tables: &[TableRef],
-    ) -> Result<Vec<TableSnapshot>> {
-        self.refresh_if_stale().await?;
+        tables: &[QueryTableRef],
+    ) -> Result<Vec<QueryTableSnapshot>> {
+        if tables
+            .iter()
+            .any(|table| matches!(table, QueryTableRef::Lake(_)))
+        {
+            self.refresh_if_stale().await?;
+        }
         let mut snapshots = Vec::with_capacity(tables.len());
         for table in tables {
-            let snapshot = self
-                .catalog
-                .resolve_snapshot(table)
-                .await
-                .map_err(|source| QueryError::SnapshotResolution {
-                    table: table.clone(),
-                    source,
-                })?
-                .ok_or_else(|| QueryError::UnpinnableTable {
-                    table: table.clone(),
-                })?;
-            snapshots.push(snapshot);
+            match table {
+                QueryTableRef::Lake(table) => {
+                    let snapshot = self
+                        .catalog
+                        .resolve_snapshot(table)
+                        .await
+                        .map_err(|source| QueryError::SnapshotResolution {
+                            table: table.clone(),
+                            source,
+                        })?
+                        .ok_or_else(|| QueryError::UnpinnableTable {
+                            table: table.clone(),
+                        })?;
+                    snapshots.push(QueryTableSnapshot::Lake(snapshot));
+                }
+                QueryTableRef::Iceberg { namespace, table } => {
+                    let iceberg = self
+                        .iceberg
+                        .as_ref()
+                        .ok_or(QueryError::IcebergNotConfigured)?;
+                    let snapshot =
+                        iceberg
+                            .resolve_snapshot(namespace, table)
+                            .await
+                            .map_err(|source| QueryError::IcebergSnapshot {
+                                namespace: namespace.clone(),
+                                table: table.clone(),
+                                source,
+                            })?;
+                    if snapshot.snapshot_id().is_none() {
+                        return Err(QueryError::UnpinnableIcebergTable {
+                            namespace: namespace.clone(),
+                            table:     table.clone(),
+                        });
+                    }
+                    snapshots.push(QueryTableSnapshot::Iceberg(snapshot));
+                }
+            }
         }
         Ok(snapshots)
+    }
+
+    pub(crate) async fn resolve_iceberg_snapshot_at(
+        &self,
+        namespace: &str,
+        table: &str,
+        snapshot_id: i64,
+    ) -> Result<QueryTableSnapshot> {
+        let iceberg = self
+            .iceberg
+            .as_ref()
+            .ok_or(QueryError::IcebergNotConfigured)?;
+        iceberg
+            .resolve_snapshot_at(namespace, table, snapshot_id)
+            .await
+            .map(QueryTableSnapshot::Iceberg)
+            .map_err(|source| QueryError::IcebergSnapshot {
+                namespace: namespace.to_owned(),
+                table: table.to_owned(),
+                source,
+            })
     }
 
     /// Plan SQL using only the exact immutable providers in `snapshots`.
@@ -780,34 +913,45 @@ impl QueryEngine {
     pub(crate) async fn plan_sql_at(
         &self,
         sql: &str,
-        snapshots: &[TableSnapshot],
+        snapshots: &[QueryTableSnapshot],
     ) -> Result<DataFrame> {
         let ctx =
             SessionContext::new_with_config_rt(self.ctx.copied_config(), self.ctx.runtime_env());
-        let catalog = Arc::new(MemoryCatalogProvider::new());
-        ctx.register_catalog("lake", catalog.clone());
+        let lake_catalog = Arc::new(MemoryCatalogProvider::new());
+        let iceberg_catalog = Arc::new(MemoryCatalogProvider::new());
+        ctx.register_catalog("lake", lake_catalog.clone());
+        ctx.register_catalog("iceberg", iceberg_catalog.clone());
         for snapshot in snapshots {
-            let namespace = &snapshot.table().namespace.0;
-            let schema = if let Some(schema) = catalog.schema(namespace) {
-                schema
-            } else {
-                let schema: Arc<dyn SchemaProvider> = Arc::new(MemorySchemaProvider::new());
-                catalog
-                    .register_schema(namespace, schema.clone())
-                    .context(ExecuteSnafu)?;
-                schema
-            };
-            let provider =
-                self.catalog
-                    .provider_for_snapshot(snapshot)
-                    .await
-                    .map_err(|source| QueryError::SnapshotProvider {
-                        table: snapshot.table().clone(),
-                        source,
+            match snapshot {
+                QueryTableSnapshot::Lake(snapshot) => {
+                    let namespace = &snapshot.table().namespace.0;
+                    let schema = memory_schema(&lake_catalog, namespace)?;
+                    let provider =
+                        self.catalog
+                            .provider_for_snapshot(snapshot)
+                            .await
+                            .map_err(|source| QueryError::SnapshotProvider {
+                                table: snapshot.table().clone(),
+                                source,
+                            })?;
+                    schema
+                        .register_table(snapshot.table().name.0.clone(), provider)
+                        .context(ExecuteSnafu)?;
+                }
+                QueryTableSnapshot::Iceberg(snapshot) => {
+                    let schema = memory_schema(&iceberg_catalog, snapshot.namespace())?;
+                    let provider = snapshot.table_provider().await.map_err(|source| {
+                        QueryError::IcebergSnapshot {
+                            namespace: snapshot.namespace().to_owned(),
+                            table: snapshot.table().to_owned(),
+                            source,
+                        }
                     })?;
-            schema
-                .register_table(snapshot.table().name.0.clone(), provider)
-                .context(ExecuteSnafu)?;
+                    schema
+                        .register_table(snapshot.table().to_owned(), provider)
+                        .context(ExecuteSnafu)?;
+                }
+            }
         }
         ctx.sql_with_options(sql, read_only_sql_options())
             .await
@@ -842,6 +986,20 @@ impl QueryEngine {
     }
 
     pub(crate) fn context(&self) -> &SessionContext { &self.ctx }
+}
+
+fn memory_schema(
+    catalog: &Arc<MemoryCatalogProvider>,
+    namespace: &str,
+) -> std::result::Result<Arc<dyn SchemaProvider>, QueryError> {
+    if let Some(schema) = catalog.schema(namespace) {
+        return Ok(schema);
+    }
+    let schema: Arc<dyn SchemaProvider> = Arc::new(MemorySchemaProvider::new());
+    catalog
+        .register_schema(namespace, schema.clone())
+        .context(ExecuteSnafu)?;
+    Ok(schema)
 }
 
 /// Run the Arrow Flight SQL server, serving SQL from `engine` over `addr`.
@@ -1248,6 +1406,22 @@ mod tests {
         },
     };
     use futures::{StreamExt, TryStreamExt};
+    use iceberg::{
+        Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent,
+        io::LocalFsStorageFactory,
+        memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder},
+        spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type},
+        transaction::{ApplyTransactionAction, Transaction},
+        writer::{
+            IcebergWriter, IcebergWriterBuilder,
+            base_writer::data_file_writer::DataFileWriterBuilder,
+            file_writer::{
+                ParquetWriterBuilder,
+                location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
+                rolling_writer::RollingFileWriterBuilder,
+            },
+        },
+    };
     use lake_common::{
         AppendOperation, MANAGED_STAGE_DISCOVERY_ACTION, ManagedStageDescriptor, Principal,
         PrincipalId, PrincipalRole, TableLocation, TenantId, Version,
@@ -1257,6 +1431,7 @@ mod tests {
     };
     use lake_engine_lance::LanceEngine;
     use lake_flight::{BearerPrincipalBinding, ClientSecurity, ServerSecurity};
+    use lake_iceberg::{IcebergCatalog, IcebergCatalogConfig};
     use lake_meta::{MetaStore, MetaStoreRef, registry::TableRegistration};
     use rcgen::generate_simple_self_signed;
     use tokio::sync::Notify;
@@ -1562,6 +1737,189 @@ mod tests {
         )
         .expect("streaming table");
         test_query_engine(Arc::new(table), "late-error-test")
+    }
+
+    pub(crate) async fn test_iceberg_catalog()
+    -> (tempfile::TempDir, IcebergCatalog, Arc<MemoryCatalog>) {
+        let warehouse = tempfile::tempdir().expect("create Iceberg warehouse");
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .with_storage_factory(Arc::new(LocalFsStorageFactory))
+                .load(
+                    "memory",
+                    std::collections::HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_owned(),
+                        warehouse.path().display().to_string(),
+                    )]),
+                )
+                .await
+                .expect("open Iceberg memory catalog"),
+        );
+        let namespace = NamespaceIdent::new("analytics".to_owned());
+        catalog
+            .create_namespace(&namespace, std::collections::HashMap::new())
+            .await
+            .expect("create Iceberg namespace");
+        catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("episodes".to_owned())
+                    .location(format!("{}/episodes", warehouse.path().display()))
+                    .schema(
+                        IcebergSchema::builder()
+                            .with_schema_id(0)
+                            .with_fields(vec![
+                                NestedField::required(
+                                    1,
+                                    "episode_id",
+                                    Type::Primitive(PrimitiveType::Long),
+                                )
+                                .into(),
+                            ])
+                            .build()
+                            .expect("build Iceberg schema"),
+                    )
+                    .properties(std::collections::HashMap::new())
+                    .build(),
+            )
+            .await
+            .expect("create Iceberg table");
+        append_test_iceberg_episode(&catalog, 1).await;
+        let config = IcebergCatalogConfig::try_new(
+            "https://catalog.example",
+            "s3://warehouse",
+            ["analytics"],
+        )
+        .expect("build Iceberg configuration");
+        (
+            warehouse,
+            IcebergCatalog::from_catalog(config, catalog.clone()),
+            catalog,
+        )
+    }
+
+    pub(crate) async fn append_test_iceberg_episode(catalog: &Arc<MemoryCatalog>, value: i64) {
+        let table = catalog
+            .load_table(&TableIdent::new(
+                NamespaceIdent::new("analytics".to_owned()),
+                "episodes".to_owned(),
+            ))
+            .await
+            .expect("load Iceberg table");
+        let schema = Arc::new(
+            table
+                .metadata()
+                .current_schema()
+                .as_ref()
+                .try_into()
+                .expect("convert Iceberg schema to Arrow"),
+        );
+        let location_generator = DefaultLocationGenerator::new(table.metadata())
+            .expect("create data location generator");
+        let file_name_generator = DefaultFileNameGenerator::new(
+            format!("test-{value}"),
+            None,
+            iceberg::spec::DataFileFormat::Parquet,
+        );
+        let parquet_writer = ParquetWriterBuilder::new(
+            datafusion::parquet::file::properties::WriterProperties::default(),
+            table.metadata().current_schema().clone(),
+        );
+        let rolling_writer = RollingFileWriterBuilder::new_with_default_file_size(
+            parquet_writer,
+            table.file_io().clone(),
+            location_generator,
+            file_name_generator,
+        );
+        let mut data_file_writer = DataFileWriterBuilder::new(rolling_writer)
+            .build(None)
+            .await
+            .expect("build Iceberg data file writer");
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))])
+            .expect("build Iceberg data batch");
+        data_file_writer
+            .write(batch)
+            .await
+            .expect("write Iceberg data batch");
+        let data_file = data_file_writer
+            .close()
+            .await
+            .expect("close Iceberg data file writer");
+        let transaction = Transaction::new(&table);
+        let action = transaction.fast_append().add_data_files(data_file);
+        let transaction = action.apply(transaction).expect("apply Iceberg append");
+        transaction
+            .commit(catalog.as_ref())
+            .await
+            .expect("commit Iceberg append");
+    }
+
+    #[tokio::test]
+    async fn iceberg_catalog_table_is_queryable_through_direct_sql() {
+        let (_warehouse, iceberg, _catalog) = test_iceberg_catalog().await;
+        let meta: MetaStoreRef = Arc::new(CountingMeta::default());
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let query = QueryEngine::new(meta, storage).with_iceberg_catalog(iceberg);
+
+        let batches = query
+            .execute_sql("SELECT * FROM iceberg.analytics.episodes")
+            .await
+            .expect("plan external Iceberg table")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("read external Iceberg table");
+
+        let values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Iceberg episode ID column")
+                    .iter()
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn external_snapshot_resolution_does_not_refresh_lake_registry() {
+        let (_warehouse, iceberg, _catalog) = test_iceberg_catalog().await;
+        let meta = Arc::new(CountingMeta::default());
+        let meta_ref: MetaStoreRef = meta.clone();
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let query = QueryEngine::new(meta_ref, storage).with_iceberg_catalog(iceberg);
+
+        let snapshots = query
+            .resolve_snapshots(&[QueryTableRef::Iceberg {
+                namespace: "analytics".to_owned(),
+                table:     "episodes".to_owned(),
+            }])
+            .await
+            .expect("resolve external snapshot");
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(meta.scans.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn iceberg_catalog_mutations_are_rejected_before_any_write() {
+        let (_warehouse, iceberg, _catalog) = test_iceberg_catalog().await;
+        let meta: MetaStoreRef = Arc::new(CountingMeta::default());
+        let storage: TableEngineRef = Arc::new(LanceEngine::new());
+        let query = QueryEngine::new(meta, storage).with_iceberg_catalog(iceberg);
+
+        let error = match query
+            .execute_sql("INSERT INTO iceberg.analytics.episodes VALUES (9)")
+            .await
+        {
+            Ok(_) => panic!("public SQL must reject Iceberg mutation"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("DML not supported"));
     }
 
     #[tokio::test]

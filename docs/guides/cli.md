@@ -36,6 +36,32 @@ not just the e2e self-check binary.
   `--catalog-url`, or `--endpoint`; avoid ambiguous positional arguments for
   operational commands.
 
+### External Iceberg REST catalog
+
+`lake query` may expose one read-only external Iceberg REST catalog as the SQL
+catalog `iceberg`. Configure the Query process with all three of the following
+variables, or none of them:
+
+```bash
+LAKE_ICEBERG_REST_ENDPOINT=https://catalog.example.com \
+LAKE_ICEBERG_WAREHOUSE=s3://embodied-warehouse \
+LAKE_ICEBERG_NAMESPACES=analytics,models \
+lake query --metadata-addr https://metasrv.example.com:50052
+```
+
+`LAKE_ICEBERG_REST_ENDPOINT` must be a credential-free HTTP(S) URL.
+`LAKE_ICEBERG_WAREHOUSE` is passed to the REST catalog, and
+`LAKE_ICEBERG_NAMESPACES` is a comma-separated finite allowlist. Any partial
+or invalid triple fails before Query binds. REST credentials and object-store
+credentials are supplied by the deployment/runtime, never through CLI flags,
+Lake metadata, or Flight tickets.
+
+Query accepts `SELECT ... FROM iceberg.<namespace>.<table>` only for a
+configured namespace. It does not enumerate external namespaces or tables in
+Flight discovery; clients must use a full table name. The external catalog owns
+its snapshots and commits. Iceberg DDL/DML is rejected, and Flight tickets pin
+the selected Iceberg snapshot through `DoGet`.
+
 `LAKE_LANCE_RETAIN_VERSIONS` controls the recent untagged dataset versions
 preserved by engine maintenance. It defaults to `10` and must be within
 `1..=10000`. Configuration is parsed before local or cloud storage opens;

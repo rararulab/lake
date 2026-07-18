@@ -27,6 +27,8 @@ flowchart LR
     query -->|"cache miss / bounded refresh"| meta["Metasrv\nstateful authority"]
     meta -->|"registry + operation records"| kv["DynamoDB / RocksDB\nHA KV"]
     query -->|"direct snapshot scan"| dataset["Lance datasets\nobject storage"]
+    query -->|"exact table/snapshot lookup"| iceberg_catalog["Iceberg REST catalog\nexternal authority"]
+    query -->|"direct Parquet/manifest scan"| iceberg_data["Iceberg table files\nobject storage"]
     sdk["SDK FILE upload / direct read"] -. "large-object bytes" .-> objects["managed object stage\nobject storage"]
     query -->|"metadata-only append proxy"| meta
     meta -->|"commit / version pointer"| dataset
@@ -39,7 +41,7 @@ Two rules make this diagram useful in practice:
 | SQL/control | Flight SQL, catalog generations, schemas, table versions, `DataLocation` metadata | video/model bytes, storage credentials, mutable file lists | Query cache shields Metasrv from read fan-out |
 | object data | immutable table files and managed large objects | registry CAS, append coordination, user SQL | SDK and Query stream directly to object storage |
 
-The planned external-Iceberg connector follows the same boundary: its catalog
+The external-Iceberg connector follows the same boundary: its catalog
 remains the authority for Iceberg metadata and snapshots, while Lake Query
 caches and reads it as a distinct, read-only SQL catalog. It does not put
 external Iceberg metadata in Lake's registry. See
@@ -718,10 +720,11 @@ design-level ones:
   is cluster-global async fairness. A
   self-built engine slots in behind `TableEngine`
   if/when Lance's ceiling is hit.
-- **v3 (external Iceberg federation)** — planned: one read-only Iceberg REST
-  catalog exposed as a separate SQL catalog. It retains Iceberg's own metadata
-  and commit authority; no external write path or registry mirroring is part
-  of this phase. See [Iceberg federation](design/iceberg-federation.md).
+- **v3 (external Iceberg federation)** — one read-only Iceberg REST catalog is
+  exposed as the separate `iceberg` SQL catalog. It retains Iceberg's own
+  metadata and commit authority; no external write path, catalog enumeration,
+  or registry mirroring is part of this phase. See
+  [Iceberg federation](design/iceberg-federation.md).
 
 Invariant across all phases: fleet reads go through the stateless query
 layer, never directly at the metadata authority.
