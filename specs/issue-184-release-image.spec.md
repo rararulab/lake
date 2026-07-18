@@ -37,6 +37,7 @@ crates/lake-cli/tests/release_artifacts.rs
 docs/guides/kubernetes.md
 deploy/kubernetes/lake.yaml
 specs/issue-184-release-image.spec.md
+verification/issue-184-release-image.md
 
 ### Forbidden
 application protocol or runtime source changes
