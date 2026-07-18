@@ -41,3 +41,38 @@ fn mise_bootstrap_serializes_tool_installation() {
     assert_eq!(mise["with"]["install"].as_bool(), Some(true));
     assert_eq!(mise["with"]["install_args"].as_str(), Some("--jobs=1"));
 }
+
+#[test]
+fn direct_mise_actions_serialize_tool_installation() {
+    let path = root().join(".github/workflows/ci.yml");
+    let workflow: Value = serde_yaml::from_str(
+        &fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
+    )
+    .expect("CI workflow must be valid YAML");
+    let jobs = workflow["jobs"].as_mapping().expect("CI workflow jobs");
+
+    let direct_mise_steps = jobs
+        .values()
+        .flat_map(|job| {
+            job["steps"]
+                .as_sequence()
+                .into_iter()
+                .flatten()
+                .filter(|step| {
+                    step["uses"]
+                        .as_str()
+                        .is_some_and(|uses| uses.starts_with("jdx/mise-action@"))
+                })
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        !direct_mise_steps.is_empty(),
+        "CI must keep direct mise jobs covered"
+    );
+    for step in direct_mise_steps {
+        assert_eq!(step["with"]["install"].as_bool(), Some(true));
+        assert_eq!(step["with"]["install_args"].as_str(), Some("--jobs=1"));
+    }
+}
