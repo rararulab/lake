@@ -2359,14 +2359,11 @@ mod tests {
             .build();
         let action = Action {
             r#type: MANAGED_READ_CAPABILITY_ACTION.to_owned(),
-            body:   ManagedReadCapabilityRequest::try_new(
-                location.clone(),
-                Duration::from_secs(60),
-            )
-            .expect("bounded request")
-            .to_wire()
-            .expect("encoded request")
-            .into(),
+            body:   ManagedReadCapabilityRequest::try_new(location.clone(), Duration::from_mins(1))
+                .expect("bounded request")
+                .to_wire()
+                .expect("encoded request")
+                .into(),
         };
         let principal = Principal::try_new(
             PrincipalId::try_new("tenant-a-reader").expect("principal id"),
@@ -2405,7 +2402,7 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].0, descriptor.scope_to_tenant(principal.tenant()));
         assert_eq!(seen[0].1, location);
-        assert_eq!(seen[0].2, Duration::from_secs(60));
+        assert_eq!(seen[0].2, Duration::from_mins(1));
     }
 
     #[tokio::test]
@@ -2442,7 +2439,7 @@ mod tests {
             .size_bytes(4_294_967_296)
             .sha256("f00d")
             .build();
-        let body = ManagedReadCapabilityRequest::try_new(location, Duration::from_secs(60))
+        let body = ManagedReadCapabilityRequest::try_new(location, Duration::from_mins(1))
             .expect("bounded request")
             .to_wire()
             .expect("encoded request");
@@ -2466,7 +2463,9 @@ mod tests {
         {
             Ok(Err(error)) => error,
             Ok(Ok(_)) => panic!("second signing request must be admission-controlled"),
-            Err(_) => panic!("second signing request waited for the issuer instead of admission"),
+            Err(error) => {
+                panic!("second signing request waited for the issuer instead of admission: {error}")
+            }
         };
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
         assert_eq!(issuer.issues.load(Ordering::SeqCst), 1);
@@ -2515,7 +2514,7 @@ mod tests {
             .sha256("f00d")
             .build();
         let mut invalid_expiry: serde_json::Value = serde_json::from_slice(
-            &ManagedReadCapabilityRequest::try_new(foreign.clone(), Duration::from_secs(60))
+            &ManagedReadCapabilityRequest::try_new(foreign.clone(), Duration::from_mins(1))
                 .expect("bounded request")
                 .to_wire()
                 .expect("encoded request"),
@@ -2531,7 +2530,7 @@ mod tests {
                 tonic::Code::InvalidArgument,
             ),
             (
-                ManagedReadCapabilityRequest::try_new(foreign, Duration::from_secs(60))
+                ManagedReadCapabilityRequest::try_new(foreign, Duration::from_mins(1))
                     .expect("bounded request")
                     .to_wire()
                     .expect("encoded request")
@@ -2578,7 +2577,7 @@ mod tests {
             .build();
         let mut request = Request::new(Action {
             r#type: MANAGED_READ_CAPABILITY_ACTION.to_owned(),
-            body:   ManagedReadCapabilityRequest::try_new(location, Duration::from_secs(60))
+            body:   ManagedReadCapabilityRequest::try_new(location, Duration::from_mins(1))
                 .expect("bounded request")
                 .to_wire()
                 .expect("encoded request")
