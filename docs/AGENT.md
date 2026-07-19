@@ -1,7 +1,9 @@
 # docs/
 
 Project documentation. Progressive disclosure: root `AGENT.md`/`CLAUDE.md`
-are catalogs; the substance is here.
+are catalogs; the substance is here. Public Markdown in this directory is also
+rendered by the Astro site under `/docs/`; keep links relative so they work in
+both GitHub and the generated site.
 
 - `architecture.md` — system design: read path, commit protocol,
   invariants, crate map, deliberate simplifications (`ponytail:` markers)

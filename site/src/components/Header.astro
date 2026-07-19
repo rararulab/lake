@@ -1,0 +1,76 @@
+---
+import config from "@/config";
+import { stripBase, withBase } from "@/utils/withBase";
+
+const path = stripBase(Astro.url.pathname).replace(/\/$/, "") || "/";
+const active = (prefix: string) => path === prefix || path.startsWith(`${prefix}/`);
+---
+
+<a
+  href="#main-content"
+  class="bg-accent text-accent-foreground fixed top-3 left-3 z-50 -translate-y-24 rounded px-3 py-2 text-sm font-semibold transition focus:translate-y-0"
+>
+  Skip to content
+</a>
+
+<header
+  class="bg-background/92 border-border sticky top-0 z-40 border-b backdrop-blur-lg"
+>
+  <div class="site-shell flex min-h-16 items-center justify-between gap-4">
+    <a
+      href={withBase("")}
+      class="rounded py-2 text-2xl font-semibold tracking-[-0.06em]"
+    >
+      lake<span class="text-accent">/</span>
+    </a>
+
+    <nav aria-label="Primary navigation" class="flex items-center gap-1 sm:gap-3">
+      <a
+        href={withBase("docs/")}
+        class:list={[
+          "hover:text-accent rounded px-2 py-2 text-sm font-medium sm:px-3",
+          { "active-nav": active("/docs") },
+        ]}
+      >
+        Docs
+      </a>
+      <a
+        href={withBase("search/")}
+        class:list={[
+          "hover:text-accent rounded px-2 py-2 text-sm font-medium sm:px-3",
+          { "active-nav": active("/search") },
+        ]}
+      >
+        Search
+      </a>
+      <a
+        href={config.site.repositoryUrl}
+        target="_blank"
+        rel="noreferrer"
+        class="hover:text-accent hidden rounded px-3 py-2 text-sm font-medium sm:inline-flex"
+      >
+        GitHub ↗
+      </a>
+      {
+        config.features.lightAndDarkMode && (
+          <button
+            id="theme-toggle"
+            type="button"
+            class="hover:text-accent grid size-10 place-items-center rounded"
+            aria-label="Toggle color theme"
+            title="Toggle color theme"
+          >
+            <svg
+              aria-hidden="true"
+              viewBox="0 0 24 24"
+              class="size-5 fill-none stroke-current stroke-2"
+            >
+              <path d="M12 3v2m0 14v2M3 12h2m14 0h2M5.6 5.6 7 7m10 10 1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4" />
+              <circle cx="12" cy="12" r="4" />
+            </svg>
+          </button>
+        )
+      }
+    </nav>
+  </div>
+</header>

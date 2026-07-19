@@ -1,0 +1,51 @@
+---
+import type { DocEntry } from "@/utils/docs";
+import DocsNav from "@/components/DocsNav.astro";
+import Footer from "@/components/Footer.astro";
+import Header from "@/components/Header.astro";
+import Layout from "@/layouts/Layout.astro";
+import { withBase } from "@/utils/withBase";
+
+interface Props {
+  docs: DocEntry[];
+  currentSlug: string;
+  title: string;
+  description?: string;
+}
+
+const { docs, currentSlug, title, description } = Astro.props;
+---
+
+<Layout title={title} description={description}>
+  <Header />
+  <div class="site-shell flex-1 py-8 sm:py-12">
+    <div class="text-muted-foreground font-code mb-8 flex items-center gap-2 text-xs">
+      <a href={withBase("")} class="hover:text-accent">lake</a>
+      <span aria-hidden="true">/</span>
+      <a href={withBase("docs/")} class="hover:text-accent">docs</a>
+      <span aria-hidden="true">/</span>
+      <span class="text-foreground truncate">{title}</span>
+    </div>
+    <div class="grid gap-12 lg:grid-cols-[15rem_minmax(0,1fr)] lg:gap-14">
+      <aside
+        class="border-border border-b pb-8 lg:border-r lg:border-b-0 lg:pr-8 lg:pb-0"
+      >
+        <details class="group lg:hidden">
+          <summary class="hover:text-accent cursor-pointer font-semibold">
+            Browse documentation
+          </summary>
+          <div class="mt-6">
+            <DocsNav docs={docs} currentSlug={currentSlug} />
+          </div>
+        </details>
+        <div class="hidden lg:block">
+          <DocsNav docs={docs} currentSlug={currentSlug} />
+        </div>
+      </aside>
+      <main id="main-content" class="app-prose min-w-0" data-pagefind-body>
+        <slot />
+      </main>
+    </div>
+  </div>
+  <Footer />
+</Layout>

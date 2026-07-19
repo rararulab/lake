@@ -149,8 +149,8 @@ implementer with one quality gate. The implementer:
    - `mise run test` — `cargo test --workspace --all-targets`
    - `mise run e2e` — `cargo run -p lake-cli`, the end-to-end self-check
      (ingest → commit → SQL query)
-   - `mise run site-check` — frozen Bun install, TypeScript typecheck,
-     Vitest, and the GitHub Pages production build
+   - `mise run site-check` — frozen Bun install, Astro typecheck, lint,
+     formatting, production build, Pagefind index, and output smoke tests
 6. **Lane 1 only**: runs `mise run spec-lifecycle specs/issue-N-<slug>.spec.md`
    (routed through `scripts/spec-lifecycle-guard.ts` — a `Test:` selector
    matching zero tests FAILS even if agent-spec reports green) and confirms

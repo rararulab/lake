@@ -1,0 +1,64 @@
+---
+import config from "@/config";
+import { withBase } from "@/utils/withBase";
+import "@/styles/global.css";
+
+interface Props {
+  title?: string;
+  description?: string;
+  canonicalURL?: string;
+}
+
+const {
+  title = config.site.title,
+  description = config.site.description,
+  canonicalURL = new URL(Astro.url.pathname, Astro.site).href,
+} = Astro.props;
+
+const pageTitle =
+  title === config.site.title ? title : `${title} · ${config.site.title}`;
+const socialImageURL = new URL(withBase("default-og.svg"), Astro.site ?? Astro.url);
+---
+
+<!doctype html>
+<html lang={config.site.lang} class="overflow-y-scroll">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href={withBase("favicon.svg")} />
+    <link rel="canonical" href={canonicalURL} />
+    <link rel="sitemap" href={withBase("sitemap-index.xml")} />
+    <meta name="generator" content={Astro.generator} />
+    <meta name="theme-color" content="#151512" />
+    <title>{pageTitle}</title>
+    <meta name="description" content={description} />
+    <meta name="author" content={config.site.author} />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content={config.site.title} />
+    <meta property="og:title" content={pageTitle} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonicalURL} />
+    <meta property="og:image" content={socialImageURL} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={pageTitle} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={socialImageURL} />
+    <script is:inline>
+      (() => {
+        const stored = localStorage.getItem("theme");
+        const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+        const theme =
+          stored === "light" || stored === "dark" ? stored : dark ? "dark" : "light";
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.classList.toggle("dark", theme === "dark");
+        window.__lakeTheme = theme;
+      })();
+    </script>
+  </head>
+  <body class="flex min-h-[100dvh] flex-col">
+    <slot />
+    <script>
+      import "@/scripts/theme";
+    </script>
+  </body>
+</html>

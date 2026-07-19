@@ -1,0 +1,31 @@
+---
+import { getCollection, render, type CollectionEntry } from "astro:content";
+import DocsLayout from "@/layouts/DocsLayout.astro";
+import { getDocSlug, getDocTitle, isPublicDoc, sortDocs } from "@/utils/docs";
+
+export async function getStaticPaths() {
+  const docs = (await getCollection("docs")).filter(isPublicDoc);
+  return docs.map(doc => ({ params: { slug: getDocSlug(doc) }, props: { doc } }));
+}
+
+interface Props {
+  doc: CollectionEntry<"docs">;
+}
+
+const { doc } = Astro.props;
+const docs = sortDocs((await getCollection("docs")).filter(isPublicDoc));
+const title = getDocTitle(doc);
+const slug = getDocSlug(doc);
+const { Content, headings } = await render(doc);
+const hasPrimaryHeading = headings.some(heading => heading.depth === 1);
+---
+
+<DocsLayout
+  docs={docs}
+  currentSlug={slug}
+  title={title}
+  description={doc.data.description}
+>
+  {!hasPrimaryHeading && <h1>{title}</h1>}
+  <Content />
+</DocsLayout>

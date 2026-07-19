@@ -1,0 +1,88 @@
+---
+import { getCollection } from "astro:content";
+import DocsNav from "@/components/DocsNav.astro";
+import Footer from "@/components/Footer.astro";
+import Header from "@/components/Header.astro";
+import Layout from "@/layouts/Layout.astro";
+import {
+  getDocSection,
+  getDocTitle,
+  getDocUrl,
+  isPublicDoc,
+  sortDocs,
+} from "@/utils/docs";
+
+const docs = sortDocs((await getCollection("docs")).filter(isPublicDoc));
+const sections = Map.groupBy(docs, getDocSection);
+const descriptions: Record<string, string> = {
+  overview: "System architecture and project-wide documentation.",
+  design: "Focused decisions for metadata, storage, and SQL paths.",
+  guides: "Contributor workflows, operations, CLI, and deployment guidance.",
+  plans: "Implementation plans that preserve the reasoning behind major changes.",
+};
+---
+
+<Layout
+  title="Documentation"
+  description="Architecture, design notes, guides, and implementation plans for lake."
+>
+  <Header />
+  <main id="main-content" class="site-shell flex-1 py-12 sm:py-16" data-pagefind-body>
+    <div class="grid gap-14 lg:grid-cols-[15rem_minmax(0,1fr)]">
+      <aside class="border-border border-b pb-8 lg:border-r lg:border-b-0 lg:pr-8">
+        <DocsNav docs={docs} />
+      </aside>
+      <div class="min-w-0">
+        <p class="text-accent font-code text-xs tracking-[0.14em] uppercase">
+          Canonical repository docs
+        </p>
+        <h1
+          class="mt-5 text-5xl font-semibold tracking-[-0.06em] text-balance sm:text-6xl"
+        >
+          Documentation
+        </h1>
+        <p class="text-muted-foreground mt-6 max-w-[42rem] text-lg leading-8">
+          Architecture, design decisions, contributor guides, and implementation
+          plans—rendered directly from the Markdown in <code
+            class="bg-muted font-code rounded px-1.5 py-0.5 text-sm">docs/</code
+          >.
+        </p>
+        <div class="mt-12 grid gap-5 sm:grid-cols-2">
+          {
+            [...sections].map(([section, entries]) => (
+              <section id={section} class="doc-card scroll-mt-24">
+                <p class="text-accent font-code m-0 text-[0.68rem] tracking-[0.1em] uppercase">
+                  {section}
+                </p>
+                <h2 class="mt-3 text-2xl font-semibold capitalize">
+                  {section.replaceAll("-", " ")}
+                </h2>
+                <p class="text-muted-foreground mt-2 min-h-12 text-sm leading-6">
+                  {descriptions[section]}
+                </p>
+                <ul class="mt-5 space-y-2 p-0">
+                  {entries.slice(0, 5).map(entry => (
+                    <li class="list-none">
+                      <a
+                        href={getDocUrl(entry)}
+                        class="decoration-border hover:text-accent hover:decoration-accent font-medium underline underline-offset-4"
+                      >
+                        {getDocTitle(entry)}
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+                {entries.length > 5 && (
+                  <p class="text-muted-foreground mt-4 text-xs">
+                    + {entries.length - 5} more in navigation
+                  </p>
+                )}
+              </section>
+            ))
+          }
+        </div>
+      </div>
+    </div>
+  </main>
+  <Footer />
+</Layout>

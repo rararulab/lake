@@ -1,0 +1,63 @@
+---
+import "@pagefind/default-ui/css/ui.css";
+import Footer from "@/components/Footer.astro";
+import Header from "@/components/Header.astro";
+import Layout from "@/layouts/Layout.astro";
+import { withBase } from "@/utils/withBase";
+
+const bundlePath = withBase("pagefind/");
+---
+
+<Layout title="Search" description="Search lake documentation.">
+  <Header />
+  <main id="main-content" class="content-shell flex-1 py-12 sm:py-16">
+    <p class="text-accent font-code text-xs tracking-[0.14em] uppercase">
+      Pagefind index
+    </p>
+    <h1 class="mt-5 text-5xl font-semibold tracking-[-0.06em]">Search</h1>
+    <p class="text-muted-foreground mt-4">
+      Search the landing page and every published document.
+    </p>
+    <div id="pagefind-search" class="mt-10" data-bundle-path={bundlePath}></div>
+  </main>
+  <Footer />
+</Layout>
+
+<script>
+  async function initializeSearch() {
+    const element = document.querySelector<HTMLElement>("#pagefind-search");
+    if (!element || element.querySelector("form")) return;
+
+    const bundlePath = element.dataset.bundlePath;
+    if (!bundlePath) return;
+
+    if (import.meta.env.DEV) {
+      element.innerHTML =
+        "<p>Build the site once to create the local search index.</p>";
+      return;
+    }
+
+    // @ts-expect-error Pagefind's browser bundle does not publish complete TypeScript declarations.
+    const { PagefindUI } = await import("@pagefind/default-ui");
+    new PagefindUI({
+      element: "#pagefind-search",
+      bundlePath,
+      showImages: false,
+      showSubResults: true,
+    });
+  }
+
+  initializeSearch();
+</script>
+
+<style is:global>
+  #pagefind-search {
+    --pagefind-ui-font: var(--font-geist);
+    --pagefind-ui-text: var(--foreground);
+    --pagefind-ui-background: var(--background);
+    --pagefind-ui-border: var(--border);
+    --pagefind-ui-primary: var(--accent);
+    --pagefind-ui-tag: var(--surface);
+    --pagefind-ui-border-radius: 0.35rem;
+  }
+</style>
