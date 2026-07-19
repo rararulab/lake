@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.1](https://github.com/rararulab/lake/compare/v1.5.0...v1.5.1) (2026-07-19)
+
+
+### Bug Fixes
+
+* **ci:** bound post-merge quality gate duration ([#267](https://github.com/rararulab/lake/issues/267)) ([5d20477](https://github.com/rararulab/lake/commit/5d20477d0691901362679f9646d9d713131f7363))
+
 ## [1.5.0](https://github.com/rararulab/lake/compare/v1.4.1...v1.5.0) (2026-07-19)
 
 
