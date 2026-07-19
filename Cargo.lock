@@ -4585,10 +4585,11 @@ dependencies = [
 
 [[package]]
 name = "lake-iceberg"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "bon",
  "datafusion",
  "iceberg",
  "iceberg-catalog-rest",

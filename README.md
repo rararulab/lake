@@ -293,6 +293,14 @@ LAKE_ICEBERG_NAMESPACES=analytics,models \
 lake query --metadata-addr https://metasrv.example.com:50052
 ```
 
+For an authenticated REST catalog, add exactly one process-local auth mode. A
+static bearer token uses `LAKE_ICEBERG_REST_TOKEN`. OAuth client credentials
+use `LAKE_ICEBERG_REST_CREDENTIAL` (`client-id:client-secret`) and may set
+`LAKE_ICEBERG_REST_OAUTH2_SERVER_URI`, `LAKE_ICEBERG_REST_OAUTH_SCOPE`,
+`LAKE_ICEBERG_REST_OAUTH_AUDIENCE`, and `LAKE_ICEBERG_REST_OAUTH_RESOURCE`.
+Inject these values from the deployment secret manager; never put credentials
+in the endpoint URL, SQL, Lake metadata, or a Flight ticket.
+
 All three variables are required together and are validated before Query binds.
 Cloud and catalog credentials stay in the Query deployment's normal runtime
 configuration. Query supports fully-qualified scans such as:

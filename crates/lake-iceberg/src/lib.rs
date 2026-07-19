@@ -39,6 +39,7 @@ use url::Url;
 const DEFAULT_CACHE_FRESHNESS: Duration = Duration::from_secs(5);
 const DEFAULT_CACHE_STALE_IF_ERROR: Duration = Duration::from_mins(1);
 const SNAPSHOT_CACHE_CAPACITY: usize = 10_000;
+const MAX_REST_SECRET_BYTES: usize = 8 * 1024;
 
 /// Errors returned while validating external Iceberg catalog configuration.
 #[derive(Debug, Snafu)]
@@ -59,6 +60,9 @@ pub enum IcebergError {
     /// External snapshot cache freshness and stale-if-error bounds are invalid.
     #[snafu(display("Iceberg snapshot cache policy is invalid"))]
     InvalidCachePolicy,
+    /// REST authentication configuration is malformed.
+    #[snafu(display("Iceberg REST authentication is invalid"))]
+    InvalidRestAuth,
     /// A table is outside the configured namespace allowlist.
     #[snafu(display("Iceberg table is not configured"))]
     TableNotConfigured,
@@ -70,20 +74,144 @@ pub enum IcebergError {
     NamespaceUnavailable,
     /// An external catalog operation failed without exposing endpoint details.
     #[snafu(display("Iceberg catalog operation failed"))]
-    Catalog { source: iceberg::Error },
+    Catalog,
 }
 
 /// Result type for the read-only Iceberg federation adapter.
 pub type Result<T> = std::result::Result<T, IcebergError>;
 
+/// Process-local authentication for an external Iceberg REST catalog.
+///
+/// The value is supplied by the Query deployment and is never serialized into
+/// Lake metadata or statement tickets. Its `Debug` implementation deliberately
+/// omits secret material.
+#[derive(Clone, Eq, PartialEq)]
+pub struct IcebergRestAuth {
+    kind: RestAuthKind,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+enum RestAuthKind {
+    BearerToken(String),
+    OAuthClientCredentials {
+        credential: String,
+        options:    IcebergOAuthOptions,
+    },
+}
+
+/// Optional standard properties for OAuth client-credential REST sessions.
+///
+/// These values identify the token request but contain no client secret. The
+/// client credential itself is accepted separately by
+/// [`IcebergRestAuth::oauth_client_credentials`].
+#[derive(bon::Builder, Clone, Debug, Eq, PartialEq)]
+pub struct IcebergOAuthOptions {
+    #[builder(into)]
+    oauth2_server_uri: Option<String>,
+    #[builder(into)]
+    scope:             Option<String>,
+    #[builder(into)]
+    audience:          Option<String>,
+    #[builder(into)]
+    resource:          Option<String>,
+}
+
+impl IcebergRestAuth {
+    /// Validate a static bearer token supplied by the Query runtime.
+    pub fn bearer_token(token: impl AsRef<str>) -> Result<Self> {
+        let token = token.as_ref();
+        if !valid_rest_secret(token) {
+            return Err(IcebergError::InvalidRestAuth);
+        }
+        Ok(Self {
+            kind: RestAuthKind::BearerToken(token.to_owned()),
+        })
+    }
+
+    /// Validate OAuth client credentials supplied by the Query runtime.
+    pub fn oauth_client_credentials(
+        credential: impl AsRef<str>,
+        options: IcebergOAuthOptions,
+    ) -> Result<Self> {
+        let credential = credential.as_ref();
+        if !valid_rest_secret(credential) || !options.valid() {
+            return Err(IcebergError::InvalidRestAuth);
+        }
+        Ok(Self {
+            kind: RestAuthKind::OAuthClientCredentials {
+                credential: credential.to_owned(),
+                options,
+            },
+        })
+    }
+
+    fn catalog_properties(&self) -> HashMap<String, String> {
+        match &self.kind {
+            RestAuthKind::BearerToken(token) => {
+                HashMap::from([("token".to_owned(), token.clone())])
+            }
+            RestAuthKind::OAuthClientCredentials {
+                credential,
+                options,
+            } => options.catalog_properties(credential),
+        }
+    }
+}
+
+impl std::fmt::Debug for IcebergRestAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IcebergRestAuth")
+            .field(
+                "kind",
+                &match &self.kind {
+                    RestAuthKind::BearerToken(_) => "bearer_token",
+                    RestAuthKind::OAuthClientCredentials { .. } => "oauth_client_credentials",
+                },
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl IcebergOAuthOptions {
+    fn valid(&self) -> bool {
+        self.oauth2_server_uri.as_deref().is_none_or(|value| {
+            Url::parse(value).is_ok_and(|endpoint| valid_credential_free_http_url(&endpoint))
+        }) && [
+            self.scope.as_deref(),
+            self.audience.as_deref(),
+            self.resource.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(valid_rest_secret)
+    }
+
+    fn catalog_properties(&self, credential: &str) -> HashMap<String, String> {
+        let mut properties = HashMap::from([("credential".to_owned(), credential.to_owned())]);
+        for (name, value) in [
+            ("oauth2-server-uri", self.oauth2_server_uri.as_ref()),
+            ("scope", self.scope.as_ref()),
+            ("audience", self.audience.as_ref()),
+            ("resource", self.resource.as_ref()),
+        ] {
+            if let Some(value) = value {
+                properties.insert(name.to_owned(), value.clone());
+            }
+        }
+        properties
+    }
+}
+
 /// Immutable deployment configuration for one external Iceberg REST catalog.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct IcebergCatalogConfig {
     endpoint:             Url,
     warehouse:            String,
     namespaces:           Arc<[String]>,
     cache_freshness:      Duration,
     cache_stale_if_error: Duration,
+    rest_auth:            Option<IcebergRestAuth>,
 }
 
 impl IcebergCatalogConfig {
@@ -98,13 +226,7 @@ impl IcebergCatalogConfig {
         S: AsRef<str>,
     {
         let mut endpoint = Url::parse(endpoint).map_err(|_| IcebergError::InvalidEndpoint)?;
-        if !matches!(endpoint.scheme(), "http" | "https")
-            || endpoint.host_str().is_none()
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.query().is_some()
-            || endpoint.fragment().is_some()
-        {
+        if !valid_credential_free_http_url(&endpoint) {
             return Err(IcebergError::InvalidEndpoint);
         }
         let normalized_path = endpoint.path().trim_end_matches('/').to_owned();
@@ -134,7 +256,15 @@ impl IcebergCatalogConfig {
             namespaces: namespaces.into(),
             cache_freshness: DEFAULT_CACHE_FRESHNESS,
             cache_stale_if_error: DEFAULT_CACHE_STALE_IF_ERROR,
+            rest_auth: None,
         })
+    }
+
+    /// Attach process-local REST authentication to this deployment config.
+    #[must_use]
+    pub fn with_rest_auth(mut self, auth: IcebergRestAuth) -> Self {
+        self.rest_auth = Some(auth);
+        self
     }
 
     /// Set bounded external-snapshot cache freshness and stale-if-error time.
@@ -170,6 +300,26 @@ impl IcebergCatalogConfig {
     fn cache_freshness(&self) -> Duration { self.cache_freshness }
 
     fn cache_stale_if_error(&self) -> Duration { self.cache_stale_if_error }
+
+    fn rest_properties(&self) -> HashMap<String, String> {
+        self.rest_auth
+            .as_ref()
+            .map_or_else(HashMap::new, IcebergRestAuth::catalog_properties)
+    }
+}
+
+impl std::fmt::Debug for IcebergCatalogConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IcebergCatalogConfig")
+            .field("endpoint", &self.endpoint)
+            .field("warehouse", &self.warehouse)
+            .field("namespaces", &self.namespaces)
+            .field("cache_freshness", &self.cache_freshness)
+            .field("cache_stale_if_error", &self.cache_stale_if_error)
+            .field("rest_auth", &self.rest_auth.as_ref().map(|_| "configured"))
+            .finish()
+    }
 }
 
 fn valid_namespace(namespace: &str) -> bool {
@@ -178,6 +328,24 @@ fn valid_namespace(namespace: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
+
+fn valid_rest_secret(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_REST_SECRET_BYTES
+        && value.trim() == value
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn valid_credential_free_http_url(endpoint: &Url) -> bool {
+    matches!(endpoint.scheme(), "http" | "https")
+        && endpoint.host_str().is_some()
+        && endpoint.username().is_empty()
+        && endpoint.password().is_none()
+        && endpoint.query().is_none()
+        && endpoint.fragment().is_none()
+}
+
+fn catalog_error(_: iceberg::Error) -> IcebergError { IcebergError::Catalog }
 
 /// Read-only access to one configured external Iceberg catalog.
 #[derive(Clone)]
@@ -205,30 +373,29 @@ impl IcebergCatalog {
     /// Startup performs only bounded point checks over the deployment
     /// allowlist. It never lists external namespaces or tables.
     pub async fn connect(config: IcebergCatalogConfig) -> Result<Self> {
+        let mut properties = HashMap::from([
+            (
+                REST_CATALOG_PROP_URI.to_owned(),
+                config.endpoint().as_str().trim_end_matches('/').to_owned(),
+            ),
+            (
+                REST_CATALOG_PROP_WAREHOUSE.to_owned(),
+                config.warehouse().to_owned(),
+            ),
+        ]);
+        properties.extend(config.rest_properties());
         let catalog = RestCatalogBuilder::default()
             .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
-            .load(
-                "lake-iceberg",
-                HashMap::from([
-                    (
-                        REST_CATALOG_PROP_URI.to_owned(),
-                        config.endpoint().as_str().trim_end_matches('/').to_owned(),
-                    ),
-                    (
-                        REST_CATALOG_PROP_WAREHOUSE.to_owned(),
-                        config.warehouse().to_owned(),
-                    ),
-                ]),
-            )
+            .load("lake-iceberg", properties)
             .await
-            .map_err(|source| IcebergError::Catalog { source })?;
+            .map_err(catalog_error)?;
         let catalog = Self::from_catalog(config, Arc::new(catalog));
         for namespace in catalog.config.namespaces() {
             let exists = catalog
                 .catalog
                 .namespace_exists(&NamespaceIdent::new(namespace.clone()))
                 .await
-                .map_err(|source| IcebergError::Catalog { source })?;
+                .map_err(catalog_error)?;
             if !exists {
                 return Err(IcebergError::NamespaceUnavailable);
             }
@@ -312,7 +479,7 @@ impl IcebergCatalog {
                 key.table.clone(),
             ))
             .await
-            .map_err(|source| IcebergError::Catalog { source })?;
+            .map_err(catalog_error)?;
         if table.metadata().snapshot_by_id(snapshot_id).is_none() {
             return Err(IcebergError::SnapshotUnavailable);
         }
@@ -348,7 +515,7 @@ impl IcebergCatalog {
                 key.table.clone(),
             ))
             .await
-            .map_err(|source| IcebergError::Catalog { source })?;
+            .map_err(catalog_error)?;
         Ok(IcebergTableSnapshot {
             namespace: key.namespace.clone(),
             table:     table.identifier().name().to_owned(),
@@ -512,7 +679,7 @@ impl IcebergTableSnapshot {
             }
             None => IcebergStaticTableProvider::try_new_from_table(self.inner.clone()).await,
         }
-        .map_err(|source| IcebergError::Catalog { source })?;
+        .map_err(catalog_error)?;
         Ok(Arc::new(provider))
     }
 }

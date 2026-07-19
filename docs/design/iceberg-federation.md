@@ -69,11 +69,27 @@ LAKE_ICEBERG_NAMESPACES=analytics,models \
 lake query --metadata-addr https://metasrv.example.com:50052
 ```
 
+The REST session is either unauthenticated, a static bearer token via
+`LAKE_ICEBERG_REST_TOKEN`, or an OAuth client-credentials session via
+`LAKE_ICEBERG_REST_CREDENTIAL` (`client-id:client-secret`). The two modes are
+mutually exclusive. OAuth may additionally use the standard
+`LAKE_ICEBERG_REST_OAUTH2_SERVER_URI`, `LAKE_ICEBERG_REST_OAUTH_SCOPE`,
+`LAKE_ICEBERG_REST_OAUTH_AUDIENCE`, and
+`LAKE_ICEBERG_REST_OAUTH_RESOURCE` properties; each requires client
+credentials. Values are validated before the Flight listener binds, including
+the credential-free HTTP(S) requirement for an overridden OAuth token endpoint.
+
 The adapter uses Apache `iceberg-rust`'s DataFusion integration at the pinned
 Apache revision declared in the workspace. Its storage factory resolves the
 table-file URI at scan time. Cloud credentials and REST authentication are
 therefore deployment/runtime concerns (for example the normal cloud-provider
 credential chain), never Lake registry fields, SQL text, or ticket claims.
+
+The Query process passes the validated auth value only to its in-memory REST
+client. It is deliberately absent from `Debug` output, errors, metrics, Lake
+metadata, table descriptors, and encrypted Flight ticket claims. Deploy it
+through the platform secret manager, never endpoint userinfo or a repository
+configuration file.
 
 Startup performs a bounded existence check for each configured namespace. It
 does not list external namespaces or tables. At query time a reference to
