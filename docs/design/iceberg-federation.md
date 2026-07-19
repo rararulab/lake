@@ -151,7 +151,10 @@ single-flights one `regenerate_token` call and retries the same namespace check
 or exact table lookup once. The same in-flight result is shared when that
 renewal fails, so an identity-provider outage cannot turn one observed token
 generation into one credential exchange per reader; a later independent read
-may make a fresh bounded attempt. Static bearer tokens are never refreshed.
+may make a fresh bounded attempt. If the reader leading that renewal is
+cancelled, its in-flight followers receive the same opaque failed result rather
+than waiting for a renewal that no longer has an owner. Static bearer tokens
+are never refreshed.
 This is not a background timer, a credential-discovery mechanism, or a
 Lake-owned token service; a renewal or retry failure remains an external
 catalog error.
