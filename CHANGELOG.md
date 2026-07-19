@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.3](https://github.com/rararulab/lake/compare/v1.3.2...v1.3.3) (2026-07-19)
+
+
+### Bug Fixes
+
+* **query:** avoid registry refresh for Iceberg scans ([#227](https://github.com/rararulab/lake/issues/227)) ([#228](https://github.com/rararulab/lake/issues/228)) ([a4f72a8](https://github.com/rararulab/lake/commit/a4f72a8910e1c5a23f05c535ca4a251fed645c52))
+
 ## [1.3.2](https://github.com/rararulab/lake/compare/v1.3.1...v1.3.2) (2026-07-19)
 
 
