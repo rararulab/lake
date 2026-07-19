@@ -204,8 +204,9 @@ separate metadata authorities and failure domains. A cold load or expired
 refresh is single-flight per namespace/table key: concurrent planners wait for
 one exact external lookup and receive the same selected snapshot (including a
 last-good stale-if-error result). The cache lock is not held across that I/O;
-if its leading request is cancelled, a later caller may establish a replacement
-load rather than waiting on stranded state.
+if its leading request is cancelled, already-waiting callers observe the closed
+load and one becomes the replacement, rather than waiting on stranded state or
+requiring a new caller to repair it.
 
 ## Non-goals and the write gate
 

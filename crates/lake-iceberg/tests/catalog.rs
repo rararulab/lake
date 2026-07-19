@@ -775,6 +775,57 @@ async fn cancelled_snapshot_leader_allows_a_new_load() {
 }
 
 #[tokio::test]
+async fn cancelled_snapshot_leader_releases_existing_follower() {
+    let load_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (_warehouse, catalog) = recording_catalog_with_episodes(Some(load_gate.clone())).await;
+    let config =
+        IcebergCatalogConfig::try_new("https://catalog.example", "s3://warehouse", ["analytics"])
+            .expect("build config")
+            .with_cache_policy(Duration::ZERO, Duration::from_mins(1))
+            .expect("configure immediate refresh for test");
+    let federation = Arc::new(IcebergCatalog::from_catalog(config, catalog.clone()));
+
+    let leader_catalog = federation.clone();
+    let leader = tokio::spawn(async move {
+        leader_catalog
+            .resolve_snapshot("analytics", "episodes")
+            .await
+    });
+    while catalog.table_loads() == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    let (follower_started, follower_joined) = tokio::sync::oneshot::channel();
+    let follower_catalog = federation.clone();
+    let follower = tokio::spawn(async move {
+        follower_started
+            .send(())
+            .expect("test must observe the waiting follower");
+        follower_catalog
+            .resolve_snapshot("analytics", "episodes")
+            .await
+    });
+    follower_joined
+        .await
+        .expect("follower task must start while the leader load is pending");
+
+    leader.abort();
+    assert!(leader.await.is_err(), "blocked leader must be cancelled");
+    load_gate.add_permits(1);
+    let snapshot = tokio::time::timeout(Duration::from_secs(1), follower)
+        .await
+        .expect("an existing follower must take over after the leader is cancelled")
+        .expect("follower task must not panic")
+        .expect("follower replacement snapshot load must succeed");
+    assert_eq!(snapshot.table(), "episodes");
+    assert_eq!(
+        catalog.table_loads(),
+        2,
+        "the follower must replace the cancelled leader with one exact table load"
+    );
+}
+
+#[tokio::test]
 async fn rest_catalog_connect_warms_each_configured_namespace() {
     let requests = RestRequests {
         config:     Arc::new(AtomicUsize::new(0)),
