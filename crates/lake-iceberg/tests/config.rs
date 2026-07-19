@@ -33,6 +33,28 @@ fn iceberg_configuration_rejects_invalid_or_duplicate_namespaces() {
 }
 
 #[test]
+fn iceberg_catalog_config_debug_redacts_warehouse() {
+    const WAREHOUSE: &str = "abfss://tenant-secret@lake-account.dfs.core.windows.net/warehouse";
+    let config = IcebergCatalogConfig::try_new("https://catalog.example", WAREHOUSE, ["analytics"])
+        .expect("construct Iceberg configuration");
+
+    let debug = format!("{config:?}");
+    assert!(
+        !debug.contains(WAREHOUSE),
+        "warehouse identifier must not appear in diagnostics"
+    );
+    assert!(
+        !debug.contains("tenant-secret"),
+        "credential-looking warehouse component must not appear in diagnostics"
+    );
+    assert!(
+        debug.contains("warehouse: \"configured\""),
+        "diagnostics must retain the opaque configured warehouse marker"
+    );
+    assert_eq!(config.warehouse(), WAREHOUSE);
+}
+
+#[test]
 fn external_rest_urls_require_tls_or_numeric_loopback() {
     for endpoint in [
         "https://catalog.example",

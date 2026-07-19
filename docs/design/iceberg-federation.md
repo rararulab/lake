@@ -139,9 +139,10 @@ end-to-end Flight planning deadline remains the outer request boundary.
 
 The Query process passes the validated auth value only to its in-memory REST
 client. It is deliberately absent from `Debug` output, errors, metrics, Lake
-metadata, table descriptors, and encrypted Flight ticket claims. Deploy it
-through the platform secret manager, never endpoint userinfo or a repository
-configuration file.
+metadata, table descriptors, and encrypted Flight ticket claims. The warehouse
+identifier is likewise opaque in configuration diagnostics while remaining
+available to the in-memory REST client. Deploy credentials through the platform
+secret manager, never endpoint userinfo or a repository configuration file.
 
 The pinned upstream REST client caches an OAuth access token but does not
 refresh it automatically. Lake therefore treats an OAuth failure on one of its
