@@ -49,12 +49,22 @@ lake query --metadata-addr https://metasrv.example.com:50052
 ```
 
 `LAKE_ICEBERG_REST_ENDPOINT` must be credential-free HTTPS in production;
-plain HTTP is accepted only for numeric loopback addresses in development. Set
-either `LAKE_ICEBERG_REST_TOKEN` or the OAuth client-credential variables
-(`LAKE_ICEBERG_REST_CREDENTIAL` plus optional standard OAuth properties) from
-the deployment's secret manager, never from SQL or a table row. The Query
-workload identity, not an SDK/client, needs read access to the Iceberg table
-files.
+plain HTTP is accepted only for numeric loopback addresses in development. Use
+exactly one process-local auth mode from the deployment's secret manager:
+`LAKE_ICEBERG_REST_TOKEN`, or `LAKE_ICEBERG_REST_CREDENTIAL`
+(`client-id:client-secret`) with the optional standard OAuth server, scope,
+audience, and resource properties. The catalog endpoint and an overridden OAuth
+token endpoint require the same transport rule. A failed bounded OAuth read
+renews the in-memory session once; concurrent failures share that renewal, and
+a failed renewal or retry is still an external-catalog error. Credentials never
+belong in an endpoint URL, SQL, a table row, Lake metadata, or a Flight ticket.
+The Query workload identity, not an SDK/client, needs read access to Iceberg
+table files.
+
+`LAKE_ICEBERG_REST_TIMEOUT_MS` is optional (default `10000`, range
+`1..=60000`) and bounds the configuration handshake, namespace point checks,
+exact table loads, and OAuth exchanges. It prevents the external authority from
+becoming an unbounded startup or request dependency.
 
 Access is the intersection of two finite allowlists: the deployment's
 `LAKE_ICEBERG_NAMESPACES` and the authenticated Lake principal's existing
@@ -69,6 +79,12 @@ share one external call. The encrypted Flight ticket pins that snapshot. On
 then streams Parquet and manifest data directly from object storage. Iceberg
 credentials and object bytes never enter Lake metadata, statement tickets, or
 the Flight stream.
+
+The same rule applies to durable Flight SQL. `PollFlightInfo` stores only the
+encrypted snapshot identity in Lake's bounded job state; a later worker
+point-loads that exact snapshot before materializing Arrow result parts. If
+upstream retention removed it, the job fails; it never switches to the
+catalog's current head.
 
 Iceberg federation is intentionally scan-only: Lake rejects Iceberg DDL/DML,
 does not mirror its catalog into Metasrv, and never becomes an Iceberg commit
@@ -319,8 +335,21 @@ expired; the SDK treats that rejection as conclusive and removes the local
 append checkpoint. Monitor pending checkpoints and run the startup recovery
 loop before the shortest retention configured across the deployment.
 
+### Direct `FILE` reads and snapshot-stable SQL
+
 Query results stream back through the same SDK connection. Decode the logical
 `FILE` value into its stable `DataLocation`, then open the object directly:
+
+```rust
+let mut results = client
+    .query("SELECT video FROM lake.robots.episodes")
+    .await?;
+let batch = results.try_next().await?.expect("one result batch");
+let location = lake_sdk::data_location(&batch, "video", 0)?;
+let mut reader = client.open(&location).await?;
+let mut destination = tokio::fs::File::create("episode.mp4").await?;
+tokio::io::copy(&mut reader, &mut destination).await?; // drain to verified EOF
+```
 
 The Flight SQL statement capability is snapshot-stable across its two RPCs.
 `GetFlightInfo` resolves every physical table in joins, subqueries, and CTEs
@@ -333,68 +362,7 @@ snapshot fails explicitly and never falls forward to latest. Ticket protocol
 upgrades require blue/green or drained cutover because older replicas are
 intentionally unable to ignore new snapshot claims.
 
-## External Iceberg REST tables
-
-Query can expose one external Apache Iceberg REST catalog as the read-only SQL
-catalog `iceberg`; Lake-owned tables remain under `lake`. The external catalog
-keeps ownership of Iceberg metadata, commits, and retention. Lake never copies
-that metadata into Metasrv or proxies Parquet/video/model bytes through Flight.
-
-```bash
-LAKE_ICEBERG_REST_ENDPOINT=https://catalog.example.com \
-LAKE_ICEBERG_WAREHOUSE=s3://embodied-warehouse \
-LAKE_ICEBERG_NAMESPACES=analytics,models \
-LAKE_ICEBERG_REST_TIMEOUT_MS=10000 \
-lake query --metadata-addr https://metasrv.example.com:50052
-```
-
-For an authenticated REST catalog, add exactly one process-local auth mode. A
-static bearer token uses `LAKE_ICEBERG_REST_TOKEN`. OAuth client credentials
-use `LAKE_ICEBERG_REST_CREDENTIAL` (`client-id:client-secret`) and may set
-`LAKE_ICEBERG_REST_OAUTH2_SERVER_URI`, `LAKE_ICEBERG_REST_OAUTH_SCOPE`,
-`LAKE_ICEBERG_REST_OAUTH_AUDIENCE`, and `LAKE_ICEBERG_REST_OAUTH_RESOURCE`.
-The catalog endpoint and an overridden OAuth token endpoint must use HTTPS;
-plain HTTP is accepted only for numeric IP loopback development endpoints
-(`127.0.0.0/8` or `::1`), never hostnames such as `localhost`. Inject these
-values from the deployment secret manager; never put credentials in the
-endpoint URL, SQL, Lake metadata, or a Flight ticket.
-
-For OAuth client credentials only, a failed bounded namespace check or exact
-table lookup renews the in-memory REST session once and retries that same
-read. Concurrent failures share one renewal. This recovers an expired access
-token without background scheduling or secret rotation; a failed renewal or
-retry still returns an error.
-
-All three base variables are required together and are validated before Query
-binds. `LAKE_ICEBERG_REST_TIMEOUT_MS` is optional; it defaults to 10,000 ms
-and accepts `1..=60000`. Lake applies it to each REST configuration handshake,
-namespace point check, exact table lookup, and OAuth exchange, so a stalled
-external catalog cannot inherit an unbounded startup dependency. Cloud and
-catalog credentials stay in the Query deployment's normal runtime
-configuration. Query supports fully-qualified scans such as:
-
-```sql
-SELECT episode_id, reward
-FROM iceberg.analytics.episodes;
-```
-
-It does not enumerate external tables, issue Iceberg writes, or mirror catalog
-state into Lake. A Flight statement ticket pins the selected Iceberg snapshot,
-so a later upstream commit cannot change a result after `GetFlightInfo`; an
-expired upstream snapshot fails rather than silently reading latest. See the
-[Iceberg federation design](docs/design/iceberg-federation.md) for cache and
-availability bounds.
-
-```rust
-let mut results = client
-    .query("SELECT video FROM lake.robots.episodes")
-    .await?;
-let batch = results.try_next().await?.expect("one result batch");
-let location = lake_sdk::data_location(&batch, "video", 0)?;
-let mut reader = client.open(&location).await?;
-let mut destination = tokio::fs::File::create("episode.mp4").await?;
-tokio::io::copy(&mut reader, &mut destination).await?; // drain to verified EOF
-```
+### Durable SQL results
 
 For queries whose result generation should survive one client connection or
 Query replica, use the same client with standard Flight `PollFlightInfo`:
@@ -410,11 +378,8 @@ while let Some(batch) = results.try_next().await? {
 }
 ```
 
-The same durable Flight lifecycle accepts configured read-only
-`iceberg.<namespace>.<table>` scans. The encrypted job carries only the exact
-Iceberg snapshot identity selected at submission. A worker point-loads that
-same snapshot before execution; if external retention removed it, the job
-fails rather than reading the catalog's current head.
+The configuration and exact-snapshot rule above apply unchanged to configured
+read-only `iceberg.<namespace>.<table>` scans.
 
 For workflow engines and long jobs, persist the opaque handle and resume after
 a process or Query-connection restart:
