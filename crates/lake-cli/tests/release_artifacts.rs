@@ -73,6 +73,11 @@ fn workflow() -> Value {
         .expect("release-image workflow must be valid YAML")
 }
 
+fn release_please_workflow() -> Value {
+    serde_yaml::from_str(&read(".github/workflows/release-please.yml"))
+        .expect("release-please workflow must be valid YAML")
+}
+
 fn steps(workflow: &Value) -> &[Value] {
     workflow["jobs"]["publish-image"]["steps"]
         .as_sequence()
@@ -209,6 +214,47 @@ fn release_image_workflow_rejects_mismatched_tags_and_preserves_digest_pinning()
     assert!(guide.contains("Do not deploy a mutable tag in production."));
     assert!(guide.contains("@sha256:<digest>"));
     assert!(guide.contains("REPLACE_WITH_RELEASE_MANIFEST_DIGEST"));
+}
+
+#[test]
+fn release_please_dispatches_image_publication_for_root_release() {
+    let workflow = release_please_workflow();
+    assert_eq!(
+        workflow["jobs"]["release"]["permissions"]["actions"].as_str(),
+        Some("write")
+    );
+
+    let steps = workflow["jobs"]["release"]["steps"]
+        .as_sequence()
+        .expect("Release Please steps");
+    let dispatch = steps
+        .iter()
+        .find(|step| {
+            step["run"]
+                .as_str()
+                .is_some_and(|run| run.contains("gh workflow run release-image.yml"))
+        })
+        .expect("Release Please must dispatch image publication after a release");
+    assert_eq!(
+        dispatch["if"].as_str(),
+        Some("${{ steps.release.outputs.release_created == 'true' }}")
+    );
+    assert_eq!(
+        dispatch["env"]["GH_TOKEN"].as_str(),
+        Some("${{ github.token }}")
+    );
+    assert_eq!(
+        dispatch["env"]["RELEASE_TAG"].as_str(),
+        Some("${{ steps.release.outputs.tag_name }}")
+    );
+    let command = dispatch["run"].as_str().expect("image publication command");
+    assert!(command.contains("--ref main"));
+    assert!(command.contains("tag=$RELEASE_TAG"));
+
+    let guide = read("docs/guides/mise-ci.md");
+    let normalized_guide = guide.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(normalized_guide.contains("automatically dispatches the existing image workflow"));
+    assert!(normalized_guide.contains("manual image backfill"));
 }
 
 #[test]

@@ -15,6 +15,7 @@ jobs:
   release:
     name: Maintain release
     permissions:
+      actions: write
       contents: write
       issues: write
       pull-requests: write
@@ -26,3 +27,13 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # Releases created by GITHUB_TOKEN do not emit another release workflow
+      # event. workflow_dispatch is the deliberate exception, and the image
+      # workflow re-validates this exact published tag before it can publish.
+      - name: Dispatch release image publication
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+        run: gh workflow run release-image.yml --ref main -f "tag=$RELEASE_TAG"
