@@ -28,6 +28,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+lake-objects = { workspace = true }
 tempfile = "3"
 
 [lints]

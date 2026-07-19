@@ -642,8 +642,10 @@ fn object_identities(batch: &RecordBatch) -> std::io::Result<Vec<ObjectIdentity>
             .ok_or_else(|| invalid_reference("FILE size_bytes child is not UInt64"))?;
         let sha256 = string_child(values, "sha256")?;
         for row in 0..values.len() {
-            if values.is_null(row)
-                || uri.is_null(row)
+            if values.is_null(row) {
+                continue;
+            }
+            if uri.is_null(row)
                 || content_type.is_null(row)
                 || size_bytes.is_null(row)
                 || sha256.is_null(row)
@@ -1253,6 +1255,7 @@ mod tests {
         physical_plan::stream::RecordBatchStreamAdapter,
     };
     use lake_meta::{MetaStore, RocksMeta};
+    use lake_objects::episode_artifact_table_v1;
 
     use super::*;
 
@@ -1324,6 +1327,53 @@ mod tests {
 
     fn file_batch(index: usize) -> RecordBatch {
         RecordBatch::try_new(file_schema(), vec![file_array(index)]).unwrap()
+    }
+
+    fn robot_artifact(uri: &str, sha256: &str) -> lake_common::DataLocation {
+        lake_common::DataLocation::builder()
+            .uri(uri)
+            .content_type("application/octet-stream")
+            .size_bytes(42)
+            .sha256(sha256)
+            .build()
+    }
+
+    fn episode_bundle_batch() -> (RecordBatch, Vec<ObjectIdentity>) {
+        let manifest = robot_artifact(
+            "file:///lake/objects/manifest.json",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let recording = robot_artifact(
+            "file:///lake/objects/recording.rrd",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let episode = lake_common::EpisodeRecordV1::builder()
+            .episode_id("episode-1")
+            .manifest_artifact_id("manifest-1")
+            .build();
+        let references = vec![
+            lake_common::ArtifactRefV1::builder()
+                .episode_id("episode-1")
+                .artifact_id("manifest-1")
+                .layer_id("base")
+                .role("manifest")
+                .object(manifest.clone())
+                .build(),
+            lake_common::ArtifactRefV1::builder()
+                .episode_id("episode-1")
+                .artifact_id("recording-1")
+                .layer_id("base")
+                .role("recording")
+                .recording_format("rrd")
+                .object(recording.clone())
+                .build(),
+        ];
+        let bundle = lake_common::EpisodeBundleV1::try_new(episode, references)
+            .expect("valid Episode bundle");
+        (
+            episode_artifact_table_v1(&bundle).expect("valid Episode Arrow batch"),
+            vec![manifest.into(), recording.into()],
+        )
     }
 
     async fn commit_without_finalizing_references(
@@ -1862,6 +1912,80 @@ mod tests {
             added.extend_from_slice(delta.added());
         }
         assert_eq!(added.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn nullable_file_rows_keep_present_episode_artifacts_reachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = TableLocation::new(dir.path().join("episodes.lance").to_str().unwrap());
+        let engine = LanceEngine::new();
+        let (batch, expected) = episode_bundle_batch();
+        let handle = engine.create(&location, batch.schema()).await.unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
+        ));
+
+        let version = handle.append(&operation(), stream).await.unwrap();
+        let page = engine
+            .retained_object_references(
+                &location,
+                ObjectReferenceRequest::try_new(version, None, 1_024).unwrap(),
+            )
+            .await
+            .expect("complete retained Episode reference lineage");
+        let actual = page
+            .deltas()
+            .iter()
+            .flat_map(|delta| delta.added().iter().cloned())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(actual, expected.into_iter().collect());
+        assert!(page.next_cursor().is_none());
+    }
+
+    #[tokio::test]
+    async fn partially_null_file_identity_fails_before_manifest_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = TableLocation::new(dir.path().join("episodes.lance").to_str().unwrap());
+        let engine = LanceEngine::new();
+        let fields = Fields::from(vec![
+            Field::new("uri", DataType::Utf8, false),
+            Field::new("content_type", DataType::Utf8, false),
+            Field::new("size_bytes", DataType::UInt64, false),
+            Field::new("sha256", DataType::Utf8, true),
+        ]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "object",
+            DataType::Struct(fields.clone()),
+            true,
+        )]));
+        let object = Arc::new(StructArray::new(
+            fields,
+            vec![
+                Arc::new(StringArray::from(vec![Some("file:///lake/objects/a")])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("application/octet-stream")])),
+                Arc::new(UInt64Array::from(vec![Some(42)])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+            ],
+            None,
+        ));
+        let batch = RecordBatch::try_new(schema.clone(), vec![object]).unwrap();
+        let handle = engine.create(&location, schema.clone()).await.unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
+        ));
+        let before = handle.current_version();
+        let error = handle.append(&operation(), stream).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("FILE identity contains null values")
+        );
+        let reopened = engine.open(&location).await.unwrap().unwrap();
+        assert_eq!(reopened.current_version(), before);
     }
 
     #[tokio::test]

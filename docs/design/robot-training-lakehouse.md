@@ -272,7 +272,7 @@ episode_id
 robot_id
 embodiment
 task
-started_at
+started_at_ns
 duration_ns
 num_steps
 success
@@ -298,10 +298,15 @@ producer_version
 
 The manifest itself has an ArtifactRef record whose `role` is `manifest`; base
 recordings, media shards, sidecar indexes, and derived Layer outputs each have
-their own record. The exact Arrow encoding of the two record kinds belongs to
-the behavioral spec, but every `object FILE` must remain a top-level exact
-`DataLocation` struct until the GC reference protocol explicitly supports a
-different representation.
+their own record. The v1 encoding is defined by
+`EpisodeBundleV1`/`ArtifactRefV1` in `lake-common` and
+`episode_artifact_table_v1` in `lake-objects`, with the behavioral contract in
+`specs/issue-258-episode-artifact-contract.spec.md`. It is one flat Arrow schema
+with `record_kind` and `episode_id` non-null. Record-kind-specific fields are
+nullable at the schema level and validated before encoding. The Episode row has
+a null `object`; every ArtifactRef row has a top-level exact `DataLocation`
+struct. The reference extractor skips only a null parent FILE cell and fails on
+any present identity with a null child.
 
 The structured Episode manifest describes Recording selectors, timelines,
 streams, codecs, Layers, and optional sidecar indexes. Scalar columns are a
@@ -360,8 +365,8 @@ explicitly.
 ### 0. Domain contract
 
 - Define a versioned Episode manifest.
-- Define the Episode/ArtifactRef table contract and prove GC retains every
-  multi-Artifact reference.
+- [x] Define the Episode/ArtifactRef v1 table contract and prove GC retains
+  every multi-Artifact reference.
 - Add a generic typed Arrow append path rather than extending the narrow SQL
   parser one scalar at a time.
 - Prove the format seam with at least two Adapters.

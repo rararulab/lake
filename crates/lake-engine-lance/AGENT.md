@@ -14,6 +14,8 @@ Lance dataset.
   digest, and reference-stage identity in Lance transaction properties.
 - Reference lineage is staged before manifest visibility and repaired from
   transaction history before a recovered version is returned.
+- Reference extraction skips null parent FILE cells used by logical table rows,
+  but any present FILE with a null identity child fails before publication.
 - Reference staging lives until the durable coordinator operation expires.
   Expiry holds the same table lock as append, cleans the exact stage first,
   and only then permits the operation record to be deleted.

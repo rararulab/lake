@@ -53,11 +53,12 @@ Iceberg table's object storage.
 
 ## Planned robot-training data model
 
-This section is a target model, not a map of implemented components. Today Lake
-provides the underlying immutable `DataLocation`, exact per-table versions,
-managed-object reads, and SQL primitives. Episode record types, format adapters,
-public DatasetRevision and TrainingView APIs, Python readers, Materializations,
-and Layers are planned work.
+This section distinguishes implemented contracts from the target model. Today
+Lake provides the underlying immutable `DataLocation`, exact per-table versions,
+managed-object reads, SQL primitives, and the format-neutral
+`EpisodeBundleV1`/`ArtifactRefV1` contract with validated Arrow encoding. Public
+Episode ingestion, format adapters, DatasetRevision and TrainingView APIs,
+Python readers, Materializations, and Layers are planned work.
 
 In the target model, Lake is authoritative for Dataset membership,
 DatasetRevision identity, access, retention, TrainingView selection, and
@@ -70,7 +71,7 @@ The full terminology, current capability boundary, and delivery sequence live in
 flowchart LR
     source["External: robot / simulator"] --> adapters["Planned: format adapters\nRRD / MCAP / LeRobot"]
     adapters --> objects["Current primitive: immutable FILE Artifacts\nmanaged object storage"]
-    adapters --> episodes["Planned: Episode + ArtifactRef records\non current Lake tables"]
+    adapters --> episodes["Current contract: Episode + ArtifactRef Arrow rows\npublic ingestion planned"]
     objects --> revision["Planned: DatasetRevision\nover current exact table versions"]
     episodes --> revision
     revision --> view["Planned: TrainingView"]
@@ -521,9 +522,9 @@ which are below the ordinary ADBC DB-API surface.
 
 | Crate | Owns | Tier |
 |-------|------|------|
-| `lake-common` | shared newtypes: `Namespace`, `TableName`, `Version`, `TableLocation` | — |
+| `lake-common` | shared newtypes plus format-neutral Episode/ArtifactRef v1 values | — |
 | `lake-flight` | shared Flight TLS, bearer authentication, exposure policy, and secure Channel construction | transport |
-| `lake-objects` | SQL `FILE` physical representation (`DataLocation`), Arrow encoding, direct object I/O | storage |
+| `lake-objects` | SQL `FILE` representation, Episode/ArtifactRef v1 Arrow encoding, direct object I/O | storage |
 | `lake-meta` | `MetaStore` (KvBackend) trait; `RocksMeta` (dev), `DynamoMeta` (prod) | metastore |
 | `lake-engine` | `TableEngine` / `TableHandle` traits + shared types | storage |
 | `lake-engine-lance` | Lance impl and `ExternalManifestStore` adapter; the ONLY crate that names `lance::` | storage |

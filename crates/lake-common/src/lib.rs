@@ -26,6 +26,7 @@ mod location;
 mod managed_stage;
 mod object_reference;
 mod principal;
+mod robotics;
 
 pub use data_location::DataLocation;
 pub use file_write::{
@@ -40,6 +41,10 @@ pub use managed_stage::{
 };
 pub use object_reference::{ObjectIdentity, ObjectReferenceDelta, ObjectReferenceError};
 pub use principal::{Principal, PrincipalError, PrincipalId, PrincipalRole, TenantId};
+pub use robotics::{
+    ARTIFACT_REF_RECORD_KIND, ArtifactRefV1, EPISODE_RECORD_KIND, EPISODE_TABLE_CONTRACT_VERSION,
+    EpisodeBundleV1, EpisodeContractError, EpisodeRecordV1, MANIFEST_ARTIFACT_ROLE,
+};
 
 #[cfg(test)]
 mod managed_stage_contract_tests {
