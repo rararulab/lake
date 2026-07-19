@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.1](https://github.com/rararulab/lake/compare/v1.8.0...v1.8.1) (2026-07-19)
+
+
+### Performance Improvements
+
+* **devex:** reuse Rust build artifacts across jj workspaces ([#287](https://github.com/rararulab/lake/issues/287)) ([bb342b8](https://github.com/rararulab/lake/commit/bb342b824bc5bb73cddc8573ae693a2110a2ec22))
+
 ## [1.8.0](https://github.com/rararulab/lake/compare/v1.7.0...v1.8.0) (2026-07-19)
 
 
