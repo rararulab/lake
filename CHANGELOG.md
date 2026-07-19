@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.3.0](https://github.com/rararulab/lake/compare/v1.2.0...v1.3.0) (2026-07-19)
+
+
+### Features
+
+* **iceberg:** support durable asynchronous SQL ([#212](https://github.com/rararulab/lake/issues/212)) ([#216](https://github.com/rararulab/lake/issues/216)) ([e506635](https://github.com/rararulab/lake/commit/e506635a6896b7a7e2163941f6c622d96219dd00))
+
+
+### Bug Fixes
+
+* **release:** align Iceberg lockfile version ([#213](https://github.com/rararulab/lake/issues/213)) ([#214](https://github.com/rararulab/lake/issues/214)) ([5e01f21](https://github.com/rararulab/lake/commit/5e01f219a5637b10aafeac89ba3408c941f1b2e9))
+
 ## [1.2.0](https://github.com/rararulab/lake/compare/v1.1.0...v1.2.0) (2026-07-19)
 
 
