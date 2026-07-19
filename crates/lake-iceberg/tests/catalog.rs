@@ -18,7 +18,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -51,6 +51,7 @@ use iceberg::{
     },
 };
 use lake_iceberg::{IcebergCatalog, IcebergCatalogConfig, IcebergOAuthOptions, IcebergRestAuth};
+use tokio::sync::Notify;
 
 #[derive(Debug)]
 struct RecordingCatalog {
@@ -692,11 +693,21 @@ async fn rest_catalog_connect_warms_each_configured_namespace() {
 
 #[tokio::test]
 async fn rest_catalog_timeout_bounds_unresponsive_startup() {
-    async fn delayed_config() -> StatusCode {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        StatusCode::NO_CONTENT
+    #[derive(Clone)]
+    struct DelayedConfig {
+        request_started: Arc<Notify>,
     }
 
+    async fn delayed_config(State(state): State<DelayedConfig>) -> StatusCode {
+        state.request_started.notify_one();
+        std::future::pending().await
+    }
+
+    let request_started = Arc::new(Notify::new());
+    let delayed_config_state = DelayedConfig {
+        request_started: request_started.clone(),
+    };
+    let wait_for_request = request_started.notified();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind delayed REST catalog");
@@ -706,7 +717,9 @@ async fn rest_catalog_timeout_bounds_unresponsive_startup() {
     let server = tokio::spawn(async move {
         axum::serve(
             listener,
-            Router::new().route("/v1/config", get(delayed_config)),
+            Router::new()
+                .route("/v1/config", get(delayed_config))
+                .with_state(delayed_config_state),
         )
         .await
         .expect("serve delayed REST catalog");
@@ -720,16 +733,17 @@ async fn rest_catalog_timeout_bounds_unresponsive_startup() {
     .expect("build config")
     .with_rest_timeout(Duration::from_millis(25))
     .expect("short REST timeout is valid");
-    let started = Instant::now();
-    let error = IcebergCatalog::connect(config)
+    let connect = tokio::spawn(IcebergCatalog::connect(config));
+
+    wait_for_request.await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_millis(26)).await;
+    let error = connect
         .await
+        .expect("catalog startup task must not panic")
         .expect_err("unresponsive REST config must time out");
 
     assert!(matches!(error, lake_iceberg::IcebergError::Catalog));
-    assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "configured deadline must win over the delayed response"
-    );
     server.abort();
 }
 
