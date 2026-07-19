@@ -135,6 +135,10 @@ first.
   comment, label, publish, or upload need explicit extra permissions.
 - Use workflow-level `concurrency` keyed by workflow + PR number/ref, with
   `cancel-in-progress: true`, so force-pushes do not burn runner time.
+- Every hosted job declares an explicit `timeout-minutes` budget. The Apache
+  Iceberg REST integration job uses the same 30-minute cold-run margin as the
+  LocalStack integration job; do not leave a Docker fixture to the platform's
+  default six-hour timeout.
 - Do not make CI depend on local-only state such as installed hooks, local data
   directories, or untracked files.
 
@@ -178,7 +182,9 @@ component prefix, and publishes the matching GitHub Release. When that root
 release is created, the same short-lived token automatically dispatches the
 existing image workflow with the exact release tag. The image workflow still
 checks out and validates that published immutable tag before it publishes the
-multi-platform GHCR image.
+multi-platform GHCR image. Its 180-minute job budget leaves room for a cold
+QEMU build while making a stalled release a finite, actionable failure instead
+of relying on the GitHub Actions default.
 
 The `release` event created by `GITHUB_TOKEN` intentionally does not trigger a
 second workflow, so this `workflow_dispatch` handoff is required rather than

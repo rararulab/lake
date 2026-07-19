@@ -73,6 +73,10 @@ fn workflow() -> Value {
         .expect("release-image workflow must be valid YAML")
 }
 
+fn ci_workflow() -> Value {
+    serde_yaml::from_str(&read(".github/workflows/ci.yml")).expect("CI workflow must be valid YAML")
+}
+
 fn release_please_workflow() -> Value {
     serde_yaml::from_str(&read(".github/workflows/release-please.yml"))
         .expect("release-please workflow must be valid YAML")
@@ -191,6 +195,30 @@ fn release_image_workflow_reuses_scoped_build_cache() {
     assert_eq!(
         build["with"]["cache-to"].as_str(),
         Some("type=gha,scope=lake-release-image,mode=max")
+    );
+}
+
+#[test]
+fn release_workflows_have_explicit_execution_budgets() {
+    let ci = ci_workflow();
+    let jobs = ci["jobs"].as_mapping().expect("CI jobs");
+    for (name, job) in jobs {
+        if job["runs-on"].is_string() {
+            assert!(
+                job["timeout-minutes"].as_u64().is_some_and(|timeout| timeout > 0),
+                "hosted CI job {name:?} must declare a positive timeout"
+            );
+        }
+    }
+    assert_eq!(
+        ci["jobs"]["iceberg-integration"]["timeout-minutes"].as_u64(),
+        Some(30)
+    );
+
+    let release = workflow();
+    assert_eq!(
+        release["jobs"]["publish-image"]["timeout-minutes"].as_u64(),
+        Some(180)
     );
 }
 
