@@ -26,6 +26,11 @@ by Metasrv, and its current version is Lake's visibility boundary.
 Iceberg metadata determine the snapshot; Lake never mirrors it into the Lake
 registry.
 
+Open the source-controlled [federation topology](../assets/iceberg-federation.html)
+for the deployment view. It complements the diagram below: the topology shows
+the admission, credential, cache, and direct-object boundaries, while this
+guide defines their contract.
+
 ```mermaid
 sequenceDiagram
     participant F as Flight SQL client
@@ -47,6 +52,27 @@ sequenceDiagram
 The catalog request is a metadata path. The query scan is a direct object-data
 path. Neither large objects nor Iceberg credentials pass through Flight SQL,
 Metasrv, or the Lake registry.
+
+## Operational read contract
+
+The path below is intentionally narrow. It keeps external metadata authority
+out of Lake's registry without allowing a reader fan-out to turn into catalog
+enumeration or a per-reader OAuth storm.
+
+| Phase | Query does | Boundary it preserves |
+|---|---|---|
+| startup | Validates the complete deployment configuration, builds one in-memory REST client, and point-checks each configured namespace before binding Flight. | No partially configured listener; no namespace/table enumeration. |
+| statement planning | Authenticates the Flight caller, intersects its Lake namespace grant with the finite deployment allowlist, then resolves one exact table. | A caller cannot make the deployment discover or expose a namespace it was not granted. |
+| current-snapshot load | Uses a cache of at most 10,000 table snapshots. A cold or expired key admits one external lookup; concurrent planners await that same result. | External catalog load is O(one per replica/key refresh), not O(readers). |
+| Flight ticket | Encrypts the selected namespace, table, and immutable snapshot ID into the normal statement ticket. | A later catalog change cannot silently change a running statement's source snapshot. |
+| `DoGet` | Point-loads the named snapshot and rejects it when upstream retention removed it; then Query reads Parquet/manifests directly from Iceberg storage. | No fall-forward to a newer snapshot; no object bytes through Metasrv or the external REST catalog. |
+
+The configured namespace set is only the deployment ceiling. Query also applies
+the authenticated principal's ordinary Lake namespace grant to the Iceberg
+namespace, so access to `iceberg.analytics.episodes` requires both
+`analytics` in `LAKE_ICEBERG_NAMESPACES` and `analytics` in that principal's
+grant. This shared namespace policy is authorization only: it does not alias
+the external table into the `lake` catalog or add it to Lake's registry.
 
 ## Deployment configuration
 
@@ -116,6 +142,13 @@ does not list external namespaces or tables. At query time a reference to
 namespace outside the allowlist is not visible. Flight table discovery likewise
 does not enumerate the external catalog, so clients must address a configured
 Iceberg table by its full three-part name.
+
+The default current-snapshot freshness is 5 seconds. If a refresh fails, a
+last-good snapshot is usable for at most 60 seconds from its successful load;
+after that the external error is returned. These bounds apply independently on
+each Query replica. The ticket execution check is deliberately not served from
+that cache: it must prove that the exact snapshot named in the ticket is still
+retained upstream.
 
 ## Scope and write boundary
 
