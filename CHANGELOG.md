@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.3.5](https://github.com/rararulab/lake/compare/v1.3.4...v1.3.5) (2026-07-19)
+
+
+### Bug Fixes
+
+* **iceberg:** coalesce failed OAuth renewals ([#235](https://github.com/rararulab/lake/issues/235)) ([#239](https://github.com/rararulab/lake/issues/239)) ([6bf0f47](https://github.com/rararulab/lake/commit/6bf0f472450aacc36006cf5ef282033ee7792b53))
+* **tooling:** make ship validate Jujutsu commits ([#236](https://github.com/rararulab/lake/issues/236)) ([#237](https://github.com/rararulab/lake/issues/237)) ([f2cf655](https://github.com/rararulab/lake/commit/f2cf655051cb244e817839a980f3cd06562bb20a))
+
 ## [1.3.4](https://github.com/rararulab/lake/compare/v1.3.3...v1.3.4) (2026-07-19)
 
 
