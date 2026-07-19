@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.2](https://github.com/rararulab/lake/compare/v1.3.1...v1.3.2) (2026-07-19)
+
+
+### Bug Fixes
+
+* **release:** cover every workspace lockfile package ([#223](https://github.com/rararulab/lake/issues/223)) ([#224](https://github.com/rararulab/lake/issues/224)) ([587aab8](https://github.com/rararulab/lake/commit/587aab878ef774dc6eec0f34e01fef54f811660c))
+
 ## [1.3.1](https://github.com/rararulab/lake/compare/v1.3.0...v1.3.1) (2026-07-19)
 
 
