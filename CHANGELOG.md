@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.0](https://github.com/rararulab/lake/compare/v1.5.2...v1.6.0) (2026-07-19)
+
+
+### Features
+
+* **query:** bound async execution across replicas ([#273](https://github.com/rararulab/lake/issues/273)) ([469ff74](https://github.com/rararulab/lake/commit/469ff746cbf00ce2bf78d6925cd1e3626e65fcb8))
+
 ## [1.5.2](https://github.com/rararulab/lake/compare/v1.5.1...v1.5.2) (2026-07-19)
 
 
