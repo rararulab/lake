@@ -36,4 +36,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
-        run: gh workflow run release-image.yml --ref main -f "tag=$RELEASE_TAG"
+        run: |
+          gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/release-image.yml/dispatches" \
+            -f ref=main \
+            -f "inputs[tag]=$RELEASE_TAG"
