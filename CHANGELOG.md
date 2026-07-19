@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.2](https://github.com/rararulab/lake/compare/v1.5.1...v1.5.2) (2026-07-19)
+
+
+### Bug Fixes
+
+* **site:** publish architecture diagram assets ([#270](https://github.com/rararulab/lake/issues/270)) ([6696a81](https://github.com/rararulab/lake/commit/6696a81c15806a644c4ef76687bb6b17aead12ea))
+
 ## [1.5.1](https://github.com/rararulab/lake/compare/v1.5.0...v1.5.1) (2026-07-19)
 
 
