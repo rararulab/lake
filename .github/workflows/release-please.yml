@@ -3,6 +3,9 @@ name: Release Please
 on:
   push:
     branches: [main]
+  # Recovery path for a delayed or missed push event. Release Please remains
+  # the sole writer of release PRs, manifests, tags, and GitHub Releases.
+  workflow_dispatch:
 
 concurrency:
   group: release-please-${{ github.ref }}
