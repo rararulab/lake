@@ -37,7 +37,7 @@ use iceberg_catalog_rest::{
 use iceberg_datafusion::IcebergStaticTableProvider;
 use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use snafu::Snafu;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, watch};
 use url::{Host, Url};
 
 const DEFAULT_CACHE_FRESHNESS: Duration = Duration::from_secs(5);
@@ -403,7 +403,7 @@ pub struct IcebergCatalog {
     config:             IcebergCatalogConfig,
     catalog:            Arc<dyn Catalog>,
     oauth_rest_session: Option<Arc<OAuthRestSession>>,
-    cache:              Arc<Mutex<HashMap<TableCacheKey, CachedSnapshot>>>,
+    cache:              Arc<Mutex<SnapshotCache>>,
 }
 
 struct OAuthRestSession {
@@ -422,6 +422,92 @@ struct TableCacheKey {
 struct CachedSnapshot {
     snapshot:     IcebergTableSnapshot,
     refreshed_at: Instant,
+}
+
+struct SnapshotCache {
+    snapshots:    HashMap<TableCacheKey, CachedSnapshot>,
+    in_flight:    HashMap<TableCacheKey, InFlightSnapshotLoad>,
+    next_load_id: u64,
+}
+
+struct InFlightSnapshotLoad {
+    id:     u64,
+    sender: watch::Sender<SnapshotLoadState>,
+}
+
+#[derive(Clone)]
+enum SnapshotLoadState {
+    Loading,
+    Ready(Arc<IcebergTableSnapshot>),
+    Failed,
+}
+
+enum SnapshotLoadDecision {
+    Cached(IcebergTableSnapshot),
+    Leader {
+        cached: Option<CachedSnapshot>,
+        load:   SnapshotLoadLeader,
+    },
+    Follower(watch::Receiver<SnapshotLoadState>),
+}
+
+struct SnapshotLoadLeader {
+    cache:     Arc<Mutex<SnapshotCache>>,
+    key:       TableCacheKey,
+    id:        u64,
+    completed: bool,
+}
+
+impl SnapshotLoadLeader {
+    fn complete(&mut self, snapshot: Option<IcebergTableSnapshot>, cache_snapshot: bool) {
+        let state = snapshot
+            .as_ref()
+            .map_or(SnapshotLoadState::Failed, |snapshot| {
+                SnapshotLoadState::Ready(Arc::new(snapshot.clone()))
+            });
+        let sender = {
+            let mut cache = self
+                .cache
+                .lock()
+                .expect("Iceberg snapshot cache lock poisoned");
+            if cache_snapshot {
+                insert_cached_snapshot(
+                    &mut cache.snapshots,
+                    self.key.clone(),
+                    snapshot.expect("cached snapshot"),
+                );
+            }
+            let current = cache.in_flight.get(&self.key);
+            if current.is_some_and(|current| current.id == self.id) {
+                cache.in_flight.remove(&self.key).map(|load| load.sender)
+            } else {
+                None
+            }
+        };
+        self.completed = true;
+        if let Some(sender) = sender {
+            sender.send_replace(state);
+        }
+    }
+}
+
+impl Drop for SnapshotLoadLeader {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let mut cache = self
+            .cache
+            .lock()
+            .expect("Iceberg snapshot cache lock poisoned");
+        if cache
+            .in_flight
+            .get(&self.key)
+            .is_some_and(|current| current.id == self.id)
+        {
+            cache.in_flight.remove(&self.key);
+        }
+    }
 }
 
 impl IcebergCatalog {
@@ -494,7 +580,11 @@ impl IcebergCatalog {
             config,
             catalog,
             oauth_rest_session,
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(Mutex::new(SnapshotCache {
+                snapshots:    HashMap::new(),
+                in_flight:    HashMap::new(),
+                next_load_id: 0,
+            })),
         }
     }
 
@@ -516,31 +606,36 @@ impl IcebergCatalog {
         table: &str,
     ) -> Result<IcebergTableSnapshot> {
         let key = self.cache_key(namespace, table)?;
-        let cached = self
-            .cache
-            .lock()
-            .expect("Iceberg snapshot cache lock poisoned")
-            .get(&key)
-            .cloned();
-        if cached
-            .as_ref()
-            .is_some_and(|cached| cached.refreshed_at.elapsed() < self.config.cache_freshness())
-        {
-            return Ok(cached.expect("checked above").snapshot);
-        }
-        match self.load_current_snapshot(&key).await {
-            Ok(snapshot) => {
-                self.insert_cached(key, snapshot.clone());
-                Ok(snapshot)
+        loop {
+            match self.begin_snapshot_load(key.clone()) {
+                SnapshotLoadDecision::Cached(snapshot) => return Ok(snapshot),
+                SnapshotLoadDecision::Leader { cached, mut load } => {
+                    match self.load_current_snapshot(&key).await {
+                        Ok(snapshot) => {
+                            load.complete(Some(snapshot.clone()), true);
+                            return Ok(snapshot);
+                        }
+                        Err(_)
+                            if cached.as_ref().is_some_and(|cached| {
+                                cached.refreshed_at.elapsed() < self.config.cache_stale_if_error()
+                            }) =>
+                        {
+                            let snapshot = cached.expect("checked above").snapshot;
+                            load.complete(Some(snapshot.clone()), false);
+                            return Ok(snapshot);
+                        }
+                        Err(error) => {
+                            load.complete(None, false);
+                            return Err(error);
+                        }
+                    }
+                }
+                SnapshotLoadDecision::Follower(mut receiver) => {
+                    if let Some(result) = wait_for_snapshot_load(&mut receiver).await {
+                        return result;
+                    }
+                }
             }
-            Err(_error)
-                if cached.as_ref().is_some_and(|cached| {
-                    cached.refreshed_at.elapsed() < self.config.cache_stale_if_error()
-                }) =>
-            {
-                Ok(cached.expect("checked above").snapshot)
-            }
-            Err(error) => Err(error),
         }
     }
 
@@ -654,25 +749,73 @@ impl IcebergCatalog {
         Ok(true)
     }
 
-    fn insert_cached(&self, key: TableCacheKey, snapshot: IcebergTableSnapshot) {
+    fn begin_snapshot_load(&self, key: TableCacheKey) -> SnapshotLoadDecision {
         let mut cache = self
             .cache
             .lock()
             .expect("Iceberg snapshot cache lock poisoned");
-        if cache.len() >= SNAPSHOT_CACHE_CAPACITY && !cache.contains_key(&key) {
-            let evicted = cache.keys().next().cloned();
-            if let Some(evicted) = evicted {
-                cache.remove(&evicted);
-            }
+        let cached = cache.snapshots.get(&key).cloned();
+        if cached
+            .as_ref()
+            .is_some_and(|cached| cached.refreshed_at.elapsed() < self.config.cache_freshness())
+        {
+            return SnapshotLoadDecision::Cached(cached.expect("checked above").snapshot);
         }
-        cache.insert(
-            key,
-            CachedSnapshot {
-                snapshot,
-                refreshed_at: Instant::now(),
+        if let Some(load) = cache.in_flight.get(&key) {
+            return SnapshotLoadDecision::Follower(load.sender.subscribe());
+        }
+        let (sender, _receiver) = watch::channel(SnapshotLoadState::Loading);
+        let id = cache.next_load_id;
+        cache.next_load_id = cache.next_load_id.wrapping_add(1);
+        cache
+            .in_flight
+            .insert(key.clone(), InFlightSnapshotLoad { id, sender });
+        SnapshotLoadDecision::Leader {
+            cached,
+            load: SnapshotLoadLeader {
+                cache: self.cache.clone(),
+                key,
+                id,
+                completed: false,
             },
-        );
+        }
     }
+}
+
+async fn wait_for_snapshot_load(
+    receiver: &mut watch::Receiver<SnapshotLoadState>,
+) -> Option<Result<IcebergTableSnapshot>> {
+    loop {
+        let state = receiver.borrow_and_update().clone();
+        match state {
+            SnapshotLoadState::Loading => {}
+            SnapshotLoadState::Ready(snapshot) => return Some(Ok((*snapshot).clone())),
+            SnapshotLoadState::Failed => return Some(Err(IcebergError::Catalog)),
+        }
+        if receiver.changed().await.is_err() {
+            return None;
+        }
+    }
+}
+
+fn insert_cached_snapshot(
+    cache: &mut HashMap<TableCacheKey, CachedSnapshot>,
+    key: TableCacheKey,
+    snapshot: IcebergTableSnapshot,
+) {
+    if cache.len() >= SNAPSHOT_CACHE_CAPACITY && !cache.contains_key(&key) {
+        let evicted = cache.keys().next().cloned();
+        if let Some(evicted) = evicted {
+            cache.remove(&evicted);
+        }
+    }
+    cache.insert(
+        key,
+        CachedSnapshot {
+            snapshot,
+            refreshed_at: Instant::now(),
+        },
+    );
 }
 
 impl std::fmt::Debug for IcebergCatalog {

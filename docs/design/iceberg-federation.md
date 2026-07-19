@@ -143,7 +143,12 @@ snapshots. A cache entry is fresh for 5 seconds. On refresh failure, a
 last-good entry may be used for up to 60 seconds from its successful load;
 after that, the external error is returned. Iceberg-only Flight planning does
 not refresh the Lake registry. The external catalog and the Lake catalog have
-separate metadata authorities and failure domains.
+separate metadata authorities and failure domains. A cold load or expired
+refresh is single-flight per namespace/table key: concurrent planners wait for
+one exact external lookup and receive the same selected snapshot (including a
+last-good stale-if-error result). The cache lock is not held across that I/O;
+if its leading request is cancelled, a later caller may establish a replacement
+load rather than waiting on stranded state.
 
 ## Non-goals and the write gate
 
