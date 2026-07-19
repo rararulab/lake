@@ -30,7 +30,13 @@ use datafusion::{
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
 };
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent, table::Table};
+use iceberg::{
+    Catalog, CatalogBuilder, NamespaceIdent, TableIdent,
+    io::{
+        S3_ALLOW_ANONYMOUS, S3_DISABLE_EC2_METADATA, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION,
+    },
+    table::Table,
+};
 use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalog, RestCatalogBuilder,
 };
@@ -74,6 +80,9 @@ pub enum IcebergError {
     /// REST authentication configuration is malformed.
     #[snafu(display("Iceberg REST authentication is invalid"))]
     InvalidRestAuth,
+    /// S3-compatible object-store configuration is malformed.
+    #[snafu(display("Iceberg S3 configuration is invalid"))]
+    InvalidS3Configuration,
     /// A table is outside the configured namespace allowlist.
     #[snafu(display("Iceberg table is not configured"))]
     TableNotConfigured,
@@ -239,6 +248,90 @@ impl IcebergOAuthOptions {
     }
 }
 
+/// Deployment-only S3-compatible storage settings for external Iceberg files.
+///
+/// The value contains no credentials and is never serialized into Lake
+/// metadata or statement tickets. Query obtains credentials through its normal
+/// workload identity; this configuration exists for a non-default endpoint,
+/// region, path-style addressing, or a disposable public development bucket.
+#[derive(Clone, Eq, PartialEq)]
+pub struct IcebergS3Config {
+    endpoint:          Url,
+    region:            Option<String>,
+    path_style_access: bool,
+    anonymous_access:  bool,
+}
+
+impl IcebergS3Config {
+    /// Validate a credential-free TLS or loopback-development S3 endpoint.
+    pub fn try_new(endpoint: &str) -> Result<Self> {
+        let endpoint = Url::parse(endpoint).map_err(|_| IcebergError::InvalidS3Configuration)?;
+        if !valid_credential_free_external_rest_url(&endpoint) {
+            return Err(IcebergError::InvalidS3Configuration);
+        }
+        Ok(Self {
+            endpoint,
+            region: None,
+            path_style_access: false,
+            anonymous_access: false,
+        })
+    }
+
+    /// Attach a deployment region without supplying credentials.
+    pub fn with_region(mut self, region: impl AsRef<str>) -> Result<Self> {
+        let region = region.as_ref();
+        if !valid_rest_secret(region) {
+            return Err(IcebergError::InvalidS3Configuration);
+        }
+        self.region = Some(region.to_owned());
+        Ok(self)
+    }
+
+    /// Enable path-style addressing for S3-compatible storage.
+    #[must_use]
+    pub fn with_path_style_access(mut self) -> Self {
+        self.path_style_access = true;
+        self
+    }
+
+    /// Allow unauthenticated reads from a deliberately public bucket.
+    #[must_use]
+    pub fn with_anonymous_access(mut self) -> Self {
+        self.anonymous_access = true;
+        self
+    }
+
+    fn catalog_properties(&self) -> HashMap<String, String> {
+        let mut properties = HashMap::from([(
+            S3_ENDPOINT.to_owned(),
+            self.endpoint.as_str().trim_end_matches('/').to_owned(),
+        )]);
+        if let Some(region) = &self.region {
+            properties.insert(S3_REGION.to_owned(), region.clone());
+        }
+        if self.path_style_access {
+            properties.insert(S3_PATH_STYLE_ACCESS.to_owned(), "true".to_owned());
+        }
+        if self.anonymous_access {
+            properties.insert(S3_ALLOW_ANONYMOUS.to_owned(), "true".to_owned());
+            properties.insert(S3_DISABLE_EC2_METADATA.to_owned(), "true".to_owned());
+        }
+        properties
+    }
+}
+
+impl std::fmt::Debug for IcebergS3Config {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IcebergS3Config")
+            .field("endpoint", &"configured")
+            .field("region", &self.region)
+            .field("path_style_access", &self.path_style_access)
+            .field("anonymous_access", &self.anonymous_access)
+            .finish()
+    }
+}
+
 /// Immutable deployment configuration for one external Iceberg REST catalog.
 #[derive(Clone, Eq, PartialEq)]
 pub struct IcebergCatalogConfig {
@@ -249,6 +342,7 @@ pub struct IcebergCatalogConfig {
     cache_stale_if_error: Duration,
     rest_timeout:         Duration,
     rest_auth:            Option<IcebergRestAuth>,
+    s3:                   Option<IcebergS3Config>,
 }
 
 impl IcebergCatalogConfig {
@@ -295,6 +389,7 @@ impl IcebergCatalogConfig {
             cache_stale_if_error: DEFAULT_CACHE_STALE_IF_ERROR,
             rest_timeout: DEFAULT_REST_TIMEOUT,
             rest_auth: None,
+            s3: None,
         })
     }
 
@@ -302,6 +397,13 @@ impl IcebergCatalogConfig {
     #[must_use]
     pub fn with_rest_auth(mut self, auth: IcebergRestAuth) -> Self {
         self.rest_auth = Some(auth);
+        self
+    }
+
+    /// Attach deployment-only S3 settings for external Iceberg file reads.
+    #[must_use]
+    pub fn with_s3_config(mut self, s3: IcebergS3Config) -> Self {
+        self.s3 = Some(s3);
         self
     }
 
@@ -357,9 +459,14 @@ impl IcebergCatalogConfig {
     fn cache_stale_if_error(&self) -> Duration { self.cache_stale_if_error }
 
     fn rest_properties(&self) -> HashMap<String, String> {
-        self.rest_auth
+        let mut properties = self
+            .rest_auth
             .as_ref()
-            .map_or_else(HashMap::new, IcebergRestAuth::catalog_properties)
+            .map_or_else(HashMap::new, IcebergRestAuth::catalog_properties);
+        if let Some(s3) = &self.s3 {
+            properties.extend(s3.catalog_properties());
+        }
+        properties
     }
 
     fn uses_oauth_client_credentials(&self) -> bool {
@@ -380,6 +487,7 @@ impl std::fmt::Debug for IcebergCatalogConfig {
             .field("cache_stale_if_error", &self.cache_stale_if_error)
             .field("rest_timeout", &self.rest_timeout)
             .field("rest_auth", &self.rest_auth.as_ref().map(|_| "configured"))
+            .field("s3", &self.s3.as_ref().map(|_| "configured"))
             .finish()
     }
 }

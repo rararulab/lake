@@ -40,6 +40,8 @@ uuid = { workspace = true }
 axum = { workspace = true }
 lake-engine-lance = { workspace = true }
 iceberg = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
 lake-metasrv = { workspace = true }
 tempfile = "3"
 rcgen = "^0.13"

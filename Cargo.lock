@@ -4694,6 +4694,8 @@ dependencies = [
  "datafusion",
  "futures",
  "iceberg",
+ "iceberg-catalog-rest",
+ "iceberg-storage-opendal",
  "lake-catalog",
  "lake-common",
  "lake-engine",

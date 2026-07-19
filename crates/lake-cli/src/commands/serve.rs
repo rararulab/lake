@@ -20,7 +20,9 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
 use lake_common::{ManagedStageBackend, ManagedStageDescriptor};
 use lake_flight::ClientSecurity;
-use lake_iceberg::{IcebergCatalog, IcebergCatalogConfig, IcebergOAuthOptions, IcebergRestAuth};
+use lake_iceberg::{
+    IcebergCatalog, IcebergCatalogConfig, IcebergOAuthOptions, IcebergRestAuth, IcebergS3Config,
+};
 use lake_meta::{DynamoMeta, MetaStoreRef, RocksMeta};
 use lake_metasrv::MetasrvServerConfig;
 use lake_objects::{
@@ -181,6 +183,12 @@ fn iceberg_catalog_config_from_env() -> anyhow::Result<Option<IcebergCatalogConf
     let warehouse = optional_env("LAKE_ICEBERG_WAREHOUSE")?;
     let namespaces = optional_env("LAKE_ICEBERG_NAMESPACES")?;
     let rest_timeout = optional_env("LAKE_ICEBERG_REST_TIMEOUT_MS")?;
+    let s3 = IcebergS3ConfigValues {
+        endpoint:          optional_env("LAKE_ICEBERG_S3_ENDPOINT")?,
+        region:            optional_env("LAKE_ICEBERG_S3_REGION")?,
+        path_style_access: optional_env("LAKE_ICEBERG_S3_PATH_STYLE_ACCESS")?,
+        anonymous_access:  optional_env("LAKE_ICEBERG_S3_ALLOW_ANONYMOUS")?,
+    };
     let auth = IcebergRestAuthValues {
         token:             optional_env("LAKE_ICEBERG_REST_TOKEN")?,
         credential:        optional_env("LAKE_ICEBERG_REST_CREDENTIAL")?,
@@ -189,12 +197,13 @@ fn iceberg_catalog_config_from_env() -> anyhow::Result<Option<IcebergCatalogConf
         audience:          optional_env("LAKE_ICEBERG_REST_OAUTH_AUDIENCE")?,
         resource:          optional_env("LAKE_ICEBERG_REST_OAUTH_RESOURCE")?,
     };
-    iceberg_catalog_config_from_all_values(
+    iceberg_catalog_config_from_all_values_with_s3(
         endpoint.as_deref(),
         warehouse.as_deref(),
         namespaces.as_deref(),
         auth.as_deref(),
         rest_timeout.as_deref(),
+        s3.as_deref(),
     )
 }
 
@@ -235,6 +244,13 @@ struct IcebergRestAuthValues<T> {
     resource:          Option<T>,
 }
 
+struct IcebergS3ConfigValues<T> {
+    endpoint:          Option<T>,
+    region:            Option<T>,
+    path_style_access: Option<T>,
+    anonymous_access:  Option<T>,
+}
+
 impl<T> IcebergRestAuthValues<T> {
     fn as_deref(&self) -> IcebergRestAuthValues<&str>
     where
@@ -251,12 +267,49 @@ impl<T> IcebergRestAuthValues<T> {
     }
 }
 
+impl<T> IcebergS3ConfigValues<T> {
+    fn as_deref(&self) -> IcebergS3ConfigValues<&str>
+    where
+        T: AsRef<str>,
+    {
+        IcebergS3ConfigValues {
+            endpoint:          self.endpoint.as_ref().map(AsRef::as_ref),
+            region:            self.region.as_ref().map(AsRef::as_ref),
+            path_style_access: self.path_style_access.as_ref().map(AsRef::as_ref),
+            anonymous_access:  self.anonymous_access.as_ref().map(AsRef::as_ref),
+        }
+    }
+}
+
 fn iceberg_catalog_config_from_all_values(
     endpoint: Option<&str>,
     warehouse: Option<&str>,
     namespaces: Option<&str>,
     auth_values: IcebergRestAuthValues<&str>,
     rest_timeout: Option<&str>,
+) -> anyhow::Result<Option<IcebergCatalogConfig>> {
+    iceberg_catalog_config_from_all_values_with_s3(
+        endpoint,
+        warehouse,
+        namespaces,
+        auth_values,
+        rest_timeout,
+        IcebergS3ConfigValues {
+            endpoint:          None,
+            region:            None,
+            path_style_access: None,
+            anonymous_access:  None,
+        },
+    )
+}
+
+fn iceberg_catalog_config_from_all_values_with_s3(
+    endpoint: Option<&str>,
+    warehouse: Option<&str>,
+    namespaces: Option<&str>,
+    auth_values: IcebergRestAuthValues<&str>,
+    rest_timeout: Option<&str>,
+    s3_values: IcebergS3ConfigValues<&str>,
 ) -> anyhow::Result<Option<IcebergCatalogConfig>> {
     let config = iceberg_catalog_config_from_values(endpoint, warehouse, namespaces)?;
     let config = match (config, rest_timeout) {
@@ -273,6 +326,16 @@ fn iceberg_catalog_config_from_all_values(
             Some(config.with_rest_timeout(Duration::from_millis(millis))?)
         }
     };
+    let s3 = iceberg_s3_config_from_values(s3_values)?;
+    let config = match (config, s3) {
+        (None, None) => None,
+        (None, Some(_)) => anyhow::bail!(
+            "Iceberg S3 configuration requires LAKE_ICEBERG_REST_ENDPOINT, \
+             LAKE_ICEBERG_WAREHOUSE, and LAKE_ICEBERG_NAMESPACES"
+        ),
+        (Some(config), None) => Some(config),
+        (Some(config), Some(s3)) => Some(config.with_s3_config(s3)),
+    };
     let auth = iceberg_rest_auth_from_values(auth_values)?;
     match (config, auth) {
         (None, None) => Ok(None),
@@ -282,6 +345,47 @@ fn iceberg_catalog_config_from_all_values(
         ),
         (Some(config), None) => Ok(Some(config)),
         (Some(config), Some(auth)) => Ok(Some(config.with_rest_auth(auth))),
+    }
+}
+
+fn iceberg_s3_config_from_values(
+    values: IcebergS3ConfigValues<&str>,
+) -> anyhow::Result<Option<IcebergS3Config>> {
+    let has_options = [
+        values.region,
+        values.path_style_access,
+        values.anonymous_access,
+    ]
+    .into_iter()
+    .any(|value| value.is_some());
+    let Some(endpoint) = values.endpoint else {
+        if has_options {
+            anyhow::bail!("Iceberg S3 options require LAKE_ICEBERG_S3_ENDPOINT");
+        }
+        return Ok(None);
+    };
+    let Some(region) = values.region else {
+        anyhow::bail!("LAKE_ICEBERG_S3_REGION is required with LAKE_ICEBERG_S3_ENDPOINT");
+    };
+    let mut s3 = IcebergS3Config::try_new(endpoint)?;
+    s3 = s3.with_region(region)?;
+    if optional_iceberg_s3_bool(
+        "LAKE_ICEBERG_S3_PATH_STYLE_ACCESS",
+        values.path_style_access,
+    )? {
+        s3 = s3.with_path_style_access();
+    }
+    if optional_iceberg_s3_bool("LAKE_ICEBERG_S3_ALLOW_ANONYMOUS", values.anonymous_access)? {
+        s3 = s3.with_anonymous_access();
+    }
+    Ok(Some(s3))
+}
+
+fn optional_iceberg_s3_bool(name: &str, value: Option<&str>) -> anyhow::Result<bool> {
+    match value {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => anyhow::bail!("invalid {name}"),
     }
 }
 
@@ -453,9 +557,9 @@ mod tests {
     use lake_query::QueryResources;
 
     use super::{
-        IcebergRestAuthValues, iceberg_catalog_config_from_all_values,
-        iceberg_catalog_config_from_values, query_engine_for_server,
-        read_capability_issuer_for_stage,
+        IcebergRestAuthValues, IcebergS3ConfigValues, iceberg_catalog_config_from_all_values,
+        iceberg_catalog_config_from_all_values_with_s3, iceberg_catalog_config_from_values,
+        query_engine_for_server, read_capability_issuer_for_stage,
     };
     use crate::commands::QueryContext;
 
@@ -750,6 +854,128 @@ mod tests {
             )
             .is_err(),
             "REST authentication without an enabled Iceberg catalog must fail"
+        );
+    }
+
+    #[test]
+    fn iceberg_s3_endpoint_override_is_validated_before_listener_bind() {
+        let endpoint = Some("https://catalog.example.test");
+        let warehouse = Some("s3://warehouse");
+        let namespaces = Some("analytics");
+        let unauthenticated = IcebergRestAuthValues::<&str> {
+            token:             None,
+            credential:        None,
+            oauth2_server_uri: None,
+            scope:             None,
+            audience:          None,
+            resource:          None,
+        };
+        let configured = iceberg_catalog_config_from_all_values_with_s3(
+            endpoint,
+            warehouse,
+            namespaces,
+            unauthenticated,
+            None,
+            IcebergS3ConfigValues {
+                endpoint:          Some("https://objects.example.test"),
+                region:            Some("us-east-1"),
+                path_style_access: Some("true"),
+                anonymous_access:  Some("true"),
+            },
+        )
+        .expect("valid S3-compatible endpoint override")
+        .expect("Iceberg catalog is configured");
+        let debug = format!("{configured:?}");
+        assert!(debug.contains("s3: Some(\"configured\")"));
+        assert!(!debug.contains("objects.example.test"));
+
+        for storage in [
+            IcebergS3ConfigValues {
+                endpoint:          Some("http://objects.example.test"),
+                region:            None,
+                path_style_access: None,
+                anonymous_access:  None,
+            },
+            IcebergS3ConfigValues {
+                endpoint:          None,
+                region:            Some("us-east-1"),
+                path_style_access: None,
+                anonymous_access:  None,
+            },
+            IcebergS3ConfigValues {
+                endpoint:          Some("https://objects.example.test"),
+                region:            None,
+                path_style_access: Some("not-a-bool"),
+                anonymous_access:  None,
+            },
+            IcebergS3ConfigValues {
+                endpoint:          Some("https://objects.example.test"),
+                region:            None,
+                path_style_access: None,
+                anonymous_access:  None,
+            },
+        ] {
+            assert!(
+                iceberg_catalog_config_from_all_values_with_s3(
+                    endpoint,
+                    warehouse,
+                    namespaces,
+                    IcebergRestAuthValues {
+                        token:             None,
+                        credential:        None,
+                        oauth2_server_uri: None,
+                        scope:             None,
+                        audience:          None,
+                        resource:          None,
+                    },
+                    None,
+                    storage,
+                )
+                .is_err(),
+                "invalid S3 override must fail before listener bind"
+            );
+        }
+        assert!(
+            iceberg_catalog_config_from_all_values_with_s3(
+                None,
+                None,
+                None,
+                IcebergRestAuthValues {
+                    token:             None,
+                    credential:        None,
+                    oauth2_server_uri: None,
+                    scope:             None,
+                    audience:          None,
+                    resource:          None,
+                },
+                None,
+                IcebergS3ConfigValues {
+                    endpoint:          Some("https://objects.example.test"),
+                    region:            None,
+                    path_style_access: None,
+                    anonymous_access:  None,
+                },
+            )
+            .is_err(),
+            "S3 override without an enabled Iceberg catalog must fail"
+        );
+        assert!(
+            iceberg_catalog_config_from_all_values(
+                endpoint,
+                warehouse,
+                namespaces,
+                IcebergRestAuthValues {
+                    token:             None,
+                    credential:        None,
+                    oauth2_server_uri: None,
+                    scope:             None,
+                    audience:          None,
+                    resource:          None,
+                },
+                None,
+            )
+            .expect("existing unauthenticated configuration stays valid")
+            .is_some()
         );
     }
 
