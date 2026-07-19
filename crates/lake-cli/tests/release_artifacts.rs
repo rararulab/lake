@@ -232,7 +232,7 @@ fn release_please_dispatches_image_publication_for_root_release() {
         .find(|step| {
             step["run"]
                 .as_str()
-                .is_some_and(|run| run.contains("gh workflow run release-image.yml"))
+                .is_some_and(|run| run.contains("gh api --method POST"))
         })
         .expect("Release Please must dispatch image publication after a release");
     assert_eq!(
@@ -248,8 +248,12 @@ fn release_please_dispatches_image_publication_for_root_release() {
         Some("${{ steps.release.outputs.tag_name }}")
     );
     let command = dispatch["run"].as_str().expect("image publication command");
-    assert!(command.contains("--ref main"));
-    assert!(command.contains("tag=$RELEASE_TAG"));
+    assert!(
+        command.contains("repos/$GITHUB_REPOSITORY/actions/workflows/release-image.yml/dispatches")
+    );
+    assert!(command.contains("-f ref=main"));
+    assert!(command.contains("inputs[tag]=$RELEASE_TAG"));
+    assert!(!command.contains("gh workflow run"));
 
     let guide = read("docs/guides/mise-ci.md");
     let normalized_guide = guide.split_whitespace().collect::<Vec<_>>().join(" ");
