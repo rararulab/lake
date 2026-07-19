@@ -69,6 +69,8 @@ first.
 - `mise run test-integration` owns checkout-scoped LocalStack lifecycle;
   `mise run test-integration-external` runs the identical ignored-only package
   suite against a caller-managed endpoint and is the GitHub CI entry point.
+  Both exclude the Apache Iceberg REST fixture test; its environment is not a
+  LocalStack fallback.
 - `mise run test-iceberg-integration` owns an Apache Iceberg REST Catalog plus
   MinIO lifecycle and runs the real ignored interoperability test. It belongs
   to the comprehensive `ci` task, not the fast `gate`; its external variant

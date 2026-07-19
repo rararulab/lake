@@ -102,6 +102,21 @@ fn apache_rest_catalog_fixture_runner_selects_real_interoperability_test() {
     }
 }
 
+#[test]
+fn localstack_runner_excludes_apache_rest_fixture_test() {
+    let runner = include_str!("../../../scripts/test-integration.ts");
+    for required in [
+        "--run-ignored",
+        "ignored-only",
+        "not test(apache_rest_catalog_with_minio_is_queryable)",
+    ] {
+        assert!(
+            runner.contains(required),
+            "LocalStack integration runner must contain {required:?}"
+        );
+    }
+}
+
 fn s3_properties(endpoint: &str) -> HashMap<String, String> {
     HashMap::from([
         (S3_ENDPOINT.to_owned(), endpoint.to_owned()),
