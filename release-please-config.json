@@ -23,6 +23,11 @@
     {
       "type": "toml",
       "path": "Cargo.lock",
+      "jsonpath": "$.package[?(@.name.value == \"lake-iceberg\")].version"
+    },
+    {
+      "type": "toml",
+      "path": "Cargo.lock",
       "jsonpath": "$.package[?(@.name.value == \"lake-meta\")].version"
     },
     {

@@ -22,6 +22,52 @@ fn read(path: &str) -> String {
     fs::read_to_string(root().join(path)).unwrap_or_else(|error| panic!("read {path}: {error}"))
 }
 
+fn toml_string(section: &str, key: &str) -> Option<String> {
+    section.lines().find_map(|line| {
+        line.strip_prefix(key)
+            .and_then(|value| value.strip_prefix(" = \""))
+            .and_then(|value| value.strip_suffix('"'))
+            .map(str::to_owned)
+    })
+}
+
+fn workspace_version() -> String {
+    let manifest = read("Cargo.toml");
+    let package = manifest
+        .split_once("[workspace.package]\n")
+        .expect("workspace package section")
+        .1
+        .split_once("\n[")
+        .expect("workspace package section terminator")
+        .0;
+    toml_string(package, "version").expect("workspace package version")
+}
+
+fn locked_lake_packages() -> Vec<(String, String)> {
+    read("Cargo.lock")
+        .split("\n[[package]]\n")
+        .filter_map(|package| {
+            let name = toml_string(package, "name")?;
+            name.starts_with("lake-").then(|| {
+                let version = toml_string(package, "version")
+                    .unwrap_or_else(|| panic!("{name} lockfile version"));
+                (name, version)
+            })
+        })
+        .collect()
+}
+
+fn release_lockfile_selectors() -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(&read("release-please-config.json"))
+        .expect("release-please config must be valid JSON")["extra-files"]
+        .as_array()
+        .expect("release-please extra files")
+        .iter()
+        .filter(|file| file["path"].as_str() == Some("Cargo.lock"))
+        .filter_map(|file| file["jsonpath"].as_str().map(str::to_owned))
+        .collect()
+}
+
 fn workflow() -> Value {
     serde_yaml::from_str(&read(".github/workflows/release-image.yml"))
         .expect("release-image workflow must be valid YAML")
@@ -163,4 +209,31 @@ fn release_image_workflow_rejects_mismatched_tags_and_preserves_digest_pinning()
     assert!(guide.contains("Do not deploy a mutable tag in production."));
     assert!(guide.contains("@sha256:<digest>"));
     assert!(guide.contains("REPLACE_WITH_RELEASE_MANIFEST_DIGEST"));
+}
+
+#[test]
+fn release_please_covers_every_workspace_lockfile_package() {
+    let workspace_version = workspace_version();
+    let lockfile_selectors = release_lockfile_selectors();
+    let locked_packages = locked_lake_packages();
+    assert!(
+        !locked_packages.is_empty(),
+        "Cargo.lock must contain workspace lake packages"
+    );
+
+    for (name, locked_version) in locked_packages {
+        assert_eq!(
+            locked_version, workspace_version,
+            "{name} lockfile version must match the workspace version"
+        );
+        let selector = format!("$.package[?(@.name.value == \"{name}\")].version");
+        assert_eq!(
+            lockfile_selectors
+                .iter()
+                .filter(|candidate| *candidate == &selector)
+                .count(),
+            1,
+            "{name} must have exactly one Cargo.lock release-please selector"
+        );
+    }
 }
