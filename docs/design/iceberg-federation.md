@@ -148,9 +148,13 @@ The pinned upstream REST client caches an OAuth access token but does not
 refresh it automatically. Lake therefore treats an OAuth failure on one of its
 already-bounded metadata reads as a recoverable session failure: it
 single-flights one `regenerate_token` call and retries the same namespace check
-or exact table lookup once. Static bearer tokens are never refreshed. This is
-not a background timer, a credential-discovery mechanism, or a Lake-owned
-token service; a renewal or retry failure remains an external catalog error.
+or exact table lookup once. The same in-flight result is shared when that
+renewal fails, so an identity-provider outage cannot turn one observed token
+generation into one credential exchange per reader; a later independent read
+may make a fresh bounded attempt. Static bearer tokens are never refreshed.
+This is not a background timer, a credential-discovery mechanism, or a
+Lake-owned token service; a renewal or retry failure remains an external
+catalog error.
 
 Startup performs a bounded existence check for each configured namespace. It
 does not list external namespaces or tables. At query time a reference to

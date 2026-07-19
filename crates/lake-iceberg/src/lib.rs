@@ -37,7 +37,7 @@ use iceberg_catalog_rest::{
 use iceberg_datafusion::IcebergStaticTableProvider;
 use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use snafu::Snafu;
-use tokio::sync::{Mutex as AsyncMutex, watch};
+use tokio::sync::watch;
 use url::{Host, Url};
 
 const DEFAULT_CACHE_FRESHNESS: Duration = Duration::from_secs(5);
@@ -409,7 +409,68 @@ pub struct IcebergCatalog {
 struct OAuthRestSession {
     catalog:    Arc<RestCatalog>,
     generation: AtomicU64,
-    refresh:    AsyncMutex<()>,
+    refresh:    Mutex<OAuthRefreshState>,
+}
+
+struct OAuthRefreshState {
+    in_flight: Option<InFlightOAuthRefresh>,
+}
+
+struct InFlightOAuthRefresh {
+    generation: u64,
+    sender:     watch::Sender<OAuthRefreshOutcome>,
+}
+
+#[derive(Clone)]
+enum OAuthRefreshOutcome {
+    Loading,
+    Succeeded,
+    Failed,
+}
+
+enum OAuthRefreshDecision {
+    AlreadyRefreshed,
+    Leader(OAuthRefreshLeader),
+    Follower(watch::Receiver<OAuthRefreshOutcome>),
+}
+
+struct OAuthRefreshLeader {
+    session:    Arc<OAuthRestSession>,
+    generation: u64,
+    completed:  bool,
+}
+
+impl OAuthRefreshLeader {
+    fn complete(&mut self, outcome: OAuthRefreshOutcome) {
+        let sender = {
+            let mut refresh = self
+                .session
+                .refresh
+                .lock()
+                .expect("Iceberg OAuth refresh lock poisoned");
+            if refresh
+                .in_flight
+                .as_ref()
+                .is_some_and(|current| current.generation == self.generation)
+            {
+                refresh.in_flight.take().map(|current| current.sender)
+            } else {
+                None
+            }
+        };
+        self.completed = true;
+        if let Some(sender) = sender {
+            sender.send_replace(outcome);
+        }
+    }
+}
+
+impl Drop for OAuthRefreshLeader {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.complete(OAuthRefreshOutcome::Failed);
+        }
+    }
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -545,7 +606,7 @@ impl IcebergCatalog {
             Arc::new(OAuthRestSession {
                 catalog:    rest_catalog.clone(),
                 generation: AtomicU64::new(0),
-                refresh:    AsyncMutex::new(()),
+                refresh:    Mutex::new(OAuthRefreshState { in_flight: None }),
             })
         });
         let catalog: Arc<dyn Catalog> = rest_catalog;
@@ -734,19 +795,25 @@ impl IcebergCatalog {
         let (Some(session), Some(generation)) = (&self.oauth_rest_session, generation) else {
             return Ok(false);
         };
-        // The lock deliberately spans the external exchange so a token expiry
-        // cannot fan out into one client-credential request per reader.
-        let _refresh = session.refresh.lock().await;
-        if session.generation.load(Ordering::Acquire) != generation {
-            return Ok(true);
+        match begin_oauth_refresh(session.clone(), generation) {
+            OAuthRefreshDecision::AlreadyRefreshed => Ok(true),
+            OAuthRefreshDecision::Leader(mut leader) => {
+                match session.catalog.regenerate_token().await {
+                    Ok(()) => {
+                        session.generation.fetch_add(1, Ordering::Release);
+                        leader.complete(OAuthRefreshOutcome::Succeeded);
+                        Ok(true)
+                    }
+                    Err(_) => {
+                        leader.complete(OAuthRefreshOutcome::Failed);
+                        Err(IcebergError::Catalog)
+                    }
+                }
+            }
+            OAuthRefreshDecision::Follower(mut receiver) => {
+                wait_for_oauth_refresh(&mut receiver).await
+            }
         }
-        session
-            .catalog
-            .regenerate_token()
-            .await
-            .map_err(catalog_error)?;
-        session.generation.fetch_add(1, Ordering::Release);
-        Ok(true)
     }
 
     fn begin_snapshot_load(&self, key: TableCacheKey) -> SnapshotLoadDecision {
@@ -778,6 +845,44 @@ impl IcebergCatalog {
                 id,
                 completed: false,
             },
+        }
+    }
+}
+
+fn begin_oauth_refresh(session: Arc<OAuthRestSession>, generation: u64) -> OAuthRefreshDecision {
+    {
+        let mut refresh = session
+            .refresh
+            .lock()
+            .expect("Iceberg OAuth refresh lock poisoned");
+        if session.generation.load(Ordering::Acquire) != generation {
+            return OAuthRefreshDecision::AlreadyRefreshed;
+        }
+        if let Some(in_flight) = refresh.in_flight.as_ref() {
+            return OAuthRefreshDecision::Follower(in_flight.sender.subscribe());
+        }
+        let (sender, _receiver) = watch::channel(OAuthRefreshOutcome::Loading);
+        refresh.in_flight = Some(InFlightOAuthRefresh { generation, sender });
+    }
+    OAuthRefreshDecision::Leader(OAuthRefreshLeader {
+        session,
+        generation,
+        completed: false,
+    })
+}
+
+async fn wait_for_oauth_refresh(
+    receiver: &mut watch::Receiver<OAuthRefreshOutcome>,
+) -> Result<bool> {
+    loop {
+        let outcome = receiver.borrow_and_update().clone();
+        match outcome {
+            OAuthRefreshOutcome::Loading => {}
+            OAuthRefreshOutcome::Succeeded => return Ok(true),
+            OAuthRefreshOutcome::Failed => return Err(IcebergError::Catalog),
+        }
+        if receiver.changed().await.is_err() {
+            return Err(IcebergError::Catalog);
         }
     }
 }

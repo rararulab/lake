@@ -50,7 +50,9 @@ use iceberg::{
         },
     },
 };
-use lake_iceberg::{IcebergCatalog, IcebergCatalogConfig, IcebergOAuthOptions, IcebergRestAuth};
+use lake_iceberg::{
+    IcebergCatalog, IcebergCatalogConfig, IcebergError, IcebergOAuthOptions, IcebergRestAuth,
+};
 use tokio::sync::Notify;
 
 #[derive(Debug)]
@@ -149,6 +151,15 @@ struct RefreshingOAuthRestDataTable {
     table_rejections: Arc<AtomicUsize>,
 }
 
+#[derive(Clone)]
+struct FailedOAuthRenewalRestCatalog {
+    exchanges:           Arc<AtomicUsize>,
+    renewal_requests:    Arc<AtomicUsize>,
+    table_requests:      Arc<AtomicUsize>,
+    renewal_started:     Arc<tokio::sync::Notify>,
+    release_first_retry: Arc<tokio::sync::Notify>,
+}
+
 impl RefreshingOAuthRestDataTable {
     fn authorized(&self, headers: &HeaderMap) -> bool {
         let expected = match self.exchanges.load(Ordering::Relaxed) {
@@ -160,6 +171,19 @@ impl RefreshingOAuthRestDataTable {
             .get("authorization")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value == expected)
+    }
+}
+
+impl FailedOAuthRenewalRestCatalog {
+    fn initial_token_authorized(&self, headers: &HeaderMap) -> bool {
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == "Bearer initial-oauth-access-token")
+    }
+
+    fn startup_authorized(&self, headers: &HeaderMap) -> bool {
+        self.exchanges.load(Ordering::Relaxed) == 1 && self.initial_token_authorized(headers)
     }
 }
 
@@ -307,6 +331,63 @@ async fn refreshing_oauth_token(
         })
         .to_string(),
     ))
+}
+
+async fn failed_oauth_renewal_config(
+    State(state): State<FailedOAuthRenewalRestCatalog>,
+    headers: HeaderMap,
+) -> Result<([(&'static str, &'static str); 1], &'static str), StatusCode> {
+    if !state.initial_token_authorized(&headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok((
+        [("content-type", "application/json")],
+        r#"{"defaults":{},"overrides":{}}"#,
+    ))
+}
+
+async fn failed_oauth_renewal_namespace(
+    State(state): State<FailedOAuthRenewalRestCatalog>,
+    headers: HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    state
+        .startup_authorized(&headers)
+        .then_some(StatusCode::NO_CONTENT)
+        .ok_or(StatusCode::UNAUTHORIZED)
+}
+
+async fn failed_oauth_renewal_table(
+    State(state): State<FailedOAuthRenewalRestCatalog>,
+    headers: HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    if !state.initial_token_authorized(&headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    state.table_requests.fetch_add(1, Ordering::Relaxed);
+    Err(StatusCode::UNAUTHORIZED)
+}
+
+async fn failed_oauth_renewal_token(
+    State(state): State<FailedOAuthRenewalRestCatalog>,
+) -> Result<([(&'static str, &'static str); 1], String), StatusCode> {
+    match state.exchanges.fetch_add(1, Ordering::Relaxed) {
+        0 => Ok((
+            [("content-type", "application/json")],
+            serde_json::json!({
+                "access_token": "initial-oauth-access-token",
+                "token_type": "Bearer",
+                "expires_in": 60,
+            })
+            .to_string(),
+        )),
+        _ => {
+            if state.renewal_requests.fetch_add(1, Ordering::Relaxed) == 0 {
+                state.renewal_started.notify_one();
+                state.release_first_retry.notified().await;
+            }
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
 }
 
 async fn bearer_rest_echo_authorization_error(headers: HeaderMap) -> (StatusCode, String) {
@@ -1275,6 +1356,115 @@ async fn concurrent_oauth_expiry_single_flights_table_load_and_shares_session_re
         state.exchanges.load(Ordering::Relaxed),
         2,
         "one initial exchange plus one shared renewal is expected"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn concurrent_oauth_refresh_failure_is_single_flight() {
+    const CREDENTIAL: &str = "lake-query:lake-rest-oauth-secret";
+    const CONCURRENT_READS: usize = 8;
+
+    let state = FailedOAuthRenewalRestCatalog {
+        exchanges:           Arc::new(AtomicUsize::new(0)),
+        renewal_requests:    Arc::new(AtomicUsize::new(0)),
+        table_requests:      Arc::new(AtomicUsize::new(0)),
+        renewal_started:     Arc::new(tokio::sync::Notify::new()),
+        release_first_retry: Arc::new(tokio::sync::Notify::new()),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind failed-renewal OAuth REST catalog");
+    let address = listener
+        .local_addr()
+        .expect("read failed-renewal OAuth REST catalog address");
+    let app = Router::new()
+        .route("/v1/config", get(failed_oauth_renewal_config))
+        .route(
+            "/v1/namespaces/analytics",
+            head(failed_oauth_renewal_namespace),
+        )
+        .route(
+            "/v1/namespaces/analytics/tables/{table}",
+            get(failed_oauth_renewal_table),
+        )
+        .route("/oauth/token", post(failed_oauth_renewal_token))
+        .with_state(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve failed-renewal OAuth REST catalog");
+    });
+    let auth = IcebergRestAuth::oauth_client_credentials(
+        CREDENTIAL,
+        IcebergOAuthOptions::builder()
+            .oauth2_server_uri(format!("http://{address}/oauth/token"))
+            .build(),
+    )
+    .expect("validate OAuth client credential");
+    let catalog = Arc::new(
+        IcebergCatalog::connect(
+            IcebergCatalogConfig::try_new(
+                &format!("http://{address}"),
+                "file:///warehouse",
+                ["analytics"],
+            )
+            .expect("build OAuth REST configuration")
+            .with_rest_auth(auth),
+        )
+        .await
+        .expect("connect OAuth REST catalog"),
+    );
+
+    let wait_for_renewal = state.renewal_started.notified();
+    let first_catalog = catalog.clone();
+    let first =
+        tokio::spawn(async move { first_catalog.resolve_snapshot("analytics", "first").await });
+    wait_for_renewal.await;
+
+    let mut followers = tokio::task::JoinSet::new();
+    for table in [
+        "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
+    ] {
+        let catalog = catalog.clone();
+        followers.spawn(async move { catalog.resolve_snapshot("analytics", table).await });
+    }
+    let all_table_requests = tokio::time::timeout(Duration::from_secs(1), async {
+        while state.table_requests.load(Ordering::Relaxed) < CONCURRENT_READS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        all_table_requests.is_ok(),
+        "all readers must reach their bounded table loads before the renewal is released; \
+         observed {}",
+        state.table_requests.load(Ordering::Relaxed)
+    );
+    for _ in 0..CONCURRENT_READS {
+        tokio::task::yield_now().await;
+    }
+    state.release_first_retry.notify_one();
+
+    assert!(matches!(
+        first.await.expect("first reader must not panic"),
+        Err(IcebergError::Catalog)
+    ));
+    while let Some(result) = followers.join_next().await {
+        assert!(matches!(
+            result.expect("follower must not panic"),
+            Err(IcebergError::Catalog)
+        ));
+    }
+    assert_eq!(
+        state.renewal_requests.load(Ordering::Relaxed),
+        1,
+        "concurrent readers must share the failed renewal result"
+    );
+    assert_eq!(
+        state.exchanges.load(Ordering::Relaxed),
+        2,
+        "one startup exchange and one failed renewal are expected"
     );
     server.abort();
 }
