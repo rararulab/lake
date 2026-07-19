@@ -17,6 +17,7 @@
 //! labels.
 
 pub(crate) fn describe() {
+    lake_iceberg::describe_metrics();
     metrics::describe_counter!(
         "lake_query_admission_total",
         "Query admission decisions by bounded outcome"

@@ -208,6 +208,24 @@ if its leading request is cancelled, already-waiting callers observe the closed
 load and one becomes the replacement, rather than waiting on stranded state or
 requiring a new caller to repair it.
 
+## Observability
+
+When Query's existing Prometheus endpoint is enabled, federation emits only
+the following bounded counters. They let an operator distinguish a warm cache,
+an external catalog failure, and an OAuth renewal without turning the metrics
+endpoint into another source of table discovery or credential disclosure.
+
+| Metric | Bounded labels | Meaning |
+|---|---|---|
+| `lake_iceberg_snapshot_resolution_total` | `outcome=cache_hit\|loaded\|stale\|singleflight_shared\|error\|cancelled` | Result observed while choosing the current snapshot. |
+| `lake_iceberg_catalog_operation_total` | `operation=namespace_check\|table_load`, `outcome=success\|error` | One bounded external catalog request attempt. A renewed retry is a second attempt. |
+| `lake_iceberg_oauth_refresh_total` | `outcome=started\|success\|error\|already_refreshed\|singleflight_shared\|singleflight_error\|cancelled` | OAuth renewal state; this observes the existing one-retry, single-flight state machine. |
+
+Namespace, table, endpoint, warehouse, SQL, principal, tenant, URI, token, and
+credential values are never labels or metric values. These counters neither
+start a listener nor change cache, retry, timeout, cancellation, or OAuth
+behavior.
+
 ## Non-goals and the write gate
 
 Read federation does not make Lake an Iceberg writer. Adding writes later
