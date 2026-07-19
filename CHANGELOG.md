@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.7.0](https://github.com/rararulab/lake/compare/v1.6.0...v1.7.0) (2026-07-19)
+
+
+### Features
+
+* **iceberg:** verify Apache REST catalog interoperability ([#278](https://github.com/rararulab/lake/issues/278)) ([7d0c293](https://github.com/rararulab/lake/commit/7d0c2935947502e8ddf779ac5094ac0d91ad8c4a))
+
+
+### Bug Fixes
+
+* **release:** make Release Please recoverable ([#280](https://github.com/rararulab/lake/issues/280)) ([a5f9315](https://github.com/rararulab/lake/commit/a5f931562b5a397ea175b17025ad7d7ded666aa9))
+
 ## [1.6.0](https://github.com/rararulab/lake/compare/v1.5.2...v1.6.0) (2026-07-19)
 
 
