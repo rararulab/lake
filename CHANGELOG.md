@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.3.1](https://github.com/rararulab/lake/compare/v1.3.0...v1.3.1) (2026-07-19)
+
+
+### Bug Fixes
+
+* **release:** align Iceberg lockfile version ([#218](https://github.com/rararulab/lake/issues/218)) ([1b822ce](https://github.com/rararulab/lake/commit/1b822ced15988e6c7a8343f040101e0bf9f7be9e))
+* **release:** align Iceberg lockfile version ([#218](https://github.com/rararulab/lake/issues/218)) ([73933ba](https://github.com/rararulab/lake/commit/73933ba157a8128dda9da170e9ccacdc8e02f742))
+
 ## [1.3.0](https://github.com/rararulab/lake/compare/v1.2.0...v1.3.0) (2026-07-19)
 
 
