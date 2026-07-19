@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.8.3](https://github.com/rararulab/lake/compare/v1.8.2...v1.8.3) (2026-07-19)
+
+
+### Bug Fixes
+
+* **release:** dispatch image publication after Release Please ([1d12e84](https://github.com/rararulab/lake/commit/1d12e8440dfa7bd04647630b400a670092790f05))
+* **release:** dispatch image publication after Release Please ([#295](https://github.com/rararulab/lake/issues/295)) ([ded3e7b](https://github.com/rararulab/lake/commit/ded3e7beaec4724fbc57277e5ed30d1d47c56824))
+
 ## [1.8.2](https://github.com/rararulab/lake/compare/v1.8.1...v1.8.2) (2026-07-19)
 
 
