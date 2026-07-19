@@ -158,7 +158,8 @@ depends = ["gate", "dependency-deny", "dependency-shear", "doc", "spec-selftest"
 description = "full local gate + conventional-commit check, then push"
 run = '''
 mise run ci
-mise run check-commits "origin/main..@"
+parent=$(jj log -r @- --no-graph -T 'commit_id')
+mise run check-commits "origin/main..$parent"
 jj git push
 '''
 
