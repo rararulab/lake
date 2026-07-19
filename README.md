@@ -32,7 +32,7 @@ the metadata authority.
 ```mermaid
 flowchart LR
     sdk["SDK / fleet client"] -->|"Flight SQL + DataLocation metadata"| query["Lake Query\nstateless"]
-    query -->|"cache miss, DDL, native append"| meta["Metasrv\nbounded authority"]
+    query -->|"cache miss / native append"| meta["Metasrv\nbounded authority"]
     meta -->|"native version pointer"| lake_data["Lake Lance datasets\nobject storage"]
     sdk -. "multi-GB FILE upload / direct read" .-> managed["Lake-managed objects\nobject storage"]
     query -->|"native snapshot scan"| lake_data
