@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.4.0](https://github.com/rararulab/lake/compare/v1.3.5...v1.4.0) (2026-07-19)
+
+
+### Features
+
+* **iceberg:** expose bounded federation metrics ([#246](https://github.com/rararulab/lake/issues/246)) ([#250](https://github.com/rararulab/lake/issues/250)) ([304dc7c](https://github.com/rararulab/lake/commit/304dc7c9ae0c3399215668ba8cd0a2154f311241))
+* **site:** migrate Pages to AstroPaper with docs ([#241](https://github.com/rararulab/lake/issues/241)) ([#247](https://github.com/rararulab/lake/issues/247)) ([bdc9ea6](https://github.com/rararulab/lake/commit/bdc9ea6d4bc17fde8d2cde4130905245b9a8ecf3))
+
+
+### Bug Fixes
+
+* **ci:** serialize Pages mise bootstrap ([#249](https://github.com/rararulab/lake/issues/249)) ([#252](https://github.com/rararulab/lake/issues/252)) ([5f77318](https://github.com/rararulab/lake/commit/5f77318dec6c42b15c5f0f4478289643184cbe28))
+
 ## [1.3.5](https://github.com/rararulab/lake/compare/v1.3.4...v1.3.5) (2026-07-19)
 
 
