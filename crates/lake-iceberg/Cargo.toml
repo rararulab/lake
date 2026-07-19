@@ -16,6 +16,7 @@ iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-datafusion = { workspace = true }
 iceberg-storage-opendal = { workspace = true }
+iceberg-reqwest = { package = "reqwest", version = "^0.12", default-features = false, features = ["json", "rustls-tls"] }
 snafu = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 url = { workspace = true }

@@ -46,6 +46,7 @@ variables, or none of them:
 LAKE_ICEBERG_REST_ENDPOINT=https://catalog.example.com \
 LAKE_ICEBERG_WAREHOUSE=s3://embodied-warehouse \
 LAKE_ICEBERG_NAMESPACES=analytics,models \
+LAKE_ICEBERG_REST_TIMEOUT_MS=10000 \
 lake query --metadata-addr https://metasrv.example.com:50052
 ```
 
@@ -55,6 +56,12 @@ lake query --metadata-addr https://metasrv.example.com:50052
 or invalid triple fails before Query binds. REST credentials and object-store
 credentials are supplied by the deployment/runtime, never through CLI flags,
 Lake metadata, or Flight tickets.
+
+`LAKE_ICEBERG_REST_TIMEOUT_MS` is optional and defaults to `10000`; it must
+be in `1..=60000`. Lake applies the resulting total and connect deadline to
+each external REST configuration handshake, namespace point check, exact table
+lookup, and OAuth exchange. The override without the base catalog triple, or a
+malformed/out-of-range value, fails before Query binds.
 
 An external catalog may be unauthenticated, or use exactly one of the following
 runtime-only REST authentication modes:

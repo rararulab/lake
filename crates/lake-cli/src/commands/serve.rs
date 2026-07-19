@@ -14,7 +14,7 @@
 
 //! `lake query` / `lake meta` — run the tier servers.
 
-use std::{env, future::Future, sync::Arc};
+use std::{env, future::Future, sync::Arc, time::Duration};
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
@@ -179,6 +179,7 @@ fn iceberg_catalog_config_from_env() -> anyhow::Result<Option<IcebergCatalogConf
     let endpoint = optional_env("LAKE_ICEBERG_REST_ENDPOINT")?;
     let warehouse = optional_env("LAKE_ICEBERG_WAREHOUSE")?;
     let namespaces = optional_env("LAKE_ICEBERG_NAMESPACES")?;
+    let rest_timeout = optional_env("LAKE_ICEBERG_REST_TIMEOUT_MS")?;
     let auth = IcebergRestAuthValues {
         token:             optional_env("LAKE_ICEBERG_REST_TOKEN")?,
         credential:        optional_env("LAKE_ICEBERG_REST_CREDENTIAL")?,
@@ -192,6 +193,7 @@ fn iceberg_catalog_config_from_env() -> anyhow::Result<Option<IcebergCatalogConf
         warehouse.as_deref(),
         namespaces.as_deref(),
         auth.as_deref(),
+        rest_timeout.as_deref(),
     )
 }
 
@@ -253,8 +255,23 @@ fn iceberg_catalog_config_from_all_values(
     warehouse: Option<&str>,
     namespaces: Option<&str>,
     auth_values: IcebergRestAuthValues<&str>,
+    rest_timeout: Option<&str>,
 ) -> anyhow::Result<Option<IcebergCatalogConfig>> {
     let config = iceberg_catalog_config_from_values(endpoint, warehouse, namespaces)?;
+    let config = match (config, rest_timeout) {
+        (None, None) => None,
+        (None, Some(_)) => anyhow::bail!(
+            "LAKE_ICEBERG_REST_TIMEOUT_MS requires LAKE_ICEBERG_REST_ENDPOINT, \
+             LAKE_ICEBERG_WAREHOUSE, and LAKE_ICEBERG_NAMESPACES"
+        ),
+        (Some(config), None) => Some(config),
+        (Some(config), Some(value)) => {
+            let millis = value
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("invalid LAKE_ICEBERG_REST_TIMEOUT_MS"))?;
+            Some(config.with_rest_timeout(Duration::from_millis(millis))?)
+        }
+    };
     let auth = iceberg_rest_auth_from_values(auth_values)?;
     match (config, auth) {
         (None, None) => Ok(None),
@@ -421,6 +438,8 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use lake_common::ManagedStageDescriptor;
     use lake_engine_lance::LanceMaintenancePolicy;
     use lake_flight::ClientSecurity;
@@ -513,6 +532,69 @@ mod tests {
     }
 
     #[test]
+    fn iceberg_rest_timeout_override_is_validated_before_listener_bind() {
+        let endpoint = Some("https://catalog.example.test");
+        let warehouse = Some("s3://warehouse");
+        let namespaces = Some("analytics");
+        let unauthenticated = IcebergRestAuthValues::<&str> {
+            token:             None,
+            credential:        None,
+            oauth2_server_uri: None,
+            scope:             None,
+            audience:          None,
+            resource:          None,
+        };
+
+        let configured = iceberg_catalog_config_from_all_values(
+            endpoint,
+            warehouse,
+            namespaces,
+            unauthenticated.as_deref(),
+            Some("25"),
+        )
+        .expect("valid REST timeout configuration")
+        .expect("Iceberg catalog is configured");
+        assert_eq!(configured.rest_timeout(), Duration::from_millis(25));
+
+        let default_timeout = iceberg_catalog_config_from_all_values(
+            endpoint,
+            warehouse,
+            namespaces,
+            unauthenticated.as_deref(),
+            None,
+        )
+        .expect("default REST timeout configuration")
+        .expect("Iceberg catalog is configured");
+        assert_eq!(default_timeout.rest_timeout(), Duration::from_secs(10));
+
+        for timeout in [Some("0"), Some("61000"), Some("not-a-duration")] {
+            assert!(
+                iceberg_catalog_config_from_all_values(
+                    endpoint,
+                    warehouse,
+                    namespaces,
+                    unauthenticated.as_deref(),
+                    timeout,
+                )
+                .is_err(),
+                "invalid REST timeout must fail before listener bind"
+            );
+        }
+
+        assert!(
+            iceberg_catalog_config_from_all_values(
+                None,
+                None,
+                None,
+                unauthenticated.as_deref(),
+                Some("25"),
+            )
+            .is_err(),
+            "REST timeout without an enabled Iceberg catalog must fail"
+        );
+    }
+
+    #[test]
     fn iceberg_rest_auth_configuration_is_validated_before_listener_bind() {
         const TOKEN: &str = "lake-rest-static-token";
         const CREDENTIAL: &str = "lake-query:lake-rest-oauth-secret";
@@ -533,6 +615,7 @@ mod tests {
                 audience:          None,
                 resource:          None,
             },
+            None,
         )
         .expect("static bearer configuration is valid")
         .expect("Iceberg catalog is configured");
@@ -553,6 +636,7 @@ mod tests {
                 audience:          Some("lake"),
                 resource:          Some("catalog"),
             },
+            None,
         )
         .expect("OAuth client configuration is valid")
         .expect("Iceberg catalog is configured");
@@ -585,6 +669,7 @@ mod tests {
                     audience:          invalid.4,
                     resource:          invalid.5,
                 },
+                None,
             )
             .expect_err("contradictory or partial REST authentication must fail before bind");
             assert!(
@@ -606,6 +691,7 @@ mod tests {
                     audience:          None,
                     resource:          None,
                 },
+                None,
             )
             .is_err(),
             "REST authentication without an enabled Iceberg catalog must fail"

@@ -42,6 +42,8 @@ use url::Url;
 
 const DEFAULT_CACHE_FRESHNESS: Duration = Duration::from_secs(5);
 const DEFAULT_CACHE_STALE_IF_ERROR: Duration = Duration::from_mins(1);
+const DEFAULT_REST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_REST_TIMEOUT: Duration = Duration::from_mins(1);
 const SNAPSHOT_CACHE_CAPACITY: usize = 10_000;
 const MAX_REST_SECRET_BYTES: usize = 8 * 1024;
 
@@ -64,6 +66,9 @@ pub enum IcebergError {
     /// External snapshot cache freshness and stale-if-error bounds are invalid.
     #[snafu(display("Iceberg snapshot cache policy is invalid"))]
     InvalidCachePolicy,
+    /// The external REST request deadline is zero or exceeds Lake's bound.
+    #[snafu(display("Iceberg REST request timeout is invalid"))]
+    InvalidRestTimeout,
     /// REST authentication configuration is malformed.
     #[snafu(display("Iceberg REST authentication is invalid"))]
     InvalidRestAuth,
@@ -219,6 +224,7 @@ pub struct IcebergCatalogConfig {
     namespaces:           Arc<[String]>,
     cache_freshness:      Duration,
     cache_stale_if_error: Duration,
+    rest_timeout:         Duration,
     rest_auth:            Option<IcebergRestAuth>,
 }
 
@@ -264,6 +270,7 @@ impl IcebergCatalogConfig {
             namespaces: namespaces.into(),
             cache_freshness: DEFAULT_CACHE_FRESHNESS,
             cache_stale_if_error: DEFAULT_CACHE_STALE_IF_ERROR,
+            rest_timeout: DEFAULT_REST_TIMEOUT,
             rest_auth: None,
         })
     }
@@ -293,6 +300,19 @@ impl IcebergCatalogConfig {
         Ok(self)
     }
 
+    /// Set the total and connect deadline for each external REST request.
+    ///
+    /// The bound applies to the REST configuration handshake, namespace point
+    /// checks, exact table loads, and OAuth token exchanges. It deliberately
+    /// does not add retries or change Query's end-to-end execution deadline.
+    pub fn with_rest_timeout(mut self, timeout: Duration) -> Result<Self> {
+        if timeout.is_zero() || timeout > MAX_REST_TIMEOUT {
+            return Err(IcebergError::InvalidRestTimeout);
+        }
+        self.rest_timeout = timeout;
+        Ok(self)
+    }
+
     /// Return the validated credential-free REST endpoint.
     #[must_use]
     pub fn endpoint(&self) -> &Url { &self.endpoint }
@@ -304,6 +324,10 @@ impl IcebergCatalogConfig {
     /// Return the finite allowlist of external SQL namespaces.
     #[must_use]
     pub fn namespaces(&self) -> &[String] { &self.namespaces }
+
+    /// Return the bounded HTTP deadline applied to each external REST request.
+    #[must_use]
+    pub const fn rest_timeout(&self) -> Duration { self.rest_timeout }
 
     fn cache_freshness(&self) -> Duration { self.cache_freshness }
 
@@ -331,6 +355,7 @@ impl std::fmt::Debug for IcebergCatalogConfig {
             .field("namespaces", &self.namespaces)
             .field("cache_freshness", &self.cache_freshness)
             .field("cache_stale_if_error", &self.cache_stale_if_error)
+            .field("rest_timeout", &self.rest_timeout)
             .field("rest_auth", &self.rest_auth.as_ref().map(|_| "configured"))
             .finish()
     }
@@ -405,8 +430,15 @@ impl IcebergCatalog {
             ),
         ]);
         properties.extend(config.rest_properties());
+        let rest_timeout = config.rest_timeout();
+        let http_client = iceberg_reqwest::Client::builder()
+            .connect_timeout(rest_timeout)
+            .timeout(rest_timeout)
+            .build()
+            .map_err(|_| IcebergError::Catalog)?;
         let rest_catalog = Arc::new(
             RestCatalogBuilder::default()
+                .with_client(http_client)
                 .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
                 .load("lake-iceberg", properties)
                 .await
