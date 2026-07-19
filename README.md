@@ -79,71 +79,35 @@ FROM iceberg.analytics.episodes
 WHERE robot_id = 'alpha';
 ```
 
-Enable it on each Query replica with the complete configuration below. The
-replica validates it and point-checks every configured namespace before it
-binds its public listener; setting only part of the three required variables is
-a startup error.
+Enable the complete required configuration on each Query replica. An unset
+triple leaves federation disabled; a partial triple is a startup error.
 
 ```bash
 LAKE_ICEBERG_REST_ENDPOINT=https://catalog.example.com \
 LAKE_ICEBERG_WAREHOUSE=s3://embodied-warehouse \
 LAKE_ICEBERG_NAMESPACES=analytics,models \
-LAKE_ICEBERG_REST_TIMEOUT_MS=10000 \
 lake query --metadata-addr https://metasrv.example.com:50052
 ```
 
-`LAKE_ICEBERG_REST_ENDPOINT` must be credential-free HTTPS in production;
-plain HTTP is accepted only for numeric loopback addresses in development. Use
-exactly one process-local auth mode from the deployment's secret manager:
-`LAKE_ICEBERG_REST_TOKEN`, or `LAKE_ICEBERG_REST_CREDENTIAL`
-(`client-id:client-secret`) with the optional standard OAuth server, scope,
-audience, and resource properties. The catalog endpoint and an overridden OAuth
-token endpoint require the same transport rule. A failed bounded OAuth read
-renews the in-memory session once; concurrent failures share that renewal, and
-a failed renewal or retry is still an external-catalog error. Credentials never
-belong in an endpoint URL, SQL, a table row, Lake metadata, or a Flight ticket.
-The Query workload identity, not an SDK/client, needs read access to Iceberg
-table files.
-
-`LAKE_ICEBERG_REST_TIMEOUT_MS` is optional (default `10000`, range
-`1..=60000`) and bounds the configuration handshake, namespace point checks,
-exact table loads, and OAuth exchanges. It prevents the external authority from
-becoming an unbounded startup or request dependency.
-
-Access is the intersection of two finite allowlists: the deployment's
-`LAKE_ICEBERG_NAMESPACES` and the authenticated Lake principal's existing
-namespace grants. Query does not enumerate external namespaces or tables, so
-clients must address a configured table by its complete
+The Query workload identity, not an SDK/client, reads the Iceberg table files.
+Use credential-free HTTPS for the production catalog endpoint, and keep any
+REST token or OAuth client credential in the deployment's secret manager—never
+in the endpoint URL, SQL, Lake metadata, or a Flight ticket. Access is the
+intersection of `LAKE_ICEBERG_NAMESPACES` and the authenticated Lake
+principal's namespace grants, so queries must use the complete
 `iceberg.<namespace>.<table>` name.
 
-At planning, a Query replica resolves an immutable Iceberg snapshot through a
-bounded per-replica cache; concurrent cold or expired lookups for one table
-share one external call. The encrypted Flight ticket pins that snapshot. On
-`DoGet`, Query verifies that the exact snapshot is still retained upstream,
-then streams Parquet and manifest data directly from object storage. Iceberg
-credentials and object bytes never enter Lake metadata, statement tickets, or
-the Flight stream.
+Query resolves and pins one immutable external snapshot, then reads its
+manifests and Parquet files directly from object storage. It does not enumerate
+the external catalog, proxy Iceberg object bytes, mirror metadata into Metasrv,
+or write Iceberg state; DDL and DML against `iceberg` are rejected.
 
-If the external REST catalog omits a non-default S3-compatible endpoint,
-configure `LAKE_ICEBERG_S3_ENDPOINT` together with
-`LAKE_ICEBERG_S3_REGION`; optional strict boolean
-`LAKE_ICEBERG_S3_PATH_STYLE_ACCESS` and
-`LAKE_ICEBERG_S3_ALLOW_ANONYMOUS` cover compatible storage and deliberately
-public buckets. This is a credential-free endpoint override, not a static-key
-configuration surface: Query still uses its workload identity for production
-object access. The [federation guide](docs/design/iceberg-federation.md)
-documents the configuration boundary and data path.
-
-The same rule applies to durable Flight SQL. `PollFlightInfo` stores only the
-encrypted snapshot identity in Lake's bounded job state; a later worker
-point-loads that exact snapshot before materializing Arrow result parts. If
-upstream retention removed it, the job fails; it never switches to the
-catalog's current head.
-
-Iceberg federation is intentionally scan-only: Lake rejects Iceberg DDL/DML,
-does not mirror its catalog into Metasrv, and never becomes an Iceberg commit
-writer. Read the [federation guide](docs/design/iceberg-federation.md) and its
-[topology diagram](docs/assets/iceberg-federation.html) before deploying it.
+For the production contract—REST/OAuth authentication, request deadline, S3
+endpoint override, snapshot/async behavior, and topology—read the
+[Iceberg federation guide](docs/design/iceberg-federation.md) and its
+[topology diagram](docs/assets/iceberg-federation.html). To verify client
+compatibility locally, run `mise run test-iceberg-integration`; it owns an
+ephemeral Apache REST Catalog + MinIO fixture and is not a deployment template.
 
 ## SQL-managed files
 
