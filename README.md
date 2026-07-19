@@ -301,6 +301,12 @@ use `LAKE_ICEBERG_REST_CREDENTIAL` (`client-id:client-secret`) and may set
 Inject these values from the deployment secret manager; never put credentials
 in the endpoint URL, SQL, Lake metadata, or a Flight ticket.
 
+For OAuth client credentials only, a failed bounded namespace check or exact
+table lookup renews the in-memory REST session once and retries that same
+read. Concurrent failures share one renewal. This recovers an expired access
+token without background scheduling or secret rotation; a failed renewal or
+retry still returns an error.
+
 All three variables are required together and are validated before Query binds.
 Cloud and catalog credentials stay in the Query deployment's normal runtime
 configuration. Query supports fully-qualified scans such as:

@@ -17,6 +17,7 @@ iceberg-catalog-rest = { workspace = true }
 iceberg-datafusion = { workspace = true }
 iceberg-storage-opendal = { workspace = true }
 snafu = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 url = { workspace = true }
 
 [dev-dependencies]

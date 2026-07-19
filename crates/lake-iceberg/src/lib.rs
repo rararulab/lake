@@ -17,7 +17,10 @@
 use std::{
     any::Any,
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -29,11 +32,12 @@ use datafusion::{
 };
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent, table::Table};
 use iceberg_catalog_rest::{
-    REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
+    REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalog, RestCatalogBuilder,
 };
 use iceberg_datafusion::IcebergStaticTableProvider;
 use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use snafu::Snafu;
+use tokio::sync::Mutex as AsyncMutex;
 use url::Url;
 
 const DEFAULT_CACHE_FRESHNESS: Duration = Duration::from_secs(5);
@@ -155,6 +159,10 @@ impl IcebergRestAuth {
                 options,
             } => options.catalog_properties(credential),
         }
+    }
+
+    fn uses_oauth_client_credentials(&self) -> bool {
+        matches!(self.kind, RestAuthKind::OAuthClientCredentials { .. })
     }
 }
 
@@ -306,6 +314,12 @@ impl IcebergCatalogConfig {
             .as_ref()
             .map_or_else(HashMap::new, IcebergRestAuth::catalog_properties)
     }
+
+    fn uses_oauth_client_credentials(&self) -> bool {
+        self.rest_auth
+            .as_ref()
+            .is_some_and(IcebergRestAuth::uses_oauth_client_credentials)
+    }
 }
 
 impl std::fmt::Debug for IcebergCatalogConfig {
@@ -350,9 +364,16 @@ fn catalog_error(_: iceberg::Error) -> IcebergError { IcebergError::Catalog }
 /// Read-only access to one configured external Iceberg catalog.
 #[derive(Clone)]
 pub struct IcebergCatalog {
-    config:  IcebergCatalogConfig,
-    catalog: Arc<dyn Catalog>,
-    cache:   Arc<Mutex<HashMap<TableCacheKey, CachedSnapshot>>>,
+    config:             IcebergCatalogConfig,
+    catalog:            Arc<dyn Catalog>,
+    oauth_rest_session: Option<Arc<OAuthRestSession>>,
+    cache:              Arc<Mutex<HashMap<TableCacheKey, CachedSnapshot>>>,
+}
+
+struct OAuthRestSession {
+    catalog:    Arc<RestCatalog>,
+    generation: AtomicU64,
+    refresh:    AsyncMutex<()>,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -384,18 +405,27 @@ impl IcebergCatalog {
             ),
         ]);
         properties.extend(config.rest_properties());
-        let catalog = RestCatalogBuilder::default()
-            .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
-            .load("lake-iceberg", properties)
-            .await
-            .map_err(catalog_error)?;
-        let catalog = Self::from_catalog(config, Arc::new(catalog));
+        let rest_catalog = Arc::new(
+            RestCatalogBuilder::default()
+                .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
+                .load("lake-iceberg", properties)
+                .await
+                .map_err(catalog_error)?,
+        );
+        let oauth_rest_session = config.uses_oauth_client_credentials().then(|| {
+            Arc::new(OAuthRestSession {
+                catalog:    rest_catalog.clone(),
+                generation: AtomicU64::new(0),
+                refresh:    AsyncMutex::new(()),
+            })
+        });
+        let catalog: Arc<dyn Catalog> = rest_catalog;
+        let catalog =
+            Self::from_catalog_with_oauth_rest_session(config, catalog, oauth_rest_session);
         for namespace in catalog.config.namespaces() {
             let exists = catalog
-                .catalog
-                .namespace_exists(&NamespaceIdent::new(namespace.clone()))
-                .await
-                .map_err(catalog_error)?;
+                .namespace_exists(NamespaceIdent::new(namespace.clone()))
+                .await?;
             if !exists {
                 return Err(IcebergError::NamespaceUnavailable);
             }
@@ -409,9 +439,18 @@ impl IcebergCatalog {
     /// deployment credentials in the resulting adapter.
     #[must_use]
     pub fn from_catalog(config: IcebergCatalogConfig, catalog: Arc<dyn Catalog>) -> Self {
+        Self::from_catalog_with_oauth_rest_session(config, catalog, None)
+    }
+
+    fn from_catalog_with_oauth_rest_session(
+        config: IcebergCatalogConfig,
+        catalog: Arc<dyn Catalog>,
+        oauth_rest_session: Option<Arc<OAuthRestSession>>,
+    ) -> Self {
         Self {
             config,
             catalog,
+            oauth_rest_session,
             cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -473,13 +512,11 @@ impl IcebergCatalog {
     ) -> Result<IcebergTableSnapshot> {
         let key = self.cache_key(namespace, table)?;
         let table = self
-            .catalog
-            .load_table(&TableIdent::new(
+            .load_table(TableIdent::new(
                 NamespaceIdent::new(key.namespace.clone()),
                 key.table.clone(),
             ))
-            .await
-            .map_err(catalog_error)?;
+            .await?;
         if table.metadata().snapshot_by_id(snapshot_id).is_none() {
             return Err(IcebergError::SnapshotUnavailable);
         }
@@ -509,13 +546,11 @@ impl IcebergCatalog {
 
     async fn load_current_snapshot(&self, key: &TableCacheKey) -> Result<IcebergTableSnapshot> {
         let table = self
-            .catalog
-            .load_table(&TableIdent::new(
+            .load_table(TableIdent::new(
                 NamespaceIdent::new(key.namespace.clone()),
                 key.table.clone(),
             ))
-            .await
-            .map_err(catalog_error)?;
+            .await?;
         Ok(IcebergTableSnapshot {
             namespace: key.namespace.clone(),
             table:     table.identifier().name().to_owned(),
@@ -525,6 +560,55 @@ impl IcebergCatalog {
                 .map(|snapshot| snapshot.snapshot_id()),
             inner:     table,
         })
+    }
+
+    async fn namespace_exists(&self, namespace: NamespaceIdent) -> Result<bool> {
+        let generation = self.oauth_generation();
+        match self.catalog.namespace_exists(&namespace).await {
+            Ok(exists) => Ok(exists),
+            Err(_) if self.refresh_oauth_after_failed_read(generation).await? => self
+                .catalog
+                .namespace_exists(&namespace)
+                .await
+                .map_err(catalog_error),
+            Err(_) => Err(IcebergError::Catalog),
+        }
+    }
+
+    async fn load_table(&self, table: TableIdent) -> Result<Table> {
+        let generation = self.oauth_generation();
+        match self.catalog.load_table(&table).await {
+            Ok(table) => Ok(table),
+            Err(_) if self.refresh_oauth_after_failed_read(generation).await? => {
+                self.catalog.load_table(&table).await.map_err(catalog_error)
+            }
+            Err(_) => Err(IcebergError::Catalog),
+        }
+    }
+
+    fn oauth_generation(&self) -> Option<u64> {
+        self.oauth_rest_session
+            .as_ref()
+            .map(|session| session.generation.load(Ordering::Acquire))
+    }
+
+    async fn refresh_oauth_after_failed_read(&self, generation: Option<u64>) -> Result<bool> {
+        let (Some(session), Some(generation)) = (&self.oauth_rest_session, generation) else {
+            return Ok(false);
+        };
+        // The lock deliberately spans the external exchange so a token expiry
+        // cannot fan out into one client-credential request per reader.
+        let _refresh = session.refresh.lock().await;
+        if session.generation.load(Ordering::Acquire) != generation {
+            return Ok(true);
+        }
+        session
+            .catalog
+            .regenerate_token()
+            .await
+            .map_err(catalog_error)?;
+        session.generation.fetch_add(1, Ordering::Release);
+        Ok(true)
     }
 
     fn insert_cached(&self, key: TableCacheKey, snapshot: IcebergTableSnapshot) {

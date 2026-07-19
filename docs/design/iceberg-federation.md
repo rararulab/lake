@@ -91,6 +91,14 @@ metadata, table descriptors, and encrypted Flight ticket claims. Deploy it
 through the platform secret manager, never endpoint userinfo or a repository
 configuration file.
 
+The pinned upstream REST client caches an OAuth access token but does not
+refresh it automatically. Lake therefore treats an OAuth failure on one of its
+already-bounded metadata reads as a recoverable session failure: it
+single-flights one `regenerate_token` call and retries the same namespace check
+or exact table lookup once. Static bearer tokens are never refreshed. This is
+not a background timer, a credential-discovery mechanism, or a Lake-owned
+token service; a renewal or retry failure remains an external catalog error.
+
 Startup performs a bounded existence check for each configured namespace. It
 does not list external namespaces or tables. At query time a reference to
 `iceberg.analytics.episodes` performs one exact external table lookup; a

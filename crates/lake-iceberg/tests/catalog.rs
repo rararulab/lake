@@ -140,6 +140,28 @@ struct OAuthRequest {
     exchanges:            Arc<AtomicUsize>,
 }
 
+#[derive(Clone)]
+struct RefreshingOAuthRestDataTable {
+    table: Table,
+    exchanges: Arc<AtomicUsize>,
+    table_rejections: Arc<AtomicUsize>,
+    first_table_failure_barrier: Option<Arc<tokio::sync::Barrier>>,
+}
+
+impl RefreshingOAuthRestDataTable {
+    fn authorized(&self, headers: &HeaderMap) -> bool {
+        let expected = match self.exchanges.load(Ordering::Relaxed) {
+            1 => "Bearer initial-oauth-access-token",
+            2 => "Bearer refreshed-oauth-access-token",
+            _ => return false,
+        };
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == expected)
+    }
+}
+
 impl BearerRestDataTable {
     fn authorized(&self, headers: &HeaderMap) -> bool {
         headers
@@ -217,6 +239,73 @@ async fn bearer_rest_oauth_token(
             "access_token": token,
             "token_type": "Bearer",
             "expires_in": 3600,
+        })
+        .to_string(),
+    ))
+}
+
+async fn refreshing_oauth_config(
+    State(state): State<RefreshingOAuthRestDataTable>,
+    headers: HeaderMap,
+) -> Result<([(&'static str, &'static str); 1], &'static str), StatusCode> {
+    if !state.authorized(&headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok((
+        [("content-type", "application/json")],
+        r#"{"defaults":{},"overrides":{}}"#,
+    ))
+}
+
+async fn refreshing_oauth_namespace(
+    State(state): State<RefreshingOAuthRestDataTable>,
+    headers: HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    state
+        .authorized(&headers)
+        .then_some(StatusCode::NO_CONTENT)
+        .ok_or(StatusCode::UNAUTHORIZED)
+}
+
+async fn refreshing_oauth_table(
+    State(state): State<RefreshingOAuthRestDataTable>,
+    headers: HeaderMap,
+) -> Result<([(&'static str, &'static str); 1], String), StatusCode> {
+    if !state.authorized(&headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if state.exchanges.load(Ordering::Relaxed) == 1 {
+        state.table_rejections.fetch_add(1, Ordering::Relaxed);
+        if let Some(barrier) = &state.first_table_failure_barrier {
+            barrier.wait().await;
+        }
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let response = serde_json::json!({
+        "metadata-location": state.table.metadata_location(),
+        "metadata": state.table.metadata(),
+        "config": {},
+    });
+    Ok((
+        [("content-type", "application/json")],
+        serde_json::to_string(&response).expect("encode REST table response"),
+    ))
+}
+
+async fn refreshing_oauth_token(
+    State(state): State<RefreshingOAuthRestDataTable>,
+) -> Result<([(&'static str, &'static str); 1], String), StatusCode> {
+    let token = match state.exchanges.fetch_add(1, Ordering::Relaxed) {
+        0 => "initial-oauth-access-token",
+        1 => "refreshed-oauth-access-token",
+        _ => return Err(StatusCode::TOO_MANY_REQUESTS),
+    };
+    Ok((
+        [("content-type", "application/json")],
+        serde_json::json!({
+            "access_token": token,
+            "token_type": "Bearer",
+            "expires_in": 60,
         })
         .to_string(),
     ))
@@ -880,6 +969,146 @@ async fn rest_catalog_oauth_client_credentials_are_runtime_only() {
             .load(Ordering::Relaxed),
         1,
         "client credentials should create one cached REST session token"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn rest_catalog_oauth_expiry_regenerates_once_for_exact_table_load() {
+    const CREDENTIAL: &str = "lake-query:lake-rest-oauth-secret";
+
+    let (_warehouse, table) = populated_local_table().await;
+    let state = RefreshingOAuthRestDataTable {
+        table,
+        exchanges: Arc::new(AtomicUsize::new(0)),
+        table_rejections: Arc::new(AtomicUsize::new(0)),
+        first_table_failure_barrier: None,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind refreshable OAuth REST catalog");
+    let address = listener
+        .local_addr()
+        .expect("read refreshable OAuth REST catalog address");
+    let app = Router::new()
+        .route("/v1/config", get(refreshing_oauth_config))
+        .route("/v1/namespaces/analytics", head(refreshing_oauth_namespace))
+        .route(
+            "/v1/namespaces/analytics/tables/episodes",
+            get(refreshing_oauth_table),
+        )
+        .route("/oauth/token", post(refreshing_oauth_token))
+        .with_state(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve refreshable OAuth REST catalog");
+    });
+    let auth = IcebergRestAuth::oauth_client_credentials(
+        CREDENTIAL,
+        IcebergOAuthOptions::builder()
+            .oauth2_server_uri(format!("http://{address}/oauth/token"))
+            .build(),
+    )
+    .expect("validate OAuth client credential");
+    let catalog = IcebergCatalog::connect(
+        IcebergCatalogConfig::try_new(
+            &format!("http://{address}"),
+            "file:///warehouse",
+            ["analytics"],
+        )
+        .expect("build OAuth REST configuration")
+        .with_rest_auth(auth),
+    )
+    .await
+    .expect("connect OAuth REST catalog");
+
+    let snapshot = catalog
+        .resolve_snapshot("analytics", "episodes")
+        .await
+        .expect("expired OAuth session must refresh once and retry its exact table lookup");
+    assert_eq!(snapshot.table(), "episodes");
+    assert_eq!(state.table_rejections.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        state.exchanges.load(Ordering::Relaxed),
+        2,
+        "one initial exchange plus one bounded renewal is expected"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn concurrent_oauth_expiry_shares_one_session_renewal() {
+    const CREDENTIAL: &str = "lake-query:lake-rest-oauth-secret";
+    const CONCURRENT_LOADS: usize = 8;
+
+    let (_warehouse, table) = populated_local_table().await;
+    let state = RefreshingOAuthRestDataTable {
+        table,
+        exchanges: Arc::new(AtomicUsize::new(0)),
+        table_rejections: Arc::new(AtomicUsize::new(0)),
+        first_table_failure_barrier: Some(Arc::new(tokio::sync::Barrier::new(CONCURRENT_LOADS))),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind concurrent refreshable OAuth REST catalog");
+    let address = listener
+        .local_addr()
+        .expect("read concurrent refreshable OAuth REST catalog address");
+    let app = Router::new()
+        .route("/v1/config", get(refreshing_oauth_config))
+        .route("/v1/namespaces/analytics", head(refreshing_oauth_namespace))
+        .route(
+            "/v1/namespaces/analytics/tables/episodes",
+            get(refreshing_oauth_table),
+        )
+        .route("/oauth/token", post(refreshing_oauth_token))
+        .with_state(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve concurrent refreshable OAuth REST catalog");
+    });
+    let auth = IcebergRestAuth::oauth_client_credentials(
+        CREDENTIAL,
+        IcebergOAuthOptions::builder()
+            .oauth2_server_uri(format!("http://{address}/oauth/token"))
+            .build(),
+    )
+    .expect("validate OAuth client credential");
+    let catalog = Arc::new(
+        IcebergCatalog::connect(
+            IcebergCatalogConfig::try_new(
+                &format!("http://{address}"),
+                "file:///warehouse",
+                ["analytics"],
+            )
+            .expect("build OAuth REST configuration")
+            .with_rest_auth(auth),
+        )
+        .await
+        .expect("connect OAuth REST catalog"),
+    );
+
+    let mut loads = tokio::task::JoinSet::new();
+    for _ in 0..CONCURRENT_LOADS {
+        let catalog = catalog.clone();
+        loads.spawn(async move { catalog.resolve_snapshot("analytics", "episodes").await });
+    }
+    while let Some(result) = loads.join_next().await {
+        result
+            .expect("concurrent load task must not panic")
+            .expect("each concurrent expired OAuth load must succeed after the shared renewal");
+    }
+
+    assert_eq!(
+        state.table_rejections.load(Ordering::Relaxed),
+        CONCURRENT_LOADS
+    );
+    assert_eq!(
+        state.exchanges.load(Ordering::Relaxed),
+        2,
+        "one initial exchange plus one shared renewal is expected"
     );
     server.abort();
 }
