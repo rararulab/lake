@@ -835,6 +835,7 @@ async fn cancelled_snapshot_leader_allows_a_new_load() {
     while catalog.table_loads() == 0 {
         tokio::task::yield_now().await;
     }
+
     leader.abort();
     assert!(leader.await.is_err(), "blocked leader must be cancelled");
 
@@ -848,6 +849,84 @@ async fn cancelled_snapshot_leader_allows_a_new_load() {
     .expect("replacement snapshot load must succeed");
     assert_eq!(snapshot.table(), "episodes");
     assert_eq!(catalog.table_loads(), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_snapshot_leader_metrics_preserve_handoff_visibility() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    lake_iceberg::describe_metrics();
+
+    let load_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (_warehouse, catalog) = recording_catalog_with_episodes(Some(load_gate.clone())).await;
+    let config = IcebergCatalogConfig::try_new(
+        "https://catalog.example",
+        "s3://warehouse/lake-iceberg-test-secret",
+        ["analytics"],
+    )
+    .expect("build config")
+    .with_cache_policy(Duration::ZERO, Duration::from_mins(1))
+    .expect("configure immediate refresh for test");
+    let federation = Arc::new(IcebergCatalog::from_catalog(config, catalog.clone()));
+    let leader_catalog = federation.clone();
+    let leader = tokio::spawn(async move {
+        leader_catalog
+            .resolve_snapshot("analytics", "episodes")
+            .await
+    });
+    while catalog.table_loads() == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    let (follower_started, follower_joined) = tokio::sync::oneshot::channel();
+    let follower_catalog = federation.clone();
+    let follower = tokio::spawn(async move {
+        follower_started
+            .send(())
+            .expect("test must observe the waiting follower");
+        follower_catalog
+            .resolve_snapshot("analytics", "episodes")
+            .await
+    });
+    follower_joined
+        .await
+        .expect("follower task must start while the leader load is pending");
+
+    leader.abort();
+    assert!(leader.await.is_err(), "blocked leader must be cancelled");
+
+    load_gate.add_permits(1);
+    let snapshot = tokio::time::timeout(Duration::from_secs(1), follower)
+        .await
+        .expect("an existing follower must take over after the leader is cancelled")
+        .expect("follower task must not panic")
+        .expect("follower replacement snapshot load must succeed");
+    assert_eq!(snapshot.table(), "episodes");
+    assert_eq!(catalog.table_loads(), 2);
+
+    let rendered = handle.render();
+    for expected in [
+        "lake_iceberg_snapshot_resolution_total{outcome=\"cancelled\"} 1",
+        "lake_iceberg_snapshot_resolution_total{outcome=\"loaded\"} 1",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}:\n{rendered}"
+        );
+    }
+    for forbidden in [
+        "analytics",
+        "episodes",
+        "catalog.example",
+        "warehouse",
+        "lake-iceberg-test-secret",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "identity must not appear in metric output: {forbidden}\n{rendered}"
+        );
+    }
 }
 
 #[tokio::test]
