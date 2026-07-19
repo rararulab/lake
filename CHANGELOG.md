@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.4](https://github.com/rararulab/lake/compare/v1.3.3...v1.3.4) (2026-07-19)
+
+
+### Bug Fixes
+
+* **iceberg:** redact warehouse diagnostics ([#230](https://github.com/rararulab/lake/issues/230)) ([#231](https://github.com/rararulab/lake/issues/231)) ([d57b294](https://github.com/rararulab/lake/commit/d57b294d17f1870a31b8bbd30bf1d55e86f7fe27))
+
 ## [1.3.3](https://github.com/rararulab/lake/compare/v1.3.2...v1.3.3) (2026-07-19)
 
 
