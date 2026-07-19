@@ -1,0 +1,21 @@
+---
+import config from "@/config";
+import { withBase } from "@/utils/withBase";
+
+const year = new Date().getFullYear();
+---
+
+<footer class="site-shell mt-auto pt-16">
+  <div
+    class="border-border flex flex-col gap-3 border-t py-6 text-sm sm:flex-row sm:items-center sm:justify-between"
+  >
+    <p class="text-muted-foreground m-0">© {year} Rararulab · Apache-2.0</p>
+    <nav aria-label="Footer navigation" class="flex flex-wrap gap-x-5 gap-y-2">
+      <a href={withBase("docs/")} class="hover:text-accent">Documentation</a>
+      <a href={config.site.repositoryUrl} class="hover:text-accent">Source</a>
+      <a href="https://github.com/satnaing/astro-paper" class="hover:text-accent"
+        >AstroPaper</a
+      >
+    </nav>
+  </div>
+</footer>

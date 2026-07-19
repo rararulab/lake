@@ -1,0 +1,78 @@
+---
+import type { DocEntry } from "@/utils/docs";
+import {
+  getDocSection,
+  getDocSlug,
+  getDocTitle,
+  getDocUrl,
+  sortDocs,
+} from "@/utils/docs";
+import { withBase } from "@/utils/withBase";
+
+interface Props {
+  docs: DocEntry[];
+  currentSlug?: string;
+}
+
+const { docs, currentSlug } = Astro.props;
+const sections = Map.groupBy(sortDocs(docs), getDocSection);
+const currentSection = currentSlug
+  ? getDocSection(docs.find(entry => getDocSlug(entry) === currentSlug) ?? docs[0])
+  : undefined;
+const labels: Record<string, string> = {
+  overview: "Overview",
+  design: "Design notes",
+  guides: "Guides",
+  plans: "Implementation plans",
+};
+---
+
+<nav aria-label="Documentation" class="text-sm">
+  <a
+    href={withBase("docs/")}
+    class:list={[
+      "hover:text-accent mb-5 inline-flex rounded font-semibold",
+      { "text-accent": !currentSlug },
+    ]}
+  >
+    Documentation home
+  </a>
+  <div class="space-y-5">
+    {
+      [...sections].map(([section, entries]) => (
+        <section>
+          <a
+            href={withBase(`docs/#${section}`)}
+            class:list={[
+              "text-muted-foreground font-code hover:text-accent mb-2 inline-flex rounded text-[0.68rem] tracking-[0.12em] uppercase",
+              { "text-accent": currentSection === section },
+            ]}
+          >
+            {labels[section] ?? section.replaceAll("-", " ")} · {entries.length}
+          </a>
+          {currentSection === section && (
+            <ul class="m-0 max-h-[65dvh] space-y-1 overflow-y-auto p-0 pr-1">
+              {entries.map(entry => {
+                const slug = getDocSlug(entry);
+                return (
+                  <li class="list-none">
+                    <a
+                      href={getDocUrl(entry)}
+                      aria-current={slug === currentSlug ? "page" : undefined}
+                      class:list={[
+                        "hover:text-accent block rounded px-2 py-1.5 leading-5 hover:bg-[var(--surface)]",
+                        { "text-accent bg-[var(--surface)]": slug === currentSlug },
+                      ]}
+                    >
+                      {getDocTitle(entry)}
+                    </a>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </section>
+      ))
+    }
+  </div>
+</nav>

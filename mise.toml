@@ -105,11 +105,11 @@ description = "end-to-end self-check: create -> ingest -> SQL query"
 run = "cargo run -p lake-cli -- selftest"
 
 [tasks.site-install]
-description = "install frozen dependencies for the GitHub Pages marketing site"
+description = "install frozen dependencies for the Astro GitHub Pages site"
 run = "bun install --cwd site --frozen-lockfile"
 
 [tasks.site-check]
-description = "install, typecheck, test, and build the GitHub Pages marketing site"
+description = "typecheck, lint, build, index, and smoke-test the GitHub Pages site and docs"
 depends = ["site-install"]
 run = "bun run --cwd site check"
 
@@ -133,11 +133,11 @@ run = "bun scripts/test-integration.ts --external"
 description = "strictly validate the checked-in Kubernetes reference against Kubernetes 1.32"
 run = "kubeconform -strict -summary -kubernetes-version 1.32.0 deploy/kubernetes/lake.yaml"
 
-# ponytail: gate = the FAST local loop (hooks, cargo test, e2e, marketing site).
+# ponytail: gate = the FAST local loop (hooks, cargo test, e2e, Astro site).
 # Dependency policy plus slow passes (cargo doc warnings, spec-selftest tooling
 # lock) run in the comprehensive local gate via `mise run ci`.
 [tasks.gate]
-description = "fast local quality gate: hooks + Rust tests + e2e + marketing site"
+description = "fast local quality gate: hooks + Rust tests + e2e + Astro site and docs"
 depends = ["hooks", "test", "test-adbc", "e2e", "site-check"]
 
 [tasks.doc]

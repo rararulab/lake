@@ -1,0 +1,94 @@
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+@import "tailwindcss";
+@import "./theme.css";
+@import "./typography.css";
+@import "rehype-callouts/theme/obsidian";
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+@layer base {
+  * {
+    @apply border-border outline-accent/75;
+    box-sizing: border-box;
+    scrollbar-color: var(--muted) transparent;
+  }
+
+  html {
+    @apply bg-background scroll-smooth;
+  }
+
+  body {
+    @apply bg-background font-app text-foreground m-0 min-w-80 antialiased;
+  }
+
+  a,
+  button {
+    @apply outline-offset-2 focus-visible:outline-2 focus-visible:outline-dashed;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  ::selection {
+    color: var(--accent-foreground);
+    background: var(--accent);
+  }
+}
+
+@utility site-shell {
+  @apply mx-auto w-full max-w-6xl px-4 sm:px-6;
+}
+
+@utility content-shell {
+  @apply mx-auto w-full max-w-3xl px-4 sm:px-6;
+}
+
+@utility active-nav {
+  @apply text-accent underline decoration-wavy decoration-2 underline-offset-8;
+}
+
+.hero-grid {
+  background-image:
+    linear-gradient(
+      color-mix(in srgb, var(--border) 58%, transparent) 1px,
+      transparent 1px
+    ),
+    linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--border) 58%, transparent) 1px,
+      transparent 1px
+    );
+  background-size: 4rem 4rem;
+  mask-image: linear-gradient(to bottom, black, transparent 92%);
+}
+
+.layer-row {
+  @apply border-border bg-background grid gap-4 border-t py-5 sm:grid-cols-[8rem_1fr];
+}
+
+.doc-card {
+  @apply border-border rounded-md border bg-[var(--surface)] p-5 transition duration-200;
+}
+
+.doc-card:hover {
+  @apply border-accent -translate-y-0.5;
+}
+
+:target {
+  scroll-margin-block: 6rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

@@ -55,7 +55,8 @@ first.
   optional GitHub workflow gaps, but it must fail for missing required tools or
   a broken Rust build.
 - `mise run gate` is the fast local push gate. It must include hooks, Rust
-  tests, the e2e self-check, and `site-check` for the marketing site.
+  tests, the e2e self-check, and `site-check` for the Astro site and rendered
+  documentation.
 - `mise run test-adbc` serializes its test functions because each launches a
   bounded upstream-driver subprocess and Query fixture. This preserves the
   ADBC deadline while `gate` continues running independent tasks in parallel.
@@ -72,8 +73,8 @@ first.
   worktree view, so its boundary check is scoped to the current colocated
   Jujutsu workspace.
 - `site-check` must start from `bun install --frozen-lockfile`, then typecheck,
-  test, and build the production artifact. This keeps local and Pages builds
-  on the same dependency graph.
+  lint, format-check, build, index, and smoke-test the static output. This keeps
+  local and Pages builds on the same dependency graph.
 - Task names are part of the agent contract. Rename a task only with matching
   updates to `AGENT.md`, `CLAUDE.md`, workflow docs, hooks, and CI.
 - Parameterized tasks use mise's `usage` field and `${usage_name?}`

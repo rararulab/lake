@@ -1,0 +1,214 @@
+---
+import Footer from "@/components/Footer.astro";
+import Header from "@/components/Header.astro";
+import Layout from "@/layouts/Layout.astro";
+import config from "@/config";
+import { withBase } from "@/utils/withBase";
+
+const layers = [
+  {
+    label: "01 / Query layer",
+    title: "Stateless SQL compute",
+    body: "DataFusion nodes fan out with training and evaluation demand, reading table data directly from object storage.",
+  },
+  {
+    label: "02 / Metadata layer",
+    title: "Bounded catalog authority",
+    body: "Leader-elected metadata coordinates versions and writes while cached readers keep per-query load away from it.",
+  },
+  {
+    label: "03 / Storage",
+    title: "Immutable object data",
+    body: "Robot episodes live as immutable files. Lance is the default engine behind a replaceable storage trait.",
+  },
+];
+---
+
+<Layout>
+  <Header />
+  <main id="main-content" data-pagefind-body>
+    <section class="border-border relative overflow-hidden border-b">
+      <div class="hero-grid pointer-events-none absolute inset-0" aria-hidden="true">
+      </div>
+      <div
+        class="site-shell relative grid gap-14 py-20 sm:py-28 lg:grid-cols-[1.2fr_0.8fr] lg:py-36"
+      >
+        <div>
+          <p class="text-accent font-code mb-6 text-xs tracking-[0.14em] uppercase">
+            Open source · Rust · Arrow Flight SQL
+          </p>
+          <h1
+            class="max-w-[12ch] text-[clamp(3.25rem,8vw,7rem)] leading-[0.9] font-semibold tracking-[-0.07em] text-balance"
+          >
+            The lakehouse for embodied AI.
+          </h1>
+          <p
+            class="text-muted-foreground mt-8 max-w-[38rem] text-lg leading-8 text-pretty sm:text-xl"
+          >
+            Immutable robot episodes in object storage. Stateless SQL compute for
+            concurrent training and evaluation reads.
+          </p>
+          <div class="mt-10 flex flex-wrap gap-4">
+            <a
+              href={withBase("docs/")}
+              class="bg-accent text-accent-foreground inline-flex min-h-11 items-center rounded px-5 py-3 font-semibold transition hover:-translate-y-0.5"
+            >
+              Read the documentation <span aria-hidden="true" class="ml-2">→</span>
+            </a>
+            <a
+              href={config.site.repositoryUrl}
+              class="border-border bg-background hover:border-accent hover:text-accent inline-flex min-h-11 items-center rounded border px-5 py-3 font-semibold transition"
+            >
+              View source <span aria-hidden="true" class="ml-2">↗</span>
+            </a>
+          </div>
+        </div>
+
+        <aside
+          class="border-border self-end rounded-md border bg-[var(--surface)] p-5 shadow-2xl shadow-black/5 sm:p-6"
+        >
+          <div
+            class="text-muted-foreground font-code mb-6 flex items-center justify-between text-[0.7rem] tracking-[0.1em] uppercase"
+          >
+            <span>Read path</span>
+            <span class="text-accent">cache shielded</span>
+          </div>
+          <ol class="m-0 space-y-3 p-0">
+            <li class="border-border bg-background list-none rounded border p-4">
+              <strong class="block font-medium">Fleet readers</strong>
+              <span class="text-muted-foreground text-sm"
+                >Training · evaluation · replay</span
+              >
+            </li>
+            <li class="text-accent font-code list-none text-center" aria-hidden="true">
+              ↓
+            </li>
+            <li class="border-accent bg-background list-none rounded border p-4">
+              <strong class="block font-medium">Stateless query nodes</strong>
+              <span class="text-muted-foreground text-sm"
+                >SQL planning · catalog cache · direct reads</span
+              >
+            </li>
+            <li class="text-accent font-code list-none text-center" aria-hidden="true">
+              ↙ &nbsp;&nbsp; ↘
+            </li>
+            <li class="grid list-none grid-cols-2 gap-3">
+              <span class="border-border bg-background rounded border p-3 text-sm"
+                >Metadata authority</span
+              >
+              <span class="border-border bg-background rounded border p-3 text-sm"
+                >Object storage</span
+              >
+            </li>
+          </ol>
+        </aside>
+      </div>
+    </section>
+
+    <section class="site-shell py-20 sm:py-28" aria-labelledby="architecture-title">
+      <div class="grid gap-10 lg:grid-cols-[0.65fr_1.35fr] lg:gap-20">
+        <div>
+          <p class="text-accent font-code text-xs tracking-[0.14em] uppercase">
+            Architecture / 01
+          </p>
+          <h2
+            id="architecture-title"
+            class="mt-5 max-w-[11ch] text-4xl leading-[0.98] font-semibold tracking-[-0.05em] text-balance sm:text-5xl"
+          >
+            Separate what scales from what must agree.
+          </h2>
+        </div>
+        <div>
+          {
+            layers.map(layer => (
+              <article class="layer-row">
+                <p class="text-accent font-code m-0 text-[0.68rem] tracking-[0.08em] uppercase">
+                  {layer.label}
+                </p>
+                <div>
+                  <h3 class="m-0 text-xl font-semibold tracking-tight">
+                    {layer.title}
+                  </h3>
+                  <p class="text-muted-foreground mt-2 max-w-[42rem] leading-7">
+                    {layer.body}
+                  </p>
+                </div>
+              </article>
+            ))
+          }
+        </div>
+      </div>
+    </section>
+
+    <section
+      class="border-border border-y bg-[var(--surface)]"
+      aria-labelledby="targets-title"
+    >
+      <div class="site-shell py-20 sm:py-24">
+        <div class="flex flex-col justify-between gap-6 sm:flex-row sm:items-end">
+          <div>
+            <p class="text-accent font-code text-xs tracking-[0.14em] uppercase">
+              Scale / 02
+            </p>
+            <h2
+              id="targets-title"
+              class="mt-4 text-4xl font-semibold tracking-[-0.05em] sm:text-5xl"
+            >
+              Design targets
+            </h2>
+          </div>
+          <p class="text-muted-foreground max-w-md text-sm leading-6">
+            Architecture targets, not production claims. They describe the workload lake
+            is designed to absorb.
+          </p>
+        </div>
+        <div class="border-border mt-12 grid border-y sm:grid-cols-2">
+          <article class="sm:border-border py-8 sm:border-r sm:pr-10">
+            <p class="text-accent font-code text-xs uppercase">Design target</p>
+            <p
+              class="font-code mt-5 text-7xl tracking-[-0.09em] tabular-nums sm:text-8xl"
+            >
+              10⁴
+            </p>
+            <p class="text-muted-foreground mt-3">
+              tables across robot fleets and datasets
+            </p>
+          </article>
+          <article class="border-border border-t py-8 sm:border-t-0 sm:pl-10">
+            <p class="text-accent font-code text-xs uppercase">Design target</p>
+            <p
+              class="font-code mt-5 text-7xl tracking-[-0.09em] tabular-nums sm:text-8xl"
+            >
+              10¹¹
+            </p>
+            <p class="text-muted-foreground mt-3">
+              episodes across immutable table versions
+            </p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="content-shell py-20 text-center sm:py-28">
+      <p class="text-accent font-code text-xs tracking-[0.14em] uppercase">
+        Documentation / 03
+      </p>
+      <h2
+        class="mt-5 text-4xl leading-tight font-semibold tracking-[-0.05em] text-balance sm:text-5xl"
+      >
+        The architecture and operating guides now live with the site.
+      </h2>
+      <p class="text-muted-foreground mx-auto mt-6 max-w-[42rem] text-lg leading-8">
+        Browse the same Markdown maintained in the repository, with static search and
+        stable GitHub Pages routes.
+      </p>
+      <a
+        href={withBase("docs/")}
+        class="decoration-accent hover:text-accent mt-9 inline-flex rounded font-semibold underline decoration-dashed underline-offset-8"
+      >
+        Browse all documentation →
+      </a>
+    </section>
+  </main>
+  <Footer />
+</Layout>

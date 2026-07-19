@@ -1,10 +1,11 @@
-name: Deploy marketing site
+name: Deploy site and documentation
 
 on:
   push:
     branches: [main]
     paths:
       - "site/**"
+      - "docs/**"
       - ".github/workflows/pages.yml"
       - "mise.toml"
   workflow_dispatch:
@@ -18,7 +19,7 @@ permissions:
 
 jobs:
   build:
-    name: Build site
+    name: Build site and documentation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

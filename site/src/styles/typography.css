@@ -1,0 +1,89 @@
+@plugin "@tailwindcss/typography";
+
+@layer base {
+  .app-prose {
+    @apply prose prose-neutral dark:prose-invert max-w-none;
+
+    h1,
+    h2,
+    h3,
+    h4,
+    th {
+      @apply text-foreground scroll-mt-24 tracking-tight;
+    }
+
+    h1 {
+      @apply text-4xl leading-tight font-semibold sm:text-5xl;
+      text-wrap: balance;
+    }
+
+    h2 {
+      @apply border-border mt-12 border-b pb-3 text-2xl font-semibold;
+    }
+
+    h3 {
+      @apply mt-9 text-xl font-semibold;
+    }
+
+    p,
+    strong,
+    ol,
+    ul,
+    figcaption,
+    table,
+    code {
+      @apply text-foreground;
+    }
+
+    p,
+    li {
+      @apply leading-7;
+    }
+
+    a {
+      @apply text-foreground decoration-accent hover:text-accent decoration-dashed underline-offset-4 focus-visible:no-underline;
+      overflow-wrap: anywhere;
+    }
+
+    li::marker {
+      color: var(--accent);
+    }
+
+    hr {
+      @apply border-border;
+    }
+
+    table {
+      @apply block max-w-full overflow-x-auto text-sm;
+    }
+
+    th,
+    td {
+      @apply border-border border px-3 py-2;
+    }
+
+    :not(pre) > code {
+      @apply bg-muted font-code rounded px-1.5 py-0.5 text-[0.88em] before:content-none after:content-none;
+    }
+
+    pre {
+      @apply border-border font-code rounded-md border focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-dashed;
+    }
+
+    .astro-code,
+    .astro-code span {
+      color: var(--shiki-light);
+      background-color: var(--shiki-light-bg);
+    }
+
+    blockquote {
+      @apply border-s-accent text-foreground opacity-80;
+    }
+  }
+
+  html[data-theme="dark"] .app-prose .astro-code,
+  html[data-theme="dark"] .app-prose .astro-code span {
+    color: var(--shiki-dark);
+    background-color: var(--shiki-dark-bg);
+  }
+}

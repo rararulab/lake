@@ -1,0 +1,36 @@
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --font-app: var(--font-geist);
+  --font-code: var(--font-geist-mono);
+}
+
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+  --background: #fbfaf7;
+  --foreground: #292824;
+  --accent: #c64c1a;
+  --accent-foreground: #ffffff;
+  --muted: #ebe8e1;
+  --muted-foreground: #6f6c63;
+  --border: #ddd8ce;
+  --surface: #f3f0e9;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+  --background: #151512;
+  --foreground: #efede6;
+  --accent: #ff7038;
+  --accent-foreground: #1b0c06;
+  --muted: #282822;
+  --muted-foreground: #aaa79e;
+  --border: #3b3932;
+  --surface: #1d1d19;
+}
