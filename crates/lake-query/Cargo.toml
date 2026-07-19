@@ -37,6 +37,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 lake-engine-lance = { workspace = true }
 iceberg = { workspace = true }
 lake-metasrv = { workspace = true }
