@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.0](https://github.com/rararulab/lake/compare/v1.7.0...v1.8.0) (2026-07-19)
+
+
+### Features
+
+* **robotics:** define Episode and ArtifactRef table contract ([#258](https://github.com/rararulab/lake/issues/258)) ([e6fd75a](https://github.com/rararulab/lake/commit/e6fd75a0c6ede1c7d72699952e998c22e02a6aad))
+
 ## [1.7.0](https://github.com/rararulab/lake/compare/v1.6.0...v1.7.0) (2026-07-19)
 
 
