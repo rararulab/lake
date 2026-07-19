@@ -390,6 +390,57 @@ async fn failed_oauth_renewal_token(
     }
 }
 
+async fn start_failed_oauth_renewal_catalog(
+    state: FailedOAuthRenewalRestCatalog,
+) -> (Arc<IcebergCatalog>, tokio::task::JoinHandle<()>) {
+    const CREDENTIAL: &str = "lake-query:lake-rest-oauth-secret";
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind failed-renewal OAuth REST catalog");
+    let address = listener
+        .local_addr()
+        .expect("read failed-renewal OAuth REST catalog address");
+    let app = Router::new()
+        .route("/v1/config", get(failed_oauth_renewal_config))
+        .route(
+            "/v1/namespaces/analytics",
+            head(failed_oauth_renewal_namespace),
+        )
+        .route(
+            "/v1/namespaces/analytics/tables/{table}",
+            get(failed_oauth_renewal_table),
+        )
+        .route("/oauth/token", post(failed_oauth_renewal_token))
+        .with_state(state);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve failed-renewal OAuth REST catalog");
+    });
+    let auth = IcebergRestAuth::oauth_client_credentials(
+        CREDENTIAL,
+        IcebergOAuthOptions::builder()
+            .oauth2_server_uri(format!("http://{address}/oauth/token"))
+            .build(),
+    )
+    .expect("validate OAuth client credential");
+    let catalog = Arc::new(
+        IcebergCatalog::connect(
+            IcebergCatalogConfig::try_new(
+                &format!("http://{address}"),
+                "file:///warehouse",
+                ["analytics"],
+            )
+            .expect("build OAuth REST configuration")
+            .with_rest_auth(auth),
+        )
+        .await
+        .expect("connect OAuth REST catalog"),
+    );
+    (catalog, server)
+}
+
 async fn bearer_rest_echo_authorization_error(headers: HeaderMap) -> (StatusCode, String) {
     let authorization = headers
         .get("authorization")
@@ -1362,7 +1413,6 @@ async fn concurrent_oauth_expiry_single_flights_table_load_and_shares_session_re
 
 #[tokio::test]
 async fn concurrent_oauth_refresh_failure_is_single_flight() {
-    const CREDENTIAL: &str = "lake-query:lake-rest-oauth-secret";
     const CONCURRENT_READS: usize = 8;
 
     let state = FailedOAuthRenewalRestCatalog {
@@ -1372,49 +1422,7 @@ async fn concurrent_oauth_refresh_failure_is_single_flight() {
         renewal_started:     Arc::new(tokio::sync::Notify::new()),
         release_first_retry: Arc::new(tokio::sync::Notify::new()),
     };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind failed-renewal OAuth REST catalog");
-    let address = listener
-        .local_addr()
-        .expect("read failed-renewal OAuth REST catalog address");
-    let app = Router::new()
-        .route("/v1/config", get(failed_oauth_renewal_config))
-        .route(
-            "/v1/namespaces/analytics",
-            head(failed_oauth_renewal_namespace),
-        )
-        .route(
-            "/v1/namespaces/analytics/tables/{table}",
-            get(failed_oauth_renewal_table),
-        )
-        .route("/oauth/token", post(failed_oauth_renewal_token))
-        .with_state(state.clone());
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("serve failed-renewal OAuth REST catalog");
-    });
-    let auth = IcebergRestAuth::oauth_client_credentials(
-        CREDENTIAL,
-        IcebergOAuthOptions::builder()
-            .oauth2_server_uri(format!("http://{address}/oauth/token"))
-            .build(),
-    )
-    .expect("validate OAuth client credential");
-    let catalog = Arc::new(
-        IcebergCatalog::connect(
-            IcebergCatalogConfig::try_new(
-                &format!("http://{address}"),
-                "file:///warehouse",
-                ["analytics"],
-            )
-            .expect("build OAuth REST configuration")
-            .with_rest_auth(auth),
-        )
-        .await
-        .expect("connect OAuth REST catalog"),
-    );
+    let (catalog, server) = start_failed_oauth_renewal_catalog(state.clone()).await;
 
     let wait_for_renewal = state.renewal_started.notified();
     let first_catalog = catalog.clone();
@@ -1465,6 +1473,69 @@ async fn concurrent_oauth_refresh_failure_is_single_flight() {
         state.exchanges.load(Ordering::Relaxed),
         2,
         "one startup exchange and one failed renewal are expected"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn cancelled_oauth_renewal_leader_releases_follower() {
+    let state = FailedOAuthRenewalRestCatalog {
+        exchanges:           Arc::new(AtomicUsize::new(0)),
+        renewal_requests:    Arc::new(AtomicUsize::new(0)),
+        table_requests:      Arc::new(AtomicUsize::new(0)),
+        renewal_started:     Arc::new(tokio::sync::Notify::new()),
+        release_first_retry: Arc::new(tokio::sync::Notify::new()),
+    };
+    let (catalog, server) = start_failed_oauth_renewal_catalog(state.clone()).await;
+
+    let wait_for_renewal = state.renewal_started.notified();
+    let leader_catalog = catalog.clone();
+    let leader =
+        tokio::spawn(async move { leader_catalog.resolve_snapshot("analytics", "leader").await });
+    wait_for_renewal.await;
+
+    let follower_catalog = catalog.clone();
+    let follower = tokio::spawn(async move {
+        follower_catalog
+            .resolve_snapshot("analytics", "follower")
+            .await
+    });
+    let follower_reached_failed_read = tokio::time::timeout(Duration::from_secs(1), async {
+        while state.table_requests.load(Ordering::Relaxed) < 2 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        follower_reached_failed_read.is_ok(),
+        "the follower must join while the leader renewal is pending; observed {} table reads",
+        state.table_requests.load(Ordering::Relaxed)
+    );
+
+    leader.abort();
+    assert!(
+        leader
+            .await
+            .expect_err("cancelled leader must not complete")
+            .is_cancelled()
+    );
+    let follower_result = tokio::time::timeout(Duration::from_secs(1), follower)
+        .await
+        .expect("follower must be released after the renewal leader is cancelled")
+        .expect("follower task must not panic");
+    assert!(matches!(follower_result, Err(IcebergError::Catalog)));
+    assert_eq!(
+        state.renewal_requests.load(Ordering::Relaxed),
+        1,
+        "cancelling the leader must release the existing follower, not start another renewal"
+    );
+    assert_eq!(
+        state.exchanges.load(Ordering::Relaxed),
+        2,
+        "one startup exchange and one cancelled renewal are expected"
     );
     server.abort();
 }
