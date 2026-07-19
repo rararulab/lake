@@ -171,6 +171,28 @@ identifier is likewise opaque in configuration diagnostics while remaining
 available to the in-memory REST client. Deploy credentials through the platform
 secret manager, never endpoint userinfo or a repository configuration file.
 
+## Local interoperability proof
+
+Run the repository-owned compatibility fixture when changing or validating the
+connector:
+
+```bash
+mise run test-iceberg-integration
+```
+
+The task starts checkout-scoped Docker containers for Apache's
+`iceberg-rest-fixture` and MinIO on ephemeral host ports, creates an Iceberg
+table through the external REST catalog, and runs Lake's ignored real-protocol
+test. The fixture intentionally omits its non-default S3 endpoint properties,
+so the test also exercises Lake's credential-free
+`LAKE_ICEBERG_S3_ENDPOINT`/`LAKE_ICEBERG_S3_REGION` compatibility path. The
+warehouse is public only inside that test fixture; production Query processes
+use their workload identity for object reads.
+
+This is a regression and interoperability check, not a deployment template:
+the fixture is torn down by the task, its endpoints are not stable, and it
+does not configure production credentials, TLS, or an Iceberg write path.
+
 The pinned upstream REST client caches an OAuth access token but does not
 refresh it automatically. Lake therefore treats an OAuth failure on one of its
 already-bounded metadata reads as a recoverable session failure: it
