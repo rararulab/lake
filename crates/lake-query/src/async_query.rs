@@ -2528,7 +2528,7 @@ mod tests {
     use datafusion::arrow::{array::Int64Array, ipc::reader::StreamReader};
     use lake_common::{Principal, PrincipalId, PrincipalRole, TenantId};
     use lake_engine_lance::LanceEngine;
-    use lake_meta::{MetaScanPage, MetaStore, MetaStoreRef, RocksMeta};
+    use lake_meta::{DynamoMeta, MetaScanPage, MetaStore, MetaStoreRef, RocksMeta};
     use lake_objects::{
         LocalObjectStore, ManagedObjectStore, ObjectError, ObjectReader, Result as ObjectResult,
     };
@@ -3230,6 +3230,122 @@ mod tests {
                 .is_pending(),
             "capacity pressure must not claim or terminally fail the job"
         );
+    }
+
+    #[test]
+    fn dynamo_execution_leases_localstack_is_wired() {
+        let integration = include_str!("../../../scripts/test-integration.ts");
+
+        assert!(integration.contains("\"lake-query\""));
+        assert!(integration.contains("--run-ignored"));
+        assert!(integration.contains("ignored-only"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LocalStack DynamoDB"]
+    async fn dynamo_execution_leases_preserve_cluster_capacity_and_fencing() {
+        let endpoint = std::env::var("LAKE_DYNAMODB_ENDPOINT")
+            .expect("LAKE_DYNAMODB_ENDPOINT is set by the integration runner");
+        let table = format!("lake_query_async_global_{}", uuid::Uuid::now_v7().simple());
+        let primary_meta = DynamoMeta::connect(Some(&endpoint), &table)
+            .await
+            .expect("connect primary DynamoDB client");
+        primary_meta
+            .ensure_table()
+            .await
+            .expect("create primary DynamoDB tables");
+        let secondary_meta = DynamoMeta::connect(Some(&endpoint), &table)
+            .await
+            .expect("connect secondary DynamoDB client");
+        secondary_meta
+            .open_tables()
+            .await
+            .expect("open existing secondary DynamoDB tables");
+        let primary = AsyncQueryStore::new(Arc::new(primary_meta));
+        let secondary = AsyncQueryStore::new(Arc::new(secondary_meta));
+        let limits = super::AsyncGlobalExecutionLimits::try_new(1, 1).unwrap();
+        let pending = "0198f73b-12b0-7d20-b8ab-8195ce8bfe47";
+        let stale_query = "0198f73b-12b0-7d20-b8ab-8195ce8bfe44";
+        let stale_token = "018f73b1-12b0-7d20-b8ab-8195ce8bfe44";
+
+        secondary
+            .create(
+                AsyncQueryRecord::try_new(
+                    pending,
+                    "tenant-b",
+                    "reader@example",
+                    job_spec(),
+                    1_000,
+                    2_000,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        primary
+            .reserve_execution("tenant-a", stale_query, stale_token, 1_000, 30, limits)
+            .await
+            .expect("primary replica reserves global capacity");
+
+        assert!(matches!(
+            secondary
+                .reserve_execution(
+                    "tenant-b",
+                    pending,
+                    "018f73b1-12b0-7d20-b8ab-8195ce8bfe47",
+                    1_000,
+                    30,
+                    limits,
+                )
+                .await,
+            Err(AsyncQueryStoreError::ExecutionCapacityHeld)
+        ));
+        assert!(
+            secondary
+                .load(pending)
+                .await
+                .unwrap()
+                .expect("record remains present")
+                .is_pending(),
+            "capacity pressure must not claim or terminally fail the job"
+        );
+
+        let successor_query = "0198f73b-12b0-7d20-b8ab-8195ce8bfe45";
+        let successor_token = "018f73b1-12b0-7d20-b8ab-8195ce8bfe45";
+        secondary
+            .reserve_execution(
+                "tenant-b",
+                successor_query,
+                successor_token,
+                1_031,
+                30,
+                limits,
+            )
+            .await
+            .expect("expiry reclaims capacity for the secondary replica");
+        assert!(matches!(
+            primary
+                .renew_execution(stale_query, stale_token, 1_031, 30)
+                .await,
+            Err(AsyncQueryStoreError::ExecutionLeaseLost)
+        ));
+        primary
+            .release_execution(stale_query, stale_token, 1_031)
+            .await
+            .expect("stale release is exact");
+        assert!(matches!(
+            primary
+                .reserve_execution(
+                    "tenant-c",
+                    "0198f73b-12b0-7d20-b8ab-8195ce8bfe46",
+                    "018f73b1-12b0-7d20-b8ab-8195ce8bfe46",
+                    1_031,
+                    30,
+                    limits,
+                )
+                .await,
+            Err(AsyncQueryStoreError::ExecutionCapacityHeld)
+        ));
     }
 
     #[tokio::test]
