@@ -23,7 +23,7 @@ exclude = ["third_party/datafusion-execution"]
 ignored = ["lake-sdk"]
 
 [workspace.package]
-version = "1.6.0"
+version = "1.7.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["crrow"]
