@@ -59,6 +59,7 @@ Iceberg disabled.
 | `LAKE_ICEBERG_REST_ENDPOINT` | Credential-free HTTP(S) REST catalog base URL |
 | `LAKE_ICEBERG_WAREHOUSE` | Iceberg warehouse identifier passed to the catalog |
 | `LAKE_ICEBERG_NAMESPACES` | Comma-separated, finite SQL namespace allowlist |
+| `LAKE_ICEBERG_REST_TIMEOUT_MS` | Optional per-request total/connect deadline in milliseconds (default `10000`, range `1..=60000`) |
 
 For example:
 
@@ -84,6 +85,13 @@ Apache revision declared in the workspace. Its storage factory resolves the
 table-file URI at scan time. Cloud credentials and REST authentication are
 therefore deployment/runtime concerns (for example the normal cloud-provider
 credential chain), never Lake registry fields, SQL text, or ticket claims.
+
+Lake builds the upstream REST catalog with its own bounded HTTP client. The
+timeout applies to the configuration handshake, namespace point checks, exact
+table loads, and OAuth exchanges; it prevents a stalled external authority
+from becoming an implicit unbounded startup dependency. It does not add a
+retry policy, circuit breaker, or background health task. Query's separate
+end-to-end Flight planning deadline remains the outer request boundary.
 
 The Query process passes the validated auth value only to its in-memory REST
 client. It is deliberately absent from `Debug` output, errors, metrics, Lake

@@ -18,7 +18,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -601,6 +601,66 @@ async fn rest_catalog_connect_warms_each_configured_namespace() {
         .expect("load REST catalog table with a storage factory");
     assert_eq!(snapshot.snapshot_id(), Some(3_497_810_964_824_022_504));
     server.abort();
+}
+
+#[tokio::test]
+async fn rest_catalog_timeout_bounds_unresponsive_startup() {
+    async fn delayed_config() -> StatusCode {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        StatusCode::NO_CONTENT
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind delayed REST catalog");
+    let address = listener
+        .local_addr()
+        .expect("read delayed REST catalog address");
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route("/v1/config", get(delayed_config)),
+        )
+        .await
+        .expect("serve delayed REST catalog");
+    });
+
+    let config = IcebergCatalogConfig::try_new(
+        &format!("http://{address}"),
+        "s3://warehouse",
+        ["analytics"],
+    )
+    .expect("build config")
+    .with_rest_timeout(Duration::from_millis(25))
+    .expect("short REST timeout is valid");
+    let started = Instant::now();
+    let error = IcebergCatalog::connect(config)
+        .await
+        .expect_err("unresponsive REST config must time out");
+
+    assert!(matches!(error, lake_iceberg::IcebergError::Catalog));
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "configured deadline must win over the delayed response"
+    );
+    server.abort();
+}
+
+#[test]
+fn rest_timeout_rejects_zero_and_excessive_values() {
+    let config = IcebergCatalogConfig::try_new(
+        "https://catalog.example.test",
+        "s3://warehouse",
+        ["analytics"],
+    )
+    .expect("build config");
+
+    for timeout in [Duration::ZERO, Duration::from_secs(61)] {
+        assert!(matches!(
+            config.clone().with_rest_timeout(timeout),
+            Err(lake_iceberg::IcebergError::InvalidRestTimeout)
+        ));
+    }
 }
 
 async fn populated_local_table() -> (tempfile::TempDir, Table) {

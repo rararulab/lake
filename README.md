@@ -290,6 +290,7 @@ that metadata into Metasrv or proxies Parquet/video/model bytes through Flight.
 LAKE_ICEBERG_REST_ENDPOINT=https://catalog.example.com \
 LAKE_ICEBERG_WAREHOUSE=s3://embodied-warehouse \
 LAKE_ICEBERG_NAMESPACES=analytics,models \
+LAKE_ICEBERG_REST_TIMEOUT_MS=10000 \
 lake query --metadata-addr https://metasrv.example.com:50052
 ```
 
@@ -307,8 +308,12 @@ read. Concurrent failures share one renewal. This recovers an expired access
 token without background scheduling or secret rotation; a failed renewal or
 retry still returns an error.
 
-All three variables are required together and are validated before Query binds.
-Cloud and catalog credentials stay in the Query deployment's normal runtime
+All three base variables are required together and are validated before Query
+binds. `LAKE_ICEBERG_REST_TIMEOUT_MS` is optional; it defaults to 10,000 ms
+and accepts `1..=60000`. Lake applies it to each REST configuration handshake,
+namespace point check, exact table lookup, and OAuth exchange, so a stalled
+external catalog cannot inherit an unbounded startup dependency. Cloud and
+catalog credentials stay in the Query deployment's normal runtime
 configuration. Query supports fully-qualified scans such as:
 
 ```sql
