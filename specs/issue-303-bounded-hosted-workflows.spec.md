@@ -63,8 +63,18 @@ Scenario: Existing execution semantics remain intact
   Targets: .github/workflows/release-image.yml
   Given the two workflow timeout values are added
   When the workflow diff is reviewed
-  Then its commands, runner classes, cache, permissions, triggers, tag
-  validation, and concurrency settings are unchanged
+  Then its commands, runner class, permissions, triggers, tag validation, and
+  multi-architecture publication settings are unchanged
+
+Scenario: Release build cache remains configured
+  Test:
+    Package: lake-cli
+    Filter: release_image_workflow_reuses_scoped_build_cache
+  Level: static-contract
+  Targets: .github/workflows/release-image.yml
+  Given the release image workflow has an explicit execution budget
+  When it constructs its Buildx invocation
+  Then it still imports and exports the dedicated release-image cache scope
 
 ## Out of Scope
 
