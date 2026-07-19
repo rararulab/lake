@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.0](https://github.com/rararulab/lake/compare/v1.4.1...v1.5.0) (2026-07-19)
+
+
+### Features
+
+* **deploy:** make Iceberg federation a secure Kubernetes opt-in ([#262](https://github.com/rararulab/lake/issues/262)) ([166c3ce](https://github.com/rararulab/lake/commit/166c3ce740fd4984b3e68e01029e11eddf8bdb50))
+
 ## [1.4.1](https://github.com/rararulab/lake/compare/v1.4.0...v1.4.1) (2026-07-19)
 
 
