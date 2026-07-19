@@ -107,6 +107,86 @@ The Query adapter rejects all manifest mutations, including legacy
 latest-pointer installation. Lake intentionally does not fall back to registry
 storage when the manifest table is missing.
 
+### Optional Iceberg federation
+
+The base manifest deliberately has no `LAKE_ICEBERG_*` values. Query reads only
+the listed optional keys from `lake-iceberg-runtime`; when neither resource
+exists, Iceberg is disabled. The manifest accepts endpoint, warehouse,
+namespace, timeout, and OAuth metadata keys from the ConfigMap, but accepts the
+two authentication keys only from the Secret. Extra ConfigMap or Secret keys
+are not injected into Query. Do not create either resource with empty or partial
+values: Query requires the endpoint, warehouse, and namespace allowlist as one
+complete configuration before it binds.
+
+Create the non-secret configuration in the same namespace. The external
+endpoint must be credential-free HTTPS, and the timeout is optional (the normal
+default is 10 seconds):
+
+```bash
+kubectl -n lake-system create configmap lake-iceberg-runtime \
+  --from-literal=LAKE_ICEBERG_REST_ENDPOINT=https://catalog.example.com \
+  --from-literal=LAKE_ICEBERG_WAREHOUSE=s3://embodied-warehouse \
+  --from-literal=LAKE_ICEBERG_NAMESPACES=analytics,models \
+  --from-literal=LAKE_ICEBERG_REST_TIMEOUT_MS=10000
+```
+
+The optional Secret is imported by the `lake-query` pod only; it is not mounted
+by or exposed to Metasrv, and the reference never commits a Secret object or
+credential value. Use no Secret for an unauthenticated catalog. For an
+authenticated catalog, create exactly one of the following secret forms — never
+put both keys in one Secret:
+
+```bash
+# Static bearer-token catalog
+kubectl -n lake-system create secret generic lake-iceberg-runtime \
+  --from-file=LAKE_ICEBERG_REST_TOKEN=./catalog-token
+
+# OAuth client-credentials catalog
+kubectl -n lake-system create secret generic lake-iceberg-runtime \
+  --from-file=LAKE_ICEBERG_REST_CREDENTIAL=./catalog-client-credential
+```
+
+For OAuth metadata, add the credential-free optional
+`LAKE_ICEBERG_REST_OAUTH2_SERVER_URI`, `LAKE_ICEBERG_REST_OAUTH_SCOPE`,
+`LAKE_ICEBERG_REST_OAUTH_AUDIENCE`, or `LAKE_ICEBERG_REST_OAUTH_RESOURCE`
+values to the ConfigMap before the rollout. The OAuth endpoint follows the same
+credential-free HTTPS rule. The full runtime semantics, including direct
+Iceberg object reads and snapshot pinning, are in the
+[Iceberg federation guide](../design/iceberg-federation.md).
+
+After creating the ConfigMap and, when needed, the Secret, restart Query so the
+new environment is present before its startup validation and namespace checks:
+
+```bash
+kubectl -n lake-system rollout restart deployment/lake-query
+kubectl -n lake-system rollout status deployment/lake-query
+```
+
+The reference uses `Recreate` for Query, so this activation has the same
+controlled Query availability window as every Query rollout. Pause and drain
+admission according to the async rollout procedure below; do not present this
+configuration change as a zero-downtime rollout.
+
+Limit Secret read/update and Pod exec permissions to the deployment operators.
+The Query workload identity needs direct read access (and, where applicable,
+KMS decrypt permission) to the selected Iceberg warehouse's metadata,
+manifests, and Parquet objects. It also needs egress to the catalog and OAuth
+endpoints. Metasrv receives none of those REST credentials; this does not grant
+the client SDK access to the Iceberg warehouse.
+
+To rotate a token or credential, apply a replacement Secret with the same name,
+then restart and wait for the Query Deployment so every process starts one
+bounded in-memory REST session with the new value. To disable federation, remove
+the Secret first when present, then remove the complete configuration and roll
+Query:
+
+```bash
+kubectl -n lake-system delete secret lake-iceberg-runtime --ignore-not-found
+kubectl -n lake-system delete configmap lake-iceberg-runtime --ignore-not-found
+kubectl -n lake-system rollout restart deployment/lake-query
+kubectl -n lake-system rollout status deployment/lake-query
+```
+
 When `LAKE_ASYNC_QUERIES=true`, also provision
 `$LAKE_ASYNC_DYNAMODB_TABLE` and
 `$LAKE_ASYNC_DYNAMODB_TABLE_prefix_v2` with the same key schemas. These tables

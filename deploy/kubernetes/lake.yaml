@@ -199,6 +199,71 @@ spec:
             - configMapRef:
                 name: lake-runtime
           env:
+            # Iceberg federation is disabled unless the operator creates the
+            # Query-only sources. Bind each key rather than envFrom so a
+            # ConfigMap cannot inject a credential or unrelated runtime value.
+            - name: LAKE_ICEBERG_REST_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: lake-iceberg-runtime
+                  key: LAKE_ICEBERG_REST_ENDPOINT
+                  optional: true
+            - name: LAKE_ICEBERG_WAREHOUSE
+              valueFrom:
+                configMapKeyRef:
+                  name: lake-iceberg-runtime
+                  key: LAKE_ICEBERG_WAREHOUSE
+                  optional: true
+            - name: LAKE_ICEBERG_NAMESPACES
+              valueFrom:
+                configMapKeyRef:
+                  name: lake-iceberg-runtime
+                  key: LAKE_ICEBERG_NAMESPACES
+                  optional: true
+            - name: LAKE_ICEBERG_REST_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: lake-iceberg-runtime
+                  key: LAKE_ICEBERG_REST_TIMEOUT_MS
+                  optional: true
+            - name: LAKE_ICEBERG_REST_OAUTH2_SERVER_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: lake-iceberg-runtime
+                  key: LAKE_ICEBERG_REST_OAUTH2_SERVER_URI
+                  optional: true
+            - name: LAKE_ICEBERG_REST_OAUTH_SCOPE
+              valueFrom:
+                configMapKeyRef:
+                  name: lake-iceberg-runtime
+                  key: LAKE_ICEBERG_REST_OAUTH_SCOPE
+                  optional: true
+            - name: LAKE_ICEBERG_REST_OAUTH_AUDIENCE
+              valueFrom:
+                configMapKeyRef:
+                  name: lake-iceberg-runtime
+                  key: LAKE_ICEBERG_REST_OAUTH_AUDIENCE
+                  optional: true
+            - name: LAKE_ICEBERG_REST_OAUTH_RESOURCE
+              valueFrom:
+                configMapKeyRef:
+                  name: lake-iceberg-runtime
+                  key: LAKE_ICEBERG_REST_OAUTH_RESOURCE
+                  optional: true
+            # Only these two credential keys can come from the Secret; Metasrv
+            # never imports them.
+            - name: LAKE_ICEBERG_REST_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: lake-iceberg-runtime
+                  key: LAKE_ICEBERG_REST_TOKEN
+                  optional: true
+            - name: LAKE_ICEBERG_REST_CREDENTIAL
+              valueFrom:
+                secretKeyRef:
+                  name: lake-iceberg-runtime
+                  key: LAKE_ICEBERG_REST_CREDENTIAL
+                  optional: true
             - name: LAKE_LOG_FORMAT
               value: json
             - name: OTEL_SERVICE_NAME
