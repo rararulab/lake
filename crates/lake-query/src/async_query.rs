@@ -1035,12 +1035,24 @@ impl AsyncQueryWorker {
             .open_job(&record)
             .await
             .map_err(|source| AsyncQueryWorkerError::Coordinator { source })?;
-        let snapshots = statement
+        let mut snapshots = statement
             .snapshots
             .iter()
             .map(job_snapshot)
             .map(crate::QueryTableSnapshot::Lake)
             .collect::<Vec<_>>();
+        for snapshot in &statement.iceberg_snapshots {
+            snapshots.push(
+                self.engine
+                    .resolve_iceberg_snapshot_at(
+                        &snapshot.namespace,
+                        &snapshot.table,
+                        snapshot.snapshot_id,
+                    )
+                    .await
+                    .map_err(|source| AsyncQueryWorkerError::Query { source })?,
+            );
+        }
         let dataframe = self
             .engine
             .plan_sql_at(&statement.sql, &snapshots)

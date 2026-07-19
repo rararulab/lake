@@ -66,6 +66,7 @@ enumeration or a per-reader OAuth storm.
 | current-snapshot load | Uses a cache of at most 10,000 table snapshots. A cold or expired key admits one external lookup; concurrent planners await that same result. | External catalog load is O(one per replica/key refresh), not O(readers). |
 | Flight ticket | Encrypts the selected namespace, table, and immutable snapshot ID into the normal statement ticket. | A later catalog change cannot silently change a running statement's source snapshot. |
 | `DoGet` | Point-loads the named snapshot and rejects it when upstream retention removed it; then Query reads Parquet/manifests directly from Iceberg storage. | No fall-forward to a newer snapshot; no object bytes through Metasrv or the external REST catalog. |
+| `PollFlightInfo` | Persists the same encrypted snapshot ticket in Lake's bounded async-job store. A later worker point-loads that exact ID before materializing immutable Arrow result parts. | Long scans survive client/replica changes without storing external credentials or falling forward to the current snapshot. |
 
 The configured namespace set is only the deployment ceiling. Query also applies
 the authenticated principal's ordinary Lake namespace grant to the Iceberg
@@ -152,9 +153,9 @@ retained upstream.
 
 ## Scope and write boundary
 
-The slice supports scans through direct SQL and standard Flight statement
-execution. Lake SQL is read-only, so the following are rejected before an
-external mutation can begin:
+The slice supports scans through direct SQL, standard Flight statement
+execution, and durable `PollFlightInfo` execution. Lake SQL is read-only, so
+the following are rejected before an external mutation can begin:
 
 - Iceberg `CREATE`, `DROP`, `ALTER`, `INSERT`, `UPDATE`, `DELETE`, and
   `MERGE` statements;
@@ -166,10 +167,11 @@ external mutation can begin:
 
 An Iceberg table provider is bound to the snapshot chosen while a statement is
 planned. A Flight ticket records the namespace, table, and immutable Iceberg
-snapshot ID. `DoGet` point-loads that ID and reconstructs a request-local
-provider; it never adopts a newer current snapshot after ticket issue. A later
-statement can refresh and use a newer snapshot. If upstream retention has
-removed the ticketed snapshot, the request fails rather than falling forward.
+snapshot ID. `DoGet` and a durable async worker both point-load that ID and
+reconstruct a request-local provider; neither adopts a newer current snapshot
+after ticket issue. A later statement can refresh and use a newer snapshot. If
+upstream retention has removed the ticketed snapshot, the request fails rather
+than falling forward.
 
 Each Query replica has a bounded cache of at most 10,000 external table
 snapshots. A cache entry is fresh for 5 seconds. On refresh failure, a
