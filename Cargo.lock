@@ -4551,6 +4551,7 @@ dependencies = [
  "lake-common",
  "lake-engine",
  "lake-meta",
+ "lake-objects",
  "lance",
  "lance-table",
  "object_store",

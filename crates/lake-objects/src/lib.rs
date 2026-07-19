@@ -34,6 +34,7 @@ use snafu::{OptionExt, Snafu};
 use tokio::io::AsyncRead;
 
 mod checkpoint;
+mod episode_table;
 mod gc;
 mod gc_apply;
 mod gc_plan;
@@ -41,6 +42,7 @@ mod integrity;
 mod inventory;
 mod local;
 mod reference_index;
+pub use episode_table::{episode_artifact_table_schema_v1, episode_artifact_table_v1};
 pub use gc::{GcPlanPage, GcPlanner, ObjectCandidate};
 pub use gc_apply::{DeleteOutcome, GcApplyProgress, GcPlanApplier, ManagedObjectDeleter};
 pub use gc_plan::{GcPlan, GcPlanWriter};
@@ -67,6 +69,11 @@ const MAX_MANAGED_READ_CAPABILITY_WIRE_BYTES: usize = 16 * 1024;
 pub enum ObjectError {
     #[snafu(display("DataLocation column '{column}' is missing or has an unexpected type"))]
     InvalidDataLocation { column: &'static str },
+
+    #[snafu(display("Episode/ArtifactRef v1 Arrow batch is invalid"))]
+    EpisodeTable {
+        source: datafusion::arrow::error::ArrowError,
+    },
 
     #[snafu(display("DataLocation column '{column}' is null at row {row}"))]
     NullDataLocation { column: &'static str, row: usize },
@@ -725,7 +732,10 @@ mod tests {
     use async_trait::async_trait;
     use aws_config::BehaviorVersion;
     use aws_sdk_s3::config::{Credentials, Region};
-    use lake_common::DataLocation;
+    use datafusion::arrow::array::{Array, StringArray, StructArray};
+    use lake_common::{
+        ArtifactRefV1, DataLocation, EpisodeBundleV1, EpisodeContractError, EpisodeRecordV1,
+    };
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
     use tokio::{
@@ -737,7 +747,8 @@ mod tests {
         InventoryRequest, LocalObjectStore, ManagedObjectInventory, ManagedObjectScope,
         ManagedObjectStore, ManagedReadCapabilityRequest, ManagedReadCapabilityResponse,
         ObjectError, ObjectIntegrityError, ObjectReader, PresignedRead, Result as ObjectResult,
-        S3ObjectStore, data_location_array, data_location_from_array, open_verified,
+        S3ObjectStore, data_location_array, data_location_from_array, episode_artifact_table_v1,
+        open_verified,
     };
 
     struct StaticReadStore {
@@ -960,6 +971,107 @@ mod tests {
         let array = data_location_array(std::slice::from_ref(&location));
 
         assert_eq!(data_location_from_array(&array, 0).unwrap(), location);
+    }
+
+    fn episode_artifact(uri: &str, digest: &str) -> DataLocation {
+        DataLocation::builder()
+            .uri(uri)
+            .content_type("application/octet-stream")
+            .size_bytes(42)
+            .sha256(digest)
+            .build()
+    }
+
+    #[test]
+    fn episode_artifact_table_v1_encodes_multi_artifact_bundle() {
+        let manifest = episode_artifact(
+            "s3://lake/objects/manifest.json",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let recording = episode_artifact(
+            "s3://lake/objects/recording.rrd",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let episode = EpisodeRecordV1::builder()
+            .episode_id("episode-1")
+            .manifest_artifact_id("manifest-1")
+            .robot_id("robot-a")
+            .task("pick")
+            .build();
+        let references = vec![
+            ArtifactRefV1::builder()
+                .episode_id("episode-1")
+                .artifact_id("manifest-1")
+                .layer_id("base")
+                .role("manifest")
+                .object(manifest.clone())
+                .build(),
+            ArtifactRefV1::builder()
+                .episode_id("episode-1")
+                .artifact_id("recording-1")
+                .layer_id("base")
+                .role("recording")
+                .recording_format("rrd")
+                .object(recording.clone())
+                .build(),
+        ];
+        let bundle = EpisodeBundleV1::try_new(episode, references).expect("valid v1 bundle");
+
+        let batch = episode_artifact_table_v1(&bundle).expect("encode v1 table batch");
+
+        assert_eq!(batch.num_rows(), 3);
+        let record_kinds = batch
+            .column_by_name("record_kind")
+            .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+            .expect("record_kind Utf8 column");
+        assert_eq!(
+            (0..record_kinds.len())
+                .map(|row| record_kinds.value(row))
+                .collect::<Vec<_>>(),
+            ["episode", "artifact_ref", "artifact_ref"]
+        );
+        let episode_ids = batch
+            .column_by_name("episode_id")
+            .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+            .expect("episode_id Utf8 column");
+        assert_eq!(
+            (0..episode_ids.len())
+                .map(|row| episode_ids.value(row))
+                .collect::<Vec<_>>(),
+            ["episode-1", "episode-1", "episode-1"]
+        );
+        let objects = batch
+            .column_by_name("object")
+            .and_then(|array| array.as_any().downcast_ref::<StructArray>())
+            .expect("top-level FILE struct column");
+        assert!(objects.is_null(0));
+        assert_eq!(data_location_from_array(objects, 1).unwrap(), manifest);
+        assert_eq!(data_location_from_array(objects, 2).unwrap(), recording);
+    }
+
+    #[test]
+    fn episode_artifact_table_v1_rejects_missing_manifest_reference() {
+        let episode = EpisodeRecordV1::builder()
+            .episode_id("episode-1")
+            .manifest_artifact_id("manifest-1")
+            .build();
+        let references = vec![
+            ArtifactRefV1::builder()
+                .episode_id("episode-1")
+                .artifact_id("recording-1")
+                .layer_id("base")
+                .role("recording")
+                .object(episode_artifact(
+                    "s3://lake/objects/recording.rrd",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                ))
+                .build(),
+        ];
+
+        assert!(matches!(
+            EpisodeBundleV1::try_new(episode, references),
+            Err(EpisodeContractError::MissingManifestReference { .. })
+        ));
     }
 
     #[tokio::test]
