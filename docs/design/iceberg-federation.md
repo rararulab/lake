@@ -27,31 +27,45 @@ Iceberg metadata determine the snapshot; Lake never mirrors it into the Lake
 registry.
 
 Open the source-controlled [federation topology](../assets/iceberg-federation.html)
-for the deployment view. It complements the diagram below: the topology shows
-the admission, credential, cache, and direct-object boundaries, while this
-guide defines their contract.
+for the deployment view. It complements the diagram below: both distinguish
+the interactive `DoGet` route from the durable `PollFlightInfo` route, while
+showing that they share admission, encrypted snapshot pinning, and direct
+Iceberg object reads.
 
 ```mermaid
 sequenceDiagram
     participant F as Flight SQL client
     participant Q as Lake Query replica
+    participant A as durable async state
+    participant W as Query async worker
     participant C as Iceberg REST catalog
     participant O as Iceberg object storage
 
-    F->>Q: GetFlightInfo(SELECT from iceberg.namespace.table)
+    F->>Q: GetFlightInfo or PollFlightInfo(SELECT from iceberg.namespace.table)
     Q->>C: exact table lookup / bounded refresh
     C-->>Q: immutable Iceberg metadata + snapshot
-    Q->>O: direct Parquet/manifest reads for schema
-    Q-->>F: encrypted ticket containing snapshot ID
-    F->>Q: DoGet(ticket)
-    Q->>C: exact table lookup at ticket snapshot ID
-    Q->>O: direct Parquet/manifest reads
-    Q-->>F: streamed Arrow batches
+    alt interactive statement
+        Q-->>F: encrypted ticket containing snapshot ID
+        F->>Q: DoGet(ticket)
+        Q->>C: exact table lookup at ticket snapshot ID
+        Q->>O: direct Parquet/manifest reads
+        Q-->>F: streamed Arrow batches
+    else durable statement
+        Q->>A: sealed job: snapshot identity only
+        A->>W: CAS-fenced claim
+        W->>C: exact table lookup at sealed snapshot ID
+        W->>O: direct Parquet/manifest reads
+        W->>A: bounded result parts + immutable manifest
+        F->>Q: poll identity-bound handle
+        Q-->>F: short-lived result endpoints
+    end
 ```
 
 The catalog request is a metadata path. The query scan is a direct object-data
-path. Neither large objects nor Iceberg credentials pass through Flight SQL,
-Metasrv, or the Lake registry.
+path. The durable state holds a sealed statement and bounded result metadata;
+it does not hold Iceberg credentials or source-object bytes. Neither those
+credentials nor large Iceberg objects pass through Flight SQL, Metasrv, or the
+Lake registry.
 
 ## Operational read contract
 
