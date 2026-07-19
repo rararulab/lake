@@ -795,9 +795,7 @@ async fn distinct_snapshot_loads_are_bounded_and_release_after_cancellation() {
         } else {
             format!("adversary_{index}")
         };
-        leaders.spawn(async move {
-            federation.resolve_snapshot("analytics", &table).await
-        });
+        leaders.spawn(async move { federation.resolve_snapshot("analytics", &table).await });
     }
     tokio::time::timeout(Duration::from_secs(1), async {
         while catalog.table_loads() < MAX_DISTINCT_PENDING_LOADS {
@@ -812,7 +810,9 @@ async fn distinct_snapshot_loads_are_bounded_and_release_after_cancellation() {
     let follower_catalog = federation.clone();
     let follower = tokio::spawn(async move {
         follower_ready.notify_one();
-        follower_catalog.resolve_snapshot("analytics", "episodes").await
+        follower_catalog
+            .resolve_snapshot("analytics", "episodes")
+            .await
     });
     follower_started.notified().await;
     tokio::task::yield_now().await;
