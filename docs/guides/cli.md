@@ -56,6 +56,23 @@ or invalid triple fails before Query binds. REST credentials and object-store
 credentials are supplied by the deployment/runtime, never through CLI flags,
 Lake metadata, or Flight tickets.
 
+An external catalog may be unauthenticated, or use exactly one of the following
+runtime-only REST authentication modes:
+
+| Variables | Mode |
+|---|---|
+| `LAKE_ICEBERG_REST_TOKEN` | Static bearer token |
+| `LAKE_ICEBERG_REST_CREDENTIAL` | OAuth client credentials in `client-id:client-secret` form |
+| `LAKE_ICEBERG_REST_OAUTH2_SERVER_URI` | Optional credential-free OAuth token endpoint; requires `..._CREDENTIAL` |
+| `LAKE_ICEBERG_REST_OAUTH_SCOPE`, `LAKE_ICEBERG_REST_OAUTH_AUDIENCE`, `LAKE_ICEBERG_REST_OAUTH_RESOURCE` | Optional standard OAuth token parameters; each requires `..._CREDENTIAL` |
+
+`LAKE_ICEBERG_REST_TOKEN` and `LAKE_ICEBERG_REST_CREDENTIAL` are mutually
+exclusive. Auth variables without the base catalog triple, malformed OAuth
+endpoint URLs, and empty/invalid values fail before the listener binds. Inject
+secrets from the deployment secret manager as environment variables; do not
+put them in endpoint URLs, CLI flags, config files committed to source control,
+or diagnostic output.
+
 Query accepts `SELECT ... FROM iceberg.<namespace>.<table>` only for a
 configured namespace. It does not enumerate external namespaces or tables in
 Flight discovery; clients must use a full table name. The external catalog owns

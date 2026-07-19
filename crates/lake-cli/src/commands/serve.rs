@@ -20,7 +20,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
 use lake_common::{ManagedStageBackend, ManagedStageDescriptor};
 use lake_flight::ClientSecurity;
-use lake_iceberg::{IcebergCatalog, IcebergCatalogConfig};
+use lake_iceberg::{IcebergCatalog, IcebergCatalogConfig, IcebergOAuthOptions, IcebergRestAuth};
 use lake_meta::{DynamoMeta, MetaStoreRef, RocksMeta};
 use lake_metasrv::MetasrvServerConfig;
 use lake_objects::{
@@ -176,10 +176,22 @@ async fn query_engine_for_server(
 }
 
 fn iceberg_catalog_config_from_env() -> anyhow::Result<Option<IcebergCatalogConfig>> {
-    iceberg_catalog_config_from_values(
-        optional_env("LAKE_ICEBERG_REST_ENDPOINT")?.as_deref(),
-        optional_env("LAKE_ICEBERG_WAREHOUSE")?.as_deref(),
-        optional_env("LAKE_ICEBERG_NAMESPACES")?.as_deref(),
+    let endpoint = optional_env("LAKE_ICEBERG_REST_ENDPOINT")?;
+    let warehouse = optional_env("LAKE_ICEBERG_WAREHOUSE")?;
+    let namespaces = optional_env("LAKE_ICEBERG_NAMESPACES")?;
+    let auth = IcebergRestAuthValues {
+        token:             optional_env("LAKE_ICEBERG_REST_TOKEN")?,
+        credential:        optional_env("LAKE_ICEBERG_REST_CREDENTIAL")?,
+        oauth2_server_uri: optional_env("LAKE_ICEBERG_REST_OAUTH2_SERVER_URI")?,
+        scope:             optional_env("LAKE_ICEBERG_REST_OAUTH_SCOPE")?,
+        audience:          optional_env("LAKE_ICEBERG_REST_OAUTH_AUDIENCE")?,
+        resource:          optional_env("LAKE_ICEBERG_REST_OAUTH_RESOURCE")?,
+    };
+    iceberg_catalog_config_from_all_values(
+        endpoint.as_deref(),
+        warehouse.as_deref(),
+        namespaces.as_deref(),
+        auth.as_deref(),
     )
 }
 
@@ -208,6 +220,87 @@ fn iceberg_catalog_config_from_values(
             "LAKE_ICEBERG_REST_ENDPOINT, LAKE_ICEBERG_WAREHOUSE, and LAKE_ICEBERG_NAMESPACES must \
              all be set together"
         ),
+    }
+}
+
+struct IcebergRestAuthValues<T> {
+    token:             Option<T>,
+    credential:        Option<T>,
+    oauth2_server_uri: Option<T>,
+    scope:             Option<T>,
+    audience:          Option<T>,
+    resource:          Option<T>,
+}
+
+impl<T> IcebergRestAuthValues<T> {
+    fn as_deref(&self) -> IcebergRestAuthValues<&str>
+    where
+        T: AsRef<str>,
+    {
+        IcebergRestAuthValues {
+            token:             self.token.as_ref().map(AsRef::as_ref),
+            credential:        self.credential.as_ref().map(AsRef::as_ref),
+            oauth2_server_uri: self.oauth2_server_uri.as_ref().map(AsRef::as_ref),
+            scope:             self.scope.as_ref().map(AsRef::as_ref),
+            audience:          self.audience.as_ref().map(AsRef::as_ref),
+            resource:          self.resource.as_ref().map(AsRef::as_ref),
+        }
+    }
+}
+
+fn iceberg_catalog_config_from_all_values(
+    endpoint: Option<&str>,
+    warehouse: Option<&str>,
+    namespaces: Option<&str>,
+    auth_values: IcebergRestAuthValues<&str>,
+) -> anyhow::Result<Option<IcebergCatalogConfig>> {
+    let config = iceberg_catalog_config_from_values(endpoint, warehouse, namespaces)?;
+    let auth = iceberg_rest_auth_from_values(auth_values)?;
+    match (config, auth) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => anyhow::bail!(
+            "Iceberg REST authentication requires LAKE_ICEBERG_REST_ENDPOINT, \
+             LAKE_ICEBERG_WAREHOUSE, and LAKE_ICEBERG_NAMESPACES"
+        ),
+        (Some(config), None) => Ok(Some(config)),
+        (Some(config), Some(auth)) => Ok(Some(config.with_rest_auth(auth))),
+    }
+}
+
+fn iceberg_rest_auth_from_values(
+    values: IcebergRestAuthValues<&str>,
+) -> anyhow::Result<Option<IcebergRestAuth>> {
+    let has_oauth_options = [
+        values.oauth2_server_uri,
+        values.scope,
+        values.audience,
+        values.resource,
+    ]
+    .into_iter()
+    .any(|value| value.is_some());
+    match (values.token, values.credential) {
+        (None, None) if !has_oauth_options => Ok(None),
+        (None, None) => anyhow::bail!("Iceberg OAuth options require LAKE_ICEBERG_REST_CREDENTIAL"),
+        (Some(_), Some(_)) => anyhow::bail!(
+            "set only one of LAKE_ICEBERG_REST_TOKEN and LAKE_ICEBERG_REST_CREDENTIAL"
+        ),
+        (Some(_), None) if has_oauth_options => {
+            anyhow::bail!("Iceberg OAuth options require LAKE_ICEBERG_REST_CREDENTIAL")
+        }
+        (Some(token), None) => IcebergRestAuth::bearer_token(token)
+            .map(Some)
+            .map_err(Into::into),
+        (None, Some(credential)) => IcebergRestAuth::oauth_client_credentials(
+            credential,
+            IcebergOAuthOptions::builder()
+                .maybe_oauth2_server_uri(values.oauth2_server_uri.map(str::to_owned))
+                .maybe_scope(values.scope.map(str::to_owned))
+                .maybe_audience(values.audience.map(str::to_owned))
+                .maybe_resource(values.resource.map(str::to_owned))
+                .build(),
+        )
+        .map(Some)
+        .map_err(Into::into),
     }
 }
 
@@ -334,6 +427,7 @@ mod tests {
     use lake_query::QueryResources;
 
     use super::{
+        IcebergRestAuthValues, iceberg_catalog_config_from_all_values,
         iceberg_catalog_config_from_values, query_engine_for_server,
         read_capability_issuer_for_stage,
     };
@@ -416,6 +510,106 @@ mod tests {
                 .expect_err("partial configuration must fail before server bind");
             assert!(error.to_string().contains("all be set"));
         }
+    }
+
+    #[test]
+    fn iceberg_rest_auth_configuration_is_validated_before_listener_bind() {
+        const TOKEN: &str = "lake-rest-static-token";
+        const CREDENTIAL: &str = "lake-query:lake-rest-oauth-secret";
+        const SECRET: &str = "lake-rest-oauth-secret";
+        let endpoint = Some("https://catalog.example.test");
+        let warehouse = Some("s3://warehouse");
+        let namespaces = Some("analytics");
+
+        let static_auth = iceberg_catalog_config_from_all_values(
+            endpoint,
+            warehouse,
+            namespaces,
+            IcebergRestAuthValues {
+                token:             Some(TOKEN),
+                credential:        None,
+                oauth2_server_uri: None,
+                scope:             None,
+                audience:          None,
+                resource:          None,
+            },
+        )
+        .expect("static bearer configuration is valid")
+        .expect("Iceberg catalog is configured");
+        assert!(
+            !format!("{static_auth:?}").contains(TOKEN),
+            "static bearer token must be redacted from Query configuration"
+        );
+
+        let oauth = iceberg_catalog_config_from_all_values(
+            endpoint,
+            warehouse,
+            namespaces,
+            IcebergRestAuthValues {
+                token:             None,
+                credential:        Some(CREDENTIAL),
+                oauth2_server_uri: Some("https://identity.example.test/oauth/token"),
+                scope:             Some("lake-catalog"),
+                audience:          Some("lake"),
+                resource:          Some("catalog"),
+            },
+        )
+        .expect("OAuth client configuration is valid")
+        .expect("Iceberg catalog is configured");
+        assert!(
+            !format!("{oauth:?}").contains(SECRET),
+            "OAuth client secret must be redacted from Query configuration"
+        );
+
+        for invalid in [
+            (Some(TOKEN), Some(CREDENTIAL), None, None, None, None),
+            (None, None, None, Some("lake-catalog"), None, None),
+            (
+                None,
+                Some(CREDENTIAL),
+                Some("https://client:secret@identity.example.test/oauth/token"),
+                None,
+                None,
+                None,
+            ),
+        ] {
+            let error = iceberg_catalog_config_from_all_values(
+                endpoint,
+                warehouse,
+                namespaces,
+                IcebergRestAuthValues {
+                    token:             invalid.0,
+                    credential:        invalid.1,
+                    oauth2_server_uri: invalid.2,
+                    scope:             invalid.3,
+                    audience:          invalid.4,
+                    resource:          invalid.5,
+                },
+            )
+            .expect_err("contradictory or partial REST authentication must fail before bind");
+            assert!(
+                !error.to_string().contains(TOKEN) && !error.to_string().contains(SECRET),
+                "configuration error must not echo REST credentials"
+            );
+        }
+
+        assert!(
+            iceberg_catalog_config_from_all_values(
+                None,
+                None,
+                None,
+                IcebergRestAuthValues {
+                    token:             Some(TOKEN),
+                    credential:        None,
+                    oauth2_server_uri: None,
+                    scope:             None,
+                    audience:          None,
+                    resource:          None,
+                },
+            )
+            .is_err(),
+            "REST authentication without an enabled Iceberg catalog must fail"
+        );
     }
 
     #[tokio::test]

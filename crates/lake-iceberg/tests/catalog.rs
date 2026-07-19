@@ -25,8 +25,8 @@ use async_trait::async_trait;
 use axum::{
     Router,
     extract::{Request, State},
-    http::StatusCode,
-    routing::{any, get, head},
+    http::{HeaderMap, StatusCode},
+    routing::{any, get, head, post},
 };
 use datafusion::{
     arrow::{array::Int64Array, record_batch::RecordBatch},
@@ -50,7 +50,7 @@ use iceberg::{
         },
     },
 };
-use lake_iceberg::{IcebergCatalog, IcebergCatalogConfig};
+use lake_iceberg::{IcebergCatalog, IcebergCatalogConfig, IcebergOAuthOptions, IcebergRestAuth};
 
 #[derive(Debug)]
 struct RecordingCatalog {
@@ -123,6 +123,120 @@ async fn rest_data_table(
     (
         [("content-type", "application/json")],
         serde_json::to_string(&response).expect("encode REST table response"),
+    )
+}
+
+#[derive(Clone)]
+struct BearerRestDataTable {
+    table:      Table,
+    bearer:     String,
+    rejections: Arc<AtomicUsize>,
+    oauth:      Option<OAuthRequest>,
+}
+
+#[derive(Clone)]
+struct OAuthRequest {
+    expected_form_fields: Arc<[String]>,
+    exchanges:            Arc<AtomicUsize>,
+}
+
+impl BearerRestDataTable {
+    fn authorized(&self, headers: &HeaderMap) -> bool {
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == self.bearer)
+    }
+}
+
+async fn bearer_rest_config(
+    State(state): State<BearerRestDataTable>,
+    headers: HeaderMap,
+) -> Result<([(&'static str, &'static str); 1], &'static str), StatusCode> {
+    if !state.authorized(&headers) {
+        state.rejections.fetch_add(1, Ordering::Relaxed);
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok((
+        [("content-type", "application/json")],
+        r#"{"defaults":{},"overrides":{}}"#,
+    ))
+}
+
+async fn bearer_rest_namespace(
+    State(state): State<BearerRestDataTable>,
+    headers: HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    if state.authorized(&headers) {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        state.rejections.fetch_add(1, Ordering::Relaxed);
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+async fn bearer_rest_table(
+    State(state): State<BearerRestDataTable>,
+    headers: HeaderMap,
+) -> Result<([(&'static str, &'static str); 1], String), StatusCode> {
+    if !state.authorized(&headers) {
+        state.rejections.fetch_add(1, Ordering::Relaxed);
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let response = serde_json::json!({
+        "metadata-location": state.table.metadata_location(),
+        "metadata": state.table.metadata(),
+        "config": {},
+    });
+    Ok((
+        [("content-type", "application/json")],
+        serde_json::to_string(&response).expect("encode REST table response"),
+    ))
+}
+
+async fn bearer_rest_oauth_token(
+    State(state): State<BearerRestDataTable>,
+    body: String,
+) -> Result<([(&'static str, &'static str); 1], String), StatusCode> {
+    let oauth = state.oauth.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    if !oauth
+        .expected_form_fields
+        .iter()
+        .all(|field| body.split('&').any(|actual| actual == field))
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    oauth.exchanges.fetch_add(1, Ordering::Relaxed);
+    let token = state
+        .bearer
+        .strip_prefix("Bearer ")
+        .expect("test bearer has prefix");
+    Ok((
+        [("content-type", "application/json")],
+        serde_json::json!({
+            "access_token": token,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        })
+        .to_string(),
+    ))
+}
+
+async fn bearer_rest_echo_authorization_error(headers: HeaderMap) -> (StatusCode, String) {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("missing authorization");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({
+            "error": {
+                "message": authorization,
+                "type": "test.error",
+                "code": 500,
+            }
+        })
+        .to_string(),
     )
 }
 
@@ -557,5 +671,215 @@ async fn rest_catalog_table_is_queryable_through_iceberg_catalog() {
         })
         .collect::<Vec<_>>();
     assert_eq!(values, vec![42]);
+    server.abort();
+}
+
+#[tokio::test]
+async fn rest_catalog_static_bearer_auth_is_runtime_only() {
+    const TOKEN: &str = "lake-rest-static-token";
+
+    let (_warehouse, table) = populated_local_table().await;
+    let state = BearerRestDataTable {
+        table,
+        bearer: format!("Bearer {TOKEN}"),
+        rejections: Arc::new(AtomicUsize::new(0)),
+        oauth: None,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind protected REST catalog");
+    let address = listener
+        .local_addr()
+        .expect("read protected REST catalog address");
+    let app = Router::new()
+        .route("/v1/config", get(bearer_rest_config))
+        .route("/v1/namespaces/analytics", head(bearer_rest_namespace))
+        .route(
+            "/v1/namespaces/analytics/tables/episodes",
+            get(bearer_rest_table),
+        )
+        .with_state(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve protected REST catalog");
+    });
+    let config = IcebergCatalogConfig::try_new(
+        &format!("http://{address}"),
+        "file:///warehouse",
+        ["analytics"],
+    )
+    .expect("build protected REST configuration");
+
+    assert!(
+        IcebergCatalog::connect(config.clone()).await.is_err(),
+        "unauthenticated REST catalog startup must fail"
+    );
+    assert_eq!(state.rejections.load(Ordering::Relaxed), 1);
+
+    let config = config
+        .with_rest_auth(IcebergRestAuth::bearer_token(TOKEN).expect("validate static REST token"));
+    assert!(
+        !format!("{config:?}").contains(TOKEN),
+        "REST token must be redacted from Debug output"
+    );
+    let catalog = IcebergCatalog::connect(config)
+        .await
+        .expect("connect authenticated REST catalog");
+    let context = SessionContext::new();
+    context.register_catalog("iceberg", catalog.datafusion_catalog());
+    let batches = context
+        .sql("SELECT episode_id FROM iceberg.analytics.episodes")
+        .await
+        .expect("plan protected Iceberg REST table")
+        .collect()
+        .await
+        .expect("read protected Iceberg REST table");
+    let values = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Iceberg episode ID column")
+                .iter()
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values, vec![42]);
+    server.abort();
+}
+
+#[tokio::test]
+async fn rest_catalog_failures_redact_runtime_bearer_tokens() {
+    const TOKEN: &str = "lake-rest-static-token";
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind failing REST catalog");
+    let address = listener
+        .local_addr()
+        .expect("read failing REST catalog address");
+    let app = Router::new().route("/v1/config", get(bearer_rest_echo_authorization_error));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve failing REST catalog");
+    });
+    let config = IcebergCatalogConfig::try_new(
+        &format!("http://{address}"),
+        "file:///warehouse",
+        ["analytics"],
+    )
+    .expect("build failing REST configuration")
+    .with_rest_auth(IcebergRestAuth::bearer_token(TOKEN).expect("validate static REST token"));
+
+    let error = IcebergCatalog::connect(config)
+        .await
+        .expect_err("catalog error must be returned");
+    assert!(
+        !error.to_string().contains(TOKEN) && !format!("{error:?}").contains(TOKEN),
+        "external REST error payload must not leak the bearer token"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn rest_catalog_oauth_client_credentials_are_runtime_only() {
+    const CREDENTIAL: &str = "lake-query:lake-rest-oauth-secret";
+    const SECRET: &str = "lake-rest-oauth-secret";
+    const TOKEN: &str = "lake-rest-oauth-access-token";
+
+    let (_warehouse, table) = populated_local_table().await;
+    let state = BearerRestDataTable {
+        table,
+        bearer: format!("Bearer {TOKEN}"),
+        rejections: Arc::new(AtomicUsize::new(0)),
+        oauth: Some(OAuthRequest {
+            expected_form_fields: Arc::from([
+                "grant_type=client_credentials".to_owned(),
+                "client_id=lake-query".to_owned(),
+                format!("client_secret={SECRET}"),
+                "scope=lake-catalog".to_owned(),
+            ]),
+            exchanges:            Arc::new(AtomicUsize::new(0)),
+        }),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind OAuth REST catalog");
+    let address = listener
+        .local_addr()
+        .expect("read OAuth REST catalog address");
+    let app = Router::new()
+        .route("/v1/config", get(bearer_rest_config))
+        .route("/v1/namespaces/analytics", head(bearer_rest_namespace))
+        .route(
+            "/v1/namespaces/analytics/tables/episodes",
+            get(bearer_rest_table),
+        )
+        .route("/oauth/token", post(bearer_rest_oauth_token))
+        .with_state(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve OAuth REST catalog");
+    });
+    let auth = IcebergRestAuth::oauth_client_credentials(
+        CREDENTIAL,
+        IcebergOAuthOptions::builder()
+            .oauth2_server_uri(format!("http://{address}/oauth/token"))
+            .scope("lake-catalog")
+            .build(),
+    )
+    .expect("validate OAuth client credential");
+    let config = IcebergCatalogConfig::try_new(
+        &format!("http://{address}"),
+        "file:///warehouse",
+        ["analytics"],
+    )
+    .expect("build OAuth REST configuration")
+    .with_rest_auth(auth);
+    assert!(
+        !format!("{config:?}").contains(SECRET),
+        "OAuth client secret must be redacted from Debug output"
+    );
+
+    let catalog = IcebergCatalog::connect(config)
+        .await
+        .expect("connect OAuth REST catalog");
+    let context = SessionContext::new();
+    context.register_catalog("iceberg", catalog.datafusion_catalog());
+    let batches = context
+        .sql("SELECT episode_id FROM iceberg.analytics.episodes")
+        .await
+        .expect("plan OAuth-protected Iceberg REST table")
+        .collect()
+        .await
+        .expect("read OAuth-protected Iceberg REST table");
+    let values = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Iceberg episode ID column")
+                .iter()
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values, vec![42]);
+    assert_eq!(
+        state
+            .oauth
+            .as_ref()
+            .expect("OAuth test state")
+            .exchanges
+            .load(Ordering::Relaxed),
+        1,
+        "client credentials should create one cached REST session token"
+    );
     server.abort();
 }

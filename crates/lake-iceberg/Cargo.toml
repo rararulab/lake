@@ -10,6 +10,7 @@ description = "Read-only, snapshot-pinned Apache Iceberg REST-catalog federation
 
 [dependencies]
 async-trait = { workspace = true }
+bon = { workspace = true }
 datafusion = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
