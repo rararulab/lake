@@ -16,8 +16,10 @@ files instead). Read `docs/guides/mise-ci.md` before changing Bun Shell usage.
   `.lake/test-env.env`
 - `test-integration.ts` — `mise run test-integration`: up → run the `#[ignore]`
   LocalStack tests (`--run-ignored ignored-only`) against the endpoint → down.
-  `mise run test-integration-external` skips Docker lifecycle and runs the same
-  package list against CI's already-provisioned LocalStack service container.
+  It excludes the Apache Iceberg REST fixture test, which is owned by
+  `test-iceberg-integration.ts`. `mise run test-integration-external` skips
+  Docker lifecycle and runs the same selection against CI's already-provisioned
+  LocalStack service container.
 - `test-iceberg-env.ts` — checkout-scoped Apache Iceberg REST Catalog + public
   MinIO fixture, up/down, and dynamic endpoints written to
   `.lake/test-iceberg-env.env`.

@@ -51,6 +51,8 @@ async function runIntegration(
       ...profileArgs,
       "--run-ignored",
       "ignored-only",
+      "-E",
+      "not test(apache_rest_catalog_with_minio_is_queryable)",
     ],
     {
       stdout: "inherit",
