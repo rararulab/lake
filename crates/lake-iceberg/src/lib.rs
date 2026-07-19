@@ -38,7 +38,7 @@ use iceberg_datafusion::IcebergStaticTableProvider;
 use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use snafu::Snafu;
 use tokio::sync::Mutex as AsyncMutex;
-use url::Url;
+use url::{Host, Url};
 
 const DEFAULT_CACHE_FRESHNESS: Duration = Duration::from_secs(5);
 const DEFAULT_CACHE_STALE_IF_ERROR: Duration = Duration::from_mins(1);
@@ -51,7 +51,8 @@ const MAX_REST_SECRET_BYTES: usize = 8 * 1024;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum IcebergError {
-    /// The REST endpoint is not a credential-free HTTP(S) URL.
+    /// The REST endpoint is not a credential-free TLS or loopback-development
+    /// URL.
     #[snafu(display("Iceberg REST endpoint is invalid"))]
     InvalidEndpoint,
     /// The configured warehouse is blank.
@@ -189,7 +190,8 @@ impl std::fmt::Debug for IcebergRestAuth {
 impl IcebergOAuthOptions {
     fn valid(&self) -> bool {
         self.oauth2_server_uri.as_deref().is_none_or(|value| {
-            Url::parse(value).is_ok_and(|endpoint| valid_credential_free_http_url(&endpoint))
+            Url::parse(value)
+                .is_ok_and(|endpoint| valid_credential_free_external_rest_url(&endpoint))
         }) && [
             self.scope.as_deref(),
             self.audience.as_deref(),
@@ -240,7 +242,7 @@ impl IcebergCatalogConfig {
         S: AsRef<str>,
     {
         let mut endpoint = Url::parse(endpoint).map_err(|_| IcebergError::InvalidEndpoint)?;
-        if !valid_credential_free_http_url(&endpoint) {
+        if !valid_credential_free_external_rest_url(&endpoint) {
             return Err(IcebergError::InvalidEndpoint);
         }
         let normalized_path = endpoint.path().trim_end_matches('/').to_owned();
@@ -313,7 +315,7 @@ impl IcebergCatalogConfig {
         Ok(self)
     }
 
-    /// Return the validated credential-free REST endpoint.
+    /// Return the validated credential-free TLS or loopback REST endpoint.
     #[must_use]
     pub fn endpoint(&self) -> &Url { &self.endpoint }
 
@@ -375,13 +377,22 @@ fn valid_rest_secret(value: &str) -> bool {
         && !value.bytes().any(|byte| byte.is_ascii_control())
 }
 
-fn valid_credential_free_http_url(endpoint: &Url) -> bool {
-    matches!(endpoint.scheme(), "http" | "https")
-        && endpoint.host_str().is_some()
-        && endpoint.username().is_empty()
-        && endpoint.password().is_none()
-        && endpoint.query().is_none()
-        && endpoint.fragment().is_none()
+fn valid_credential_free_external_rest_url(endpoint: &Url) -> bool {
+    if endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return false;
+    }
+
+    match (endpoint.scheme(), endpoint.host()) {
+        ("https", _) => true,
+        ("http", Some(Host::Ipv4(address))) => address.is_loopback(),
+        ("http", Some(Host::Ipv6(address))) => address.is_loopback(),
+        _ => false,
+    }
 }
 
 fn catalog_error(_: iceberg::Error) -> IcebergError { IcebergError::Catalog }

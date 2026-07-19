@@ -56,7 +56,7 @@ Iceberg disabled.
 
 | Variable | Meaning |
 |---|---|
-| `LAKE_ICEBERG_REST_ENDPOINT` | Credential-free HTTP(S) REST catalog base URL |
+| `LAKE_ICEBERG_REST_ENDPOINT` | Credential-free HTTPS REST catalog base URL; numeric IP loopback HTTP is development-only |
 | `LAKE_ICEBERG_WAREHOUSE` | Iceberg warehouse identifier passed to the catalog |
 | `LAKE_ICEBERG_NAMESPACES` | Comma-separated, finite SQL namespace allowlist |
 | `LAKE_ICEBERG_REST_TIMEOUT_MS` | Optional per-request total/connect deadline in milliseconds (default `10000`, range `1..=60000`) |
@@ -78,7 +78,10 @@ mutually exclusive. OAuth may additionally use the standard
 `LAKE_ICEBERG_REST_OAUTH_AUDIENCE`, and
 `LAKE_ICEBERG_REST_OAUTH_RESOURCE` properties; each requires client
 credentials. Values are validated before the Flight listener binds, including
-the credential-free HTTP(S) requirement for an overridden OAuth token endpoint.
+the credential-free HTTPS requirement for both external endpoints. Plain HTTP
+is valid only for numeric IP loopback development endpoints (`127.0.0.0/8` or
+`::1`), not DNS names such as `localhost`; this keeps a bearer token or OAuth
+client credential off plaintext remote transport.
 
 The adapter uses Apache `iceberg-rust`'s DataFusion integration at the pinned
 Apache revision declared in the workspace. Its storage factory resolves the

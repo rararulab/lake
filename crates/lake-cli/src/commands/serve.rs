@@ -595,6 +595,54 @@ mod tests {
     }
 
     #[test]
+    fn iceberg_rest_transport_is_validated_before_listener_bind() {
+        const TOKEN: &str = "lake-rest-static-token";
+        const CREDENTIAL: &str = "lake-query:lake-rest-oauth-secret";
+        const SECRET: &str = "lake-rest-oauth-secret";
+        let endpoint = Some("https://catalog.example.test");
+        let warehouse = Some("s3://warehouse");
+        let namespaces = Some("analytics");
+
+        for (catalog_endpoint, auth) in [
+            (
+                Some("http://catalog.example.test"),
+                IcebergRestAuthValues {
+                    token:             Some(TOKEN),
+                    credential:        None,
+                    oauth2_server_uri: None,
+                    scope:             None,
+                    audience:          None,
+                    resource:          None,
+                },
+            ),
+            (
+                endpoint,
+                IcebergRestAuthValues {
+                    token:             None,
+                    credential:        Some(CREDENTIAL),
+                    oauth2_server_uri: Some("http://identity.example.test/oauth/token"),
+                    scope:             None,
+                    audience:          None,
+                    resource:          None,
+                },
+            ),
+        ] {
+            let error = iceberg_catalog_config_from_all_values(
+                catalog_endpoint,
+                warehouse,
+                namespaces,
+                auth,
+                None,
+            )
+            .expect_err("plaintext external REST configuration must fail before listener bind");
+            assert!(
+                !error.to_string().contains(TOKEN) && !error.to_string().contains(SECRET),
+                "configuration error must not disclose REST credentials"
+            );
+        }
+    }
+
+    #[test]
     fn iceberg_rest_auth_configuration_is_validated_before_listener_bind() {
         const TOKEN: &str = "lake-rest-static-token";
         const CREDENTIAL: &str = "lake-query:lake-rest-oauth-secret";

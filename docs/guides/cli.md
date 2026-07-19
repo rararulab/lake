@@ -50,7 +50,9 @@ LAKE_ICEBERG_REST_TIMEOUT_MS=10000 \
 lake query --metadata-addr https://metasrv.example.com:50052
 ```
 
-`LAKE_ICEBERG_REST_ENDPOINT` must be a credential-free HTTP(S) URL.
+`LAKE_ICEBERG_REST_ENDPOINT` must be a credential-free HTTPS URL. Plain HTTP
+is only valid for a numeric IP loopback development endpoint (`127.0.0.0/8` or
+`::1`); hostnames, including `localhost`, are not a loopback exception.
 `LAKE_ICEBERG_WAREHOUSE` is passed to the REST catalog, and
 `LAKE_ICEBERG_NAMESPACES` is a comma-separated finite allowlist. Any partial
 or invalid triple fails before Query binds. REST credentials and object-store
@@ -75,10 +77,12 @@ runtime-only REST authentication modes:
 
 `LAKE_ICEBERG_REST_TOKEN` and `LAKE_ICEBERG_REST_CREDENTIAL` are mutually
 exclusive. Auth variables without the base catalog triple, malformed OAuth
-endpoint URLs, and empty/invalid values fail before the listener binds. Inject
-secrets from the deployment secret manager as environment variables; do not
-put them in endpoint URLs, CLI flags, config files committed to source control,
-or diagnostic output.
+endpoint URLs, remote plaintext OAuth token endpoints, and empty/invalid values
+fail before the listener binds. The overridden OAuth token endpoint follows the
+same HTTPS-or-numeric-loopback rule as the catalog endpoint. Inject secrets
+from the deployment secret manager as environment variables; do not put them in
+endpoint URLs, CLI flags, config files committed to source control, or
+diagnostic output.
 
 When an OAuth client-credential session fails on a bounded namespace check or
 exact table lookup, Query renews its in-memory token once and retries only that

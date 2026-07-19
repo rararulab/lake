@@ -299,8 +299,11 @@ static bearer token uses `LAKE_ICEBERG_REST_TOKEN`. OAuth client credentials
 use `LAKE_ICEBERG_REST_CREDENTIAL` (`client-id:client-secret`) and may set
 `LAKE_ICEBERG_REST_OAUTH2_SERVER_URI`, `LAKE_ICEBERG_REST_OAUTH_SCOPE`,
 `LAKE_ICEBERG_REST_OAUTH_AUDIENCE`, and `LAKE_ICEBERG_REST_OAUTH_RESOURCE`.
-Inject these values from the deployment secret manager; never put credentials
-in the endpoint URL, SQL, Lake metadata, or a Flight ticket.
+The catalog endpoint and an overridden OAuth token endpoint must use HTTPS;
+plain HTTP is accepted only for numeric IP loopback development endpoints
+(`127.0.0.0/8` or `::1`), never hostnames such as `localhost`. Inject these
+values from the deployment secret manager; never put credentials in the
+endpoint URL, SQL, Lake metadata, or a Flight ticket.
 
 For OAuth client credentials only, a failed bounded namespace check or exact
 table lookup renews the in-memory REST session once and retries that same
