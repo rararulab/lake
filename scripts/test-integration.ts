@@ -45,6 +45,8 @@ async function runIntegration(
       "-p",
       "lake-meta",
       "-p",
+      "lake-query",
+      "-p",
       "lake-engine-lance",
       ...profileArgs,
       "--run-ignored",
