@@ -44,35 +44,59 @@ fn mise_bootstrap_serializes_tool_installation() {
 
 #[test]
 fn direct_mise_actions_serialize_tool_installation() {
-    let path = root().join(".github/workflows/ci.yml");
-    let workflow: Value = serde_yaml::from_str(
-        &fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
-    )
-    .expect("CI workflow must be valid YAML");
-    let jobs = workflow["jobs"].as_mapping().expect("CI workflow jobs");
+    let workflows = root().join(".github/workflows");
+    let mut direct_mise_step_count = 0;
 
-    let direct_mise_steps = jobs
-        .values()
-        .flat_map(|job| {
-            job["steps"]
-                .as_sequence()
-                .into_iter()
-                .flatten()
-                .filter(|step| {
-                    step["uses"]
-                        .as_str()
-                        .is_some_and(|uses| uses.starts_with("jdx/mise-action@"))
-                })
-        })
-        .collect::<Vec<_>>();
+    for entry in fs::read_dir(&workflows)
+        .unwrap_or_else(|error| panic!("read {}: {error}", workflows.display()))
+    {
+        let path = entry.expect("workflow directory entry").path();
+        if !matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            continue;
+        }
+
+        let workflow: Value = serde_yaml::from_str(
+            &fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
+        )
+        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+        let jobs = workflow["jobs"]
+            .as_mapping()
+            .unwrap_or_else(|| panic!("{} must define jobs", path.display()));
+
+        let direct_mise_steps = jobs
+            .values()
+            .flat_map(|job| {
+                job["steps"]
+                    .as_sequence()
+                    .into_iter()
+                    .flatten()
+                    .filter(|step| {
+                        step["uses"]
+                            .as_str()
+                            .is_some_and(|uses| uses.starts_with("jdx/mise-action@"))
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        direct_mise_step_count += direct_mise_steps.len();
+        for step in direct_mise_steps {
+            assert_eq!(step["with"]["install"].as_bool(), Some(true));
+            assert_eq!(
+                step["with"]["install_args"].as_str(),
+                Some("--jobs=1"),
+                "{} must serialize mise tool installation",
+                path.display()
+            );
+        }
+    }
 
     assert!(
-        !direct_mise_steps.is_empty(),
-        "CI must keep direct mise jobs covered"
+        direct_mise_step_count > 0,
+        "{} must contain a direct mise-action step",
+        workflows.display()
     );
-    for step in direct_mise_steps {
-        assert_eq!(step["with"]["install"].as_bool(), Some(true));
-        assert_eq!(step["with"]["install_args"].as_str(), Some("--jobs=1"));
-    }
 }

@@ -30,6 +30,7 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           install: true
+          install_args: --jobs=1
 
       - name: Check and build site
         run: mise run site-check
