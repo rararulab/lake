@@ -56,9 +56,10 @@ Iceberg table's object storage.
 This section distinguishes implemented contracts from the target model. Today
 Lake provides the underlying immutable `DataLocation`, exact per-table versions,
 managed-object reads, SQL primitives, and the format-neutral
-`EpisodeBundleV1`/`ArtifactRefV1` contract with validated Arrow encoding. Public
+`EpisodeManifestV1` plus `EpisodeBundleV1`/`ArtifactRefV1` contracts with
+canonical JSON, exact Artifact binding, and validated Arrow encoding. Public
 Episode ingestion, format adapters, DatasetRevision and TrainingView APIs,
-Python readers, Materializations, and Layers are planned work.
+Python readers, Materializations, and derived-Layer append are planned work.
 
 In the target model, Lake is authoritative for Dataset membership,
 DatasetRevision identity, access, retention, TrainingView selection, and
@@ -70,8 +71,9 @@ The full terminology, current capability boundary, and delivery sequence live in
 ```mermaid
 flowchart LR
     source["External: robot / simulator"] --> adapters["Planned: format adapters\nRRD / MCAP / LeRobot"]
-    adapters --> objects["Current primitive: immutable FILE Artifacts\nmanaged object storage"]
-    adapters --> episodes["Current contract: Episode + ArtifactRef Arrow rows\npublic ingestion planned"]
+    adapters --> manifest["Current contract: EpisodeManifest v1\ncanonical metadata + bindings"]
+    manifest --> objects["Current primitive: immutable FILE Artifacts\nmanaged object storage"]
+    manifest --> episodes["Current contract: Episode + ArtifactRef Arrow rows\npublic ingestion planned"]
     objects --> revision["Planned: DatasetRevision\nover current exact table versions"]
     episodes --> revision
     revision --> view["Planned: TrainingView"]

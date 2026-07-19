@@ -309,10 +309,17 @@ struct. The reference extractor skips only a null parent FILE cell and fails on
 any present identity with a null child.
 
 The structured Episode manifest describes Recording selectors, timelines,
-streams, codecs, Layers, and optional sidecar indexes. Scalar columns are a
-query acceleration surface, not a competing source of truth: values derived
-from the manifest must be bound to its digest and rejected when inconsistent.
-The manifest's internal references never replace ArtifactRef records.
+streams, codecs, Layers, and optional sidecar indexes. Its strict v1 JSON
+encoding is defined by `EpisodeManifestV1` in `lake-common`: construction
+canonicalizes stable collections, decode rejects unknown/future/non-canonical
+wire values, and no storage identity or credential enters the bytes. Scalar
+columns are a query acceleration surface, not a competing source of truth.
+Binding derives the Episode row from the manifest summary, verifies that the
+manifest ArtifactRef's media type, size, and SHA-256 identify the canonical
+JSON, and requires every other logical binding to match a top-level ArtifactRef
+as an exact multiset. The manifest's internal references therefore never
+replace GC-visible ArtifactRef records. Public upload/append wiring remains
+planned.
 
 `DataLocation` continues to identify one complete immutable object with URI,
 media type, exact size, and SHA-256. Adding Rerun fields to its Arrow shape would
@@ -364,7 +371,8 @@ explicitly.
 
 ### 0. Domain contract
 
-- Define a versioned Episode manifest.
+- [x] Define a versioned Episode manifest and bind its canonical bytes and
+  logical Artifact metadata to the Episode/ArtifactRef contract.
 - [x] Define the Episode/ArtifactRef v1 table contract and prove GC retains
   every multi-Artifact reference.
 - Add a generic typed Arrow append path rather than extending the narrow SQL
