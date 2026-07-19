@@ -53,6 +53,7 @@ use iceberg::{
 use lake_iceberg::{
     IcebergCatalog, IcebergCatalogConfig, IcebergError, IcebergOAuthOptions, IcebergRestAuth,
 };
+use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::sync::Notify;
 
 #[derive(Debug)]
@@ -699,6 +700,81 @@ async fn recording_catalog_with_episodes(
     (warehouse, catalog)
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_metrics_report_load_and_cache_hit_without_identity_labels() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    lake_iceberg::describe_metrics();
+
+    let (_warehouse, catalog) = recording_catalog_with_episodes(None).await;
+    let federation = IcebergCatalog::from_catalog(
+        IcebergCatalogConfig::try_new("https://catalog.example", "s3://warehouse", ["analytics"])
+            .expect("build catalog config"),
+        catalog,
+    );
+
+    federation
+        .resolve_snapshot("analytics", "episodes")
+        .await
+        .expect("load external snapshot");
+    federation
+        .resolve_snapshot("analytics", "episodes")
+        .await
+        .expect("reuse cached snapshot");
+
+    let rendered = handle.render();
+    for expected in [
+        "lake_iceberg_snapshot_resolution_total{outcome=\"loaded\"} 1",
+        "lake_iceberg_snapshot_resolution_total{outcome=\"cache_hit\"} 1",
+        "lake_iceberg_catalog_operation_total{operation=\"table_load\",outcome=\"success\"} 1",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}:\n{rendered}"
+        );
+    }
+    for forbidden in ["analytics", "episodes", "catalog.example", "warehouse"] {
+        assert!(
+            !rendered.contains(forbidden),
+            "identity must not appear in metric output: {forbidden}\n{rendered}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_metrics_report_external_load_failure() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    lake_iceberg::describe_metrics();
+
+    let (_warehouse, catalog) = recording_catalog_with_episodes(None).await;
+    catalog.fail_load.store(true, Ordering::Relaxed);
+    let federation = IcebergCatalog::from_catalog(
+        IcebergCatalogConfig::try_new("https://catalog.example", "s3://warehouse", ["analytics"])
+            .expect("build catalog config"),
+        catalog.clone(),
+    );
+
+    assert!(matches!(
+        federation.resolve_snapshot("analytics", "episodes").await,
+        Err(IcebergError::Catalog)
+    ));
+    assert_eq!(catalog.table_loads(), 1, "metrics must not add a retry");
+
+    let rendered = handle.render();
+    for expected in [
+        "lake_iceberg_snapshot_resolution_total{outcome=\"error\"} 1",
+        "lake_iceberg_catalog_operation_total{operation=\"table_load\",outcome=\"error\"} 1",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}:\n{rendered}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn concurrent_snapshot_refreshes_share_one_external_load() {
     const CONCURRENT_LOADS: usize = 8;
@@ -1317,9 +1393,14 @@ async fn rest_catalog_oauth_client_credentials_are_runtime_only() {
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn rest_catalog_oauth_expiry_regenerates_once_for_exact_table_load() {
     const CREDENTIAL: &str = "lake-query:lake-rest-oauth-secret";
+
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    lake_iceberg::describe_metrics();
 
     let (_warehouse, table) = populated_local_table().await;
     let state = RefreshingOAuthRestDataTable {
@@ -1377,6 +1458,24 @@ async fn rest_catalog_oauth_expiry_regenerates_once_for_exact_table_load() {
         2,
         "one initial exchange plus one bounded renewal is expected"
     );
+    let rendered = handle.render();
+    for expected in [
+        "lake_iceberg_oauth_refresh_total{outcome=\"started\"} 1",
+        "lake_iceberg_oauth_refresh_total{outcome=\"success\"} 1",
+        "lake_iceberg_catalog_operation_total{operation=\"table_load\",outcome=\"error\"} 1",
+        "lake_iceberg_catalog_operation_total{operation=\"table_load\",outcome=\"success\"} 1",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}:\n{rendered}"
+        );
+    }
+    for forbidden in ["analytics", "episodes", "initial-oauth-access-token"] {
+        assert!(
+            !rendered.contains(forbidden),
+            "identity must not appear in metric output: {forbidden}\n{rendered}"
+        );
+    }
     server.abort();
 }
 

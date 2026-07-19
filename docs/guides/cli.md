@@ -212,6 +212,10 @@ Core series are:
 - `lake_query_admission_total`, `lake_query_inflight_requests`,
   `lake_query_rejections_total`, `lake_query_catalog_refresh_total`, and
   `lake_query_ready`.
+- `lake_iceberg_snapshot_resolution_total`,
+  `lake_iceberg_catalog_operation_total`, and
+  `lake_iceberg_oauth_refresh_total` when the Query replica has an external
+  Iceberg catalog configured.
 - `lake_metasrv_append_admission_total`, `lake_metasrv_inflight_appends`,
   `lake_metasrv_reserved_append_bytes`, `lake_metasrv_campaign_total`,
   `lake_metasrv_write_ready`, `lake_metasrv_maintenance_pages_total`, and

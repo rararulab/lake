@@ -90,6 +90,26 @@ pub enum IcebergError {
 /// Result type for the read-only Iceberg federation adapter.
 pub type Result<T> = std::result::Result<T, IcebergError>;
 
+/// Describe the bounded, identity-free metrics emitted by Iceberg federation.
+///
+/// Query invokes this together with its other Prometheus metric descriptions.
+/// The counters use only static operation and outcome labels; external
+/// endpoints and workload identities never become telemetry dimensions.
+pub fn describe_metrics() {
+    metrics::describe_counter!(
+        "lake_iceberg_snapshot_resolution_total",
+        "External Iceberg snapshot resolution outcomes by bounded state"
+    );
+    metrics::describe_counter!(
+        "lake_iceberg_catalog_operation_total",
+        "External Iceberg catalog operations by bounded operation and outcome"
+    );
+    metrics::describe_counter!(
+        "lake_iceberg_oauth_refresh_total",
+        "External Iceberg OAuth refresh outcomes by bounded state"
+    );
+}
+
 /// Process-local authentication for an external Iceberg REST catalog.
 ///
 /// The value is supplied by the Query deployment and is never serialized into
@@ -468,6 +488,7 @@ impl OAuthRefreshLeader {
 impl Drop for OAuthRefreshLeader {
     fn drop(&mut self) {
         if !self.completed {
+            oauth_refresh("cancelled");
             self.complete(OAuthRefreshOutcome::Failed);
         }
     }
@@ -557,6 +578,7 @@ impl Drop for SnapshotLoadLeader {
         if self.completed {
             return;
         }
+        snapshot_resolution("cancelled");
         let mut cache = self
             .cache
             .lock()
@@ -669,10 +691,14 @@ impl IcebergCatalog {
         let key = self.cache_key(namespace, table)?;
         loop {
             match self.begin_snapshot_load(key.clone()) {
-                SnapshotLoadDecision::Cached(snapshot) => return Ok(snapshot),
+                SnapshotLoadDecision::Cached(snapshot) => {
+                    snapshot_resolution("cache_hit");
+                    return Ok(snapshot);
+                }
                 SnapshotLoadDecision::Leader { cached, mut load } => {
                     match self.load_current_snapshot(&key).await {
                         Ok(snapshot) => {
+                            snapshot_resolution("loaded");
                             load.complete(Some(snapshot.clone()), true);
                             return Ok(snapshot);
                         }
@@ -682,10 +708,12 @@ impl IcebergCatalog {
                             }) =>
                         {
                             let snapshot = cached.expect("checked above").snapshot;
+                            snapshot_resolution("stale");
                             load.complete(Some(snapshot.clone()), false);
                             return Ok(snapshot);
                         }
                         Err(error) => {
+                            snapshot_resolution("error");
                             load.complete(None, false);
                             return Err(error);
                         }
@@ -693,6 +721,11 @@ impl IcebergCatalog {
                 }
                 SnapshotLoadDecision::Follower(mut receiver) => {
                     if let Some(result) = wait_for_snapshot_load(&mut receiver).await {
+                        snapshot_resolution(if result.is_ok() {
+                            "singleflight_shared"
+                        } else {
+                            "error"
+                        });
                         return result;
                     }
                 }
@@ -764,24 +797,46 @@ impl IcebergCatalog {
     async fn namespace_exists(&self, namespace: NamespaceIdent) -> Result<bool> {
         let generation = self.oauth_generation();
         match self.catalog.namespace_exists(&namespace).await {
-            Ok(exists) => Ok(exists),
-            Err(_) if self.refresh_oauth_after_failed_read(generation).await? => self
-                .catalog
-                .namespace_exists(&namespace)
-                .await
-                .map_err(catalog_error),
-            Err(_) => Err(IcebergError::Catalog),
+            Ok(exists) => {
+                catalog_operation("namespace_check", "success");
+                Ok(exists)
+            }
+            Err(_) => {
+                catalog_operation("namespace_check", "error");
+                if self.refresh_oauth_after_failed_read(generation).await? {
+                    let retry = self.catalog.namespace_exists(&namespace).await;
+                    catalog_operation(
+                        "namespace_check",
+                        if retry.is_ok() { "success" } else { "error" },
+                    );
+                    retry.map_err(catalog_error)
+                } else {
+                    Err(IcebergError::Catalog)
+                }
+            }
         }
     }
 
     async fn load_table(&self, table: TableIdent) -> Result<Table> {
         let generation = self.oauth_generation();
         match self.catalog.load_table(&table).await {
-            Ok(table) => Ok(table),
-            Err(_) if self.refresh_oauth_after_failed_read(generation).await? => {
-                self.catalog.load_table(&table).await.map_err(catalog_error)
+            Ok(table) => {
+                catalog_operation("table_load", "success");
+                Ok(table)
             }
-            Err(_) => Err(IcebergError::Catalog),
+            Err(_) => {
+                catalog_operation("table_load", "error");
+                if self.refresh_oauth_after_failed_read(generation).await? {
+                    let retry = self.catalog.load_table(&table).await;
+                    catalog_operation(
+                        "table_load",
+                        if retry.is_ok() { "success" } else { "error" },
+                    );
+                    retry.map_err(catalog_error)
+                } else {
+                    Err(IcebergError::Catalog)
+                }
+            }
         }
     }
 
@@ -796,22 +851,37 @@ impl IcebergCatalog {
             return Ok(false);
         };
         match begin_oauth_refresh(session.clone(), generation) {
-            OAuthRefreshDecision::AlreadyRefreshed => Ok(true),
+            OAuthRefreshDecision::AlreadyRefreshed => {
+                oauth_refresh("already_refreshed");
+                Ok(true)
+            }
             OAuthRefreshDecision::Leader(mut leader) => {
+                oauth_refresh("started");
                 match session.catalog.regenerate_token().await {
                     Ok(()) => {
                         session.generation.fetch_add(1, Ordering::Release);
                         leader.complete(OAuthRefreshOutcome::Succeeded);
+                        oauth_refresh("success");
                         Ok(true)
                     }
                     Err(_) => {
                         leader.complete(OAuthRefreshOutcome::Failed);
+                        oauth_refresh("error");
                         Err(IcebergError::Catalog)
                     }
                 }
             }
             OAuthRefreshDecision::Follower(mut receiver) => {
-                wait_for_oauth_refresh(&mut receiver).await
+                match wait_for_oauth_refresh(&mut receiver).await {
+                    Ok(refreshed) => {
+                        oauth_refresh("singleflight_shared");
+                        Ok(refreshed)
+                    }
+                    Err(error) => {
+                        oauth_refresh("singleflight_error");
+                        Err(error)
+                    }
+                }
             }
         }
     }
@@ -901,6 +971,23 @@ async fn wait_for_snapshot_load(
             return None;
         }
     }
+}
+
+fn snapshot_resolution(outcome: &'static str) {
+    metrics::counter!("lake_iceberg_snapshot_resolution_total", "outcome" => outcome).increment(1);
+}
+
+fn catalog_operation(operation: &'static str, outcome: &'static str) {
+    metrics::counter!(
+        "lake_iceberg_catalog_operation_total",
+        "operation" => operation,
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
+fn oauth_refresh(outcome: &'static str) {
+    metrics::counter!("lake_iceberg_oauth_refresh_total", "outcome" => outcome).increment(1);
 }
 
 fn insert_cached_snapshot(
