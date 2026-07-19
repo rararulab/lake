@@ -14,6 +14,7 @@ interface VFileLike {
 interface Options {
   base: string;
   docsRoot: string;
+  docsAssetsRoot: string;
   repositoryRoot: string;
   repositoryUrl: string;
 }
@@ -48,6 +49,9 @@ export function rehypeRewriteDocLinks(options: Options) {
               .replace(/(^|\/)index$/i, "$1")
               .replace(/\/$/, "");
             node.properties.href = `${base}docs/${slug ? `${slug}/` : ""}${suffix}`;
+          } else if (isInside(options.docsAssetsRoot, target)) {
+            const asset = normalizePath(relative(options.docsAssetsRoot, target));
+            node.properties.href = `${base}assets/${asset}${suffix}`;
           } else if (isInside(options.repositoryRoot, target)) {
             const repositoryPath = normalizePath(
               relative(options.repositoryRoot, target)
