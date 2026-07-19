@@ -44,6 +44,7 @@ use arrow_flight::flight_service_server::FlightServiceServer;
 use datafusion::{
     arrow::record_batch::RecordBatch,
     catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider},
+    common::{TableReference, config::Dialect},
     dataframe::DataFrame,
     error::DataFusionError,
     execution::{memory_pool::FairSpillPool, runtime_env::RuntimeEnvBuilder},
@@ -978,11 +979,33 @@ impl QueryEngine {
 
     /// Validate and plan a statement through the public read-only SQL surface.
     pub(crate) async fn plan_sql(&self, sql: &str) -> Result<DataFrame> {
-        self.refresh_if_stale().await?;
+        if !self.references_only_iceberg(sql) {
+            self.refresh_if_stale().await?;
+        }
         self.ctx
             .sql_with_options(sql, read_only_sql_options())
             .await
             .context(ExecuteSnafu)
+    }
+
+    /// Return whether parsing proves that every physical table reference is
+    /// external Iceberg. Any parse failure, statement without a table, or
+    /// Lake/unknown reference conservatively retains the Lake refresh.
+    fn references_only_iceberg(&self, sql: &str) -> bool {
+        let state = self.ctx.state();
+        let Ok(statement) = state.sql_to_statement(sql, &Dialect::Generic) else {
+            return false;
+        };
+        let Ok(references) = state.resolve_table_references(&statement) else {
+            return false;
+        };
+        !references.is_empty()
+            && references.into_iter().all(|reference| {
+                matches!(
+                    reference,
+                    TableReference::Full { catalog, .. } if catalog.as_ref() == "iceberg"
+                )
+            })
     }
 
     pub(crate) fn context(&self) -> &SessionContext { &self.ctx }
@@ -1391,6 +1414,12 @@ mod tests {
         sql::client::FlightSqlServiceClient,
     };
     use async_trait::async_trait;
+    use axum::{
+        Router,
+        extract::State,
+        http::StatusCode,
+        routing::{get, head},
+    };
     use datafusion::{
         arrow::{
             array::Int64Array,
@@ -1411,6 +1440,7 @@ mod tests {
         io::LocalFsStorageFactory,
         memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder},
         spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type},
+        table::Table,
         transaction::{ApplyTransactionAction, Transaction},
         writer::{
             IcebergWriter, IcebergWriterBuilder,
@@ -1442,6 +1472,34 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Clone)]
+    struct RestIcebergTable {
+        table: Table,
+    }
+
+    async fn rest_iceberg_config() -> ([(&'static str, &'static str); 1], &'static str) {
+        (
+            [("content-type", "application/json")],
+            r#"{"defaults":{},"overrides":{}}"#,
+        )
+    }
+
+    async fn rest_iceberg_namespace() -> StatusCode { StatusCode::NO_CONTENT }
+
+    async fn rest_iceberg_table(
+        State(state): State<RestIcebergTable>,
+    ) -> ([(&'static str, &'static str); 1], String) {
+        let response = serde_json::json!({
+            "metadata-location": state.table.metadata_location(),
+            "metadata": state.table.metadata(),
+            "config": {},
+        });
+        (
+            [("content-type", "application/json")],
+            serde_json::to_string(&response).expect("encode Iceberg REST table response"),
+        )
+    }
 
     #[test]
     fn remote_query_requires_shared_ticket_keys_before_startup() {
@@ -1765,7 +1823,7 @@ mod tests {
                 &namespace,
                 TableCreation::builder()
                     .name("episodes".to_owned())
-                    .location(format!("{}/episodes", warehouse.path().display()))
+                    .location(format!("file://{}/episodes", warehouse.path().display()))
                     .schema(
                         IcebergSchema::builder()
                             .with_schema_id(0)
@@ -1883,6 +1941,105 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(values, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn query_engine_reads_external_rest_iceberg_catalog() {
+        let (_warehouse, _iceberg, source_catalog) = test_iceberg_catalog().await;
+        let source_table = source_catalog
+            .load_table(&TableIdent::new(
+                NamespaceIdent::new("analytics".to_owned()),
+                "episodes".to_owned(),
+            ))
+            .await
+            .expect("load external Iceberg source table");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback Iceberg REST catalog");
+        let address = listener
+            .local_addr()
+            .expect("read loopback Iceberg REST catalog address");
+        let app = Router::new()
+            .route("/v1/config", get(rest_iceberg_config))
+            .route("/v1/namespaces/analytics", head(rest_iceberg_namespace))
+            .route(
+                "/v1/namespaces/analytics/tables/episodes",
+                get(rest_iceberg_table),
+            )
+            .with_state(RestIcebergTable {
+                table: source_table,
+            });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve loopback Iceberg REST catalog");
+        });
+
+        let iceberg = IcebergCatalog::connect(
+            IcebergCatalogConfig::try_new(
+                &format!("http://{address}"),
+                "file:///warehouse",
+                ["analytics"],
+            )
+            .expect("configure loopback Iceberg REST catalog"),
+        )
+        .await
+        .expect("connect Query to external Iceberg REST catalog");
+        let meta = Arc::new(CountingMeta::default());
+        let query = QueryEngine::new(meta.clone(), Arc::new(LanceEngine::new()))
+            .with_iceberg_catalog(iceberg);
+
+        let batches = query
+            .execute_sql("SELECT episode_id FROM iceberg.analytics.episodes")
+            .await
+            .expect("plan external REST Iceberg table through QueryEngine")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("read external REST Iceberg table through QueryEngine");
+        let values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Iceberg episode ID column")
+                    .iter()
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![1]);
+        assert_eq!(
+            meta.scans.load(Ordering::Relaxed),
+            0,
+            "an external-only QueryEngine scan must not refresh the Lake registry"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn only_external_iceberg_references_skip_lake_refresh() {
+        let query = QueryEngine::new(
+            Arc::new(CountingMeta::default()),
+            Arc::new(LanceEngine::new()),
+        );
+
+        assert!(query.references_only_iceberg(
+            "WITH recent AS (SELECT * FROM iceberg.analytics.episodes) SELECT * FROM recent"
+        ));
+        for sql in [
+            "SELECT * FROM lake.analytics.episodes",
+            "SELECT * FROM iceberg.analytics.episodes JOIN lake.analytics.labels USING \
+             (episode_id)",
+            "SELECT * FROM analytics.episodes",
+            "SELECT 1",
+            "not valid SQL",
+        ] {
+            assert!(
+                !query.references_only_iceberg(sql),
+                "{sql:?} must retain Lake catalog refresh"
+            );
+        }
     }
 
     #[tokio::test]
