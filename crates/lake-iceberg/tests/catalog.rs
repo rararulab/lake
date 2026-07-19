@@ -776,6 +776,79 @@ async fn snapshot_metrics_report_external_load_failure() {
 }
 
 #[tokio::test]
+async fn distinct_snapshot_loads_are_bounded_and_release_after_cancellation() {
+    const MAX_DISTINCT_PENDING_LOADS: usize = 64;
+
+    let load_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (_warehouse, catalog) = recording_catalog_with_episodes(Some(load_gate.clone())).await;
+    let config =
+        IcebergCatalogConfig::try_new("https://catalog.example", "s3://warehouse", ["analytics"])
+            .expect("build config")
+            .with_cache_policy(Duration::ZERO, Duration::from_mins(1))
+            .expect("configure immediate refresh for test");
+    let federation = Arc::new(IcebergCatalog::from_catalog(config, catalog.clone()));
+    let mut leaders = tokio::task::JoinSet::new();
+    for index in 0..MAX_DISTINCT_PENDING_LOADS {
+        let federation = federation.clone();
+        let table = if index == 0 {
+            "episodes".to_owned()
+        } else {
+            format!("adversary_{index}")
+        };
+        leaders.spawn(async move {
+            federation.resolve_snapshot("analytics", &table).await
+        });
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while catalog.table_loads() < MAX_DISTINCT_PENDING_LOADS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every admitted distinct key must begin its external load");
+
+    let follower_started = Arc::new(Notify::new());
+    let follower_ready = follower_started.clone();
+    let follower_catalog = federation.clone();
+    let follower = tokio::spawn(async move {
+        follower_ready.notify_one();
+        follower_catalog.resolve_snapshot("analytics", "episodes").await
+    });
+    follower_started.notified().await;
+    tokio::task::yield_now().await;
+    assert!(
+        !follower.is_finished(),
+        "a matching key must remain a follower when distinct-key admission is full"
+    );
+
+    let rejected = tokio::time::timeout(
+        Duration::from_millis(100),
+        federation.resolve_snapshot("analytics", "one_too_many"),
+    )
+    .await
+    .expect("a full distinct-key admission limit must reject without waiting");
+    assert!(matches!(rejected, Err(IcebergError::Catalog)));
+    assert_eq!(
+        catalog.table_loads(),
+        MAX_DISTINCT_PENDING_LOADS,
+        "a rejected distinct key must not start external catalog I/O"
+    );
+
+    leaders.abort_all();
+    while let Some(result) = leaders.join_next().await {
+        assert!(result.is_err(), "blocked leader must be cancelled");
+    }
+
+    load_gate.add_permits(1);
+    let recovered = tokio::time::timeout(Duration::from_secs(1), follower)
+        .await
+        .expect("cancelling leaders must release the distinct-key admission")
+        .expect("matching follower task must not panic")
+        .expect("a released admission slot must load the configured table");
+    assert_eq!(recovered.table(), "episodes");
+}
+
+#[tokio::test]
 async fn concurrent_snapshot_refreshes_share_one_external_load() {
     const CONCURRENT_LOADS: usize = 8;
 

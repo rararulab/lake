@@ -45,6 +45,7 @@ const DEFAULT_CACHE_STALE_IF_ERROR: Duration = Duration::from_mins(1);
 const DEFAULT_REST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REST_TIMEOUT: Duration = Duration::from_mins(1);
 const SNAPSHOT_CACHE_CAPACITY: usize = 10_000;
+const SNAPSHOT_LOAD_ADMISSION_CAPACITY: usize = 64;
 const MAX_REST_SECRET_BYTES: usize = 8 * 1024;
 
 /// Errors returned while validating external Iceberg catalog configuration.
@@ -526,6 +527,7 @@ enum SnapshotLoadState {
 
 enum SnapshotLoadDecision {
     Cached(IcebergTableSnapshot),
+    Overloaded,
     Leader {
         cached: Option<CachedSnapshot>,
         load:   SnapshotLoadLeader,
@@ -694,6 +696,10 @@ impl IcebergCatalog {
                 SnapshotLoadDecision::Cached(snapshot) => {
                     snapshot_resolution("cache_hit");
                     return Ok(snapshot);
+                }
+                SnapshotLoadDecision::Overloaded => {
+                    snapshot_resolution("overloaded");
+                    return Err(IcebergError::Catalog);
                 }
                 SnapshotLoadDecision::Leader { cached, mut load } => {
                     match self.load_current_snapshot(&key).await {
@@ -900,6 +906,9 @@ impl IcebergCatalog {
         }
         if let Some(load) = cache.in_flight.get(&key) {
             return SnapshotLoadDecision::Follower(load.sender.subscribe());
+        }
+        if cache.in_flight.len() >= SNAPSHOT_LOAD_ADMISSION_CAPACITY {
+            return SnapshotLoadDecision::Overloaded;
         }
         let (sender, _receiver) = watch::channel(SnapshotLoadState::Loading);
         let id = cache.next_load_id;

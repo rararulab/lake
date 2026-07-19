@@ -77,7 +77,7 @@ enumeration or a per-reader OAuth storm.
 |---|---|---|
 | startup | Validates the complete deployment configuration, builds one in-memory REST client, and point-checks each configured namespace before binding Flight. | No partially configured listener; no namespace/table enumeration. |
 | statement planning | Authenticates the Flight caller, intersects its Lake namespace grant with the finite deployment allowlist, then resolves one exact table. | A caller cannot make the deployment discover or expose a namespace it was not granted. |
-| current-snapshot load | Uses a cache of at most 10,000 table snapshots. A cold or expired key admits one external lookup; concurrent planners await that same result. | External catalog load is O(one per replica/key refresh), not O(readers). |
+| current-snapshot load | Retains at most 10,000 completed table snapshots and admits at most 64 distinct pending loads. A cold or expired key admits one external lookup; concurrent planners for that same key await its result without taking another pending-load slot. | External catalog state and load work stay bounded; a new distinct key at capacity fails before external I/O. |
 | Flight ticket | Encrypts the selected namespace, table, and immutable snapshot ID into the normal statement ticket. | A later catalog change cannot silently change a running statement's source snapshot. |
 | `DoGet` | Point-loads the named snapshot and rejects it when upstream retention removed it; then Query reads Parquet/manifests directly from Iceberg storage. | No fall-forward to a newer snapshot; no object bytes through Metasrv or the external REST catalog. |
 | `PollFlightInfo` | Persists the same encrypted snapshot ticket in Lake's bounded async-job store. A later worker point-loads that exact ID before materializing immutable Arrow result parts. | Long scans survive client/replica changes without storing external credentials or falling forward to the current snapshot. |
@@ -195,17 +195,19 @@ after ticket issue. A later statement can refresh and use a newer snapshot. If
 upstream retention has removed the ticketed snapshot, the request fails rather
 than falling forward.
 
-Each Query replica has a bounded cache of at most 10,000 external table
-snapshots. A cache entry is fresh for 5 seconds. On refresh failure, a
-last-good entry may be used for up to 60 seconds from its successful load;
-after that, the external error is returned. Iceberg-only Flight planning does
-not refresh the Lake registry. The external catalog and the Lake catalog have
-separate metadata authorities and failure domains. A cold load or expired
-refresh is single-flight per namespace/table key: concurrent planners wait for
-one exact external lookup and receive the same selected snapshot (including a
-last-good stale-if-error result). The cache lock is not held across that I/O;
-if its leading request is cancelled, already-waiting callers observe the closed
-load and one becomes the replacement, rather than waiting on stranded state or
+Each Query replica retains at most 10,000 completed external table snapshots
+and has at most 64 distinct pending snapshot loads. A cache entry is fresh for
+5 seconds. On refresh failure, a last-good entry may be used for up to 60
+seconds from its successful load; after that, the external error is returned.
+Iceberg-only Flight planning does not refresh the Lake registry. The external
+catalog and the Lake catalog have separate metadata authorities and failure
+domains. A cold load or expired refresh is single-flight per namespace/table
+key: concurrent planners wait for one exact external lookup and receive the
+same selected snapshot (including a last-good stale-if-error result). They do
+not take another pending-load slot. A new distinct key at the 64-load bound
+fails before external I/O. The cache lock is not held across that I/O; if its
+leading request is cancelled, already-waiting callers observe the closed load
+and one becomes the replacement, rather than waiting on stranded state or
 requiring a new caller to repair it.
 
 ## Observability
@@ -217,7 +219,7 @@ endpoint into another source of table discovery or credential disclosure.
 
 | Metric | Bounded labels | Meaning |
 |---|---|---|
-| `lake_iceberg_snapshot_resolution_total` | `outcome=cache_hit\|loaded\|stale\|singleflight_shared\|error\|cancelled` | Result observed while choosing the current snapshot. |
+| `lake_iceberg_snapshot_resolution_total` | `outcome=cache_hit\|loaded\|stale\|singleflight_shared\|overloaded\|error\|cancelled` | Result observed while choosing the current snapshot. |
 | `lake_iceberg_catalog_operation_total` | `operation=namespace_check\|table_load`, `outcome=success\|error` | One bounded external catalog request attempt. A renewed retry is a second attempt. |
 | `lake_iceberg_oauth_refresh_total` | `outcome=started\|success\|error\|already_refreshed\|singleflight_shared\|singleflight_error\|cancelled` | OAuth renewal state; this observes the existing one-retry, single-flight state machine. |
 
