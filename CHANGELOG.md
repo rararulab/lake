@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.2.0](https://github.com/rararulab/lake/compare/v1.1.0...v1.2.0) (2026-07-19)
+
+
+### Features
+
+* **iceberg:** authenticate external REST catalog sessions ([#199](https://github.com/rararulab/lake/issues/199)) ([#200](https://github.com/rararulab/lake/issues/200)) ([64443f7](https://github.com/rararulab/lake/commit/64443f72b740ec8b5f1120b1b5f2b211459621f0))
+* **iceberg:** bound REST catalog request latency ([#204](https://github.com/rararulab/lake/issues/204)) ([#205](https://github.com/rararulab/lake/issues/205)) ([22ffaba](https://github.com/rararulab/lake/commit/22ffabaf2f790709969f533637be89be1071f043))
+* **iceberg:** renew expired REST OAuth sessions ([#202](https://github.com/rararulab/lake/issues/202)) ([#203](https://github.com/rararulab/lake/issues/203)) ([082ad4c](https://github.com/rararulab/lake/commit/082ad4c13707aefd0dae0cc7bdcc54e7d1f1c3eb))
+
+
+### Bug Fixes
+
+* **iceberg:** require TLS for external REST credentials ([#206](https://github.com/rararulab/lake/issues/206)) ([#207](https://github.com/rararulab/lake/issues/207)) ([8077407](https://github.com/rararulab/lake/commit/80774076bb5c2db320a1decf3c9fcb7744c325a4))
+* **iceberg:** single-flight concurrent snapshot refreshes ([#208](https://github.com/rararulab/lake/issues/208)) ([#209](https://github.com/rararulab/lake/issues/209)) ([2307678](https://github.com/rararulab/lake/commit/2307678ea2b793a9414f17a240c11c628ac62b2d))
+
 ## [1.1.0](https://github.com/rararulab/lake/compare/v1.0.0...v1.1.0) (2026-07-18)
 
 
