@@ -415,4 +415,3 @@ See the [Rerun training guide](https://rerun.io/docs/howto/train/dataloader).
 These constraints preserve Lake's original bet: stateless read fan-out in front
 of a bounded metadata authority, with immutable bytes in disaggregated object
 storage.
-

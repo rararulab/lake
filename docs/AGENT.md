@@ -7,6 +7,8 @@ both GitHub and the generated site.
 
 - `architecture.md` — system design: read path, commit protocol,
   invariants, crate map, deliberate simplifications (`ponytail:` markers)
+- `design/robot-training-lakehouse.md` — robotics domain language, Lake/Rerun
+  authority, format adapters, TrainingView, and phased product direction
 - `design/meta-server.md` — meta-server direction: what lake adopts/adapts/rejects from GreptimeDB metasrv, and phasing
 - `guides/workflow.md` — issue -> jj workspace -> PR -> merge, end to end
 - `guides/mise-ci.md` — mise, Bun Shell scripts, hooks, and GitHub CI standards

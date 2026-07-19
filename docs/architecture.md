@@ -787,4 +787,3 @@ design-level ones:
 
 Invariant across all phases: fleet reads go through the stateless query
 layer, never directly at the metadata authority.
-
