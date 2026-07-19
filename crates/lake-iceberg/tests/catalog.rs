@@ -59,6 +59,7 @@ struct RecordingCatalog {
     table_lists:     AtomicUsize,
     table_loads:     AtomicUsize,
     fail_load:       AtomicBool,
+    load_gate:       Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl RecordingCatalog {
@@ -142,10 +143,9 @@ struct OAuthRequest {
 
 #[derive(Clone)]
 struct RefreshingOAuthRestDataTable {
-    table: Table,
-    exchanges: Arc<AtomicUsize>,
+    table:            Table,
+    exchanges:        Arc<AtomicUsize>,
     table_rejections: Arc<AtomicUsize>,
-    first_table_failure_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl RefreshingOAuthRestDataTable {
@@ -276,9 +276,6 @@ async fn refreshing_oauth_table(
     }
     if state.exchanges.load(Ordering::Relaxed) == 1 {
         state.table_rejections.fetch_add(1, Ordering::Relaxed);
-        if let Some(barrier) = &state.first_table_failure_barrier {
-            barrier.wait().await;
-        }
         return Err(StatusCode::UNAUTHORIZED);
     }
     let response = serde_json::json!({
@@ -391,6 +388,13 @@ impl Catalog for RecordingCatalog {
 
     async fn load_table(&self, table: &TableIdent) -> IcebergResult<Table> {
         self.table_loads.fetch_add(1, Ordering::Relaxed);
+        if let Some(load_gate) = &self.load_gate {
+            load_gate
+                .acquire()
+                .await
+                .expect("test load gate must stay open")
+                .forget();
+        }
         if self.fail_load.load(Ordering::Relaxed) {
             return Err(iceberg::Error::new(
                 iceberg::ErrorKind::Unexpected,
@@ -435,54 +439,7 @@ impl Catalog for RecordingCatalog {
 
 #[tokio::test]
 async fn configured_namespace_cache_never_enumerates_unconfigured_catalog_state() {
-    let warehouse = tempfile::tempdir().expect("create warehouse");
-    let inner = MemoryCatalogBuilder::default()
-        .load(
-            "memory",
-            HashMap::from([(
-                MEMORY_CATALOG_WAREHOUSE.to_owned(),
-                warehouse.path().display().to_string(),
-            )]),
-        )
-        .await
-        .expect("open memory catalog");
-    let namespace = NamespaceIdent::new("analytics".to_owned());
-    inner
-        .create_namespace(&namespace, HashMap::new())
-        .await
-        .expect("create namespace");
-    inner
-        .create_table(
-            &namespace,
-            TableCreation::builder()
-                .name("episodes".to_owned())
-                .location(format!("{}/episodes", warehouse.path().display()))
-                .schema(
-                    Schema::builder()
-                        .with_schema_id(0)
-                        .with_fields(vec![
-                            NestedField::required(
-                                1,
-                                "episode_id",
-                                Type::Primitive(PrimitiveType::Long),
-                            )
-                            .into(),
-                        ])
-                        .build()
-                        .expect("build schema"),
-                )
-                .properties(HashMap::new())
-                .build(),
-        )
-        .await
-        .expect("create table");
-    let catalog = Arc::new(RecordingCatalog {
-        inner,
-        namespace_lists: AtomicUsize::new(0),
-        table_lists: AtomicUsize::new(0),
-        table_loads: AtomicUsize::new(0),
-        fail_load: AtomicBool::new(false),
-    });
+    let (_warehouse, catalog) = recording_catalog_with_episodes(None).await;
     let config =
         IcebergCatalogConfig::try_new("https://catalog.example", "s3://warehouse", ["analytics"])
             .expect("build config")
@@ -552,6 +509,136 @@ async fn configured_namespace_cache_never_enumerates_unconfigured_catalog_state(
         .expect("keep the last successful snapshot when refresh fails");
     assert_eq!(recovered.snapshot_id(), snapshot.snapshot_id());
     assert_eq!(catalog.table_loads(), 4);
+}
+
+async fn recording_catalog_with_episodes(
+    load_gate: Option<Arc<tokio::sync::Semaphore>>,
+) -> (tempfile::TempDir, Arc<RecordingCatalog>) {
+    let warehouse = tempfile::tempdir().expect("create warehouse");
+    let inner = MemoryCatalogBuilder::default()
+        .load(
+            "memory",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_owned(),
+                warehouse.path().display().to_string(),
+            )]),
+        )
+        .await
+        .expect("open memory catalog");
+    let namespace = NamespaceIdent::new("analytics".to_owned());
+    inner
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+    inner
+        .create_table(
+            &namespace,
+            TableCreation::builder()
+                .name("episodes".to_owned())
+                .location(format!("{}/episodes", warehouse.path().display()))
+                .schema(
+                    Schema::builder()
+                        .with_schema_id(0)
+                        .with_fields(vec![
+                            NestedField::required(
+                                1,
+                                "episode_id",
+                                Type::Primitive(PrimitiveType::Long),
+                            )
+                            .into(),
+                        ])
+                        .build()
+                        .expect("build schema"),
+                )
+                .properties(HashMap::new())
+                .build(),
+        )
+        .await
+        .expect("create table");
+    let catalog = Arc::new(RecordingCatalog {
+        inner,
+        namespace_lists: AtomicUsize::new(0),
+        table_lists: AtomicUsize::new(0),
+        table_loads: AtomicUsize::new(0),
+        fail_load: AtomicBool::new(false),
+        load_gate,
+    });
+    (warehouse, catalog)
+}
+
+#[tokio::test]
+async fn concurrent_snapshot_refreshes_share_one_external_load() {
+    const CONCURRENT_LOADS: usize = 8;
+
+    let load_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (_warehouse, catalog) = recording_catalog_with_episodes(Some(load_gate.clone())).await;
+    let config =
+        IcebergCatalogConfig::try_new("https://catalog.example", "s3://warehouse", ["analytics"])
+            .expect("build config")
+            .with_cache_policy(Duration::ZERO, Duration::from_mins(1))
+            .expect("configure immediate refresh for test");
+    let federation = Arc::new(IcebergCatalog::from_catalog(config, catalog.clone()));
+    let start = Arc::new(tokio::sync::Barrier::new(CONCURRENT_LOADS + 1));
+    let mut loads = tokio::task::JoinSet::new();
+    for _ in 0..CONCURRENT_LOADS {
+        let federation = federation.clone();
+        let start = start.clone();
+        loads.spawn(async move {
+            start.wait().await;
+            federation.resolve_snapshot("analytics", "episodes").await
+        });
+    }
+    start.wait().await;
+    for _ in 0..CONCURRENT_LOADS {
+        tokio::task::yield_now().await;
+    }
+    let observed_loads = catalog.table_loads();
+    load_gate.add_permits(CONCURRENT_LOADS);
+
+    while let Some(result) = loads.join_next().await {
+        let snapshot = result
+            .expect("concurrent snapshot task must not panic")
+            .expect("concurrent snapshot resolution must succeed");
+        assert_eq!(snapshot.table(), "episodes");
+    }
+    assert_eq!(
+        observed_loads, 1,
+        "one cache miss must issue only one external table load"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_snapshot_leader_allows_a_new_load() {
+    let load_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (_warehouse, catalog) = recording_catalog_with_episodes(Some(load_gate.clone())).await;
+    let config =
+        IcebergCatalogConfig::try_new("https://catalog.example", "s3://warehouse", ["analytics"])
+            .expect("build config")
+            .with_cache_policy(Duration::ZERO, Duration::from_mins(1))
+            .expect("configure immediate refresh for test");
+    let federation = Arc::new(IcebergCatalog::from_catalog(config, catalog.clone()));
+    let leader_catalog = federation.clone();
+    let leader = tokio::spawn(async move {
+        leader_catalog
+            .resolve_snapshot("analytics", "episodes")
+            .await
+    });
+    while catalog.table_loads() == 0 {
+        tokio::task::yield_now().await;
+    }
+    leader.abort();
+    assert!(leader.await.is_err(), "blocked leader must be cancelled");
+
+    load_gate.add_permits(1);
+    let snapshot = tokio::time::timeout(
+        Duration::from_secs(1),
+        federation.resolve_snapshot("analytics", "episodes"),
+    )
+    .await
+    .expect("a cancelled leader must not strand the next caller")
+    .expect("replacement snapshot load must succeed");
+    assert_eq!(snapshot.table(), "episodes");
+    assert_eq!(catalog.table_loads(), 2);
 }
 
 #[tokio::test]
@@ -1042,7 +1129,6 @@ async fn rest_catalog_oauth_expiry_regenerates_once_for_exact_table_load() {
         table,
         exchanges: Arc::new(AtomicUsize::new(0)),
         table_rejections: Arc::new(AtomicUsize::new(0)),
-        first_table_failure_barrier: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1098,7 +1184,7 @@ async fn rest_catalog_oauth_expiry_regenerates_once_for_exact_table_load() {
 }
 
 #[tokio::test]
-async fn concurrent_oauth_expiry_shares_one_session_renewal() {
+async fn concurrent_oauth_expiry_single_flights_table_load_and_shares_session_renewal() {
     const CREDENTIAL: &str = "lake-query:lake-rest-oauth-secret";
     const CONCURRENT_LOADS: usize = 8;
 
@@ -1107,7 +1193,6 @@ async fn concurrent_oauth_expiry_shares_one_session_renewal() {
         table,
         exchanges: Arc::new(AtomicUsize::new(0)),
         table_rejections: Arc::new(AtomicUsize::new(0)),
-        first_table_failure_barrier: Some(Arc::new(tokio::sync::Barrier::new(CONCURRENT_LOADS))),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1151,10 +1236,16 @@ async fn concurrent_oauth_expiry_shares_one_session_renewal() {
     );
 
     let mut loads = tokio::task::JoinSet::new();
+    let start = Arc::new(tokio::sync::Barrier::new(CONCURRENT_LOADS + 1));
     for _ in 0..CONCURRENT_LOADS {
         let catalog = catalog.clone();
-        loads.spawn(async move { catalog.resolve_snapshot("analytics", "episodes").await });
+        let start = start.clone();
+        loads.spawn(async move {
+            start.wait().await;
+            catalog.resolve_snapshot("analytics", "episodes").await
+        });
     }
+    start.wait().await;
     while let Some(result) = loads.join_next().await {
         result
             .expect("concurrent load task must not panic")
@@ -1163,7 +1254,8 @@ async fn concurrent_oauth_expiry_shares_one_session_renewal() {
 
     assert_eq!(
         state.table_rejections.load(Ordering::Relaxed),
-        CONCURRENT_LOADS
+        1,
+        "one single-flight table load should trigger one expired-session response"
     );
     assert_eq!(
         state.exchanges.load(Ordering::Relaxed),
