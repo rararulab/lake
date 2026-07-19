@@ -299,6 +299,14 @@ cargo-deny / cargo-shear) on Linux to catch macOS-vs-Linux platform
 differences. So there is no PR-level CI to watch; run `workflow_dispatch`
 manually if you want a Linux run on a branch before merge.
 
+Every post-merge CI job has an explicit deadline: five minutes for change
+detection and the aggregate check, ten minutes for Bun-only checks, fifteen
+minutes for dependency policy, and thirty minutes for each Rust matrix leg and
+the LocalStack integration path. These budgets include cold-cache margin; they
+turn a stalled hosted runner into a visible failed check rather than leaving
+`main` indefinitely in an unknown state. They do not replace the fuller local
+`mise run ship` gate.
+
 If the **post-merge** CI backstop on `main` fails: read the failure log,
 diagnose root cause, fix it as a new lane-2 change on `main`. Do not mark
 tests `#[ignore]` to make CI green. For genuine flakes (same test failed

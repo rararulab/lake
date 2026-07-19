@@ -37,11 +37,15 @@ env:
   RUSTUP_MAX_RETRIES: "10"
 
 jobs:
+  # A hosted-runner stall must become a bounded failed check, never leave main
+  # indefinitely in an unknown state. Budgets include cold-cache margin; local
+  # `mise run ship` remains the fuller pre-push gate.
   # Path filter so docs-/specs-only PRs skip the heavy Rust legs. Pushes to
   # main always run the full gate.
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       site: ${{ steps.filter.outputs.site }}
@@ -91,6 +95,7 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'push' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -120,6 +125,7 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'push' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       localstack:
         # Community edition; `:latest` now requires a LOCALSTACK_AUTH_TOKEN.
@@ -159,6 +165,7 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.specs == 'true' || github.event_name == 'push' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -176,6 +183,7 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.site == 'true' || github.event_name == 'push' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -196,6 +204,7 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.cargo_deps == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -209,6 +218,7 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.cargo_deps == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -223,6 +233,7 @@ jobs:
     if: always()
     needs: [changes, rust, integration, spec, site, cargo-deny, cargo-shear]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: verify no job failed
         if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
