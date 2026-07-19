@@ -196,12 +196,17 @@ under `LAKE_ASYNC_RESULT_PREFIX`; lifecycle cleanup requires List, Get, Put,
 and DeleteObject on that exact prefix.
 
 The reference ConfigMap also sets four total async workers, one worker per
-tenant, and a 30-minute execution deadline. Tune
+tenant, four shared cluster executions, one shared execution per tenant, and a
+30-minute execution deadline. Tune
 `LAKE_ASYNC_WORKER_CONCURRENCY`,
 `LAKE_ASYNC_WORKER_CONCURRENCY_PER_TENANT`, and
 `LAKE_ASYNC_EXECUTION_TIMEOUT_MS` together with pod CPU, memory, spill, and
-result-prefix capacity. Replica autoscaling multiplies aggregate worker
-capacity; these settings are not cluster-global quotas.
+result-prefix capacity. The local settings remain per replica. The complete
+`LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY` +
+`LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY_PER_TENANT` pair is a shared execution
+lease ceiling in the dedicated async state store, so autoscaling does not
+multiply running scan capacity. It is not a global queue or strict scheduling
+fairness policy.
 
 The ConfigMap also sets `LAKE_ASYNC_MAX_OUTSTANDING_PER_TENANT=8` and
 `LAKE_ASYNC_MAX_RESULT_BYTES=17179869184`. Unlike worker concurrency, these
@@ -216,20 +221,27 @@ these retained-object bounds; they do not reserve pod memory or CPU.
 ### Async schema-v2 rollout
 
 Async schema-v2 records are intentionally not readable by a schema-v1 Query
-binary. Do not use a rolling rollout, do not mix images, and do not mix durable
-quota values against one shared async authority. The reference `lake-query`
+binary. Cluster execution leases are also unknown to older workers. Do not use
+a rolling rollout, do not mix images, and do not mix durable quota or shared
+execution-limit values against one async authority. The reference `lake-query`
 Deployment therefore uses `strategy: Recreate`.
 
 For the first v2 enablement, pause `PollFlightInfo` async submission at the
 edge, leave one schema-v1 worker fleet running until every existing v1 async
 record has expired and fenced cleanup has removed its `async-query/` state and
-scoped result objects, then replace the entire Query fleet and resume
-admission. The same drain is required before changing either durable quota
-value. Once any v2 record exists, an old image must not be rolled back into the
-async fleet: forward-fix the v2 image, or pause admission and drain all v2
+scoped result objects, then drain and recreate all Query replicas before
+resuming admission. The same drain is required before enabling, disabling, or
+changing either shared execution-limit value or either durable quota value.
+Once any v2 record exists, an old image must not be rolled back into the async
+fleet: forward-fix the v2 image, or pause admission and drain all v2
 records/objects before a full old-image replacement. This procedure is
-necessary because v1 jobs have no durable tenant reservation and must never be
-silently counted as v2 jobs.
+necessary because v1 jobs have no durable tenant reservation or shared
+execution lease and must never be silently counted as v2 jobs.
+
+All Query pods sharing this authority need synchronized wall clocks. Durable
+job and execution leases use bounded UTC expiry, so keep the normal Kubernetes
+node time-synchronization service healthy before relying on a shared execution
+ceiling.
 
 A failed finalize leaves its durable barrier held. Keep admission paused,
 finish backfill, and rerun finalize. Do not delete the barrier as a routine

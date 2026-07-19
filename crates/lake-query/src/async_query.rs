@@ -80,13 +80,17 @@ const MAX_RESULT_PART_ROWS: usize = 65_536;
 const MAX_RESULT_SCHEMA_BYTES: usize = 1024 * 1024;
 const MAX_STATE_RECORD_BYTES: usize = 16 * 1024;
 const MAX_TENANT_INDEX_BYTES: usize = 32 * 1024;
+const MAX_EXECUTION_INDEX_BYTES: usize = 32 * 1024;
 const TENANT_RESERVATION_GRACE_SECS: u64 = 5 * 60;
 const TENANT_CAS_ATTEMPTS: usize = 8;
+const EXECUTION_CAS_ATTEMPTS: usize = 8;
+const MAX_CLUSTER_EXECUTIONS: usize = 64;
 const SUBMISSION_RESUME_ATTEMPTS: usize = 100;
 const SUBMISSION_RESUME_RETRY: Duration = Duration::from_millis(10);
 const SCAN_PAGE_JOBS: usize = 256;
 const STATE_KEY_PREFIX: &str = "async-query/";
 const TENANT_KEY_PREFIX: &str = "async-query-tenant/";
+const EXECUTION_KEY: &str = "async-query-execution/v1";
 const ASYNC_JOB_CONTENT_TYPE: &str = "application/vnd.lake.async-job";
 const ASYNC_PART_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 const ASYNC_MANIFEST_CONTENT_TYPE: &str = "application/vnd.lake.async-result-manifest+json";
@@ -175,6 +179,34 @@ impl Default for AsyncResourceLimits {
     }
 }
 
+/// Immutable shared capacity limits for durable async executions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AsyncGlobalExecutionLimits {
+    max_running:            usize,
+    max_running_per_tenant: usize,
+}
+
+impl AsyncGlobalExecutionLimits {
+    pub(crate) fn try_new(
+        max_running: usize,
+        max_running_per_tenant: usize,
+    ) -> Result<Self, AsyncQueryTransitionError> {
+        if !(1..=MAX_CLUSTER_EXECUTIONS).contains(&max_running)
+            || !(1..=max_running).contains(&max_running_per_tenant)
+        {
+            return Err(AsyncQueryTransitionError::InvalidRecord);
+        }
+        Ok(Self {
+            max_running,
+            max_running_per_tenant,
+        })
+    }
+
+    pub(crate) const fn max_running(self) -> usize { self.max_running }
+
+    pub(crate) const fn max_running_per_tenant(self) -> usize { self.max_running_per_tenant }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AsyncRecordResources {
@@ -195,6 +227,22 @@ struct TenantReservation {
     query_id:   String,
     token:      String,
     expires_at: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionLeaseIndex {
+    schema_version: u8,
+    entries:        Vec<ExecutionLeaseEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionLeaseEntry {
+    query_id:      String,
+    tenant_digest: String,
+    token:         String,
+    expires_at:    u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -243,6 +291,12 @@ pub(crate) enum AsyncQueryStoreError {
     AlreadyExists,
     #[snafu(display("async tenant outstanding query quota is exhausted"))]
     QuotaExceeded,
+    #[snafu(display("async cluster execution capacity is temporarily unavailable"))]
+    ExecutionCapacityHeld,
+    #[snafu(display("async cluster execution lease is held"))]
+    ExecutionLeaseHeld,
+    #[snafu(display("async cluster execution lease is no longer owned"))]
+    ExecutionLeaseLost,
     #[snafu(display("an idempotent async submission is still being created"))]
     ReservationHeld,
     #[snafu(display("async query state changed concurrently"))]
@@ -320,6 +374,8 @@ pub(crate) enum AsyncQueryWorkerError {
     ResultBound,
     #[snafu(display("async query execution deadline exceeded"))]
     ExecutionDeadline,
+    #[snafu(display("async cluster execution capacity is temporarily unavailable"))]
+    ExecutionCapacityHeld,
     #[snafu(display("async query state is unavailable"))]
     Missing,
     #[snafu(display("system time is invalid"))]
@@ -944,10 +1000,15 @@ impl AsyncResultManifest {
 
 #[derive(Clone)]
 pub(crate) struct AsyncQueryWorker {
-    coordinator: AsyncQueryCoordinator,
-    engine:      Arc<QueryEngine>,
-    identity:    WorkerIdentity,
-    lease:       Duration,
+    coordinator:             AsyncQueryCoordinator,
+    engine:                  Arc<QueryEngine>,
+    identity:                WorkerIdentity,
+    lease:                   Duration,
+    global_execution_limits: Option<AsyncGlobalExecutionLimits>,
+}
+
+struct ExecutionLease {
+    token: String,
 }
 
 impl AsyncQueryWorker {
@@ -969,7 +1030,16 @@ impl AsyncQueryWorker {
             engine,
             identity,
             lease,
+            global_execution_limits: None,
         })
+    }
+
+    pub(crate) fn with_global_execution_limits(
+        mut self,
+        limits: AsyncGlobalExecutionLimits,
+    ) -> Self {
+        self.global_execution_limits = Some(limits);
+        self
     }
 
     pub(crate) async fn run(
@@ -977,25 +1047,33 @@ impl AsyncQueryWorker {
         query_id: &str,
         execution_time: Duration,
     ) -> Result<(), AsyncQueryWorkerError> {
+        let execution_lease = self.reserve_execution(query_id).await?;
         let claimed_at = unix_now()?;
-        let lease = self
+        let lease = match self
             .coordinator
             .store()
             .claim(query_id, claimed_at, self.identity, self.lease.as_secs())
             .await
-            .map_err(|source| AsyncQueryWorkerError::Store { source })?;
+        {
+            Ok(lease) => lease,
+            Err(source) => {
+                self.release_execution(query_id, execution_lease.as_ref())
+                    .await;
+                return Err(AsyncQueryWorkerError::Store { source });
+            }
+        };
         let mut heartbeat = tokio::time::interval(self.lease / 3);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeat.tick().await;
         let deadline = tokio::time::sleep(execution_time);
-        let execution = self.run_claimed(query_id, &lease);
+        let execution = self.run_claimed(query_id, &lease, execution_lease.as_ref());
         tokio::pin!(deadline, execution);
         let result = loop {
             tokio::select! {
                 result = &mut execution => break result,
                 () = &mut deadline => break Err(AsyncQueryWorkerError::ExecutionDeadline),
                 _ = heartbeat.tick() => {
-                    if let Err(source) = self.renew(query_id, &lease).await {
+                    if let Err(source) = self.renew(query_id, &lease, execution_lease.as_ref()).await {
                         break Err(source);
                     }
                 }
@@ -1015,6 +1093,8 @@ impl AsyncQueryWorker {
                     .await;
             }
         }
+        self.release_execution(query_id, execution_lease.as_ref())
+            .await;
         result
     }
 
@@ -1022,6 +1102,7 @@ impl AsyncQueryWorker {
         &self,
         query_id: &str,
         lease: &WorkerLease,
+        execution_lease: Option<&ExecutionLease>,
     ) -> Result<(), AsyncQueryWorkerError> {
         let record = self
             .coordinator
@@ -1095,7 +1176,7 @@ impl AsyncQueryWorker {
                     result_limit_bytes,
                 )
                 .await?;
-                self.renew(query_id, lease).await?;
+                self.renew(query_id, lease, execution_lease).await?;
             }
         }
         if parts.is_empty() {
@@ -1194,12 +1275,88 @@ impl AsyncQueryWorker {
         &self,
         query_id: &str,
         lease: &WorkerLease,
+        execution_lease: Option<&ExecutionLease>,
     ) -> Result<(), AsyncQueryWorkerError> {
+        if let Some(execution_lease) = execution_lease {
+            self.coordinator
+                .store()
+                .renew_execution(
+                    query_id,
+                    &execution_lease.token,
+                    unix_now()?,
+                    self.lease.as_secs(),
+                )
+                .await
+                .map_err(|source| AsyncQueryWorkerError::Store { source })?;
+        }
         self.coordinator
             .store()
             .renew(query_id, lease, unix_now()?, self.lease.as_secs())
             .await
             .map_err(|source| AsyncQueryWorkerError::Store { source })
+    }
+
+    async fn reserve_execution(
+        &self,
+        query_id: &str,
+    ) -> Result<Option<ExecutionLease>, AsyncQueryWorkerError> {
+        let Some(limits) = self.global_execution_limits else {
+            return Ok(None);
+        };
+        let record = self
+            .coordinator
+            .store()
+            .load(query_id)
+            .await
+            .map_err(|source| AsyncQueryWorkerError::Store { source })?
+            .ok_or(AsyncQueryWorkerError::Missing)?;
+        let token = uuid::Uuid::now_v7().simple().to_string();
+        match self
+            .coordinator
+            .store()
+            .reserve_execution(
+                record.tenant_id(),
+                query_id,
+                &token,
+                unix_now()?,
+                self.lease.as_secs(),
+                limits,
+            )
+            .await
+        {
+            Ok(()) => {
+                crate::telemetry::async_cluster_execution("reserved");
+                Ok(Some(ExecutionLease { token }))
+            }
+            Err(
+                AsyncQueryStoreError::ExecutionCapacityHeld
+                | AsyncQueryStoreError::ExecutionLeaseHeld,
+            ) => {
+                crate::telemetry::async_cluster_execution("saturated");
+                Err(AsyncQueryWorkerError::ExecutionCapacityHeld)
+            }
+            Err(source) => Err(AsyncQueryWorkerError::Store { source }),
+        }
+    }
+
+    async fn release_execution(&self, query_id: &str, execution_lease: Option<&ExecutionLease>) {
+        let Some(execution_lease) = execution_lease else {
+            return;
+        };
+        match unix_now() {
+            Ok(now) => match self
+                .coordinator
+                .store()
+                .release_execution(query_id, &execution_lease.token, now)
+                .await
+            {
+                Ok(()) => crate::telemetry::async_cluster_execution("released"),
+                Err(error) => {
+                    tracing::warn!(error = %error, "async cluster execution release failed")
+                }
+            },
+            Err(error) => tracing::warn!(error = %error, "async cluster execution release skipped"),
+        }
     }
 }
 
@@ -1337,6 +1494,162 @@ impl AsyncQueryStore {
             Ok(())
         })
         .await
+    }
+
+    pub(crate) async fn reserve_execution(
+        &self,
+        tenant_id: &str,
+        query_id: &str,
+        token: &str,
+        now: u64,
+        lease_secs: u64,
+        limits: AsyncGlobalExecutionLimits,
+    ) -> Result<(), AsyncQueryStoreError> {
+        let tenant_digest =
+            execution_tenant_digest(tenant_id).ok_or(AsyncQueryStoreError::InvalidStateRecord)?;
+        if state_key(query_id).is_none()
+            || !valid_reservation_token(token)
+            || lease_secs == 0
+            || lease_secs > MAX_WORKER_LEASE_SECS
+            || AsyncGlobalExecutionLimits::try_new(
+                limits.max_running(),
+                limits.max_running_per_tenant(),
+            )
+            .is_err()
+        {
+            return Err(AsyncQueryStoreError::InvalidStateRecord);
+        }
+        let expires_at = now
+            .checked_add(lease_secs)
+            .ok_or(AsyncQueryStoreError::InvalidStateRecord)?;
+        for _ in 0..EXECUTION_CAS_ATTEMPTS {
+            let expected = self
+                .meta
+                .get(EXECUTION_KEY)
+                .await
+                .map_err(|source| AsyncQueryStoreError::Meta { source })?;
+            let mut index = decode_execution_index(expected.as_deref())?;
+            index.entries.retain(|entry| entry.expires_at > now);
+            if let Some(entry) = index
+                .entries
+                .iter_mut()
+                .find(|entry| entry.query_id == query_id)
+            {
+                if entry.token != token || entry.tenant_digest != tenant_digest {
+                    return Err(AsyncQueryStoreError::ExecutionLeaseHeld);
+                }
+                entry.expires_at = expires_at;
+            } else {
+                if index.entries.len() >= limits.max_running()
+                    || index
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.tenant_digest == tenant_digest)
+                        .count()
+                        >= limits.max_running_per_tenant()
+                {
+                    return Err(AsyncQueryStoreError::ExecutionCapacityHeld);
+                }
+                index.entries.push(ExecutionLeaseEntry {
+                    query_id: query_id.to_owned(),
+                    tenant_digest: tenant_digest.clone(),
+                    token: token.to_owned(),
+                    expires_at,
+                });
+            }
+            let encoded = encode_execution_index(&index)?;
+            if self
+                .meta
+                .cas(EXECUTION_KEY, expected.as_deref(), &encoded)
+                .await
+                .map_err(|source| AsyncQueryStoreError::Meta { source })?
+            {
+                return Ok(());
+            }
+        }
+        Err(AsyncQueryStoreError::Conflict)
+    }
+
+    pub(crate) async fn renew_execution(
+        &self,
+        query_id: &str,
+        token: &str,
+        now: u64,
+        lease_secs: u64,
+    ) -> Result<(), AsyncQueryStoreError> {
+        if state_key(query_id).is_none()
+            || !valid_reservation_token(token)
+            || lease_secs == 0
+            || lease_secs > MAX_WORKER_LEASE_SECS
+        {
+            return Err(AsyncQueryStoreError::InvalidStateRecord);
+        }
+        let expires_at = now
+            .checked_add(lease_secs)
+            .ok_or(AsyncQueryStoreError::InvalidStateRecord)?;
+        for _ in 0..EXECUTION_CAS_ATTEMPTS {
+            let expected = self
+                .meta
+                .get(EXECUTION_KEY)
+                .await
+                .map_err(|source| AsyncQueryStoreError::Meta { source })?;
+            let mut index = decode_execution_index(expected.as_deref())?;
+            index.entries.retain(|entry| entry.expires_at > now);
+            let Some(entry) = index
+                .entries
+                .iter_mut()
+                .find(|entry| entry.query_id == query_id && entry.token == token)
+            else {
+                return Err(AsyncQueryStoreError::ExecutionLeaseLost);
+            };
+            entry.expires_at = expires_at;
+            let encoded = encode_execution_index(&index)?;
+            if self
+                .meta
+                .cas(EXECUTION_KEY, expected.as_deref(), &encoded)
+                .await
+                .map_err(|source| AsyncQueryStoreError::Meta { source })?
+            {
+                return Ok(());
+            }
+        }
+        Err(AsyncQueryStoreError::Conflict)
+    }
+
+    pub(crate) async fn release_execution(
+        &self,
+        query_id: &str,
+        token: &str,
+        now: u64,
+    ) -> Result<(), AsyncQueryStoreError> {
+        if state_key(query_id).is_none() || !valid_reservation_token(token) {
+            return Err(AsyncQueryStoreError::InvalidStateRecord);
+        }
+        for _ in 0..EXECUTION_CAS_ATTEMPTS {
+            let expected = self
+                .meta
+                .get(EXECUTION_KEY)
+                .await
+                .map_err(|source| AsyncQueryStoreError::Meta { source })?;
+            let mut index = decode_execution_index(expected.as_deref())?;
+            let before = index.entries.len();
+            index.entries.retain(|entry| {
+                entry.expires_at > now && !(entry.query_id == query_id && entry.token == token)
+            });
+            if index.entries.len() == before {
+                return Ok(());
+            }
+            let encoded = encode_execution_index(&index)?;
+            if self
+                .meta
+                .cas(EXECUTION_KEY, expected.as_deref(), &encoded)
+                .await
+                .map_err(|source| AsyncQueryStoreError::Meta { source })?
+            {
+                return Ok(());
+            }
+        }
+        Err(AsyncQueryStoreError::Conflict)
     }
 
     async fn reconcile_tenant_index(
@@ -2063,11 +2376,20 @@ fn state_key(query_id: &str) -> Option<String> {
 }
 
 fn tenant_index_key(tenant_id: &str) -> Option<String> {
+    tenant_digest(b"lake-query-async-tenant-resource-v1\0", tenant_id)
+        .map(|digest| format!("{TENANT_KEY_PREFIX}{digest}"))
+}
+
+fn execution_tenant_digest(tenant_id: &str) -> Option<String> {
+    tenant_digest(b"lake-query-async-execution-v1\0", tenant_id)
+}
+
+fn tenant_digest(domain: &[u8], tenant_id: &str) -> Option<String> {
     if !bounded(tenant_id, MAX_TENANT_BYTES) {
         return None;
     }
     let mut context = digest::Context::new(&digest::SHA256);
-    context.update(b"lake-query-async-tenant-resource-v1\0");
+    context.update(domain);
     context.update(tenant_id.as_bytes());
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = context.finish();
@@ -2079,7 +2401,7 @@ fn tenant_index_key(tenant_id: &str) -> Option<String> {
             output
         },
     );
-    Some(format!("{TENANT_KEY_PREFIX}{encoded}"))
+    Some(encoded)
 }
 
 fn decode_tenant_index(
@@ -2127,6 +2449,58 @@ fn encode_tenant_index(index: &TenantResourceIndex) -> Result<Vec<u8>, AsyncQuer
         return Err(AsyncQueryStoreError::RecordTooLarge);
     }
     Ok(encoded)
+}
+
+fn decode_execution_index(
+    encoded: Option<&[u8]>,
+) -> Result<ExecutionLeaseIndex, AsyncQueryStoreError> {
+    let Some(encoded) = encoded else {
+        return Ok(ExecutionLeaseIndex {
+            schema_version: 1,
+            entries:        Vec::new(),
+        });
+    };
+    if encoded.len() > MAX_EXECUTION_INDEX_BYTES {
+        return Err(AsyncQueryStoreError::RecordTooLarge);
+    }
+    let index: ExecutionLeaseIndex = serde_json::from_slice(encoded)
+        .map_err(|source| AsyncQueryStoreError::Decode { source })?;
+    if index.schema_version != 1
+        || index.entries.len() > MAX_CLUSTER_EXECUTIONS
+        || index.entries.iter().any(|entry| {
+            state_key(&entry.query_id).is_none()
+                || !valid_tenant_digest(&entry.tenant_digest)
+                || !valid_reservation_token(&entry.token)
+                || entry.expires_at == 0
+        })
+        || index.entries.iter().enumerate().any(|(position, entry)| {
+            index.entries[..position]
+                .iter()
+                .any(|other| other.query_id == entry.query_id)
+        })
+    {
+        return Err(AsyncQueryStoreError::InvalidStateRecord);
+    }
+    Ok(index)
+}
+
+fn encode_execution_index(index: &ExecutionLeaseIndex) -> Result<Vec<u8>, AsyncQueryStoreError> {
+    if index.schema_version != 1 || index.entries.len() > MAX_CLUSTER_EXECUTIONS {
+        return Err(AsyncQueryStoreError::InvalidStateRecord);
+    }
+    let encoded =
+        serde_json::to_vec(index).map_err(|source| AsyncQueryStoreError::Encode { source })?;
+    if encoded.len() > MAX_EXECUTION_INDEX_BYTES {
+        return Err(AsyncQueryStoreError::RecordTooLarge);
+    }
+    Ok(encoded)
+}
+
+fn valid_tenant_digest(value: &str) -> bool {
+    value.len() == digest::SHA256_OUTPUT_LEN * 2
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn encode_record(record: &AsyncQueryRecord) -> Result<Vec<u8>, AsyncQueryStoreError> {
@@ -2674,6 +3048,188 @@ mod tests {
             )
             .await;
         assert!(matches!(blocked, Err(AsyncQueryStoreError::QuotaExceeded)));
+    }
+
+    #[tokio::test]
+    async fn cluster_execution_leases_are_bounded_and_durable() {
+        let directory = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(directory.path()).unwrap());
+        let stores = [
+            AsyncQueryStore::new(meta.clone()),
+            AsyncQueryStore::new(meta.clone()),
+            AsyncQueryStore::new(meta),
+        ];
+        let limits = super::AsyncGlobalExecutionLimits::try_new(2, 1).unwrap();
+        let reservations = [
+            (
+                "tenant-a",
+                "0198f73b-12b0-7d20-b8ab-8195ce8bfe41",
+                "018f73b1-12b0-7d20-b8ab-8195ce8bfe41",
+                &stores[0],
+            ),
+            (
+                "tenant-a",
+                "0198f73b-12b0-7d20-b8ab-8195ce8bfe42",
+                "018f73b1-12b0-7d20-b8ab-8195ce8bfe42",
+                &stores[1],
+            ),
+            (
+                "tenant-b",
+                "0198f73b-12b0-7d20-b8ab-8195ce8bfe43",
+                "018f73b1-12b0-7d20-b8ab-8195ce8bfe43",
+                &stores[2],
+            ),
+        ];
+        let results =
+            futures::future::join_all(reservations.map(|(tenant, query_id, token, store)| {
+                store.reserve_execution(tenant, query_id, token, 1_000, 30, limits)
+            }))
+            .await;
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 2);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(AsyncQueryStoreError::ExecutionCapacityHeld)))
+                .count(),
+            1
+        );
+        assert!(
+            results[2].is_ok(),
+            "a separate tenant remains eligible while tenant-a is at its shared limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_execution_lease_cas_conflicts_are_bounded_and_live() {
+        let directory = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(directory.path()).unwrap());
+        let limits = super::AsyncGlobalExecutionLimits::try_new(64, 1).unwrap();
+        let results = futures::future::join_all((0..32).map(|index| {
+            let store = AsyncQueryStore::new(meta.clone());
+            let tenant = format!("tenant-{index}");
+            let query_id = format!("0198f73b-12b0-7d20-b8ab-{index:012x}");
+            let token = format!("018f73b1-12b0-7d20-b8ab-{index:012x}");
+            async move {
+                store
+                    .reserve_execution(&tenant, &query_id, &token, 1_000, 30, limits)
+                    .await
+            }
+        }))
+        .await;
+
+        assert!(
+            results.iter().all(Result::is_ok),
+            "bounded retries must absorb one synchronized burst without dropping runnable jobs"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_execution_leases_reclaim_expiry_and_fence_tokens() {
+        let directory = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(directory.path()).unwrap());
+        let store = AsyncQueryStore::new(meta);
+        let limits = super::AsyncGlobalExecutionLimits::try_new(1, 1).unwrap();
+        let stale_query = "0198f73b-12b0-7d20-b8ab-8195ce8bfe44";
+        let stale_token = "018f73b1-12b0-7d20-b8ab-8195ce8bfe44";
+        store
+            .reserve_execution("tenant-a", stale_query, stale_token, 1_000, 30, limits)
+            .await
+            .unwrap();
+
+        let successor_query = "0198f73b-12b0-7d20-b8ab-8195ce8bfe45";
+        let successor_token = "018f73b1-12b0-7d20-b8ab-8195ce8bfe45";
+        store
+            .reserve_execution(
+                "tenant-b",
+                successor_query,
+                successor_token,
+                1_031,
+                30,
+                limits,
+            )
+            .await
+            .expect("expiry reclaims a crashed owner");
+        assert!(matches!(
+            store
+                .renew_execution(stale_query, stale_token, 1_031, 30)
+                .await,
+            Err(AsyncQueryStoreError::ExecutionLeaseLost)
+        ));
+        store
+            .release_execution(stale_query, stale_token, 1_031)
+            .await
+            .expect("stale release is exact and cannot remove the successor");
+        assert!(matches!(
+            store
+                .reserve_execution(
+                    "tenant-c",
+                    "0198f73b-12b0-7d20-b8ab-8195ce8bfe46",
+                    "018f73b1-12b0-7d20-b8ab-8195ce8bfe46",
+                    1_031,
+                    30,
+                    limits,
+                )
+                .await,
+            Err(AsyncQueryStoreError::ExecutionCapacityHeld)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cluster_execution_capacity_saturation_keeps_job_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(directory.path()).unwrap());
+        let store = AsyncQueryStore::new(meta);
+        let limits = super::AsyncGlobalExecutionLimits::try_new(1, 1).unwrap();
+        let pending = "0198f73b-12b0-7d20-b8ab-8195ce8bfe47";
+        store
+            .create(
+                AsyncQueryRecord::try_new(
+                    pending,
+                    "tenant-b",
+                    "reader@example",
+                    job_spec(),
+                    1_000,
+                    2_000,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        store
+            .reserve_execution(
+                "tenant-a",
+                "0198f73b-12b0-7d20-b8ab-8195ce8bfe48",
+                "018f73b1-12b0-7d20-b8ab-8195ce8bfe48",
+                1_000,
+                30,
+                limits,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .reserve_execution(
+                    "tenant-b",
+                    pending,
+                    "018f73b1-12b0-7d20-b8ab-8195ce8bfe47",
+                    1_000,
+                    30,
+                    limits,
+                )
+                .await,
+            Err(AsyncQueryStoreError::ExecutionCapacityHeld)
+        ));
+        assert!(
+            store
+                .load(pending)
+                .await
+                .unwrap()
+                .expect("record remains present")
+                .is_pending(),
+            "capacity pressure must not claim or terminally fail the job"
+        );
     }
 
     #[tokio::test]

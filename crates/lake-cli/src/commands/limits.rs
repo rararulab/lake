@@ -253,6 +253,12 @@ pub(crate) fn async_scheduler_limits_from_env() -> anyhow::Result<(usize, usize,
     )
 }
 
+pub(crate) fn async_global_execution_limits_from_env() -> anyhow::Result<Option<(usize, usize)>> {
+    let workers = env_value("LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY")?;
+    let workers_per_tenant = env_value("LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY_PER_TENANT")?;
+    async_global_execution_limits_from_values(workers.as_deref(), workers_per_tenant.as_deref())
+}
+
 pub(crate) fn async_resource_limits_from_env() -> anyhow::Result<(usize, u64)> {
     let outstanding = env_value("LAKE_ASYNC_MAX_OUTSTANDING_PER_TENANT")?;
     let result_bytes = env_value("LAKE_ASYNC_MAX_RESULT_BYTES")?;
@@ -313,6 +319,36 @@ fn async_scheduler_limits_from_values(
         workers_per_tenant,
         Duration::from_millis(execution_ms),
     ))
+}
+
+fn async_global_execution_limits_from_values(
+    workers: Option<&str>,
+    workers_per_tenant: Option<&str>,
+) -> anyhow::Result<Option<(usize, usize)>> {
+    match (workers, workers_per_tenant) {
+        (None, None) => Ok(None),
+        (Some(workers), Some(workers_per_tenant)) => {
+            let workers = parse_or(
+                "LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY",
+                Some(workers),
+                0_usize,
+            )?;
+            let workers_per_tenant = parse_or(
+                "LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY_PER_TENANT",
+                Some(workers_per_tenant),
+                0_usize,
+            )?;
+            anyhow::ensure!(
+                (1..=64).contains(&workers) && (1..=workers).contains(&workers_per_tenant),
+                "invalid async global execution limits"
+            );
+            Ok(Some((workers, workers_per_tenant)))
+        }
+        _ => anyhow::bail!(
+            "LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY and \
+             LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY_PER_TENANT must be set together"
+        ),
+    }
 }
 
 fn query_resources_from_values(
@@ -434,11 +470,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        append_limits_from_values, async_resource_limits_from_values,
-        async_scheduler_limits_from_values, discovery_limits_from_values,
-        lance_maintenance_policy_from_value, maintenance_limits_from_values,
-        operation_policy_from_values, query_limits_from_values, query_resources_from_values,
-        query_ticket_ttl_from_value, shutdown_grace_from_value,
+        append_limits_from_values, async_global_execution_limits_from_values,
+        async_resource_limits_from_values, async_scheduler_limits_from_values,
+        discovery_limits_from_values, lance_maintenance_policy_from_value,
+        maintenance_limits_from_values, operation_policy_from_values, query_limits_from_values,
+        query_resources_from_values, query_ticket_ttl_from_value, shutdown_grace_from_value,
     };
 
     #[test]
@@ -604,6 +640,29 @@ mod tests {
         assert_eq!(
             async_scheduler_limits_from_values(Some("8"), Some("2"), Some("5000")).unwrap(),
             (8, 2, Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn async_global_execution_limit_values_are_validated_before_serving() {
+        assert_eq!(
+            async_global_execution_limits_from_values(None, None).unwrap(),
+            None
+        );
+        for values in [
+            (Some("4"), None),
+            (None, Some("1")),
+            (Some("0"), Some("1")),
+            (Some("65"), Some("1")),
+            (Some("4"), Some("0")),
+            (Some("4"), Some("5")),
+            (Some("many"), Some("1")),
+        ] {
+            assert!(async_global_execution_limits_from_values(values.0, values.1).is_err());
+        }
+        assert_eq!(
+            async_global_execution_limits_from_values(Some("8"), Some("2")).unwrap(),
+            Some((8, 2))
         );
     }
 

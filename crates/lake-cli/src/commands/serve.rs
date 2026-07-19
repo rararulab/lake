@@ -34,9 +34,10 @@ use lake_query::{
 use super::{
     Context, QueryContext,
     limits::{
-        append_limits_from_env, async_resource_limits_from_env, async_scheduler_limits_from_env,
-        discovery_limits_from_env, maintenance_limits_from_env, query_limits_from_env,
-        query_resources_from_env, query_ticket_ttl_from_env, shutdown_grace_from_env,
+        append_limits_from_env, async_global_execution_limits_from_env,
+        async_resource_limits_from_env, async_scheduler_limits_from_env, discovery_limits_from_env,
+        maintenance_limits_from_env, query_limits_from_env, query_resources_from_env,
+        query_ticket_ttl_from_env, shutdown_grace_from_env,
     },
     security::{
         allow_insecure_from_env, metadata_client_security_from_env, peer_client_security_from_env,
@@ -369,11 +370,17 @@ async fn async_query_config(ctx: &QueryContext) -> anyhow::Result<AsyncQueryConf
             }
         };
     let (workers, workers_per_tenant, execution_time) = async_scheduler_limits_from_env()?;
+    let global_execution_limits = async_global_execution_limits_from_env()?;
     let (outstanding_per_tenant, result_bytes) = async_resource_limits_from_env()?;
-    AsyncQueryConfig::new(state, results)
+    let config = AsyncQueryConfig::new(state, results)
         .try_with_scheduler_limits(workers, workers_per_tenant, execution_time)
-        .and_then(|config| config.try_with_resource_limits(outstanding_per_tenant, result_bytes))
-        .map_err(Into::into)
+        .and_then(|config| config.try_with_resource_limits(outstanding_per_tenant, result_bytes))?;
+    match global_execution_limits {
+        Some((workers, workers_per_tenant)) => config
+            .try_with_global_execution_limits(workers, workers_per_tenant)
+            .map_err(Into::into),
+        None => Ok(config),
+    }
 }
 
 pub async fn meta(ctx: &Context, addr: &str) -> anyhow::Result<()> {

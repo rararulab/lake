@@ -50,6 +50,10 @@ pub(crate) fn describe() {
         "lake_query_async_quota_rejections_total",
         "Durable async submission quota rejections by bounded reason"
     );
+    metrics::describe_counter!(
+        "lake_query_async_cluster_execution_total",
+        "Durable async cluster execution lease outcomes by bounded outcome"
+    );
 }
 
 pub(crate) fn admission(outcome: &'static str) {
@@ -93,6 +97,11 @@ pub(crate) fn async_active_decrement() {
 
 pub(crate) fn async_quota_rejection(reason: &'static str) {
     metrics::counter!("lake_query_async_quota_rejections_total", "reason" => reason).increment(1);
+}
+
+pub(crate) fn async_cluster_execution(outcome: &'static str) {
+    metrics::counter!("lake_query_async_cluster_execution_total", "outcome" => outcome)
+        .increment(1);
 }
 
 #[cfg(test)]
@@ -338,6 +347,33 @@ mod tests {
             "query-id",
             "principal",
             "tenant_id",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn async_global_execution_metrics_are_bounded_and_identity_free() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        super::describe();
+        for outcome in ["reserved", "saturated", "released", "stale"] {
+            super::async_cluster_execution(outcome);
+        }
+
+        let rendered = handle.render();
+        for outcome in ["reserved", "saturated", "released", "stale"] {
+            assert!(rendered.contains(&format!(
+                "lake_query_async_cluster_execution_total{{outcome=\"{outcome}\"}} 1"
+            )));
+        }
+        for forbidden in [
+            "secret-tenant",
+            "tenant-a",
+            "query-id",
+            "worker-id",
+            "opaque-token",
         ] {
             assert!(!rendered.contains(forbidden));
         }

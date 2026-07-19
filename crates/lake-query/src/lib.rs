@@ -488,6 +488,8 @@ pub struct AsyncQueryConfig {
     scan_interval: Duration,
     worker_concurrency: usize,
     worker_concurrency_per_tenant: usize,
+    global_worker_concurrency: Option<usize>,
+    global_worker_concurrency_per_tenant: Option<usize>,
     execution_time: Duration,
     max_outstanding_per_tenant: usize,
     max_result_bytes: u64,
@@ -505,6 +507,8 @@ impl AsyncQueryConfig {
             scan_interval: Duration::from_secs(1),
             worker_concurrency: 4,
             worker_concurrency_per_tenant: 1,
+            global_worker_concurrency: None,
+            global_worker_concurrency_per_tenant: None,
             execution_time: Duration::from_mins(30),
             max_outstanding_per_tenant: async_query::DEFAULT_OUTSTANDING_PER_TENANT,
             max_result_bytes: async_query::DEFAULT_RESULT_BYTES,
@@ -557,6 +561,20 @@ impl AsyncQueryConfig {
         Ok(self)
     }
 
+    /// Set an opt-in shared execution ceiling across all Query replicas using
+    /// this async state store.
+    pub fn try_with_global_execution_limits(
+        mut self,
+        concurrency: usize,
+        concurrency_per_tenant: usize,
+    ) -> Result<Self> {
+        async_query::AsyncGlobalExecutionLimits::try_new(concurrency, concurrency_per_tenant)
+            .map_err(|_| QueryError::InvalidAsyncConfiguration)?;
+        self.global_worker_concurrency = Some(concurrency);
+        self.global_worker_concurrency_per_tenant = Some(concurrency_per_tenant);
+        Ok(self)
+    }
+
     /// Set durable per-tenant outstanding-job and immutable per-job result
     /// storage bounds.
     pub fn try_with_resource_limits(
@@ -586,6 +604,11 @@ impl std::fmt::Debug for AsyncQueryConfig {
             .field(
                 "worker_concurrency_per_tenant",
                 &self.worker_concurrency_per_tenant,
+            )
+            .field("global_worker_concurrency", &self.global_worker_concurrency)
+            .field(
+                "global_worker_concurrency_per_tenant",
+                &self.global_worker_concurrency_per_tenant,
             )
             .field("execution_time", &self.execution_time)
             .field(
@@ -1102,6 +1125,20 @@ where
             if async_config.scan_interval.is_zero() || scheduler_limits.is_err() {
                 return Err(QueryError::InvalidAsyncConfiguration);
             }
+            let global_execution_limits = match (
+                async_config.global_worker_concurrency,
+                async_config.global_worker_concurrency_per_tenant,
+            ) {
+                (None, None) => None,
+                (Some(concurrency), Some(concurrency_per_tenant)) => Some(
+                    async_query::AsyncGlobalExecutionLimits::try_new(
+                        concurrency,
+                        concurrency_per_tenant,
+                    )
+                    .map_err(|_| QueryError::InvalidAsyncConfiguration)?,
+                ),
+                _ => return Err(QueryError::InvalidAsyncConfiguration),
+            };
             let resources = async_query::AsyncResourceLimits::try_new(
                 async_config.max_outstanding_per_tenant,
                 async_config.max_result_bytes,
@@ -1119,13 +1156,16 @@ where
             )
             .map_err(|_| QueryError::InvalidAsyncConfiguration)?;
             let identity = async_query::WorkerIdentity::new(*uuid::Uuid::now_v7().as_bytes());
-            let worker = async_query::AsyncQueryWorker::try_new(
+            let mut worker = async_query::AsyncQueryWorker::try_new(
                 coordinator.clone(),
                 engine.clone(),
                 identity,
                 async_config.worker_lease,
             )
             .map_err(|_| QueryError::InvalidAsyncConfiguration)?;
+            if let Some(limits) = global_execution_limits {
+                worker = worker.with_global_execution_limits(limits);
+            }
             Some((
                 coordinator,
                 worker,
@@ -1316,6 +1356,9 @@ async fn run_async_query_loop(
                         Ok(()) => telemetry::async_scheduler("completed"),
                         Err(async_query::AsyncQueryWorkerError::ExecutionDeadline) => {
                             telemetry::async_scheduler("deadline_exceeded");
+                        }
+                        Err(async_query::AsyncQueryWorkerError::ExecutionCapacityHeld) => {
+                            telemetry::async_scheduler("cluster_saturated");
                         }
                         Err(_) => telemetry::async_scheduler("failed"),
                     }

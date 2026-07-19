@@ -122,10 +122,11 @@ policy and resource controls below:
   labels or metadata traffic. Background async workers also have a bounded
   per-replica tenant-fair scheduler and absolute execution deadline; timeout
   stops DataFusion execution and lease renewal before publishing a terminal
-  failure. Add cluster-global scheduling and per-tenant scanned bytes, result
-  bytes, memory, spill, and egress accounting. Replica ceilings are not
-  cluster-global entitlements. Cancellation must propagate to multipart
-  uploads.
+  failure. A shared bounded execution lease now caps running async scans across
+  replicas and per tenant without a global queue; saturation leaves a job
+  pending for a later bounded scan. Add strict cluster-global dispatch fairness
+  and per-tenant scanned bytes, result bytes, memory, spill, and egress
+  accounting. Cancellation must propagate to multipart uploads.
 - Encryption at rest, result-bucket lifecycle deletion, audit logs, and
   metrics for planning, scanning, spilling, materialization, and download.
 
