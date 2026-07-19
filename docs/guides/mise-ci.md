@@ -13,6 +13,12 @@ first.
   second copy of cargo / formatter / linter commands.
 - Rust stays under `rustup` and `rust-toolchain.toml`; mise does not manage
   Rust for this repo.
+- Local mise tasks put Rust artifacts in the user's XDG cache at
+  `lake/target`, rather than in each jj workspace. Cargo's normal fingerprints
+  and target-directory lock keep concurrent revisions correct; the cache is
+  untracked, contains no credentials or source data, and may be deleted to
+  force a cold rebuild. CI remains ephemeral and sets its own incremental
+  policy.
 - **Local-first**: the comprehensive gate runs LOCALLY (`mise run ship`, which
   runs `mise run ci` — gate + dependency policy + doc + spec-selftest +
   LocalStack integration — then a conventional-commit check, then push through
