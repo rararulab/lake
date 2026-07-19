@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.8.2](https://github.com/rararulab/lake/compare/v1.8.1...v1.8.2) (2026-07-19)
+
+
+### Bug Fixes
+
+* **ci:** isolate Iceberg fixture from LocalStack ([23ecf95](https://github.com/rararulab/lake/commit/23ecf952f0dedfa92cd9e12ad15774cfd72dcebd))
+* **ci:** isolate Iceberg fixture from LocalStack ([#292](https://github.com/rararulab/lake/issues/292)) ([e8df3de](https://github.com/rararulab/lake/commit/e8df3de35537a8bbce882f2a56bc6e6bea845052))
+
 ## [1.8.1](https://github.com/rararulab/lake/compare/v1.8.0...v1.8.1) (2026-07-19)
 
 
