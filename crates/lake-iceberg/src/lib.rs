@@ -353,7 +353,7 @@ impl std::fmt::Debug for IcebergCatalogConfig {
         formatter
             .debug_struct("IcebergCatalogConfig")
             .field("endpoint", &self.endpoint)
-            .field("warehouse", &self.warehouse)
+            .field("warehouse", &"configured")
             .field("namespaces", &self.namespaces)
             .field("cache_freshness", &self.cache_freshness)
             .field("cache_stale_if_error", &self.cache_stale_if_error)
