@@ -225,9 +225,11 @@ the catalog responsible for work that belongs in a format-aware runtime.
 
 ### Rerun RRD
 
-RRD is the first visualization and temporal-query Adapter. An RRD footer carries
-chunk offsets plus component, timeline, and schema statistics, so a reader can
-use bounded range reads instead of downloading an entire Artifact. See the
+RRD is the first visualization and temporal-query Adapter. When present, an
+RRD footer carries chunk offsets plus component, timeline, and schema
+statistics, so a reader can use bounded range reads instead of downloading an
+entire Artifact. Footers are optional: the Adapter must detect their absence
+and fall back to a linear scan rather than promise a partial read. See the
 [RRD format](https://rerun.io/docs/concepts/logging-and-ingestion/rrd-format).
 
 The Adapter records the producer version because Viewer compatibility tracks
