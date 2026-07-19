@@ -21,6 +21,50 @@ mise run e2e
 `mise run e2e` creates a local table, ingests data, commits a snapshot, and
 runs a SQL query.
 
+## Architecture and supported data paths
+
+The system has two deliberately separate table authorities. Native Lake tables
+are committed through Metasrv and stored as Lance datasets; Iceberg tables stay
+in their external REST catalog and are only read through Lake Query. In either
+case, large object bytes move directly to object storage rather than through
+the metadata authority.
+
+```mermaid
+flowchart LR
+    sdk["SDK / fleet client"] -->|"Flight SQL + DataLocation metadata"| query["Lake Query\nstateless"]
+    query -->|"cache miss, DDL, native append"| meta["Metasrv\nbounded authority"]
+    meta -->|"native version pointer"| lake_data["Lake Lance datasets\nobject storage"]
+    sdk -. "multi-GB FILE upload / direct read" .-> managed["Lake-managed objects\nobject storage"]
+    query -->|"native snapshot scan"| lake_data
+    query -->|"exact external snapshot lookup"| iceberg_catalog["Iceberg REST catalog\nexternal authority"]
+    query -->|"direct Parquet / manifest scan"| iceberg_data["Iceberg table files\nobject storage"]
+```
+
+| Path | Metadata and commit authority | Large-object route | Write contract |
+|---|---|---|---|
+| Native `lake.<namespace>.<table>` | Lake Metasrv and its per-table version protocol | SDK and Query read/write object storage directly; table rows hold `DataLocation` metadata | Lake `FILE` appends are the typed write path |
+| Federated `iceberg.<namespace>.<table>` | External Iceberg REST catalog and Iceberg snapshot/commit protocol | Query reads Iceberg manifests and Parquet directly with its workload identity | Scan-only; Lake rejects Iceberg DDL/DML and never imports or commits Iceberg state |
+
+For the full invariant set and the rendered topology, read the
+[architecture guide](docs/architecture.md) and its
+[architecture overview](docs/assets/architecture-overview.html). The focused
+[Iceberg federation guide](docs/design/iceberg-federation.md) covers deployment
+configuration, snapshot pinning, and the external authority boundary.
+
+Two repository-owned commands verify these paths locally:
+
+```bash
+# Native Lake: create -> ingest -> commit -> SQL query.
+mise run e2e
+
+# Iceberg: Apache's REST fixture + MinIO -> Lake Query -> real table scan.
+mise run test-iceberg-integration
+```
+
+The Iceberg command owns a checkout-scoped Docker fixture and runs the ignored
+interoperability test against it. It is compatibility coverage, not a local
+Iceberg deployment recipe.
+
 ## External Iceberg reads
 
 Lake can expose **one deployment-configured Iceberg REST catalog** as the
