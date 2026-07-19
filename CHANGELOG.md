@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.8.4](https://github.com/rararulab/lake/compare/v1.8.3...v1.8.4) (2026-07-19)
+
+
+### Bug Fixes
+
+* **release:** dispatch image workflow without checkout ([006a11a](https://github.com/rararulab/lake/commit/006a11aed5338583caca896942a36db23c428c02))
+* **release:** dispatch image workflow without checkout ([#298](https://github.com/rararulab/lake/issues/298)) ([c0464db](https://github.com/rararulab/lake/commit/c0464db03f6f749c4df5b9510304c0f59267b704))
+
 ## [1.8.3](https://github.com/rararulab/lake/compare/v1.8.2...v1.8.3) (2026-07-19)
 
 
