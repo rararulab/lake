@@ -181,6 +181,20 @@ fn release_image_workflow_is_tag_pinned_and_multiarch() {
 }
 
 #[test]
+fn release_image_workflow_reuses_scoped_build_cache() {
+    let workflow = workflow();
+    let build = step_using(steps(&workflow), "docker/build-push-action@");
+    assert_eq!(
+        build["with"]["cache-from"].as_str(),
+        Some("type=gha,scope=lake-release-image")
+    );
+    assert_eq!(
+        build["with"]["cache-to"].as_str(),
+        Some("type=gha,scope=lake-release-image,mode=max")
+    );
+}
+
+#[test]
 fn release_image_workflow_rejects_mismatched_tags_and_preserves_digest_pinning() {
     let workflow = workflow();
     let validation = steps(&workflow)
