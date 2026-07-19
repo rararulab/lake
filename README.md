@@ -414,8 +414,16 @@ with `LAKE_ASYNC_WORKER_CONCURRENCY`,
 `LAKE_ASYNC_EXECUTION_TIMEOUT_MS`. The scheduler scans bounded durable pages,
 selects eligible tenants round-robin without parking worker slots behind a
 saturated tenant, and cancels both execution and lease renewal at the deadline.
-These limits are process-local; CAS worker leases preserve single ownership but
-do not turn them into cluster-global tenant quotas.
+These limits are process-local. To bound concurrent execution across every
+Query replica sharing one async state store, set both
+`LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY` and
+`LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY_PER_TENANT` (each within `1..=64`, with
+the tenant value no greater than the total). A shared, opaque-token execution
+lease is reserved before a job worker claims it; saturation leaves the durable
+job pending for a later scan rather than terminally failing it. Drain and
+recreate the complete Query fleet before enabling, disabling, or changing this
+pair—mixed old/new workers cannot enforce the shared ceiling. This is a finite
+execution-capacity limit, not a global queue or strict dispatch-fairness claim.
 
 Retained async storage is bounded separately and durably across replicas.
 `LAKE_ASYNC_MAX_OUTSTANDING_PER_TENANT` defaults to 8 (range 1..=128), and

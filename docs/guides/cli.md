@@ -125,6 +125,16 @@ each bounded state page, and saturated tenants do not occupy worker slots while
 waiting. Deadline expiry cancels execution and lease renewal and records a
 stable terminal failure. All three values are per Query replica.
 
+Set `LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY` and
+`LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY_PER_TENANT` together to opt into one
+shared execution ceiling across replicas that use the same dedicated async
+state store. Both values must be in `1..=64`, and the tenant value cannot
+exceed the total. An absent pair leaves cluster coordination disabled; a
+partial, malformed, zero, excessive, or contradictory pair fails before Query
+binds. This limit controls only running background executions: local bounded
+page selection remains process-local, so it does not promise a global queue or
+strict dispatch order.
+
 Metasrv FILE append admission uses `LAKE_APPEND_MAX_CONCURRENT` (default `8`),
 `LAKE_APPEND_QUEUE_TIMEOUT_MS` (default `100`),
 `LAKE_APPEND_MAX_STREAM_BYTES` (default `67108864`), and

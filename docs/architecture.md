@@ -478,6 +478,25 @@ Query-replica restarts. Initial retries carry one 128-bit submission id and
 converge through the same state-record CAS. The complete API and security boundary are in
 [`docs/design/sql-api-over-s3.md`](design/sql-api-over-s3.md).
 
+When a deployment opts into global async execution limits, every replica keeps
+its local fair scheduler but reserves one exact opaque token in the dedicated
+async state store before claiming a job. The compact lease index is the only
+cross-replica authority: it is bounded, expires crashed owners, and counts a
+domain-separated tenant digest rather than a raw identity. A saturated lease
+leaves the job queued; it does not create a global queue or a terminal failure.
+
+```mermaid
+flowchart LR
+    scan["Replica-local bounded scan"] --> local["Local tenant-fair scheduler"]
+    local --> reserve["CAS reserve exact execution lease"]
+    reserve -->|"capacity"| claim["CAS claim durable job"]
+    reserve -->|"saturated"| pending["Job remains queued"]
+    claim --> execute["Direct object-storage scan"]
+    execute --> renew["Renew job + execution leases"]
+    renew --> release["Release exact execution token"]
+    reserve <--> state["Dedicated async state store\nbounded lease index"]
+```
+
 Result-part encoding and redemption are streaming and backpressured. A blocking
 Arrow IPC writer emits fixed chunks into a bounded async upload channel and
 enforces the encoded limit before an object can be published. On download, a
@@ -644,9 +663,13 @@ design-level ones:
   identities. Durable async workers separately use bounded page candidates,
   per-tenant round-robin selection, a process-local tenant ceiling, and an
   absolute execution deadline; saturated tenants never park a worker slot.
-  Durable retained async storage is additionally bounded by a CAS tenant index
-  and immutable record-level result-byte ceiling. Cluster-global CPU/memory
-  quotas, billing, and execution-fairness policy remain future work.
+  An opt-in compact shared execution-lease index additionally bounds running
+  async work globally and per tenant across replicas; it is acquired before a
+  worker claim and uses expiry plus opaque-token fencing, not a leader or
+  global queue. Durable retained async storage is additionally bounded by a CAS
+  tenant index and immutable record-level result-byte ceiling. Cluster-global
+  CPU/memory quotas, billing, and strict execution-dispatch fairness remain
+  future work.
 - Each Metasrv replica separately bounds concurrent FILE appends and reserves
   worst-case buffered control bytes before reading a request. A follower and
   leader each enforce their own local ceiling while one forwarded upload is in
@@ -775,8 +798,9 @@ design-level ones:
   health readiness, bounded Prometheus metrics, and distributed tracing are
   wired. Durable SDK append state and finite client-side schema caching are
   wired. Per-replica foreground and async tenant concurrency isolation plus
-  durable retained-job/result-byte accounting are wired; remaining policy work
-  is cluster-global async fairness. A
+  durable retained-job/result-byte accounting and cluster-wide bounded async
+  execution capacity are wired; remaining policy work is strict global async
+  dispatch fairness plus CPU/memory/billing accounting. A
   self-built engine slots in behind `TableEngine`
   if/when Lance's ceiling is hit.
 - **v3 (external Iceberg federation)** — one read-only Iceberg REST catalog is

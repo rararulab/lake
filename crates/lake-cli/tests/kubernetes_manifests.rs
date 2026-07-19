@@ -251,6 +251,8 @@ fn kubernetes_reference_is_secure_and_matches_runtime_contract() {
         "LAKE_ASYNC_RESULT_PREFIX",
         "LAKE_ASYNC_WORKER_CONCURRENCY",
         "LAKE_ASYNC_WORKER_CONCURRENCY_PER_TENANT",
+        "LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY",
+        "LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY_PER_TENANT",
         "LAKE_ASYNC_EXECUTION_TIMEOUT_MS",
         "LAKE_ASYNC_MAX_OUTSTANDING_PER_TENANT",
         "LAKE_ASYNC_MAX_RESULT_BYTES",
@@ -417,6 +419,24 @@ fn kubernetes_reference_is_secure_and_matches_runtime_contract() {
     assert!(dockerfile.contains("COPY --from=health-probe"));
     assert!(dockerfile.contains("USER 65532:65532"));
     assert!(dockerfile.contains("ENTRYPOINT [\"/usr/local/bin/lake\"]"));
+}
+
+#[test]
+fn kubernetes_reference_declares_cluster_async_execution_limits() {
+    let documents = load_documents("deploy/kubernetes/lake.yaml");
+    let config = find(&documents, "ConfigMap", "lake-runtime");
+    assert_eq!(
+        config["data"]["LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY"].as_str(),
+        Some("4")
+    );
+    assert_eq!(
+        config["data"]["LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY_PER_TENANT"].as_str(),
+        Some("1")
+    );
+    let runbook =
+        fs::read_to_string(root().join("docs/guides/kubernetes.md")).expect("Kubernetes runbook");
+    assert!(runbook.contains("drain and recreate all Query replicas"));
+    assert!(runbook.contains("LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY"));
 }
 
 #[test]

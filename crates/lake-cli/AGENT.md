@@ -59,7 +59,11 @@ All values are positive integers parsed once before serving.
 Durable async workers use `LAKE_ASYNC_WORKER_CONCURRENCY` (default 4),
 `LAKE_ASYNC_WORKER_CONCURRENCY_PER_TENANT` (default 1; at most the worker
 total), and `LAKE_ASYNC_EXECUTION_TIMEOUT_MS` (default 1800000; maximum
-86400000). These limits are per Query replica.
+86400000). These limits are per Query replica. An optional complete pair,
+`LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY` and
+`LAKE_ASYNC_GLOBAL_WORKER_CONCURRENCY_PER_TENANT`, bounds running async work
+across replicas through the dedicated async state store; partial configuration
+fails before Query binds.
 
 ## Lance maintenance policy
 
