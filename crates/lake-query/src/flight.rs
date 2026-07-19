@@ -1077,11 +1077,6 @@ impl TracedFlightSqlService {
         .await
         .map_err(|_| Status::deadline_exceeded("query planning deadline exceeded"))??;
         let (lake_snapshots, iceberg_snapshots) = ticket_snapshots(&snapshots)?;
-        if !iceberg_snapshots.is_empty() {
-            return Err(Status::failed_precondition(
-                "asynchronous Iceberg queries are not supported",
-            ));
-        }
         let statement = StatementTicket {
             sql: query.query,
             snapshots: lake_snapshots,
@@ -1782,7 +1777,9 @@ mod tests {
         async_query::{
             AsyncQueryCoordinator, AsyncQueryWorker, AsyncResourceLimits, WorkerIdentity,
         },
-        ticket::{QueryTicketKeyRing, StatementTicketCodec},
+        ticket::{
+            QueryTicketKeyRing, StatementIcebergSnapshot, StatementTicket, StatementTicketCodec,
+        },
     };
 
     #[test]
@@ -3049,6 +3046,193 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(values.values(), &[7]);
+    }
+
+    #[tokio::test]
+    async fn async_iceberg_submission_executes_pinned_snapshot() {
+        let (_warehouse, iceberg, catalog) = crate::tests::test_iceberg_catalog().await;
+        let engine = Arc::new(
+            QueryEngine::new(Arc::new(EmptyMeta), Arc::new(LanceEngine::new()))
+                .with_iceberg_catalog(iceberg),
+        );
+        let issuer = FlightSqlServiceImpl {
+            engine:                 engine.clone(),
+            metadata_addr:          None,
+            metadata_security:      ClientSecurity::new(),
+            managed_stage:          None,
+            read_capability_issuer: None,
+            admission:              QueryAdmission::new(QueryLimits::default()),
+            discovery_limits:       DiscoveryLimits::default(),
+            ticket_codec:           test_ticket_codec(),
+        };
+        let state_directory = tempfile::tempdir().unwrap();
+        let state: MetaStoreRef = Arc::new(RocksMeta::open(state_directory.path()).unwrap());
+        let object_directory = tempfile::tempdir().unwrap();
+        let objects = Arc::new(
+            LocalObjectStore::open(object_directory.path())
+                .await
+                .unwrap(),
+        );
+        let coordinator = AsyncQueryCoordinator::try_new(
+            state,
+            objects,
+            test_ticket_keys(),
+            Duration::from_hours(6),
+            Duration::from_mins(5),
+        )
+        .unwrap();
+        let service = TracedFlightSqlService::with_async_queries(issuer, coordinator.clone());
+        let principal = Principal::try_new(
+            PrincipalId::try_new("analytics-reader").unwrap(),
+            TenantId::try_new("tenant-analytics").unwrap(),
+            PrincipalRole::User,
+            ["analytics"],
+        )
+        .unwrap();
+        let query = CommandStatementQuery {
+            query:          "SELECT episode_id FROM iceberg.analytics.episodes".to_owned(),
+            transaction_id: Some(bytes::Bytes::from_static(&[4_u8; 16])),
+        };
+        let mut submission =
+            Request::new(FlightDescriptor::new_cmd(query.as_any().encode_to_vec()));
+        submission.extensions_mut().insert(principal.clone());
+        let poll = FlightService::poll_flight_info(&service, submission)
+            .await
+            .expect("submit external async query")
+            .into_inner();
+        let handle = poll.flight_descriptor.expect("poll handle");
+        let query_id = coordinator
+            .open_poll_handle(&handle.cmd, &principal)
+            .expect("identity-bound async handle");
+        let record = coordinator
+            .store()
+            .load(&query_id)
+            .await
+            .unwrap()
+            .expect("queued external async job");
+        let statement = coordinator
+            .open_job(&record)
+            .await
+            .expect("encrypted external snapshot job");
+        assert!(statement.snapshots.is_empty());
+        assert_eq!(statement.iceberg_snapshots.len(), 1);
+
+        crate::tests::append_test_iceberg_episode(&catalog, 2).await;
+        AsyncQueryWorker::try_new(
+            coordinator,
+            engine,
+            WorkerIdentity::new([4; 16]),
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .run(&query_id, Duration::from_secs(30))
+        .await
+        .expect("worker executes the submitted external snapshot");
+
+        let mut completed = Request::new(handle);
+        completed.extensions_mut().insert(principal.clone());
+        let completed = FlightService::poll_flight_info(&service, completed)
+            .await
+            .expect("poll completed external query")
+            .into_inner();
+        let endpoint = &completed.info.expect("completed FlightInfo").endpoint[0];
+        let mut result_request = Request::new(endpoint.ticket.clone().expect("result ticket"));
+        result_request.extensions_mut().insert(principal);
+        let batches = FlightRecordBatchStream::new_from_flight_data(
+            FlightService::do_get(&service, result_request)
+                .await
+                .expect("redeem external async result")
+                .into_inner()
+                .map_err(arrow_flight::error::FlightError::from),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        let values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Iceberg episode ID column")
+                    .iter()
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn async_iceberg_worker_rejects_unretained_snapshot() {
+        let (_warehouse, iceberg, catalog) = crate::tests::test_iceberg_catalog().await;
+        crate::tests::append_test_iceberg_episode(&catalog, 2).await;
+        let engine = Arc::new(
+            QueryEngine::new(Arc::new(EmptyMeta), Arc::new(LanceEngine::new()))
+                .with_iceberg_catalog(iceberg),
+        );
+        let state_directory = tempfile::tempdir().unwrap();
+        let state: MetaStoreRef = Arc::new(RocksMeta::open(state_directory.path()).unwrap());
+        let object_directory = tempfile::tempdir().unwrap();
+        let objects = Arc::new(
+            LocalObjectStore::open(object_directory.path())
+                .await
+                .unwrap(),
+        );
+        let coordinator = AsyncQueryCoordinator::try_new(
+            state,
+            objects,
+            test_ticket_keys(),
+            Duration::from_hours(6),
+            Duration::from_mins(5),
+        )
+        .unwrap();
+        let principal = Principal::try_new(
+            PrincipalId::try_new("analytics-reader").unwrap(),
+            TenantId::try_new("tenant-analytics").unwrap(),
+            PrincipalRole::User,
+            ["analytics"],
+        )
+        .unwrap();
+        let submission = coordinator
+            .submit_statement(
+                &StatementTicket {
+                    sql:               "SELECT episode_id FROM iceberg.analytics.episodes"
+                        .to_owned(),
+                    snapshots:         Vec::new(),
+                    iceberg_snapshots: vec![StatementIcebergSnapshot {
+                        namespace:   "analytics".to_owned(),
+                        table:       "episodes".to_owned(),
+                        snapshot_id: i64::MAX,
+                    }],
+                },
+                &principal,
+            )
+            .await
+            .expect("persist an exact external snapshot job");
+        let query_id = submission.query_id().to_owned();
+        let error = AsyncQueryWorker::try_new(
+            coordinator.clone(),
+            engine,
+            WorkerIdentity::new([6; 16]),
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .run(&query_id, Duration::from_secs(30))
+        .await
+        .expect_err("worker must reject a missing external snapshot");
+        assert!(matches!(
+            error,
+            crate::async_query::AsyncQueryWorkerError::Query { .. }
+        ));
+        let record = coordinator
+            .store()
+            .load(&query_id)
+            .await
+            .unwrap()
+            .expect("durable failed external job");
+        assert!(record.is_failed());
+        assert!(record.completed_manifest().is_none());
     }
 
     #[tokio::test]

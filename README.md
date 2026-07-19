@@ -410,6 +410,12 @@ while let Some(batch) = results.try_next().await? {
 }
 ```
 
+The same durable Flight lifecycle accepts configured read-only
+`iceberg.<namespace>.<table>` scans. The encrypted job carries only the exact
+Iceberg snapshot identity selected at submission. A worker point-loads that
+same snapshot before execution; if external retention removed it, the job
+fails rather than reading the catalog's current head.
+
 For workflow engines and long jobs, persist the opaque handle and resume after
 a process or Query-connection restart:
 
