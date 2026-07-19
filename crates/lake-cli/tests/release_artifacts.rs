@@ -205,7 +205,9 @@ fn release_workflows_have_explicit_execution_budgets() {
     for (name, job) in jobs {
         if job["runs-on"].is_string() {
             assert!(
-                job["timeout-minutes"].as_u64().is_some_and(|timeout| timeout > 0),
+                job["timeout-minutes"]
+                    .as_u64()
+                    .is_some_and(|timeout| timeout > 0),
                 "hosted CI job {name:?} must declare a positive timeout"
             );
         }
