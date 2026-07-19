@@ -73,6 +73,12 @@ secrets from the deployment secret manager as environment variables; do not
 put them in endpoint URLs, CLI flags, config files committed to source control,
 or diagnostic output.
 
+When an OAuth client-credential session fails on a bounded namespace check or
+exact table lookup, Query renews its in-memory token once and retries only that
+read. Concurrent failures share one renewal. Static bearer tokens do not
+refresh, and this is neither background refresh scheduling nor secret rotation.
+If renewal or the one retry fails, Query returns the failure.
+
 Query accepts `SELECT ... FROM iceberg.<namespace>.<table>` only for a
 configured namespace. It does not enumerate external namespaces or tables in
 Flight discovery; clients must use a full table name. The external catalog owns
