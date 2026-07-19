@@ -80,6 +80,16 @@ then streams Parquet and manifest data directly from object storage. Iceberg
 credentials and object bytes never enter Lake metadata, statement tickets, or
 the Flight stream.
 
+If the external REST catalog omits a non-default S3-compatible endpoint,
+configure `LAKE_ICEBERG_S3_ENDPOINT` together with
+`LAKE_ICEBERG_S3_REGION`; optional strict boolean
+`LAKE_ICEBERG_S3_PATH_STYLE_ACCESS` and
+`LAKE_ICEBERG_S3_ALLOW_ANONYMOUS` cover compatible storage and deliberately
+public buckets. This is a credential-free endpoint override, not a static-key
+configuration surface: Query still uses its workload identity for production
+object access. The [federation guide](docs/design/iceberg-federation.md)
+documents the configuration boundary and data path.
+
 The same rule applies to durable Flight SQL. `PollFlightInfo` stores only the
 encrypted snapshot identity in Lake's bounded job state; a later worker
 point-loads that exact snapshot before materializing Arrow result parts. If

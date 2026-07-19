@@ -153,6 +153,25 @@ jobs:
       - name: run integration tests (ignored-only)
         run: mise run test-integration-external
 
+  # Independent Apache REST catalog + MinIO proves that Lake's read-only
+  # federation works beyond the in-process protocol fixture. The task owns its
+  # checkout-scoped Docker lifecycle, matching the comprehensive local gate.
+  iceberg-integration:
+    name: Integration (Apache Iceberg REST)
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' || github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-lake-build
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2
+        with:
+          tool: cargo-nextest
+      - run: mise run test-iceberg-integration
+
   # Task-Contract spec self-test (bun tooling; no Rust build).
   spec:
     name: Spec selftest
@@ -221,7 +240,7 @@ jobs:
   ci-ok:
     name: CI OK
     if: always()
-    needs: [changes, rust, integration, spec, site, cargo-deny, cargo-shear]
+    needs: [changes, rust, integration, iceberg-integration, spec, site, cargo-deny, cargo-shear]
     runs-on: ubuntu-latest
     steps:
       - name: verify no job failed

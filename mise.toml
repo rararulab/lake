@@ -129,6 +129,14 @@ run = "bun scripts/test-integration.ts"
 description = "run ignored integration tests against an externally managed LocalStack"
 run = "bun scripts/test-integration.ts --external"
 
+[tasks.test-iceberg-integration]
+description = "run Apache Iceberg REST + MinIO interoperability coverage (Docker)"
+run = "bun scripts/test-iceberg-integration.ts"
+
+[tasks.test-iceberg-integration-external]
+description = "run Iceberg interoperability coverage against an externally managed fixture"
+run = "bun scripts/test-iceberg-integration.ts --external"
+
 [tasks.k8s-validate]
 description = "strictly validate the checked-in Kubernetes reference against Kubernetes 1.32"
 run = "kubeconform -strict -summary -kubernetes-version 1.32.0 deploy/kubernetes/lake.yaml"
@@ -149,8 +157,8 @@ run = 'env RUSTDOCFLAGS="-D warnings" cargo +nightly doc --workspace --no-deps -
 # a constrained ephemeral runner. Local-first: this is the real gate; CI is a
 # post-merge backstop on `main`. Ship via `mise run ship`.
 [tasks.ci]
-description = "comprehensive local gate: gate + dependency policy + doc + spec-selftest + integration (needs Docker)"
-depends = ["gate", "dependency-deny", "dependency-shear", "doc", "spec-selftest", "test-integration"]
+description = "comprehensive local gate: gate + dependency policy + doc + spec-selftest + Docker integration"
+depends = ["gate", "dependency-deny", "dependency-shear", "doc", "spec-selftest", "test-integration", "test-iceberg-integration"]
 
 # One command to ship: full local gate + Conventional Commit check, then push
 # through the jj-pre-push gate. Local-first replacement for CI-catches-problems.

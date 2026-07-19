@@ -65,6 +65,33 @@ each external REST configuration handshake, namespace point check, exact table
 lookup, and OAuth exchange. The override without the base catalog triple, or a
 malformed/out-of-range value, fails before Query binds.
 
+#### S3-compatible object-store endpoint
+
+Most catalogs return enough object-store properties for Query's workload
+identity to read their files directly. When an otherwise compatible REST
+catalog omits a non-default S3 endpoint, configure this deliberately narrow
+deployment override alongside the required catalog triple:
+
+```bash
+LAKE_ICEBERG_S3_ENDPOINT=https://objects.example.com \
+LAKE_ICEBERG_S3_REGION=us-east-1 \
+LAKE_ICEBERG_S3_PATH_STYLE_ACCESS=true \
+LAKE_ICEBERG_S3_ALLOW_ANONYMOUS=false \
+lake query --metadata-addr https://metasrv.example.com:50052
+```
+
+`LAKE_ICEBERG_S3_ENDPOINT` requires `LAKE_ICEBERG_S3_REGION`; it accepts only
+a credential-free HTTPS URL, except for numeric-loopback HTTP in development.
+`..._PATH_STYLE_ACCESS` and `..._ALLOW_ANONYMOUS` are optional strict
+`true`/`false` values. Path style is typical for S3-compatible services. Set
+anonymous access only for an intentionally public bucket.
+
+The override contains only endpoint, region, path-style, and anonymous-read
+settings, and takes precedence over an absent or incomplete catalog response.
+It cannot supply an access key, secret, signed URL, or arbitrary storage
+property. Query still obtains production object credentials from its workload
+identity; those credentials never enter SQL, Lake metadata, or Flight tickets.
+
 An external catalog may be unauthenticated, or use exactly one of the following
 runtime-only REST authentication modes:
 

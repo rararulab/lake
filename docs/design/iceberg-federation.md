@@ -101,6 +101,9 @@ Iceberg disabled.
 | `LAKE_ICEBERG_WAREHOUSE` | Iceberg warehouse identifier passed to the catalog |
 | `LAKE_ICEBERG_NAMESPACES` | Comma-separated, finite SQL namespace allowlist |
 | `LAKE_ICEBERG_REST_TIMEOUT_MS` | Optional per-request total/connect deadline in milliseconds (default `10000`, range `1..=60000`) |
+| `LAKE_ICEBERG_S3_ENDPOINT` + `LAKE_ICEBERG_S3_REGION` | Optional pair for a credential-free S3-compatible endpoint omitted by the catalog; both must be set together |
+| `LAKE_ICEBERG_S3_PATH_STYLE_ACCESS` | Optional strict `true`/`false`; enables path-style S3 addressing |
+| `LAKE_ICEBERG_S3_ALLOW_ANONYMOUS` | Optional strict `true`/`false`; permits reads from an intentionally public bucket |
 
 For example:
 
@@ -110,6 +113,30 @@ LAKE_ICEBERG_WAREHOUSE=s3://embodied-warehouse \
 LAKE_ICEBERG_NAMESPACES=analytics,models \
 lake query --metadata-addr https://metasrv.example.com:50052
 ```
+
+### Object-store configuration boundary
+
+The REST response remains the normal source of file-I/O properties. The S3
+override is only for compatible external catalogs that omit a non-default
+endpoint; its client-side properties take precedence for the one Query process.
+It is intentionally not a general property pass-through and never carries
+credentials.
+
+```mermaid
+flowchart LR
+    D["Query deployment"] -->|"REST URL, warehouse, namespace allowlist"| Q["Lake Query"]
+    D -->|"optional S3 endpoint, region, path style\nno credentials"| Q
+    C["External Iceberg REST catalog"] -->|"table metadata and snapshot"| Q
+    Q -->|"direct manifests and Parquet\nworkload identity"| O["Iceberg object storage"]
+    Q -. "never forwards bytes or credentials" .-> M["Metasrv / Lake registry"]
+```
+
+`LAKE_ICEBERG_S3_ENDPOINT` must be paired with
+`LAKE_ICEBERG_S3_REGION`. It follows the catalog's credential-free
+HTTPS-or-numeric-loopback transport rule. The optional path-style and
+anonymous-read flags are strict booleans. Anonymous reads are only appropriate
+for an intentionally public bucket; production credentials still come from the
+Query workload identity.
 
 The REST session is either unauthenticated, a static bearer token via
 `LAKE_ICEBERG_REST_TOKEN`, or an OAuth client-credentials session via

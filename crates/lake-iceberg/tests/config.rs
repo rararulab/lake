@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use lake_iceberg::{IcebergCatalogConfig, IcebergError, IcebergOAuthOptions, IcebergRestAuth};
+use lake_iceberg::{
+    IcebergCatalogConfig, IcebergError, IcebergOAuthOptions, IcebergRestAuth, IcebergS3Config,
+};
 
 #[test]
 fn iceberg_configuration_rejects_invalid_or_duplicate_namespaces() {
@@ -106,4 +108,37 @@ fn external_rest_urls_require_tls_or_numeric_loopback() {
             Err(IcebergError::InvalidRestAuth)
         ));
     }
+}
+
+#[test]
+fn s3_storage_configuration_requires_a_credential_free_endpoint() {
+    let configured = IcebergS3Config::try_new("https://objects.example.com")
+        .expect("accept TLS S3 endpoint")
+        .with_region("us-east-1")
+        .expect("accept S3 region")
+        .with_path_style_access()
+        .with_anonymous_access();
+    let debug = format!("{configured:?}");
+    assert!(debug.contains("endpoint: \"configured\""));
+    assert!(!debug.contains("objects.example.com"));
+    assert!(!debug.contains("access-key"));
+
+    for endpoint in [
+        "http://objects.example.com",
+        "https://user:secret@objects.example.com",
+        "https://objects.example.com/path?token=secret",
+        "https://objects.example.com/#secret",
+    ] {
+        assert!(
+            IcebergS3Config::try_new(endpoint).is_err(),
+            "reject unsafe object-store endpoint: {endpoint}"
+        );
+    }
+    assert!(IcebergS3Config::try_new("http://127.0.0.1:9000").is_ok());
+    assert!(
+        IcebergS3Config::try_new("https://objects.example.com")
+            .expect("build S3 configuration")
+            .with_region("\n")
+            .is_err()
+    );
 }
