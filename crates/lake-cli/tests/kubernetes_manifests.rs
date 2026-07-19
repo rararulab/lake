@@ -418,3 +418,127 @@ fn kubernetes_reference_is_secure_and_matches_runtime_contract() {
     assert!(dockerfile.contains("USER 65532:65532"));
     assert!(dockerfile.contains("ENTRYPOINT [\"/usr/local/bin/lake\"]"));
 }
+
+#[test]
+fn kubernetes_reference_iceberg_federation_is_opt_in_and_query_only() {
+    let documents = load_documents("deploy/kubernetes/lake.yaml");
+    assert!(
+        documents
+            .iter()
+            .all(|document| document["kind"].as_str() != Some("Secret")),
+        "the reference must never commit an Iceberg REST credential"
+    );
+
+    let runtime = find(&documents, "ConfigMap", "lake-runtime");
+    let runtime_values = runtime["data"]
+        .as_mapping()
+        .expect("runtime ConfigMap data");
+    assert!(
+        runtime_values
+            .keys()
+            .filter_map(Value::as_str)
+            .all(|key| !key.starts_with("LAKE_ICEBERG_")),
+        "the shared base ConfigMap must keep Iceberg disabled by absence"
+    );
+
+    let query = find(&documents, "Deployment", "lake-query");
+    let query_container = lake_container(query);
+    let query_sources = query_container["envFrom"]
+        .as_sequence()
+        .expect("Query environment sources");
+    assert!(
+        query_sources.iter().all(|source| {
+            source["configMapRef"]["name"].as_str() != Some("lake-iceberg-runtime")
+                && source["secretRef"]["name"].as_str() != Some("lake-iceberg-runtime")
+        }),
+        "Query must not inject arbitrary Iceberg runtime keys with envFrom"
+    );
+
+    let query_env = query_container["env"]
+        .as_sequence()
+        .expect("Query environment");
+    for (name, kind) in [
+        ("LAKE_ICEBERG_REST_ENDPOINT", "configMapKeyRef"),
+        ("LAKE_ICEBERG_WAREHOUSE", "configMapKeyRef"),
+        ("LAKE_ICEBERG_NAMESPACES", "configMapKeyRef"),
+        ("LAKE_ICEBERG_REST_TIMEOUT_MS", "configMapKeyRef"),
+        ("LAKE_ICEBERG_REST_OAUTH2_SERVER_URI", "configMapKeyRef"),
+        ("LAKE_ICEBERG_REST_OAUTH_SCOPE", "configMapKeyRef"),
+        ("LAKE_ICEBERG_REST_OAUTH_AUDIENCE", "configMapKeyRef"),
+        ("LAKE_ICEBERG_REST_OAUTH_RESOURCE", "configMapKeyRef"),
+        ("LAKE_ICEBERG_REST_TOKEN", "secretKeyRef"),
+        ("LAKE_ICEBERG_REST_CREDENTIAL", "secretKeyRef"),
+    ] {
+        let entry = query_env
+            .iter()
+            .find(|entry| entry["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("Query must bind optional Iceberg key {name}"));
+        assert_eq!(
+            entry["valueFrom"][kind]["name"].as_str(),
+            Some("lake-iceberg-runtime"),
+            "Iceberg key {name} must come from the scoped {kind}"
+        );
+        assert_eq!(
+            entry["valueFrom"][kind]["key"].as_str(),
+            Some(name),
+            "Iceberg key {name} must not be renamed or collide with another value"
+        );
+        assert_eq!(
+            entry["valueFrom"][kind]["optional"].as_bool(),
+            Some(true),
+            "Iceberg key {name} must leave federation disabled when absent"
+        );
+    }
+    assert!(
+        query_env.iter().all(|entry| {
+            entry["name"].as_str().is_none_or(|name| {
+                !name.starts_with("LAKE_ICEBERG_") || entry["valueFrom"].is_mapping()
+            })
+        }),
+        "Iceberg values must use a scoped optional key reference"
+    );
+
+    let metasrv = find(&documents, "StatefulSet", "lake-metasrv");
+    let metasrv_sources = lake_container(metasrv)["envFrom"]
+        .as_sequence()
+        .expect("Metasrv environment sources");
+    assert!(
+        metasrv_sources.iter().all(|source| {
+            source["configMapRef"]["name"].as_str() != Some("lake-iceberg-runtime")
+                && source["secretRef"]["name"].as_str() != Some("lake-iceberg-runtime")
+        }),
+        "Metasrv must never receive an external Iceberg REST credential"
+    );
+    assert!(
+        lake_container(metasrv)["env"]
+            .as_sequence()
+            .expect("Metasrv environment")
+            .iter()
+            .all(|entry| {
+                entry["name"]
+                    .as_str()
+                    .is_none_or(|name| !name.starts_with("LAKE_ICEBERG_"))
+            }),
+        "Metasrv must never receive an external Iceberg environment value"
+    );
+
+    let runbook =
+        fs::read_to_string(root().join("docs/guides/kubernetes.md")).expect("Kubernetes runbook");
+    for contract in [
+        "kubectl -n lake-system create configmap lake-iceberg-runtime",
+        "LAKE_ICEBERG_REST_ENDPOINT",
+        "LAKE_ICEBERG_WAREHOUSE",
+        "LAKE_ICEBERG_NAMESPACES",
+        "kubectl -n lake-system create secret generic lake-iceberg-runtime",
+        "LAKE_ICEBERG_REST_TOKEN",
+        "LAKE_ICEBERG_REST_CREDENTIAL",
+        "exactly one",
+        "After creating the ConfigMap and, when needed, the Secret",
+        "kubectl -n lake-system delete configmap lake-iceberg-runtime",
+    ] {
+        assert!(
+            runbook.contains(contract),
+            "missing Iceberg Kubernetes deployment contract: {contract}"
+        );
+    }
+}
