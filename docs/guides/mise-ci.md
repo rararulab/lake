@@ -174,7 +174,23 @@ merge, while the existing main-only CI remains the post-merge backstop.
 
 Release Please continuously updates one release PR from Conventional Commits.
 Merging that PR updates the changelog and versions, creates `vX.Y.Z` without a
-component prefix, and publishes the matching GitHub Release.
+component prefix, and publishes the matching GitHub Release. When that root
+release is created, the same short-lived token automatically dispatches the
+existing image workflow with the exact release tag. The image workflow still
+checks out and validates that published immutable tag before it publishes the
+multi-platform GHCR image.
+
+The `release` event created by `GITHUB_TOKEN` intentionally does not trigger a
+second workflow, so this `workflow_dispatch` handoff is required rather than
+optional wiring. For a release made before the handoff existed, run the manual
+image backfill with the published release tag:
+
+```bash
+gh workflow run release-image.yml --ref main -f tag=vX.Y.Z
+```
+
+Wait for the `Publish release image` run to complete, then resolve the
+manifest-list digest before updating a production deployment.
 
 ## Review Checklist
 
