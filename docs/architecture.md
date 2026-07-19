@@ -45,7 +45,11 @@ The external-Iceberg connector follows the same boundary: its catalog
 remains the authority for Iceberg metadata and snapshots, while Lake Query
 caches and reads it as a distinct, read-only SQL catalog. It does not put
 external Iceberg metadata in Lake's registry. See
-[Iceberg federation](design/iceberg-federation.md).
+[Iceberg federation](design/iceberg-federation.md) and the focused
+[federation topology](assets/iceberg-federation.html). The topology makes one
+extra property explicit: Flight tickets pin the external snapshot selected at
+planning, but object bytes continue to travel directly between Query and the
+Iceberg table's object storage.
 
 ## Three tiers
 

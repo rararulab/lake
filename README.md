@@ -21,6 +21,60 @@ mise run e2e
 `mise run e2e` creates a local table, ingests data, commits a snapshot, and
 runs a SQL query.
 
+## External Iceberg reads
+
+Lake can expose **one deployment-configured Iceberg REST catalog** as the
+separate, read-only `iceberg` SQL catalog. It is a federation boundary, not an
+import: the external catalog remains authoritative for Iceberg metadata,
+snapshots, commits, and garbage collection; Lake remains authoritative only
+for its native `lake` catalog.
+
+```sql
+SELECT episode_id, reward
+FROM iceberg.analytics.episodes
+WHERE robot_id = 'alpha';
+```
+
+Enable it on each Query replica with the complete configuration below. The
+replica validates it and point-checks every configured namespace before it
+binds its public listener; setting only part of the three required variables is
+a startup error.
+
+```bash
+LAKE_ICEBERG_REST_ENDPOINT=https://catalog.example.com \
+LAKE_ICEBERG_WAREHOUSE=s3://embodied-warehouse \
+LAKE_ICEBERG_NAMESPACES=analytics,models \
+LAKE_ICEBERG_REST_TIMEOUT_MS=10000 \
+lake query --metadata-addr https://metasrv.example.com:50052
+```
+
+`LAKE_ICEBERG_REST_ENDPOINT` must be credential-free HTTPS in production;
+plain HTTP is accepted only for numeric loopback addresses in development. Set
+either `LAKE_ICEBERG_REST_TOKEN` or the OAuth client-credential variables
+(`LAKE_ICEBERG_REST_CREDENTIAL` plus optional standard OAuth properties) from
+the deployment's secret manager, never from SQL or a table row. The Query
+workload identity, not an SDK/client, needs read access to the Iceberg table
+files.
+
+Access is the intersection of two finite allowlists: the deployment's
+`LAKE_ICEBERG_NAMESPACES` and the authenticated Lake principal's existing
+namespace grants. Query does not enumerate external namespaces or tables, so
+clients must address a configured table by its complete
+`iceberg.<namespace>.<table>` name.
+
+At planning, a Query replica resolves an immutable Iceberg snapshot through a
+bounded per-replica cache; concurrent cold or expired lookups for one table
+share one external call. The encrypted Flight ticket pins that snapshot. On
+`DoGet`, Query verifies that the exact snapshot is still retained upstream,
+then streams Parquet and manifest data directly from object storage. Iceberg
+credentials and object bytes never enter Lake metadata, statement tickets, or
+the Flight stream.
+
+Iceberg federation is intentionally scan-only: Lake rejects Iceberg DDL/DML,
+does not mirror its catalog into Metasrv, and never becomes an Iceberg commit
+writer. Read the [federation guide](docs/design/iceberg-federation.md) and its
+[topology diagram](docs/assets/iceberg-federation.html) before deploying it.
+
 ## SQL-managed files
 
 Lake models a video, model checkpoint, or similar large payload as a logical
