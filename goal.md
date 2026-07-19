@@ -8,6 +8,15 @@ immutable files; large batches of training/eval nodes read it back
 concurrently through SQL. Scale target: ~10⁴ tables holding ~10¹¹ episodes
 total (many episodes per table), under DDoS-like read fan-out.
 
+The product loop is **ingest -> inspect -> select -> freeze -> train ->
+derive**. Lake owns dataset membership, exact revisions, access, retention, and
+training provenance. Format-aware tools such as Rerun provide episode-local
+visualization, timeline alignment, decoding, and sampling without becoming a
+second catalog authority. A logical episode is independent of physical file and
+shard boundaries; RRD, MCAP, and training layouts such as LeRobot are adapters,
+not the core data model. See
+[`docs/design/robot-training-lakehouse.md`](docs/design/robot-training-lakehouse.md).
+
 lake is organized as three tiers with disaggregated compute and storage:
 
 - **Query layer** — truly stateless SQL compute (DataFusion). Fleet nodes
@@ -45,6 +54,10 @@ by adding query nodes, not by growing a central store.
   snapshot-by-version. Losers of a commit race retry.
 - **NOT a storage-node system.** Storage is disaggregated object storage;
   the query layer reads it directly. There is no datanode tier.
+- **NOT a model-training orchestrator or a Rerun Hub clone.** Lake makes
+  robot-training data inspectable, reproducible, and directly readable. Model
+  execution, annotation applications, and general workflow scheduling remain
+  external systems.
 
 ## What working lake looks like
 
