@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/rararulab/lake/compare/v1.4.0...v1.4.1) (2026-07-19)
+
+
+### Bug Fixes
+
+* **iceberg:** bound distinct snapshot loads ([#259](https://github.com/rararulab/lake/issues/259)) ([122260b](https://github.com/rararulab/lake/commit/122260b21eb93678946c13569cdc906e6b0d72ac))
+
 ## [1.4.0](https://github.com/rararulab/lake/compare/v1.3.5...v1.4.0) (2026-07-19)
 
 
