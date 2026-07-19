@@ -51,6 +51,61 @@ extra property explicit: Flight tickets pin the external snapshot selected at
 planning, but object bytes continue to travel directly between Query and the
 Iceberg table's object storage.
 
+## Planned robot-training data model
+
+This section is a target model, not a map of implemented components. Today Lake
+provides the underlying immutable `DataLocation`, exact per-table versions,
+managed-object reads, and SQL primitives. Episode record types, format adapters,
+public DatasetRevision and TrainingView APIs, Python readers, Materializations,
+and Layers are planned work.
+
+In the target model, Lake is authoritative for Dataset membership,
+DatasetRevision identity, access, retention, TrainingView selection, and
+provenance. Rerun is a first-class visualization, temporal-query, and
+training-runtime adapter; its catalog is never an independent source of truth.
+The full terminology, current capability boundary, and delivery sequence live in
+[`robot-training-lakehouse.md`](design/robot-training-lakehouse.md).
+
+```mermaid
+flowchart LR
+    source["External: robot / simulator"] --> adapters["Planned: format adapters\nRRD / MCAP / LeRobot"]
+    adapters --> objects["Current primitive: immutable FILE Artifacts\nmanaged object storage"]
+    adapters --> episodes["Planned: Episode + ArtifactRef records\non current Lake tables"]
+    objects --> revision["Planned: DatasetRevision\nover current exact table versions"]
+    episodes --> revision
+    revision --> view["Planned: TrainingView"]
+    view --> rerun["External: Rerun Viewer"]
+    view --> training["Planned: Python training readers"]
+    view --> materialized["Planned: rebuildable Materializations"]
+    training --> layers["Planned: immutable derived Layers"]
+    layers --> objects
+    layers --> episodes
+```
+
+The logical and physical identities are deliberately separate:
+
+- an Episode is the unit selected, split, and attributed for training;
+- an Artifact is one complete immutable object identified by `DataLocation`;
+- one Episode may reference several Artifacts;
+- one physical shard may contain several Episodes;
+- a Layer adds annotations, predictions, embeddings, or quality output without
+  rewriting a base Recording;
+- a DatasetRevision pins authoritative table state, while a TrainingView adds
+  selection, Layers, split, sampling, and provenance;
+- a Materialization is a derived RRD, LeRobot layout, codec index, or cache that
+  may be discarded and rebuilt from its TrainingView.
+
+Format adapters run at ingestion and client/runtime seams. They extract
+filterable Episode metadata and build immutable manifests before append. They
+may interpret RRD timelines, MCAP topics, or LeRobot shard offsets on reads, but
+no format type enters `lake-engine`, `lake-metasrv`, or `DataLocation`.
+
+Robot-training reads therefore have two levels: Lake SQL selects across
+Episodes at an exact DatasetRevision, then a format-aware runtime aligns and
+decodes data within each Episode. Query and Metasrv continue to carry metadata
+only; Recording bytes and byte-range reads go directly between clients and
+object storage. No per-sample training request may reach Metasrv.
+
 ## Three tiers
 
 ```
