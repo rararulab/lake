@@ -14,18 +14,18 @@
 
 //! Bounded RRD metadata extraction through Rerun's public format APIs.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt::Write as _,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use lake_common::{
     EpisodeManifestDraftV1, EpisodeManifestV1, EpisodeSummaryV1, LayerKindV1, LayerV1,
     ManifestArtifactBindingV1, RecordingV1, StreamV1, TimelineKindV1, TimelineV1,
 };
-use re_log_encoding::{Decodable as _, RawRrdManifest, RrdFooter, StreamFooter, StreamHeader};
-use re_log_types::TimeType;
+use re_log_encoding::{
+    Decodable as _, DecoderApp, RawRrdManifest, RrdFooter, StreamFooter, StreamHeader,
+};
+use re_log_types::{LogMsg, TimeType};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
@@ -43,6 +43,17 @@ pub struct RrdAdapter;
 struct StreamMetadata {
     timeline_ids: BTreeSet<String>,
     components:   BTreeSet<String>,
+}
+
+struct RrdRecordingMetadata {
+    selector:       String,
+    streams:        BTreeMap<String, StreamMetadata>,
+    timeline_kinds: BTreeMap<String, TimelineKindV1>,
+}
+
+enum FooterProbe {
+    Present(RrdFooter),
+    Absent { tail_start: u64, tail: Bytes },
 }
 
 #[async_trait]
@@ -69,30 +80,45 @@ impl RecordingAdapter for RrdAdapter {
             .to_version_and_options()
             .map_err(|error| format_error(error.to_string()))?;
 
-        let footer = read_indexed_footer(&mut source, size_bytes).await?;
-        let manifest = select_recording(&footer, context.selector())?;
-        manifest_from_rrd(
-            manifest,
-            context,
-            producer_version.to_string(),
-            native_selector(&manifest.store_id),
-        )
+        let metadata = match probe_footer(&mut source, size_bytes).await? {
+            FooterProbe::Present(footer) => {
+                metadata_from_manifest(select_recording(&footer, context.selector())?)?
+            }
+            FooterProbe::Absent { tail_start, tail } => {
+                scan_footerless_rrd(
+                    &mut source,
+                    size_bytes,
+                    header_bytes,
+                    tail_start,
+                    tail,
+                    context.selector(),
+                )
+                .await?
+            }
+        };
+        manifest_from_rrd(&metadata, context, producer_version.to_string())
     }
 }
 
-async fn read_indexed_footer(
+async fn probe_footer(
     source: &mut BudgetedSource<'_>,
     file_size: u64,
-) -> Result<RrdFooter, AdapterError> {
+) -> Result<FooterProbe, AdapterError> {
     let footer_size =
         u64::try_from(StreamFooter::ENCODED_SIZE_BYTES).expect("RRD stream footer size fits u64");
     if file_size < footer_size {
-        return Err(format_error("RRD footer is absent"));
+        return Ok(FooterProbe::Absent {
+            tail_start: file_size,
+            tail:       Bytes::new(),
+        });
     }
     let footer_start = file_size - footer_size;
     let footer_bytes = source.read_range(footer_start..file_size).await?;
     let Some(stream_footer) = decode_optional_stream_footer(&footer_bytes)? else {
-        return Err(format_error("RRD footer is absent"));
+        return Ok(FooterProbe::Absent {
+            tail_start: footer_start,
+            tail:       footer_bytes,
+        });
     };
     let Some(entry) = stream_footer.entries.first() else {
         return Err(format_error("RRD stream footer has no manifest entry"));
@@ -135,6 +161,7 @@ async fn read_indexed_footer(
     let transport = re_protos::log_msg::v1alpha1::RrdFooter::from_rrd_bytes(&payload)
         .map_err(|error| format_error(error.to_string()))?;
     re_log_encoding::ToApplication::to_application(&transport, ())
+        .map(FooterProbe::Present)
         .map_err(|error| format_error(error.to_string()))
 }
 
@@ -171,12 +198,7 @@ fn select_recording<'a>(
     }
 }
 
-fn manifest_from_rrd(
-    manifest: &RawRrdManifest,
-    context: &EpisodeInspectionContext,
-    producer_version: String,
-    selector: String,
-) -> Result<EpisodeManifestV1, AdapterError> {
+fn metadata_from_manifest(manifest: &RawRrdManifest) -> Result<RrdRecordingMetadata, AdapterError> {
     let mut streams = BTreeMap::<String, StreamMetadata>::new();
     for (entity, components) in manifest
         .calc_static_map()
@@ -223,16 +245,175 @@ fn manifest_from_rrd(
         return Err(AdapterError::NoTemporalStreams { format: FORMAT });
     }
 
-    let timeline_descriptors = timeline_kinds
-        .into_iter()
+    Ok(RrdRecordingMetadata {
+        selector: native_selector(&manifest.store_id),
+        streams,
+        timeline_kinds,
+    })
+}
+
+async fn scan_footerless_rrd(
+    source: &mut BudgetedSource<'_>,
+    file_size: u64,
+    header: Bytes,
+    tail_start: u64,
+    tail: Bytes,
+    selector: Option<&str>,
+) -> Result<RrdRecordingMetadata, AdapterError> {
+    if file_size > source.budget().max_fallback_scan_bytes() {
+        return Err(AdapterError::FallbackScanTooLarge {
+            size_bytes:  file_size,
+            limit_bytes: source.budget().max_fallback_scan_bytes(),
+        });
+    }
+    let capacity = usize::try_from(file_size)
+        .map_err(|_| format_error("RRD fallback size does not fit this platform"))?;
+    let header_size = u64::try_from(header.len()).expect("header length fits u64");
+    if tail_start < header_size {
+        return Err(format_error(
+            "RRD footer probe overlaps the validated header",
+        ));
+    }
+    let middle = if tail_start > header_size {
+        source.read_range(header_size..tail_start).await?
+    } else {
+        Bytes::new()
+    };
+
+    let mut bytes = Vec::with_capacity(capacity);
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&middle);
+    bytes.extend_from_slice(&tail);
+    if bytes.len() != capacity {
+        return Err(format_error("RRD fallback assembly length is inconsistent"));
+    }
+
+    let mut recordings = BTreeMap::<String, RrdRecordingMetadata>::new();
+    for decoded in DecoderApp::decode_lazy(bytes.as_slice()) {
+        let message = decoded.map_err(|error| format_error(error.to_string()))?;
+        accumulate_message(&mut recordings, message)?;
+    }
+    select_scanned_recording(recordings, selector)
+}
+
+fn accumulate_message(
+    recordings: &mut BTreeMap<String, RrdRecordingMetadata>,
+    message: LogMsg,
+) -> Result<(), AdapterError> {
+    let (store_id, arrow) = match message {
+        LogMsg::SetStoreInfo(message) => {
+            let store_id = message.info.store_id;
+            if store_id.is_recording() {
+                let selector = native_selector(&store_id);
+                recordings
+                    .entry(selector.clone())
+                    .or_insert_with(|| RrdRecordingMetadata {
+                        selector,
+                        streams: BTreeMap::new(),
+                        timeline_kinds: BTreeMap::new(),
+                    });
+            }
+            return Ok(());
+        }
+        LogMsg::ArrowMsg(store_id, arrow) if store_id.is_recording() => (store_id, arrow),
+        LogMsg::ArrowMsg(..) | LogMsg::BlueprintActivationCommand(_) => return Ok(()),
+    };
+
+    let selector = native_selector(&store_id);
+    let recording = recordings
+        .entry(selector.clone())
+        .or_insert_with(|| RrdRecordingMetadata {
+            selector,
+            streams: BTreeMap::new(),
+            timeline_kinds: BTreeMap::new(),
+        });
+    let chunk =
+        re_chunk::Chunk::from_arrow_msg(&arrow).map_err(|error| format_error(error.to_string()))?;
+    let stream = recording
+        .streams
+        .entry(chunk.entity_path().to_string())
+        .or_default();
+    stream.components.extend(
+        chunk
+            .components_identifiers()
+            .map(|component| component.as_str().to_owned()),
+    );
+    for time_column in chunk.timelines().values() {
+        let timeline = time_column.timeline();
+        let timeline_id = timeline.name().as_str().to_owned();
+        let kind = timeline_kind(timeline.typ());
+        insert_timeline_kind(&mut recording.timeline_kinds, timeline_id.clone(), kind)?;
+        stream.timeline_ids.insert(timeline_id);
+    }
+    Ok(())
+}
+
+fn select_scanned_recording(
+    mut recordings: BTreeMap<String, RrdRecordingMetadata>,
+    selector: Option<&str>,
+) -> Result<RrdRecordingMetadata, AdapterError> {
+    if let Some(selector) = selector {
+        return recordings
+            .remove(selector)
+            .ok_or(AdapterError::RecordingNotFound { format: FORMAT });
+    }
+    match recordings.len() {
+        0 => Err(AdapterError::RecordingNotFound { format: FORMAT }),
+        1 => Ok(recordings
+            .into_values()
+            .next()
+            .expect("one recording was counted")),
+        count => Err(AdapterError::AmbiguousRecording {
+            format: FORMAT,
+            count,
+        }),
+    }
+}
+
+fn timeline_kind(time_type: TimeType) -> TimelineKindV1 {
+    match time_type {
+        TimeType::Sequence => TimelineKindV1::Sequence,
+        TimeType::DurationNs | TimeType::TimestampNs => TimelineKindV1::Timestamp,
+    }
+}
+
+fn insert_timeline_kind(
+    timelines: &mut BTreeMap<String, TimelineKindV1>,
+    timeline_id: String,
+    kind: TimelineKindV1,
+) -> Result<(), AdapterError> {
+    if timelines
+        .insert(timeline_id.clone(), kind)
+        .is_some_and(|existing| existing != kind)
+    {
+        return Err(format_error(format!(
+            "timeline '{timeline_id}' is declared with conflicting types"
+        )));
+    }
+    Ok(())
+}
+
+fn manifest_from_rrd(
+    metadata: &RrdRecordingMetadata,
+    context: &EpisodeInspectionContext,
+    producer_version: String,
+) -> Result<EpisodeManifestV1, AdapterError> {
+    if metadata.streams.is_empty() {
+        return Err(AdapterError::NoTemporalStreams { format: FORMAT });
+    }
+
+    let timeline_descriptors = metadata
+        .timeline_kinds
+        .iter()
         .map(|(timeline_id, kind)| {
             TimelineV1::builder()
                 .timeline_id(timeline_id)
-                .kind(kind)
+                .kind(*kind)
                 .build()
         })
         .collect::<Vec<_>>();
-    let stream_descriptors = streams
+    let stream_descriptors = metadata
+        .streams
         .iter()
         .map(|(stream_id, metadata)| {
             StreamV1::builder()
@@ -243,8 +424,8 @@ fn manifest_from_rrd(
                 .build()
         })
         .collect::<Vec<_>>();
-    let stream_ids = streams.into_keys().collect::<Vec<_>>();
-    let schema_fingerprint = hex_bytes(&manifest.sorbet_schema_sha256);
+    let stream_ids = metadata.streams.keys().cloned().collect::<Vec<_>>();
+    let schema_fingerprint = recording_fingerprint(metadata);
 
     EpisodeManifestV1::try_from_draft(
         EpisodeManifestDraftV1::builder()
@@ -275,7 +456,7 @@ fn manifest_from_rrd(
                     .layer_id(context.layer_id())
                     .role("recording")
                     .recording_id(context.recording_id())
-                    .selector(selector)
+                    .selector(metadata.selector.clone())
                     .stream_ids(stream_ids)
                     .schema_fingerprint(schema_fingerprint)
                     .producer_version(producer_version)
@@ -303,14 +484,21 @@ fn fingerprint(components: &BTreeSet<String>) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().fold(
-        String::with_capacity(bytes.len().saturating_mul(2)),
-        |mut output, byte| {
-            write!(output, "{byte:02x}").expect("writing to a String cannot fail");
-            output
-        },
-    )
+fn recording_fingerprint(metadata: &RrdRecordingMetadata) -> String {
+    let mut hasher = Sha256::new();
+    for (stream_id, stream) in &metadata.streams {
+        hasher.update(stream_id.as_bytes());
+        hasher.update([0]);
+        for timeline_id in &stream.timeline_ids {
+            hasher.update(timeline_id.as_bytes());
+            hasher.update([0]);
+        }
+        for component in &stream.components {
+            hasher.update(component.as_bytes());
+            hasher.update([0]);
+        }
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn format_error(message: impl Into<String>) -> AdapterError {

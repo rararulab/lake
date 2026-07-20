@@ -80,7 +80,7 @@ fn context() -> EpisodeInspectionContext {
         .build()
 }
 
-fn fixture_with_footer() -> (Bytes, Vec<Range<u64>>) {
+fn fixture_messages() -> (StoreId, [LogMsg; 2]) {
     let store_id = StoreId::recording("robot-app", "native-recording");
     let positions = (0..8_192).map(|value| {
         let value = value as f32;
@@ -104,7 +104,12 @@ fn fixture_with_footer() -> (Bytes, Vec<Range<u64>>) {
             chunk.to_arrow_msg().expect("chunk encodes as ArrowMsg"),
         ),
     ];
-    let bytes = Encoder::encode(messages.iter().cloned().map(Ok)).expect("valid RRD fixture");
+    (store_id, messages)
+}
+
+fn fixture_with_footer() -> (Bytes, Vec<Range<u64>>) {
+    let (store_id, messages) = fixture_messages();
+    let bytes = Encoder::encode(messages.into_iter().map(Ok)).expect("valid RRD fixture");
 
     let mut file = tempfile::NamedTempFile::new().expect("temporary RRD file");
     file.write_all(&bytes).expect("write RRD fixture");
@@ -131,6 +136,17 @@ fn fixture_with_footer() -> (Bytes, Vec<Range<u64>>) {
         .collect();
 
     (Bytes::from(bytes), payloads)
+}
+
+fn fixture_without_footer() -> Bytes {
+    let (_, messages) = fixture_messages();
+    let mut encoder = Encoder::local().expect("create RRD encoder");
+    encoder.do_not_emit_footer();
+    encoder
+        .extend(messages.iter().map(Ok))
+        .expect("encode footerless RRD messages");
+    encoder.finish().expect("finish footerless RRD stream");
+    Bytes::from(encoder.into_inner().expect("take footerless RRD bytes"))
 }
 
 fn generous_budget(file_len: u64) -> ReadBudget {
@@ -251,4 +267,97 @@ async fn rrd_footer_metadata_stays_within_read_budget() {
     assert!(
         u64::try_from(request_short.ranges().len()).expect("range count fits u64") <= request_limit
     );
+}
+
+#[tokio::test]
+async fn rrd_missing_footer_uses_bounded_linear_fallback() {
+    let indexed_bytes = fixture_with_footer().0;
+    let footerless_bytes = fixture_without_footer();
+    let file_len = u64::try_from(footerless_bytes.len()).expect("fixture length fits u64");
+    let adapter = RrdAdapter;
+
+    let indexed = adapter
+        .inspect(
+            &InstrumentedSource::new(indexed_bytes.clone()),
+            &context(),
+            generous_budget(u64::try_from(indexed_bytes.len()).expect("fixture length fits u64")),
+        )
+        .await
+        .expect("indexed comparison fixture succeeds");
+    let source = InstrumentedSource::new(footerless_bytes.clone());
+    let fallback = adapter
+        .inspect(
+            &source,
+            &context(),
+            ReadBudget::try_new(file_len, 3, file_len, file_len).expect("exact scan budget"),
+        )
+        .await
+        .expect("bounded footerless inspection succeeds");
+
+    assert_eq!(fallback, indexed);
+    assert_eq!(source.total_bytes(), file_len);
+    assert_eq!(source.ranges().len(), 3);
+    let canonical = fallback.to_json().expect("encode canonical manifest");
+    assert_eq!(
+        lake_common::EpisodeManifestV1::from_json(&canonical)
+            .expect("fallback output is canonical"),
+        fallback
+    );
+
+    let scan_short = InstrumentedSource::new(footerless_bytes.clone());
+    let error = adapter
+        .inspect(
+            &scan_short,
+            &context(),
+            ReadBudget::try_new(file_len, 3, file_len - 1, file_len)
+                .expect("one-byte-short scan ceiling"),
+        )
+        .await
+        .expect_err("fallback scan ceiling must fail");
+    assert!(matches!(
+        error,
+        AdapterError::FallbackScanTooLarge {
+            size_bytes,
+            limit_bytes,
+        } if size_bytes == file_len && limit_bytes == file_len - 1
+    ));
+    assert!(scan_short.total_bytes() < file_len);
+
+    let byte_short = InstrumentedSource::new(footerless_bytes.clone());
+    let error = adapter
+        .inspect(
+            &byte_short,
+            &context(),
+            ReadBudget::try_new(file_len - 1, 3, file_len, file_len)
+                .expect("one-byte-short I/O budget"),
+        )
+        .await
+        .expect_err("fallback byte budget must fail");
+    assert!(matches!(
+        error,
+        AdapterError::BudgetExceeded {
+            resource: BudgetResource::Bytes,
+            ..
+        }
+    ));
+    assert!(byte_short.total_bytes() < file_len);
+
+    let request_short = InstrumentedSource::new(footerless_bytes);
+    let error = adapter
+        .inspect(
+            &request_short,
+            &context(),
+            ReadBudget::try_new(file_len, 2, file_len, file_len)
+                .expect("one-request-short I/O budget"),
+        )
+        .await
+        .expect_err("fallback request budget must fail");
+    assert!(matches!(
+        error,
+        AdapterError::BudgetExceeded {
+            resource: BudgetResource::Requests,
+            ..
+        }
+    ));
+    assert_eq!(request_short.ranges().len(), 2);
 }
