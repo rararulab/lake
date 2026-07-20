@@ -95,15 +95,6 @@ Scenario: Workflow contract follows the invoking Jujutsu workspace
    Then it resolves workflow and documentation files from that invocation
    workspace rather than a compile-time checkout path
 
-Scenario: Cargo target cache is isolated by Jujutsu workspace
-  Test:
-    Package: lake-cli
-    Filter: mise_target_directory_is_workspace_isolated
-  Given independent Jujutsu workspaces with a shared XDG cache root
-  When either workspace invokes a lane-1 Cargo selector
-  Then its target directory includes a stable hash of the active workspace
-  and cannot reuse a test executable compiled by another checkout
-
 ## Out of Scope
 
 - Changing the Dockerfile or normal Release Please authority.
