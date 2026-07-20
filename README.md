@@ -42,7 +42,7 @@ flowchart LR
 
 | Path | Choose it when | Metadata and commit authority | Large-object route | Write contract |
 |---|---|---|---|---|
-| Native `lake.<namespace>.<table>` | You need Lake-managed ingest, immutable table versions, and `FILE` rows for video/model artifacts. | Lake Metasrv and its per-table version protocol | SDK and Query read/write object storage directly; table rows hold `DataLocation` metadata. | Lake `FILE` appends are the typed write path. |
+| Native `lake.<namespace>.<table>` | You need Lake-managed ingest, immutable table versions, and `FILE` rows for video/model artifacts. | Lake Metasrv and its per-table version protocol | SDK uploads and reads `FILE` bytes directly to/from the managed stage; SQL and Query carry only immutable `DataLocation` metadata. | Lake `FILE` appends are the typed write path. |
 | Federated `iceberg.<namespace>.<table>` | Another system already owns an Iceberg REST catalog and Lake only needs exact-snapshot SQL scans. | External Iceberg REST catalog and Iceberg snapshot/commit protocol | Query reads Iceberg manifests and Parquet directly with its workload identity. | Scan-only; Lake rejects Iceberg DDL/DML and never imports or commits Iceberg state. |
 
 The authority boundary is deliberately one-way: a native Lake table is not an
