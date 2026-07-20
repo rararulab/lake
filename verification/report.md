@@ -1,75 +1,61 @@
-# Verification report — issue #308 (final rebase audit)
+# Verification report — issue #316
 
-- base_sha: 98e1667e7afc39279715e2001a20ea0e029970e1
-- head_sha: 6aec163b249f27af08988bef02d222265802b93d
-- pre_rebase_head: 39d4ebf645689e6af7c6e8e5dc62e8a8d917060b
-- previous_review_head: 5b8167481ff9f49b68c70365c5b3c60942a6564f
+- base_sha: `92e5fcfe32ac52de5807471e1c7f21802d64511f`
+- head_sha: `ce42c81f8b42467bff820e06920152f5992a9a9b`
+- verification_carrier: `c89a2e072531a8942cfc22941ab2d1c77d31e15f` (empty; exact parent is `head_sha`)
 - score_authority: verifier
 - implementer_evidence: self_check_only
 - lane: 1
-- spec: `specs/issue-308-episode-manifest-v1.spec.md`
+- spec: `specs/issue-316-typed-arrow-append.spec.md`
 
-This report scores the exact post-rebase candidate above. No earlier PASS was
-carried forward: the full gate, static checks, lane-1 lifecycle, every bound
-selector, base selector transition, and hostile probes were rerun after the
-rebase onto main issue #312.
-
-The jj workspace has an uncommitted verifier-only change to this report.
-The product candidate is its parent `@-`. Plain Git HEAD in this ignored jj
-subdirectory points at the parent checkout, so both candidate and merge-base
-were resolved with the explicit candidate commit ID.
+Fresh post-rebase verification. I did not read the previous report or use plain Git HEAD.
+`jj diff --from ce42c81f8b42467bff820e06920152f5992a9a9b --to @ --stat`
+reported zero files changed before verification.
 
 ## Commands
 
-### Pinned post-rebase state
-
-`jj log -r @- --no-graph -T 'commit_id ++ "\n"'`
+### Identity, environment, and rebase scope
 
 ```text
-6aec163b249f27af08988bef02d222265802b93d
+$ mise run doctor
+[doctor] $ bun scripts/doctor.ts
+[ ok ] mise tools installed
+[ ok ] nightly rustfmt
+
+$ jj st
+The working copy has no changes.
+Working copy  (@) : sowqtypo c89a2e07 (empty) (no description set)
+Parent commit (@-): pkvvvvln ce42c81f fix(sdk): preserve exact nested Arrow schema (#316)
+
+$ mise x -- cargo metadata --format-version 1 --no-deps | jq -r .target_directory
+/Users/ryan/Library/Caches/lake/target/b19ea257adcb88b0cfa217bcfe9b8abd4c520146ff4a7c75ac43215bf463dbcb
 ```
 
-`git -C /Users/ryan/code/rararulab/lake merge-base 6aec163b249f27af08988bef02d222265802b93d origin/main`
+The candidate used its workspace-isolated target. The fixed-base increment since the prior
+base was independently inspected: it contains release workflow/contract, site theme, and mise
+target-isolation changes only; no `lake-sdk` implementation path. The rebased issue diff remains
+inside its allowed SDK/docs/spec/report boundaries, and the carrier was clean with no conflicts.
+
+### Fresh-data full gate
 
 ```text
-98e1667e7afc39279715e2001a20ea0e029970e1
-```
-
-`jj status` before verification:
-
-```text
-Working copy changes:
-M verification/report.md
-Working copy  (@) : ytkrzwyt 79a53d14 (no description set)
-Parent commit (@-): xvnurqqz 6aec163b fix(robotics): enforce canonical manifest identity (#308)
-```
-
-`jj diff --summary` contained only:
-
-```text
-M verification/report.md
-```
-
-The exact workspace `data/` directory had no active `lsof +D` result and
-was removed before the gate.
-
-### Full quality gate from cold state
-
-`mise run gate`
-
-```text
-exit_code: 0
+$ rm -rf -- /Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append/data
+$ mise run gate
 [hooks] $ prek run --all-files
 [test] $ cargo test --workspace --all-targets
 [e2e] $ cargo run -p lake-cli -- selftest
-[hooks] cargo fmt............................................(no files to check)Skipped
-[hooks] cargo clippy.........................................(no files to check)Skipped
-[hooks] Finished in 64.0ms
-[test-adbc] test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.71s
-[site-check] Result (24 files):
+[test-adbc] $ cargo test -p lake-query --test adbc_interop -- --ignored --test-threads=1
+[site-check] $ bun run --cwd site check
+
+[hooks] Finished in 77.6ms
+[test-adbc] test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 2.08s
+[site-check] Result (25 files):
 [site-check] - 0 errors
 [site-check] - 0 warnings
 [site-check] - 0 hints
+[site-check] All matched files use Prettier code style!
+[site-check] 91 page(s) built in 3.22s
+
 [e2e] created table robots.episodes
 [e2e] committed robots.episodes at v2
 [e2e] +----------+----------+------------+
@@ -79,189 +65,188 @@ exit_code: 0
 [e2e] | beta     | 1        | 0.4        |
 [e2e] +----------+----------+------------+
 [e2e] self-check ok
-[test] test result: ok. 62 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 11.74s
-[test] Finished in 35.73s
-Finished in 35.73s
+
+[test] running 75 tests
+[test] test tests::sdk_typed_arrow_append_encodes_list_view_slices_lazily ... ok
+[test] test tests::sdk_typed_arrow_append_preserves_large_list_and_union_metadata ... ok
+[test] test tests::sdk_typed_arrow_append_preserves_dictionary_encoding ... ok
+[test] test tests::sdk_typed_arrow_append_rejects_unbounded_inputs_before_schema_rpc ... ok
+[test] test tests::sdk_typed_arrow_append_stops_encoding_at_payload_limit ... ok
+[test] test tests::sdk_typed_arrow_append_checkpoint_partition_boundary_is_consistent ... ok
+[test] test tests::sdk_typed_arrow_append_rejects_invalid_batches_before_put ... ok
+[test] test tests::sdk_typed_arrow_append_commits_episode_artifact_bundle ... ok
+[test] test tests::sdk_typed_arrow_append_reuses_durable_idempotent_transport ... ok
+[test] test append_checkpoint::tests::durable_checkpoint_accepts_maximum_typed_append_partition ... ok
+[test] test result: ok. 72 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 11.74s
+[test] Finished in 42.95s
+Finished in 42.95s
+exit: 0
 ```
 
-The prek hooks inherited the jj-subdirectory Git pathspec and matched no files,
-so they were not accepted as fmt/clippy evidence. Both commands were run
-directly:
-
-`cargo +nightly fmt --all -- --check`
+### Direct Rust checks
 
 ```text
-exit_code: 0
-(no stdout)
+$ cargo +nightly fmt --all -- --check
+exit: 0
+
+$ cargo clippy -p lake-sdk --all-targets --all-features --no-deps -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.75s
+exit: 0
 ```
 
-`cargo clippy --workspace --all-targets --all-features --no-deps -- -D warnings`
+The recurring macOS linker `__eh_frame section too large` warning did not affect status;
+direct clippy with `-D warnings` was clean.
+
+### Lane-1 lifecycle and direct selectors
 
 ```text
-exit_code: 0
-    Checking lake-cli v1.8.4 (/Users/ryan/code/rararulab/lake/.worktrees/issue-308-episode-manifest-v1/crates/lake-cli)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.86s
-```
-
-### Lane-1 lifecycle and bound selectors
-
-`mise run spec-lifecycle specs/issue-308-episode-manifest-v1.spec.md`
-
-```text
-[spec-lifecycle] $ bun scripts/spec-lifecycle-guard.ts "${usage_spec?}"
+$ mise run spec-lifecycle specs/issue-316-typed-arrow-append.spec.md
 === Lifecycle Report (guarded) ===
-Spec: episode-manifest-v1  stage: complete  passed: true
-  [PASS] v1 manifest canonically round-trips two recording representations
-  [PASS] binding derives the table summary and proves complete reachability
-  [PASS] missing, extra, or mismatched ArtifactRefs fail closed
-  [PASS] corrupt, future, and non-canonical manifest wires are rejected
+Spec: typed-arrow-append  stage: complete  passed: true
+  [PASS] Episode and ArtifactRef rows append through a Query-only SDK
+  [PASS] invalid Arrow input fails before append side effects
+  [PASS] Arrow input memory and batch fan-out are bounded before schema lookup
+  [PASS] encoded Flight collection stops at the exact payload ceiling
+  [PASS] compact Dictionary input preserves its exact Flight schema
+  [PASS] nested Arrow types and field metadata remain exact on the wire
+  [PASS] shared-child ListView slices are encoded lazily
+  [PASS] an ambiguous Arrow append converges without a duplicate commit
+  [PASS] checkpointing accepts the same maximum batch partition as memory-only preparation
+  [PASS] checkpoint framing accepts the exact dictionary-aware message ceiling
 spec-lifecycle-guard: OK — every Test selector executed >=1 test
+exit: 0
 ```
 
-`cargo test -p lake-common episode_manifest_v1_roundtrips_two_recording_formats`
+Each selector was also run directly and selected exactly one test:
 
 ```text
+$ cargo test -p lake-sdk sdk_typed_arrow_append_commits_episode_artifact_bundle
+test tests::sdk_typed_arrow_append_commits_episode_artifact_bundle ... ok
+$ cargo test -p lake-sdk sdk_typed_arrow_append_rejects_invalid_batches_before_put
+test tests::sdk_typed_arrow_append_rejects_invalid_batches_before_put ... ok
+$ cargo test -p lake-sdk sdk_typed_arrow_append_rejects_unbounded_inputs_before_schema_rpc
+test tests::sdk_typed_arrow_append_rejects_unbounded_inputs_before_schema_rpc ... ok
+$ cargo test -p lake-sdk sdk_typed_arrow_append_stops_encoding_at_payload_limit
+test tests::sdk_typed_arrow_append_stops_encoding_at_payload_limit ... ok
+$ cargo test -p lake-sdk sdk_typed_arrow_append_preserves_dictionary_encoding
+test tests::sdk_typed_arrow_append_preserves_dictionary_encoding ... ok
+$ cargo test -p lake-sdk sdk_typed_arrow_append_preserves_large_list_and_union_metadata
+test tests::sdk_typed_arrow_append_preserves_large_list_and_union_metadata ... ok
+$ cargo test -p lake-sdk sdk_typed_arrow_append_encodes_list_view_slices_lazily
+test tests::sdk_typed_arrow_append_encodes_list_view_slices_lazily ... ok
+$ cargo test -p lake-sdk sdk_typed_arrow_append_reuses_durable_idempotent_transport
+test tests::sdk_typed_arrow_append_reuses_durable_idempotent_transport ... ok
+$ cargo test -p lake-sdk sdk_typed_arrow_append_checkpoint_partition_boundary_is_consistent
+test tests::sdk_typed_arrow_append_checkpoint_partition_boundary_is_consistent ... ok
+$ cargo test -p lake-sdk durable_checkpoint_accepts_maximum_typed_append_partition
+test append_checkpoint::tests::durable_checkpoint_accepts_maximum_typed_append_partition ... ok
+
+For every command:
 running 1 test
-test episode_manifest_tests::episode_manifest_v1_roundtrips_two_recording_formats ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 74 filtered out
 ```
 
-`cargo test -p lake-common episode_manifest_v1_binds_complete_artifact_refs`
+### New fixed-base transition with a separate target
+
+The temporary base workspace had an empty carrier whose exact parent was
+`92e5fcfe32ac52de5807471e1c7f21802d64511f`; its diff from that base was zero.
+Its target was a separate APFS CoW copy and the actual Cargo process confirmed the override:
 
 ```text
-running 1 test
-test episode_manifest_tests::episode_manifest_v1_binds_complete_artifact_refs ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+$ env CARGO_TARGET_DIR=/tmp/lake-verifier-316-base-92e5-target cargo metadata --format-version 1 --no-deps | jq -r .target_directory
+/tmp/lake-verifier-316-base-92e5-target
 ```
 
-`cargo test -p lake-common episode_manifest_v1_rejects_artifact_binding_mismatch`
+All ten base commands below produced a real zero-match:
 
 ```text
-running 1 test
-test episode_manifest_tests::episode_manifest_v1_rejects_artifact_binding_mismatch ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
-```
-
-`cargo test -p lake-common episode_manifest_v1_rejects_invalid_wire`
-
-```text
-running 3 tests
-test episode_manifest_tests::episode_manifest_v1_rejects_invalid_wire_duplicate_artifact_identity ... ok
-test episode_manifest_tests::episode_manifest_v1_rejects_invalid_wire ... ok
-test episode_manifest_tests::episode_manifest_v1_rejects_invalid_wire_noncanonical_json_bytes ... ok
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
-```
-
-### New-base acceptance transition
-
-Base `98e1667e7afc39279715e2001a20ea0e029970e1` was exported from the
-Git root into an isolated `mktemp` tree. Each selector was run with
-`--locked`:
-
-```text
-cargo test --manifest-path <base>/Cargo.toml --locked -p lake-common episode_manifest_v1_roundtrips_two_recording_formats
-cargo test --manifest-path <base>/Cargo.toml --locked -p lake-common episode_manifest_v1_binds_complete_artifact_refs
-cargo test --manifest-path <base>/Cargo.toml --locked -p lake-common episode_manifest_v1_rejects_artifact_binding_mismatch
-cargo test --manifest-path <base>/Cargo.toml --locked -p lake-common episode_manifest_v1_rejects_invalid_wire
-```
-
-Every selector produced:
-
-```text
+$ env CARGO_TARGET_DIR=/tmp/lake-verifier-316-base-92e5-target cargo test -p lake-sdk sdk_typed_arrow_append_commits_episode_artifact_bundle
+$ env CARGO_TARGET_DIR=/tmp/lake-verifier-316-base-92e5-target cargo test -p lake-sdk sdk_typed_arrow_append_rejects_invalid_batches_before_put
+$ env CARGO_TARGET_DIR=/tmp/lake-verifier-316-base-92e5-target cargo test -p lake-sdk sdk_typed_arrow_append_rejects_unbounded_inputs_before_schema_rpc
+$ env CARGO_TARGET_DIR=/tmp/lake-verifier-316-base-92e5-target cargo test -p lake-sdk sdk_typed_arrow_append_stops_encoding_at_payload_limit
+$ env CARGO_TARGET_DIR=/tmp/lake-verifier-316-base-92e5-target cargo test -p lake-sdk sdk_typed_arrow_append_preserves_dictionary_encoding
+$ env CARGO_TARGET_DIR=/tmp/lake-verifier-316-base-92e5-target cargo test -p lake-sdk sdk_typed_arrow_append_preserves_large_list_and_union_metadata
+$ env CARGO_TARGET_DIR=/tmp/lake-verifier-316-base-92e5-target cargo test -p lake-sdk sdk_typed_arrow_append_encodes_list_view_slices_lazily
+$ env CARGO_TARGET_DIR=/tmp/lake-verifier-316-base-92e5-target cargo test -p lake-sdk sdk_typed_arrow_append_reuses_durable_idempotent_transport
+$ env CARGO_TARGET_DIR=/tmp/lake-verifier-316-base-92e5-target cargo test -p lake-sdk sdk_typed_arrow_append_checkpoint_partition_boundary_is_consistent
+$ env CARGO_TARGET_DIR=/tmp/lake-verifier-316-base-92e5-target cargo test -p lake-sdk durable_checkpoint_accepts_maximum_typed_append_partition
 running 0 tests
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 65 filtered out; finished in 0.00s
 ```
 
-Under the spec-lifecycle zero-match guard this is an acceptance failure.
-The isolated base tree was deleted.
-
-### Post-rebase hostile probes
-
-An isolated temporary binary crate depended on the pinned candidate's public
-`lake-common` API. It used CJK identities and created its own manifest and
-ArtifactRefs. No candidate implementation or test was edited.
-
-`cargo run --manifest-path /tmp/lake-308-rebase-probe/Cargo.toml --quiet`
+The guarded lifecycle used the candidate spec against the base tree and failed closed:
 
 ```text
-pretty=Err(NonCanonical)
-reordered=Err(NonCanonical)
-trailing=Err(NonCanonical)
-equivalent_number=Err(NonCanonical)
-duplicate_identity=Err(DuplicateIdentity { kind: "Artifact binding", identity: "对象-1" })
-canonical_digest_exact_multiset=Ok(episode=剧集-001, refs=2)
+$ env CARGO_TARGET_DIR=/tmp/lake-verifier-316-base-92e5-target PATH=<actual-tool-paths> bun scripts/spec-lifecycle-guard.ts <candidate>/specs/issue-316-typed-arrow-append.spec.md
+spec-lifecycle-guard: FAIL — Test selector(s) matched ZERO tests (0 passed; filtered out):
+  - Episode and ArtifactRef rows append through a Query-only SDK
+  - invalid Arrow input fails before append side effects
+  - Arrow input memory and batch fan-out are bounded before schema lookup
+  - encoded Flight collection stops at the exact payload ceiling
+  - compact Dictionary input preserves its exact Flight schema
+  - nested Arrow types and field metadata remain exact on the wire
+  - shared-child ListView slices are encoded lazily
+  - an ambiguous Arrow append converges without a duplicate commit
+  - checkpointing accepts the same maximum batch partition as memory-only preparation
+  - checkpoint framing accepts the exact dictionary-aware message ceiling
+Every lane-1 Test: selector must resolve to >=1 real test function — see specs/README.md.
+exit: 1
+
+$ env CARGO_TARGET_DIR=/tmp/lake-verifier-316-base-92e5-target cargo test -p lake-sdk
+running 65 tests
+test result: ok. 62 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 11.68s
+exit: 0
 ```
-
-The temporary probe tree was deleted after the run.
-
-### Reviewer P1 transition anchor
-
-Before the rebase, this same verifier exported old review head
-`5b8167481ff9f49b68c70365c5b3c60942a6564f`, copied only the repaired
-regression tests over its old implementation, and observed both tests fail:
-
-```text
-episode_manifest_v1_rejects_invalid_wire_noncanonical_json_bytes:
-test result: FAILED. 0 passed; 1 failed; 10 filtered out
-exit_code: 101
-
-episode_manifest_v1_rejects_invalid_wire_duplicate_artifact_identity:
-test result: FAILED. 0 passed; 1 failed; 10 filtered out
-exit_code: 101
-```
-
-Both exact tests are `ok` in the fresh post-rebase three-test selector above.
-
-### Feature runtime judgment
-
-Feature-specific runtime remains N/A. The changed surface is a pure, I/O-free
-`lake-common` value/wire/binding contract with no CLI, SDK, Query, Metasrv,
-object-store, or engine endpoint. The real-system e2e was still cold-booted by
-`mise run gate` and passed as a baseline regression check.
 
 ## Transition matrix
 
-- fail_to_pass:
-  - New base `98e1667e` -> candidate: all four spec selectors changed from
-    zero matches to the expected 1/1/1/3 passing tests.
-  - Review head `5b816748` -> candidate: bytewise non-canonical JSON changed
-    from regression-test exit 101 to four observed `NonCanonical` results.
-  - Review head `5b816748` -> candidate: same Artifact identity with
-    different binding semantics changed from exit 101 to observed
-    `DuplicateIdentity { kind: "Artifact binding" }`.
-- pass_to_fail: 0. The post-rebase full gate, direct fmt/clippy, lifecycle,
-  every selector, and all hostile/success probes passed on the exact candidate.
+- fail_to_pass: 10/10 selectors changed from zero-match at the new fixed base (guard exit 1)
+  to exactly one passing test each at the rebased product head (guarded lifecycle 10/10 PASS).
+- pass_to_fail: 0. Base SDK: 62 passed / 3 ignored. Candidate SDK: 72 passed /
+  3 ignored—exactly ten new passes and no lost/failing old test. The full rebased workspace,
+  ADBC, updated site, and cold-boot e2e were green.
 
 ## Probes
 
-1. Bytewise non-canonical JSON matrix
-   - Input: CJK manifest encoded as pretty JSON, reordered-map JSON, compact
-     JSON plus a trailing newline, and `0.95` rewritten as equivalent
-     `9.5e-1`.
-   - Expected: all return `NonCanonical`.
-   - Observed: four `Err(NonCanonical)` values.
-   - Result: PASS.
-2. Duplicate identity with different binding semantics
-   - Input: second binding with `artifact_id = "对象-1"` but different role
-     and selector.
-   - Expected: `DuplicateIdentity` keyed by Artifact identity.
-   - Observed: `DuplicateIdentity { kind: "Artifact binding", identity: "对象-1" }`.
-   - Result: PASS.
-3. Canonical digest and exact multiset success path
-   - Input: exact manifest SHA-256/media type/length and one exact
-     non-manifest ArtifactRef for the one logical binding.
-   - Expected: successful CJK Episode bundle with two ArtifactRefs.
-   - Observed: `Ok(episode=剧集-001, refs=2)`.
-   - Result: PASS.
+### Exact Arrow IPC — PASS
 
-## Issues
+- Dictionary: 10,000 Int32 keys share one approximately 8 KiB CJK value. Physical buffers
+  remain below 64 MiB while hydration would be 81,900,000 bytes. The low-level IPC generator
+  uses `IpcDictionaryHandling::Resend`; decoded schema and RecordBatch equal the input exactly.
+- Nested metadata: LargeList, sparse Union with outer field metadata, and schema metadata all
+  survive encode/decode exactly; decoded schema and RecordBatch are directly equality-checked.
+- ListView: 32 rows share one 64 KiB child and a 2 KiB target forces one-row slices. After
+  schema plus first data message: `encoded_slices == 1`, pending queue empty, offset 1. No later
+  slice is materialized before the collector can reject.
 
-None. The jj-subdirectory pathspec skip was closed by direct fmt/clippy.
-The full workspace gate on the #312 baseline passed, so the rebase introduced
-no observed regression.
+### Bounds and recovery — PASS
+
+- Empty/zero-row/10,001 reject; one row reaches authoritative schema comparison; exact 10,000
+  Dictionary rows encode and round-trip.
+- A `64 MiB + 1` Binary buffer returns typed `BatchInputSize` before schema RPC; the generic
+  saturating buffer-memory sum applies equally to Utf8.
+- 17 Dictionary nodes return typed `actual: 17, maximum: 16` through an unreachable lazy Query
+  channel. Nested traversal covers List/ListView/LargeList/LargeListView/Map/Struct/Union/
+  RunEndEncoded; the exact rejection is `> 16`, so 16 is accepted and 17 rejected.
+- Encoded overflow stops after polling the second message (`polled == 2`), never the third.
+- 4,096 one-row batches emit 4,097 messages; memory-only and durable paths both succeed and
+  checkpoint reload is byte-for-byte exact.
+- Maximum is `1 + 10,000 * (1 + 16) = 170,001` messages. Framing is
+  `4 + 170,001 * 4 = 680,008` bytes, below 1 MiB. Exact max save/load preserves all messages;
+  collector/checkpoint encode/decode share the bound and reject greater counts.
+- Ambiguous first-result loss retries the same durable identity/payload, converges at version 2
+  with one committed version, and removes the checkpoint.
+- Query-only Episode/ArtifactRef append commits one version and public SQL reads every row back;
+  scalar `insert`/`insert_many` regressions remain green.
+
+## Cleanup
+
+Temporary base workspace, isolated base target, and generated candidate `data/` were removed.
+Before report creation, candidate and main checkout were clean; candidate parent was exact
+`ce42c81f8b42467bff820e06920152f5992a9a9b`.
 
 ## Verdict
 
-PASS — exact post-rebase head `6aec163b249f` passes the complete gate,
-lane-1 contract, direct static checks, both repaired P1 hostile cases, and the
-original digest/exact-multiset success path with zero observed regressions.
+PASS — rebased exact product head `ce42c81f8b42467bff820e06920152f5992a9a9b`
+passes fresh gate/direct checks, all ten guarded behaviors and hostile boundaries, the new-base
+fail-to-pass transition, and has `pass_to_fail = 0`.
