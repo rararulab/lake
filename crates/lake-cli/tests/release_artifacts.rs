@@ -387,11 +387,24 @@ fn release_image_hydrates_path_dependencies_before_cargo_chef_cook() {
     let application = dockerfile
         .rfind("COPY . .")
         .expect("Docker build must copy application sources after cooking dependencies");
+    let planner_transfers = dockerfile[recipe..cook]
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("COPY --from=planner "))
+        .collect::<Vec<_>>();
 
     assert!(
         recipe < path_dependency && path_dependency < cook && cook < application,
         "the path dependency must be a cache input after the recipe and before cooking, not part \
          of the later application-source copy"
+    );
+    assert_eq!(
+        planner_transfers,
+        [
+            "COPY --from=planner /src/recipe.json recipe.json",
+            "COPY --from=planner /src/third_party/datafusion-execution third_party/datafusion-execution",
+        ],
+        "the builder must receive only the recipe and its exact path dependency before cooking"
     );
 }
 
