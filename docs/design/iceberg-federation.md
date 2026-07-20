@@ -9,6 +9,20 @@ external table format with an external catalog and its own snapshot/commit
 authority. Treating it as another `TableLocation` owned by Metasrv would merge
 two independent commit protocols and break both systems' visibility rules.
 
+## When to use this boundary
+
+Use federation when an external team or platform already owns an Iceberg REST
+catalog and Lake needs to run authorized, exact-snapshot SQL scans against its
+tables. The external catalog remains responsible for table creation, writes,
+commits, retention, and garbage collection.
+
+Do not use federation as a way to ingest multi-gigabyte videos or model
+artifacts into Lake, or as a way to add an Iceberg write path. Lake-owned
+large-object ingest uses native `lake.<namespace>.<table>` rows with `FILE`
+values: the SDK transfers bytes directly to the Lake-managed stage and SQL
+stores immutable `DataLocation` metadata. The two paths have different
+authorities rather than two encodings of the same table.
+
 ## Read-only REST catalog federation
 
 One configured Iceberg REST catalog appears as a separate DataFusion/Flight SQL
