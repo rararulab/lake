@@ -180,7 +180,8 @@ Scenario: corrupt, future, and non-canonical manifest wires are rejected
   Level: unit
   Targets: crates/lake-common/src/episode_manifest.rs
   Given malformed JSON, an unsupported format version, an unknown field,
-  duplicate identities, dangling references, and unsorted set-like collections
+  duplicate Artifact identities, dangling references, unsorted set-like
+  collections, or bytewise non-canonical compact JSON
   When EpisodeManifest v1 decode is attempted
   Then each input returns a typed decode or validation error rather than a
   partially valid manifest

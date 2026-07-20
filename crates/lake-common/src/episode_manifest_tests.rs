@@ -416,3 +416,43 @@ fn episode_manifest_v1_rejects_invalid_wire() {
         Err(EpisodeManifestError::NonCanonical)
     ));
 }
+
+#[test]
+fn episode_manifest_v1_rejects_invalid_wire_noncanonical_json_bytes() {
+    let encoded = manifest().to_json().unwrap();
+    let value: Value = serde_json::from_slice(&encoded).unwrap();
+    let pretty = serde_json::to_vec_pretty(&value).unwrap();
+    let reordered = serde_json::to_vec(&value).unwrap();
+    let mut trailing = encoded.clone();
+    trailing.push(b'\n');
+    let alternate_number = String::from_utf8(encoded.clone())
+        .unwrap()
+        .replace("\"quality_score\":0.95", "\"quality_score\":9.5e-1")
+        .into_bytes();
+
+    for noncanonical in [pretty, reordered, trailing, alternate_number] {
+        assert_ne!(noncanonical, encoded);
+        assert!(matches!(
+            EpisodeManifestV1::from_json(&noncanonical),
+            Err(EpisodeManifestError::NonCanonical)
+        ));
+    }
+}
+
+#[test]
+fn episode_manifest_v1_rejects_invalid_wire_duplicate_artifact_identity() {
+    let encoded = manifest().to_json().unwrap();
+    let mut duplicate: Value = serde_json::from_slice(&encoded).unwrap();
+    let bindings = duplicate["artifact_bindings"].as_array_mut().unwrap();
+    bindings[2]["artifact_id"] = Value::from("rrd-1");
+    bindings[2]["sidecar_of"] = Value::Null;
+    bindings.swap(1, 2);
+
+    assert!(matches!(
+        EpisodeManifestV1::from_json(&serde_json::to_vec(&duplicate).unwrap()),
+        Err(EpisodeManifestError::DuplicateIdentity {
+            kind: "Artifact binding",
+            ..
+        })
+    ));
+}

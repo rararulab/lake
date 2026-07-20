@@ -531,7 +531,11 @@ impl EpisodeManifestV1 {
             }
             canonicalize_strings(&mut binding.stream_ids, "Artifact binding stream")?;
         }
-        canonicalize_exact_bindings(&mut draft.artifact_bindings)?;
+        canonicalize_unique(
+            &mut draft.artifact_bindings,
+            "Artifact binding",
+            |binding| binding.artifact_id(),
+        )?;
 
         let recording_formats = draft
             .recordings
@@ -660,6 +664,9 @@ impl EpisodeManifestV1 {
             artifact_bindings: wire.artifact_bindings,
         })?;
         if canonical != observed {
+            return Err(EpisodeManifestError::NonCanonical);
+        }
+        if canonical.to_json()?.as_slice() != bytes {
             return Err(EpisodeManifestError::NonCanonical);
         }
         Ok(canonical)
@@ -857,19 +864,6 @@ fn canonicalize_strings(
         return Err(EpisodeManifestError::DuplicateIdentity {
             kind,
             identity: duplicate[0].clone(),
-        });
-    }
-    Ok(())
-}
-
-fn canonicalize_exact_bindings(
-    bindings: &mut [ManifestArtifactBindingV1],
-) -> Result<(), EpisodeManifestError> {
-    bindings.sort();
-    if let Some(duplicate) = bindings.windows(2).find(|pair| pair[0] == pair[1]) {
-        return Err(EpisodeManifestError::DuplicateIdentity {
-            kind:     "Artifact binding",
-            identity: duplicate[0].artifact_id().to_owned(),
         });
     }
     Ok(())
