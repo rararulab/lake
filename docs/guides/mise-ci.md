@@ -197,8 +197,19 @@ image backfill with the published release tag:
 gh workflow run release-image.yml --ref main -f tag=vX.Y.Z
 ```
 
+The workflow checks out two immutable revisions. `release-source` is always
+the published tag and is the sole Docker build context; it is validated against
+the GitHub Release target SHA and remains
+`org.opencontainers.image.revision`. `build-recipe` is the workflow revision:
+on a normal release event GitHub supplies the tag revision, while the documented
+manual command dispatches `main` and therefore supplies the current
+Cargo-chef Dockerfile to rebuild an older immutable source. The distinct
+`io.rararulab.lake.build-recipe.revision` OCI label records that recipe SHA; it
+does not change the source identity or release tag.
+
 Wait for the `Publish release image` run to complete, then resolve the
-manifest-list digest before updating a production deployment.
+manifest-list digest and verify both `linux/amd64` and `linux/arm64` before
+updating a production deployment.
 
 ## Review Checklist
 

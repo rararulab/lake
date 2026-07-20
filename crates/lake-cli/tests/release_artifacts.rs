@@ -149,11 +149,15 @@ fn release_image_workflow_is_tag_pinned_and_multiarch() {
     ] {
         assert_pinned_action(step_using(steps, action));
     }
-    let checkout = step_using(steps, "actions/checkout@");
+    let checkout = steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Check out release source"))
+        .expect("release source checkout");
     assert_eq!(
         checkout["with"]["ref"].as_str(),
         Some("${{ env.RELEASE_TAG }}")
     );
+    assert_eq!(checkout["with"]["path"].as_str(), Some("release-source"));
     assert_eq!(checkout["with"]["fetch-depth"].as_u64(), Some(0));
 
     let build = step_using(steps, "docker/build-push-action@");
@@ -181,6 +185,67 @@ fn release_image_workflow_is_tag_pinned_and_multiarch() {
                 .is_some_and(|run| run.contains("steps.build.outputs.digest"))
         }),
         "published manifest digest must be exposed in the run summary"
+    );
+}
+
+#[test]
+fn release_image_workflow_separates_source_and_recipe_for_backfills() {
+    let workflow = workflow();
+    let steps = steps(&workflow);
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| {
+                step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("actions/checkout@"))
+            })
+            .count(),
+        2,
+        "release recovery must use exactly one immutable source checkout and one immutable recipe \
+         checkout"
+    );
+
+    let recipe = steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Check out build recipe"))
+        .expect("workflow revision checkout");
+    assert_pinned_action(recipe);
+    assert_eq!(recipe["with"]["ref"].as_str(), Some("${{ github.sha }}"));
+    assert_eq!(recipe["with"]["path"].as_str(), Some("build-recipe"));
+
+    let source = steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Check out release source"))
+        .expect("release source checkout");
+    assert_pinned_action(source);
+    assert_eq!(
+        source["with"]["ref"].as_str(),
+        Some("${{ env.RELEASE_TAG }}")
+    );
+    assert_eq!(source["with"]["path"].as_str(), Some("release-source"));
+    assert_eq!(source["with"]["fetch-depth"].as_u64(), Some(0));
+
+    let validation = steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Verify release source"))
+        .expect("release source validation step");
+    assert_eq!(
+        validation["working-directory"].as_str(),
+        Some("release-source")
+    );
+
+    let build = step_using(steps, "docker/build-push-action@");
+    assert_eq!(build["with"]["context"].as_str(), Some("release-source"));
+    assert_eq!(
+        build["with"]["file"].as_str(),
+        Some("build-recipe/Dockerfile")
+    );
+    assert!(
+        build["with"]["labels"].as_str().is_some_and(|labels| labels
+            .contains("io.rararulab.lake.build-recipe.revision=${{ env.BUILD_RECIPE_REVISION }}")),
+        "historical recovery must publish the immutable build-recipe revision separately from the \
+         release source"
     );
 }
 
