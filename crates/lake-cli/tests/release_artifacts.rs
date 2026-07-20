@@ -373,6 +373,9 @@ fn release_image_caches_rust_dependencies_before_copying_application_sources() {
 #[test]
 fn release_image_hydrates_path_dependencies_before_cargo_chef_cook() {
     let dockerfile = read("Dockerfile");
+    let builder = dockerfile
+        .find("FROM chef AS builder")
+        .expect("Docker build must define the cargo-chef builder stage");
     let recipe = dockerfile
         .find("COPY --from=planner /src/recipe.json recipe.json")
         .expect("Docker build must transfer the generated dependency recipe");
@@ -387,7 +390,7 @@ fn release_image_hydrates_path_dependencies_before_cargo_chef_cook() {
     let application = dockerfile
         .rfind("COPY . .")
         .expect("Docker build must copy application sources after cooking dependencies");
-    let planner_transfers = dockerfile[recipe..cook]
+    let planner_transfers = dockerfile[builder..cook]
         .lines()
         .map(str::trim)
         .filter(|line| line.starts_with("COPY --from=planner "))
