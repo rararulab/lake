@@ -18,7 +18,9 @@ first.
   and target-directory lock keep concurrent revisions correct; the cache is
   untracked, contains no credentials or source data, and may be deleted to
   force a cold rebuild. CI remains ephemeral and sets its own incremental
-  policy.
+  policy. Tests that inspect repository artifacts must resolve them from the
+  invocation workspace, never compile-time source paths, so a reused test
+  executable cannot read a different jj workspace.
 - **Local-first**: the comprehensive gate runs LOCALLY (`mise run ship`, which
   runs `mise run ci` — gate + dependency policy + doc + spec-selftest +
   LocalStack integration — then a conventional-commit check, then push through

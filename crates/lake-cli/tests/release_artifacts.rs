@@ -12,11 +12,65 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde_yaml::Value;
 
-fn root() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..") }
+fn root() -> PathBuf {
+    let mut directory = std::env::current_dir().expect("release artifact invocation directory");
+    loop {
+        let manifest = directory.join("Cargo.toml");
+        if manifest.is_file()
+            && fs::read_to_string(&manifest).is_ok_and(|contents| contents.contains("[workspace]"))
+        {
+            return directory;
+        }
+        assert!(
+            directory.pop(),
+            "release artifact contracts must run from a Cargo workspace"
+        );
+    }
+}
+
+#[test]
+fn release_artifact_contract_uses_invocation_workspace() {
+    const PROBE: &str = "LAKE_RELEASE_ARTIFACT_ROOT_PROBE";
+
+    if std::env::var_os(PROBE).is_some() {
+        assert_eq!(
+            root(),
+            std::env::current_dir().expect("probe current directory"),
+            "release artifact tests must resolve files from the invoking workspace"
+        );
+        return;
+    }
+
+    let fixture = std::env::temp_dir().join(format!(
+        "lake-release-artifact-root-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&fixture).expect("create probe workspace");
+    fs::write(fixture.join("Cargo.toml"), "[workspace]\n").expect("write probe manifest");
+
+    let status = Command::new(std::env::current_exe().expect("current test executable"))
+        .arg("--exact")
+        .arg("release_artifact_contract_uses_invocation_workspace")
+        .env(PROBE, "1")
+        .current_dir(&fixture)
+        .status()
+        .expect("run workspace-root probe");
+    fs::remove_dir_all(&fixture).expect("remove probe workspace");
+    assert!(status.success(), "release artifact probe must pass");
+}
 
 fn read(path: &str) -> String {
     fs::read_to_string(root().join(path)).unwrap_or_else(|error| panic!("read {path}: {error}"))
@@ -234,6 +288,19 @@ fn release_image_workflow_separates_source_and_recipe_for_backfills() {
         validation["working-directory"].as_str(),
         Some("release-source")
     );
+    let validation_script = validation["run"]
+        .as_str()
+        .expect("release source validation script");
+    assert!(
+        validation_script.contains("git -C \"$GITHUB_WORKSPACE/build-recipe\" rev-parse HEAD"),
+        "the workflow must read the recipe revision from its immutable checkout"
+    );
+    assert!(
+        validation_script.contains(
+            "printf 'BUILD_RECIPE_REVISION=%s\\n' \"$build_recipe_revision\" >> \"$GITHUB_ENV\""
+        ),
+        "the workflow must export the recipe revision for OCI labeling"
+    );
 
     let build = step_using(steps, "docker/build-push-action@");
     assert_eq!(build["with"]["context"].as_str(), Some("release-source"));
@@ -242,8 +309,12 @@ fn release_image_workflow_separates_source_and_recipe_for_backfills() {
         Some("build-recipe/Dockerfile")
     );
     assert!(
-        build["with"]["labels"].as_str().is_some_and(|labels| labels
-            .contains("io.rararulab.lake.build-recipe.revision=${{ env.BUILD_RECIPE_REVISION }}")),
+        build["with"]["labels"].as_str().is_some_and(|labels| {
+            labels.contains("org.opencontainers.image.revision=${{ env.RELEASE_REVISION }}")
+                && labels.contains(
+                    "io.rararulab.lake.build-recipe.revision=${{ env.BUILD_RECIPE_REVISION }}",
+                )
+        }),
         "historical recovery must publish the immutable build-recipe revision separately from the \
          release source"
     );

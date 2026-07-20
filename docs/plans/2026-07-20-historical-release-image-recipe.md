@@ -17,6 +17,10 @@
 
 **Step 1:** Add `release_image_workflow_separates_source_and_recipe_for_backfills` asserting the two checkout paths, source validation directory, Buildx context/file, and distinct recipe OCI label.
 
+**Step 1a:** Add `release_artifact_contract_uses_invocation_workspace` so a
+shared Cargo target cannot make the workflow-contract binary read files from a
+different Jujutsu checkout.
+
 **Step 2:** Run `mise exec -- cargo test -p lake-cli --test release_artifacts release_image_workflow_separates_source_and_recipe_for_backfills`; expect failure because the old workflow has one checkout and context `.`.
 
 ### Task 2: Separate recipe from release source

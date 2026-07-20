@@ -84,6 +84,16 @@ Scenario: Historical recovery still rejects an untrusted release source
   When the workflow validates its separately checked out source
   Then it refuses publication before Buildx can publish a digest
 
+Scenario: Workflow contract follows the invoking Jujutsu workspace
+  Test:
+    Package: lake-cli
+    Filter: release_artifact_contract_uses_invocation_workspace
+  Given a cached release-artifact test executable from a different Jujutsu
+  workspace
+  When the contract runs from the candidate workspace
+  Then it resolves workflow and documentation files from that invocation
+  workspace rather than a compile-time checkout path
+
 ## Out of Scope
 
 - Changing the Dockerfile or normal Release Please authority.
