@@ -210,6 +210,16 @@ Cargo-chef Dockerfile to rebuild an older immutable source. The distinct
 `io.rararulab.lake.build-recipe.revision` OCI label records that recipe SHA; it
 does not change the source identity or release tag.
 
+Cargo-chef derives `recipe.json` from that release-source context. When the
+workspace recipe names a local path dependency, the builder must copy that
+exact dependency from the planner before `cargo chef cook`; copying only the
+recipe makes Cargo resolve a path that is absent from the builder filesystem.
+Keep this transfer narrower than the later application-source copy so normal
+source changes do not invalidate the exportable cooked-dependency layer. A
+historical backfill repair is not complete until a native `--target builder`
+build against the immutable tag reaches the builder stage, rather than merely
+proving that the planner can emit a recipe.
+
 Wait for the `Publish release image` run to complete, then resolve the
 manifest-list digest and verify both `linux/amd64` and `linux/arm64` before
 updating a production deployment.

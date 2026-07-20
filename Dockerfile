@@ -22,6 +22,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 COPY --from=planner /src/recipe.json recipe.json
+COPY --from=planner /src/third_party/datafusion-execution third_party/datafusion-execution
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --locked --release --package lake-cli --bin lake \
