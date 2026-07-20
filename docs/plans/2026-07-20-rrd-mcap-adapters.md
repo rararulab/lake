@@ -81,7 +81,7 @@ Run: `jj commit -m "feat(adapters): bound random-access inspection (#323)"`
 **Files:**
 
 - Create: `crates/lake-adapters/src/rrd.rs`
-- Create: `crates/lake-adapters/tests/rrd_adapter.rs`
+- Create: `crates/lake-adapters/tests/rrd.rs`
 - Modify: `crates/lake-adapters/src/lib.rs`
 
 **Step 1:** Build a valid modern RRD fixture with the upstream encoder and footer enabled. Write `rrd_adapter_uses_footer_within_read_budget` first. Assert:
@@ -91,7 +91,7 @@ Run: `jj commit -m "feat(adapters): bound random-access inspection (#323)"`
 - replaying with `max_bytes = successful_usage.bytes - 1` fails with `BudgetExceeded` before the source crosses the limit;
 - replaying with `max_ranges = successful_usage.ranges - 1` does the same.
 
-Run: `cargo test -p lake-adapters --test rrd_adapter rrd_adapter_uses_footer_within_read_budget -- --exact`
+Run: `cargo test -p lake-adapters --test rrd rrd_footer_metadata_stays_within_read_budget -- --exact`
 
 Expected: FAIL because `RrdAdapter` is not implemented.
 
@@ -105,7 +105,7 @@ Expected: FAIL because `RrdAdapter` is not implemented.
 
 **Step 6:** Re-run the focused selector.
 
-Run: `cargo test -p lake-adapters --test rrd_adapter rrd_adapter_uses_footer_within_read_budget -- --exact`
+Run: `cargo test -p lake-adapters --test rrd rrd_footer_metadata_stays_within_read_budget -- --exact`
 
 Expected: PASS.
 
@@ -118,11 +118,11 @@ Run: `jj commit -m "feat(adapters): inspect indexed RRD metadata (#323)"`
 **Files:**
 
 - Modify: `crates/lake-adapters/src/rrd.rs`
-- Modify: `crates/lake-adapters/tests/rrd_adapter.rs`
+- Modify: `crates/lake-adapters/tests/rrd.rs`
 
-**Step 1:** Generate the same valid RRD fixture with the upstream encoder footer disabled. Write `rrd_adapter_falls_back_to_bounded_linear_scan`. Assert the exact configured fallback size succeeds, one byte less returns `FallbackScanTooLarge`, the source never reads past either budget, and output remains a canonical `EpisodeManifestV1`.
+**Step 1:** Generate the same valid RRD fixture with the upstream encoder footer disabled. Write `rrd_missing_footer_uses_bounded_linear_fallback`. Assert the exact configured fallback size succeeds, one byte less returns `FallbackScanTooLarge`, the source never reads past either budget, and output remains a canonical `EpisodeManifestV1`.
 
-Run: `cargo test -p lake-adapters --test rrd_adapter rrd_adapter_falls_back_to_bounded_linear_scan -- --exact`
+Run: `cargo test -p lake-adapters --test rrd rrd_missing_footer_uses_bounded_linear_fallback -- --exact`
 
 Expected: FAIL because no-footer files are not handled.
 
@@ -134,7 +134,7 @@ Expected: FAIL because no-footer files are not handled.
 
 **Step 5:** Re-run both RRD selectors and the full RRD integration test binary.
 
-Run: `cargo test -p lake-adapters --test rrd_adapter`
+Run: `cargo test -p lake-adapters --test rrd`
 
 Expected: PASS.
 
@@ -147,12 +147,12 @@ Run: `jj commit -m "feat(adapters): bound legacy RRD fallback (#323)"`
 **Files:**
 
 - Create: `crates/lake-adapters/src/mcap.rs`
-- Create: `crates/lake-adapters/tests/mcap_adapter.rs`
+- Create: `crates/lake-adapters/tests/mcap.rs`
 - Modify: `crates/lake-adapters/src/lib.rs`
 
 **Step 1:** Generate a valid MCAP with a summary, two channels with schemas, time ranges, and an attachment using `mcap::Writer`. Write `mcap_adapter_uses_summary_within_read_budget` with the same exact-success and one-less-byte/range assertions as the RRD indexed test.
 
-Run: `cargo test -p lake-adapters --test mcap_adapter mcap_adapter_uses_summary_within_read_budget -- --exact`
+Run: `cargo test -p lake-adapters --test mcap mcap_summary_metadata_stays_within_read_budget -- --exact`
 
 Expected: FAIL because `McapAdapter` is not implemented.
 
@@ -164,7 +164,7 @@ Expected: FAIL because `McapAdapter` is not implemented.
 
 **Step 5:** Re-run the focused selector.
 
-Run: `cargo test -p lake-adapters --test mcap_adapter mcap_adapter_uses_summary_within_read_budget -- --exact`
+Run: `cargo test -p lake-adapters --test mcap mcap_summary_metadata_stays_within_read_budget -- --exact`
 
 Expected: PASS.
 
@@ -177,11 +177,11 @@ Run: `jj commit -m "feat(adapters): inspect indexed MCAP metadata (#323)"`
 **Files:**
 
 - Modify: `crates/lake-adapters/src/mcap.rs`
-- Modify: `crates/lake-adapters/tests/mcap_adapter.rs`
+- Modify: `crates/lake-adapters/tests/mcap.rs`
 
-**Step 1:** Generate a valid MCAP without a summary and write `mcap_adapter_falls_back_to_bounded_linear_scan`. Assert exact scan cap success, one byte less refusal before the scan, structured record-size failure, canonical streams/timelines, and bounded source usage.
+**Step 1:** Generate a valid MCAP without a summary and write `mcap_missing_summary_uses_bounded_linear_fallback`. Assert exact scan cap success, one byte less refusal before the scan, structured record-size failure, canonical streams/timelines, and bounded source usage.
 
-Run: `cargo test -p lake-adapters --test mcap_adapter mcap_adapter_falls_back_to_bounded_linear_scan -- --exact`
+Run: `cargo test -p lake-adapters --test mcap mcap_missing_summary_uses_bounded_linear_fallback -- --exact`
 
 Expected: FAIL because summary absence is not handled.
 
@@ -191,7 +191,7 @@ Expected: FAIL because summary absence is not handled.
 
 **Step 4:** Re-run both MCAP selectors and the full MCAP integration test binary.
 
-Run: `cargo test -p lake-adapters --test mcap_adapter`
+Run: `cargo test -p lake-adapters --test mcap`
 
 Expected: PASS.
 
@@ -203,13 +203,13 @@ Run: `jj commit -m "feat(adapters): bound summaryless MCAP fallback (#323)"`
 
 **Files:**
 
-- Create: `crates/lake-adapters/tests/manifest_contract.rs`
+- Create: `crates/lake-adapters/tests/format_adapters.rs`
 - Modify: `crates/lake-adapters/src/model.rs`
 - Modify: `crates/lake-adapters/src/lib.rs`
 
-**Step 1:** Write `adapter_outputs_lake_common_episode_manifest_v1`. Invoke both implementations through `&dyn RecordingAdapter`, assert both outputs expose only neutral types, round-trip each manifest through canonical JSON, and verify identical caller-owned Episode/Recording/Layer/Artifact identities.
+**Step 1:** Write `format_adapters_emit_valid_episode_manifest_v1`. Invoke both implementations through `&dyn RecordingAdapter`, assert both outputs expose only neutral types, round-trip each manifest through canonical JSON, and verify identical caller-owned Episode/Recording/Layer/Artifact identities.
 
-Run: `cargo test -p lake-adapters --test manifest_contract adapter_outputs_lake_common_episode_manifest_v1 -- --exact`
+Run: `cargo test -p lake-adapters --test format_adapters format_adapters_emit_valid_episode_manifest_v1 -- --exact`
 
 Expected: FAIL until both implementations satisfy the trait without leaking format-specific output.
 

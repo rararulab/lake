@@ -18,10 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lake_common::{
-    EpisodeManifestDraftV1, EpisodeManifestV1, EpisodeSummaryV1, LayerKindV1, LayerV1,
-    ManifestArtifactBindingV1, RecordingV1, StreamV1, TimelineKindV1, TimelineV1,
-};
+use lake_common::{EpisodeManifestV1, TimelineKindV1};
 use re_log_encoding::{
     Decodable as _, DecoderApp, RawRrdManifest, RrdFooter, StreamFooter, StreamHeader,
 };
@@ -30,6 +27,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     AdapterError, EpisodeInspectionContext, RandomAccessSource, ReadBudget, RecordingAdapter,
+    neutral::{NeutralRecordingMetadata, NeutralStream, NeutralTimeline, build_manifest},
     source::BudgetedSource,
 };
 
@@ -402,69 +400,41 @@ fn manifest_from_rrd(
         return Err(AdapterError::NoTemporalStreams { format: FORMAT });
     }
 
-    let timeline_descriptors = metadata
+    let timelines = metadata
         .timeline_kinds
         .iter()
-        .map(|(timeline_id, kind)| {
-            TimelineV1::builder()
-                .timeline_id(timeline_id)
-                .kind(*kind)
-                .build()
+        .map(|(timeline_id, kind)| NeutralTimeline {
+            timeline_id: timeline_id.clone(),
+            kind:        *kind,
         })
         .collect::<Vec<_>>();
-    let stream_descriptors = metadata
+    let streams = metadata
         .streams
         .iter()
-        .map(|(stream_id, metadata)| {
-            StreamV1::builder()
-                .stream_id(stream_id)
-                .recording_id(context.recording_id())
-                .timeline_ids(metadata.timeline_ids.iter().cloned().collect())
-                .schema_fingerprint(fingerprint(&metadata.components))
-                .build()
+        .map(|(stream_id, stream)| NeutralStream {
+            stream_id:          stream_id.clone(),
+            timeline_ids:       stream.timeline_ids.iter().cloned().collect(),
+            media_type:         None,
+            codec:              None,
+            schema_fingerprint: fingerprint(&stream.components),
         })
         .collect::<Vec<_>>();
-    let stream_ids = metadata.streams.keys().cloned().collect::<Vec<_>>();
     let schema_fingerprint = recording_fingerprint(metadata);
-
-    EpisodeManifestV1::try_from_draft(
-        EpisodeManifestDraftV1::builder()
-            .summary(
-                EpisodeSummaryV1::builder()
-                    .episode_id(context.episode_id())
-                    .build(),
-            )
-            .recordings(vec![
-                RecordingV1::builder()
-                    .recording_id(context.recording_id())
-                    .recording_format(FORMAT)
-                    .producer_version(producer_version.clone())
-                    .build(),
-            ])
-            .timelines(timeline_descriptors)
-            .streams(stream_descriptors)
-            .layers(vec![
-                LayerV1::builder()
-                    .layer_id(context.layer_id())
-                    .kind(LayerKindV1::Base)
-                    .producer("rerun")
-                    .build(),
-            ])
-            .artifact_bindings(vec![
-                ManifestArtifactBindingV1::builder()
-                    .artifact_id(context.artifact_id())
-                    .layer_id(context.layer_id())
-                    .role("recording")
-                    .recording_id(context.recording_id())
-                    .selector(metadata.selector.clone())
-                    .stream_ids(stream_ids)
-                    .schema_fingerprint(schema_fingerprint)
-                    .producer_version(producer_version)
-                    .build(),
-            ])
-            .build(),
+    build_manifest(
+        NeutralRecordingMetadata {
+            format: FORMAT,
+            producer_version: Some(producer_version),
+            layer_producer: Some("rerun".to_owned()),
+            selector: Some(metadata.selector.clone()),
+            started_at_ns: None,
+            duration_ns: None,
+            num_steps: None,
+            timelines,
+            streams,
+            schema_fingerprint,
+        },
+        context,
     )
-    .map_err(|source| AdapterError::Manifest { source })
 }
 
 fn native_selector(store_id: &re_log_types::StoreId) -> String {

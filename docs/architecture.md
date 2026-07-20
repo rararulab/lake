@@ -58,9 +58,12 @@ Lake provides the underlying immutable `DataLocation`, exact per-table versions,
 managed-object reads, SQL primitives, and the format-neutral
 `EpisodeManifestV1` plus `EpisodeBundleV1`/`ArtifactRefV1` contracts with
 canonical JSON, exact Artifact binding, validated Arrow encoding, and a public
-bounded exact-schema Arrow append path. Episode-specific ingestion conveniences,
-format adapters, DatasetRevision and TrainingView APIs, Python readers,
-Materializations, and derived-Layer append are planned work.
+bounded exact-schema Arrow append path. The leaf `lake-adapters` crate now
+extracts RRD footer or MCAP summary metadata with bounded random reads and uses
+a finite full-file fallback only when the optional index is genuinely absent.
+Episode-specific ingestion conveniences, LeRobot adapters, DatasetRevision and
+TrainingView APIs, Python readers, Materializations, and derived-Layer append
+remain planned work.
 
 In the target model, Lake is authoritative for Dataset membership,
 DatasetRevision identity, access, retention, TrainingView selection, and
@@ -71,8 +74,10 @@ The full terminology, current capability boundary, and delivery sequence live in
 
 ```mermaid
 flowchart LR
-    source["External: robot / simulator"] --> adapters["Planned: format adapters\nRRD / MCAP / LeRobot"]
+    source["External: robot / simulator"] --> adapters["Current: bounded metadata adapters\nRRD / MCAP"]
+    source -.-> future_adapter["Planned: LeRobot adapter"]
     adapters --> manifest["Current contract: EpisodeManifest v1\ncanonical metadata + bindings"]
+    future_adapter -.-> manifest
     manifest --> objects["Current primitive: immutable FILE Artifacts\nmanaged object storage"]
     manifest --> episodes["Current contract + public Arrow append\nEpisode + ArtifactRef rows"]
     objects --> revision["Planned: DatasetRevision\nover current exact table versions"]
@@ -99,10 +104,12 @@ The logical and physical identities are deliberately separate:
 - a Materialization is a derived RRD, LeRobot layout, codec index, or cache that
   may be discarded and rebuilt from its TrainingView.
 
-Format adapters run at ingestion and client/runtime seams. They extract
-filterable Episode metadata and build immutable manifests before append. They
-may interpret RRD timelines, MCAP topics, or LeRobot shard offsets on reads, but
-no format type enters `lake-engine`, `lake-metasrv`, or `DataLocation`.
+Format adapters run at ingestion and client/runtime seams. The implemented RRD
+and MCAP adapters accept a caller-owned random-access source, Lake-owned
+identities, and explicit byte/request/fallback/record limits, then return the
+exact canonical `EpisodeManifestV1`. Indexed corruption fails closed and does
+not downgrade to a scan. Future adapters may interpret LeRobot shard offsets,
+but no format type enters `lake-engine`, `lake-metasrv`, or `DataLocation`.
 
 Robot-training reads therefore have two levels: Lake SQL selects across
 Episodes at an exact DatasetRevision, then a format-aware runtime aligns and

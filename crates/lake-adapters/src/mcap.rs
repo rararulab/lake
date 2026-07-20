@@ -18,10 +18,7 @@ use std::{collections::BTreeMap, io::SeekFrom, ops::Range};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lake_common::{
-    EpisodeManifestDraftV1, EpisodeManifestV1, EpisodeSummaryV1, LayerKindV1, LayerV1,
-    ManifestArtifactBindingV1, RecordingV1, StreamV1, TimelineKindV1, TimelineV1,
-};
+use lake_common::{EpisodeManifestV1, TimelineKindV1};
 use mcap::{
     McapError, Summary,
     records::Record,
@@ -34,6 +31,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     AdapterError, EpisodeInspectionContext, RandomAccessSource, ReadBudget, RecordingAdapter,
+    neutral::{NeutralRecordingMetadata, NeutralStream, NeutralTimeline, build_manifest},
     source::BudgetedSource,
 };
 
@@ -521,74 +519,35 @@ fn manifest_from_metadata(
     if metadata.streams.is_empty() {
         return Err(AdapterError::NoTemporalStreams { format: FORMAT });
     }
-    let producer = metadata.producer;
-    let streams = metadata.streams;
-    let stream_ids = streams
-        .iter()
-        .map(|stream| stream.stream_id.clone())
-        .collect::<Vec<_>>();
-    let schema_fingerprint = recording_fingerprint(&streams);
-
-    EpisodeManifestV1::try_from_draft(
-        EpisodeManifestDraftV1::builder()
-            .summary(
-                EpisodeSummaryV1::builder()
-                    .episode_id(context.episode_id())
-                    .maybe_started_at_ns(metadata.started_at_ns)
-                    .maybe_duration_ns(metadata.duration_ns)
-                    .maybe_num_steps(metadata.num_steps)
-                    .build(),
-            )
-            .recordings(vec![
-                RecordingV1::builder()
-                    .recording_id(context.recording_id())
-                    .recording_format(FORMAT)
-                    .maybe_producer_version(producer.clone())
-                    .build(),
-            ])
-            .timelines(vec![
-                TimelineV1::builder()
-                    .timeline_id(LOG_TIME)
-                    .kind(TimelineKindV1::Timestamp)
-                    .build(),
-            ])
-            .streams(
-                streams
-                    .into_iter()
-                    .map(|stream| {
-                        StreamV1::builder()
-                            .stream_id(stream.stream_id)
-                            .recording_id(context.recording_id())
-                            .timeline_ids(vec![LOG_TIME.to_owned()])
-                            .maybe_media_type(stream.media_type)
-                            .maybe_codec(stream.codec)
-                            .schema_fingerprint(stream.schema_fingerprint)
-                            .build()
-                    })
-                    .collect(),
-            )
-            .layers(vec![
-                LayerV1::builder()
-                    .layer_id(context.layer_id())
-                    .kind(LayerKindV1::Base)
-                    .maybe_producer(producer.clone())
-                    .build(),
-            ])
-            .artifact_bindings(vec![
-                ManifestArtifactBindingV1::builder()
-                    .artifact_id(context.artifact_id())
-                    .layer_id(context.layer_id())
-                    .role("recording")
-                    .recording_id(context.recording_id())
-                    .maybe_selector(context.selector().map(str::to_owned))
-                    .stream_ids(stream_ids)
-                    .schema_fingerprint(schema_fingerprint)
-                    .maybe_producer_version(producer)
-                    .build(),
-            ])
-            .build(),
+    let schema_fingerprint = recording_fingerprint(&metadata.streams);
+    build_manifest(
+        NeutralRecordingMetadata {
+            format: FORMAT,
+            producer_version: metadata.producer.clone(),
+            layer_producer: metadata.producer,
+            selector: context.selector().map(str::to_owned),
+            started_at_ns: metadata.started_at_ns,
+            duration_ns: metadata.duration_ns,
+            num_steps: metadata.num_steps,
+            timelines: vec![NeutralTimeline {
+                timeline_id: LOG_TIME.to_owned(),
+                kind:        TimelineKindV1::Timestamp,
+            }],
+            streams: metadata
+                .streams
+                .into_iter()
+                .map(|stream| NeutralStream {
+                    stream_id:          stream.stream_id,
+                    timeline_ids:       vec![LOG_TIME.to_owned()],
+                    media_type:         stream.media_type,
+                    codec:              stream.codec,
+                    schema_fingerprint: stream.schema_fingerprint,
+                })
+                .collect(),
+            schema_fingerprint,
+        },
+        context,
     )
-    .map_err(|source| AdapterError::Manifest { source })
 }
 
 fn channel_has_messages(summary: &Summary, channel_id: u16) -> bool {
