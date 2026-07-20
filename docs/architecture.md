@@ -57,9 +57,10 @@ This section distinguishes implemented contracts from the target model. Today
 Lake provides the underlying immutable `DataLocation`, exact per-table versions,
 managed-object reads, SQL primitives, and the format-neutral
 `EpisodeManifestV1` plus `EpisodeBundleV1`/`ArtifactRefV1` contracts with
-canonical JSON, exact Artifact binding, and validated Arrow encoding. Public
-Episode ingestion, format adapters, DatasetRevision and TrainingView APIs,
-Python readers, Materializations, and derived-Layer append are planned work.
+canonical JSON, exact Artifact binding, validated Arrow encoding, and a public
+bounded exact-schema Arrow append path. Episode-specific ingestion conveniences,
+format adapters, DatasetRevision and TrainingView APIs, Python readers,
+Materializations, and derived-Layer append are planned work.
 
 In the target model, Lake is authoritative for Dataset membership,
 DatasetRevision identity, access, retention, TrainingView selection, and
@@ -73,7 +74,7 @@ flowchart LR
     source["External: robot / simulator"] --> adapters["Planned: format adapters\nRRD / MCAP / LeRobot"]
     adapters --> manifest["Current contract: EpisodeManifest v1\ncanonical metadata + bindings"]
     manifest --> objects["Current primitive: immutable FILE Artifacts\nmanaged object storage"]
-    manifest --> episodes["Current contract: Episode + ArtifactRef Arrow rows\npublic ingestion planned"]
+    manifest --> episodes["Current contract + public Arrow append\nEpisode + ArtifactRef rows"]
     objects --> revision["Planned: DatasetRevision\nover current exact table versions"]
     episodes --> revision
     revision --> view["Planned: TrainingView"]
@@ -657,6 +658,13 @@ design-level ones:
   entries after a bounded TTL, and exposes explicit per-table/full invalidation
   for coordinated replacement. This removes per-row schema planning without
   weakening Query/Metasrv append validation.
+- The Rust SDK also accepts 1..=10,000 rows across caller-owned Arrow batches.
+  It rejects empty, inconsistent, or authoritative-table-schema-mismatched input
+  before `DoPut`, encodes at most one 64 MiB Flight payload, and reuses the same
+  UUIDv7 identity, digest, durable checkpoint, and ambiguous-result retry path
+  as scalar/`FILE` inserts. Query-only clients can use this path because existing
+  `DataLocation` values are metadata; no object discovery, upload, or byte proxy
+  occurs.
 - Each stateless Query replica has finite process-local admission: bounded
   concurrent planning/execution, bounded queue wait, a stream-held execution
   deadline, and pre-planning SQL/ticket size checks. Authenticated tenants first

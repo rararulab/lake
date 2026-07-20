@@ -276,11 +276,17 @@ pub enum SdkError {
     #[snafu(display("INSERT binds {actual} values but SQL declares {expected} placeholders"))]
     ParameterCount { expected: usize, actual: usize },
 
-    #[snafu(display("INSERT batch row count {actual} is outside 1..={maximum}"))]
+    #[snafu(display("append row count {actual} is outside 1..={maximum}"))]
     BatchRowCount { actual: usize, maximum: usize },
 
-    #[snafu(display("INSERT batch metadata is {actual} bytes, above the {maximum}-byte limit"))]
+    #[snafu(display("append metadata is {actual} bytes, above the {maximum}-byte limit"))]
     BatchMetadataSize { actual: usize, maximum: usize },
+
+    #[snafu(display("Arrow batch {batch_index} does not match the first batch schema"))]
+    BatchSchemaMismatch { batch_index: usize },
+
+    #[snafu(display("Arrow append schema does not match table '{table}'"))]
+    TableSchemaMismatch { table: String },
 
     #[snafu(display("INSERT column '{column}' is missing from table schema"))]
     UnknownColumn { column: String },
@@ -1120,6 +1126,23 @@ impl LakeClient {
         self.resume_append(pending).await
     }
 
+    /// Append caller-owned Arrow batches to one exact table version.
+    ///
+    /// The aggregate must contain 1..=10,000 rows, every batch must have the
+    /// same exact schema, and that schema must equal the table schema resolved
+    /// through Query. Validation and Flight encoding are bounded before the
+    /// first append `DoPut`. This method carries only Arrow values, including
+    /// any existing [`DataLocation`] metadata; it never uploads object bytes
+    /// or requires SDK-process object-store credentials.
+    pub async fn append_batches(
+        &self,
+        table: &TableRef,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Version> {
+        let pending = self.prepare_append_batches(table, batches).await?;
+        self.resume_append(pending).await
+    }
+
     /// Resume a prepared or ambiguously timed-out append with the same
     /// operation identity and already-uploaded object references.
     pub async fn resume_append(&self, pending: PendingAppend) -> Result<Version> {
@@ -1235,15 +1258,44 @@ impl LakeClient {
             );
         }
         let batch = RecordBatch::try_new(schema, arrays).context(ArrowSnafu)?;
-        let mut messages = FlightDataEncoderBuilder::new()
+        let messages = FlightDataEncoderBuilder::new()
             .with_schema(batch.schema())
             .build(futures::stream::iter(vec![Ok(batch)]))
             .try_collect::<Vec<_>>()
             .await
             .context(FlightSnafu)?;
+        self.prepare_append_messages(insert.table, messages).await
+    }
+
+    async fn prepare_append_batches(
+        &self,
+        table: &TableRef,
+        batches: Vec<RecordBatch>,
+    ) -> Result<PendingAppend> {
+        let input_schema = validate_append_batches(&batches)?;
+        let table_schema = self.table_schema(table).await?;
+        if input_schema.as_ref() != table_schema.as_ref() {
+            return Err(SdkError::TableSchemaMismatch {
+                table: table.to_string(),
+            });
+        }
+        let messages = FlightDataEncoderBuilder::new()
+            .with_schema(input_schema)
+            .build(futures::stream::iter(batches.into_iter().map(Ok)))
+            .try_collect::<Vec<_>>()
+            .await
+            .context(FlightSnafu)?;
+        self.prepare_append_messages(table.clone(), messages).await
+    }
+
+    async fn prepare_append_messages(
+        &self,
+        table: TableRef,
+        mut messages: Vec<FlightData>,
+    ) -> Result<PendingAppend> {
         let operation_id = AppendOperationId::generate();
         let append = FileAppendRequest::new(
-            insert.table,
+            table,
             operation_id.clone(),
             append_flight_payload_digest(&messages),
         );
@@ -2082,6 +2134,39 @@ fn data_location_metadata_bytes(location: &DataLocation) -> usize {
         .saturating_add(std::mem::size_of::<u64>())
 }
 
+fn validate_append_batches(batches: &[RecordBatch]) -> Result<SchemaRef> {
+    let Some(first) = batches.first() else {
+        return Err(SdkError::BatchRowCount {
+            actual:  0,
+            maximum: MAX_INSERT_BATCH_ROWS,
+        });
+    };
+    let schema = first.schema();
+    let rows = batches
+        .iter()
+        .enumerate()
+        .try_fold(0usize, |rows, (batch_index, batch)| {
+            if batch.schema().as_ref() != schema.as_ref() {
+                return Err(SdkError::BatchSchemaMismatch { batch_index });
+            }
+            let rows = rows.saturating_add(batch.num_rows());
+            if rows > MAX_INSERT_BATCH_ROWS {
+                return Err(SdkError::BatchRowCount {
+                    actual:  rows,
+                    maximum: MAX_INSERT_BATCH_ROWS,
+                });
+            }
+            Ok(rows)
+        })?;
+    if rows == 0 {
+        return Err(SdkError::BatchRowCount {
+            actual:  rows,
+            maximum: MAX_INSERT_BATCH_ROWS,
+        });
+    }
+    Ok(schema)
+}
+
 fn validate_flight_payload_size(messages: &[FlightData], maximum: usize) -> Result<()> {
     let actual = messages.iter().fold(0usize, |total, message| {
         total.saturating_add(message.encoded_len())
@@ -2108,7 +2193,7 @@ mod tests {
     };
 
     use arrow::{
-        array::{Array, StringArray, StructArray},
+        array::{Array, Int64Array, StringArray, StructArray},
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
     };
@@ -2136,8 +2221,8 @@ mod tests {
     use bytes::Bytes;
     use futures::TryStreamExt;
     use lake_common::{
-        ManagedStageDescriptor, Principal, PrincipalId, PrincipalRole, TableLocation, TableRef,
-        TenantId, Version,
+        DataLocation, ManagedStageDescriptor, Principal, PrincipalId, PrincipalRole, TableLocation,
+        TableRef, TenantId, Version,
     };
     use lake_engine::TableEngineRef;
     use lake_engine_lance::LanceEngine;
@@ -2151,6 +2236,7 @@ mod tests {
         LocalObjectStore, ManagedObjectStore, ManagedReadCapabilityRequest,
         ManagedReadCapabilityResponse, ObjectReader, Result as ObjectResult, S3ObjectStore,
         S3ReadCapabilityIssuer, data_location_field, data_location_from_array,
+        episode_artifact_table_schema_v1, episode_artifact_table_v1,
     };
     use lake_query::{AsyncQueryConfig, QueryEngine, QueryServerConfig, QueryTicketKeyRing};
     use prost::Message;
@@ -2166,9 +2252,9 @@ mod tests {
     use crate::{
         APPEND_RETRY_WINDOW, FileUpload, InsertValue, LakeClient, MAX_INSERT_BATCH_ROWS,
         MAX_INSERT_INPUT_METADATA_BYTES, MAX_SCHEMA_CACHE_CAPACITY, MAX_SCHEMA_CACHE_TTL,
-        PresignedRead, SchemaCache, SchemaCacheConfig, SdkError, ambiguous_append_error,
-        data_location, resume_pending_with, retry_ambiguous_append_with_window,
-        validate_flight_payload_size,
+        PresignedRead, QueryOnlyObjectStore, SchemaCache, SchemaCacheConfig, SdkError,
+        ambiguous_append_error, data_location, resume_pending_with,
+        retry_ambiguous_append_with_window, validate_flight_payload_size,
     };
 
     #[derive(Clone)]
@@ -4384,6 +4470,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sdk_typed_arrow_append_commits_episode_artifact_bundle() {
+        let root = tempdir().unwrap();
+        let (client, metasrv, table) = setup_episode_append_client(root.path()).await;
+        let batch = sdk_episode_artifact_batch();
+        let expected_rows = batch.num_rows();
+
+        let version = client
+            .append_batches(&table, vec![batch])
+            .await
+            .expect("public Arrow append commits through Query");
+
+        assert_eq!(version, Version(2));
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(2)
+        );
+        let batches = client
+            .query(
+                "SELECT record_kind, episode_id FROM lake.robots.episodes ORDER BY record_kind, \
+                 artifact_id",
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            expected_rows
+        );
+        let record_kinds = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("record_kind")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(record_kinds, ["artifact_ref", "artifact_ref", "episode"]);
+    }
+
+    #[tokio::test]
+    async fn sdk_typed_arrow_append_rejects_invalid_batches_before_put() {
+        let root = tempdir().unwrap();
+        let local_only = LakeClient {
+            query:                 tonic::transport::Endpoint::from_static("http://127.0.0.1:9")
+                .connect_lazy(),
+            objects:               Arc::new(QueryOnlyObjectStore),
+            security:              ClientSecurity::new(),
+            schema_cache:          SchemaCache::new(SchemaCacheConfig::default()),
+            upload_checkpoint_dir: None,
+        };
+        let table = TableRef::new("robots", "episodes");
+        let utf8_schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        let zero_rows = RecordBatch::new_empty(utf8_schema.clone());
+        let excessive_rows = RecordBatch::try_new(
+            utf8_schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values(
+                std::iter::repeat_n("episode", MAX_INSERT_BATCH_ROWS + 1),
+            ))],
+        )
+        .unwrap();
+        let utf8_row = RecordBatch::try_new(
+            utf8_schema,
+            vec![Arc::new(StringArray::from(vec!["episode-1"]))],
+        )
+        .unwrap();
+        let int_schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Int64,
+            false,
+        )]));
+        let int_row =
+            RecordBatch::try_new(int_schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+
+        assert!(matches!(
+            local_only.append_batches(&table, Vec::new()).await,
+            Err(SdkError::BatchRowCount { actual: 0, .. })
+        ));
+        assert!(matches!(
+            local_only.append_batches(&table, vec![zero_rows]).await,
+            Err(SdkError::BatchRowCount { actual: 0, .. })
+        ));
+        assert!(matches!(
+            local_only
+                .append_batches(&table, vec![excessive_rows])
+                .await,
+            Err(SdkError::BatchRowCount { actual, .. })
+                if actual == MAX_INSERT_BATCH_ROWS + 1
+        ));
+        assert!(matches!(
+            local_only
+                .append_batches(&table, vec![utf8_row.clone(), int_row])
+                .await,
+            Err(SdkError::BatchSchemaMismatch { batch_index: 1 })
+        ));
+
+        let (client, metasrv, table, _meta, _engine) = setup_client(root.path()).await;
+        assert!(matches!(
+            client.append_batches(&table, vec![utf8_row]).await,
+            Err(SdkError::TableSchemaMismatch { .. })
+        ));
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_typed_arrow_append_reuses_durable_idempotent_transport() {
+        let root = tempdir().unwrap();
+        let (mut client, metasrv, table) = setup_episode_append_client(root.path()).await;
+        let checkpoints = root.path().join("append-checkpoints");
+        tokio::fs::create_dir_all(&checkpoints).await.unwrap();
+        client.upload_checkpoint_dir = Some(checkpoints);
+        let pending = client
+            .prepare_append_batches(&table, vec![sdk_episode_artifact_batch()])
+            .await
+            .expect("typed append is prepared durably");
+        let operation_id = pending.operation_id().clone();
+        let original_messages = pending.messages.clone();
+        let loaded = client
+            .load_pending_append(&operation_id)
+            .await
+            .expect("checkpoint reloads before retry");
+        assert_eq!(loaded.operation_id(), &operation_id);
+        assert_eq!(loaded.messages, original_messages);
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let version = resume_pending_with(pending, APPEND_RETRY_WINDOW, |messages| {
+            let attempts = attempts.clone();
+            let client = client.clone();
+            async move {
+                let result = client.put_append_once(messages).await?;
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(SdkError::Flight {
+                        source: FlightError::Tonic(Box::new(Status::unavailable(
+                            "lost first Arrow append result",
+                        ))),
+                    });
+                }
+                Ok(result)
+            }
+        })
+        .await
+        .expect("ambiguous append converges");
+
+        assert_eq!(version, Version(2));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(client.pending_append_ids().await.unwrap().is_empty());
+        assert_eq!(
+            metasrv
+                .resolve(&table)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_version,
+            Version(2)
+        );
+    }
+
+    #[tokio::test]
     async fn sdk_batch_insert_rejects_empty_and_excessive_batches() {
         let root = tempdir().unwrap();
         let client = LakeClient {
@@ -5245,6 +5512,89 @@ mod tests {
     ) {
         let objects = DelegatingStore(LocalObjectStore::open(root.join("objects")).await.unwrap());
         setup_client_with_store(root, objects).await
+    }
+
+    async fn setup_episode_append_client(
+        root: &std::path::Path,
+    ) -> (LakeClient, Arc<Metasrv>, TableRef) {
+        let meta: MetaStoreRef = Arc::new(RocksMeta::open(root.join("meta")).unwrap());
+        let engine: TableEngineRef = Arc::new(LanceEngine::new());
+        let metasrv = Arc::new(Metasrv::new(meta.clone(), engine.clone()));
+        let table = TableRef::new("robots", "episodes");
+        metasrv
+            .create_table(
+                &table,
+                TableLocation::new(root.join("tables/episodes.lance").to_string_lossy()),
+                episode_artifact_table_schema_v1(),
+            )
+            .await
+            .unwrap();
+        let meta_addr = free_addr();
+        let query_addr = free_addr();
+        tokio::spawn({
+            let metasrv = metasrv.clone();
+            let addr = meta_addr.clone();
+            async move { lake_metasrv::serve(metasrv, &addr).await }
+        });
+        tokio::spawn({
+            let query = Arc::new(QueryEngine::new(meta, engine));
+            let addr = query_addr.clone();
+            let metadata = format!("http://{meta_addr}");
+            async move { lake_query::serve_with_metadata(query, &addr, &metadata).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let client = LakeClient::connect_query_only(format!("http://{query_addr}"))
+            .await
+            .unwrap();
+        (client, metasrv, table)
+    }
+
+    fn episode_artifact_location(uri: &str, content_type: &str, sha256: &str) -> DataLocation {
+        DataLocation::builder()
+            .uri(uri)
+            .content_type(content_type)
+            .size_bytes(42)
+            .sha256(sha256)
+            .build()
+    }
+
+    fn sdk_episode_artifact_batch() -> RecordBatch {
+        let manifest = episode_artifact_location(
+            "s3://robot-data/episodes/episode-1/manifest.json",
+            lake_common::EPISODE_MANIFEST_MEDIA_TYPE,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let recording = episode_artifact_location(
+            "s3://robot-data/episodes/episode-1/recording.rrd",
+            "application/vnd.rerun.rrd",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let episode = lake_common::EpisodeRecordV1::builder()
+            .episode_id("episode-1")
+            .manifest_artifact_id("manifest-1")
+            .robot_id("robot-7")
+            .task("pick-and-place")
+            .build();
+        let artifacts = vec![
+            lake_common::ArtifactRefV1::builder()
+                .episode_id("episode-1")
+                .artifact_id("manifest-1")
+                .layer_id("base")
+                .role("manifest")
+                .object(manifest)
+                .build(),
+            lake_common::ArtifactRefV1::builder()
+                .episode_id("episode-1")
+                .artifact_id("recording-1")
+                .layer_id("base")
+                .role("recording")
+                .recording_format("rrd")
+                .object(recording)
+                .build(),
+        ];
+        let bundle = lake_common::EpisodeBundleV1::try_new(episode, artifacts)
+            .expect("valid SDK Episode fixture");
+        episode_artifact_table_v1(&bundle).expect("Episode fixture encodes")
     }
 
     async fn setup_client_with_store<S>(

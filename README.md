@@ -153,6 +153,21 @@ let version = client
     .await?;
 ```
 
+Adapters that already produce a complete Arrow contract do not need to flatten
+it through the SQL binder. `append_batches` accepts exact-schema batches,
+validates 1..=10,000 aggregate rows against the table schema through Query, and
+uses the same durable idempotent append machinery. Because it carries existing
+`DataLocation` metadata rather than object bytes, it also works with a
+query-only client:
+
+```rust
+let client = LakeClient::connect_query_only("http://127.0.0.1:50051").await?;
+let batch = lake_objects::episode_artifact_table_v1(&episode_bundle)?;
+let version = client
+    .append_batches(&TableRef::new("robots", "episodes"), vec![batch])
+    .await?;
+```
+
 At connection time the SDK asks query for a versioned, credential-free managed
 stage descriptor. Query derives `tenants/<tenant-id>` below the configured local
 root or S3 prefix and returns only that child stage's location hints. The SDK

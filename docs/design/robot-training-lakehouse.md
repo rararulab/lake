@@ -375,7 +375,7 @@ explicitly.
   logical Artifact metadata to the Episode/ArtifactRef contract.
 - [x] Define the Episode/ArtifactRef v1 table contract and prove GC retains
   every multi-Artifact reference.
-- Add a generic typed Arrow append path rather than extending the narrow SQL
+- [x] Add a generic typed Arrow append path rather than extending the narrow SQL
   parser one scalar at a time.
 - Prove the format seam with at least two Adapters.
 

@@ -6,8 +6,10 @@ The Rust SDK's typed write and direct-read surface.
 
 - Object bytes go straight between this SDK and object storage, never through
   query or metadata Flight services.
-- SQL is a narrow parameterized `FILE` INSERT binding, not a second SQL engine.
-- Schema and parameter validation complete before the SDK begins an upload.
+- SQL is a narrow parameterized `FILE` INSERT binding, not a second SQL engine;
+  generic writes accept exact-schema Arrow batches without widening that parser.
+- Caller-local batch validation precedes schema RPCs, and authoritative schema
+  validation completes before upload or append `DoPut`.
 - A `DataLocation` row is appended only after every referenced object upload
   succeeds; per-table visibility remains owned by `Metasrv::append`.
 - Ambiguous append retries reuse one UUIDv7 identity, digest, and encoded Arrow
@@ -47,4 +49,4 @@ The Rust SDK's typed write and direct-read surface.
 
 ## Layout
 
-- `lib.rs` — public client, parameter values, SQL binding, and tests.
+- `lib.rs` — public client, Arrow append, parameter values, SQL binding, and tests.
