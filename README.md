@@ -21,13 +21,13 @@ mise run e2e
 `mise run e2e` creates a local table, ingests data, commits a snapshot, and
 runs a SQL query.
 
-## Architecture and supported data paths
+## Data paths: choose an authority
 
-The system has two deliberately separate table authorities. Native Lake tables
-are committed through Metasrv and stored as Lance datasets; Iceberg tables stay
-in their external REST catalog and are only read through Lake Query. In either
-case, large object bytes move directly to object storage rather than through
-the metadata authority.
+Each table has exactly one metadata and commit authority. Choose the native
+Lake path when Lake should own writes and table versions. Choose the Iceberg
+path only when an external Iceberg REST catalog already owns those concerns and
+Lake should scan it through SQL. In both paths, multi-gigabyte video/model
+bytes move directly to object storage; they never transit Metasrv.
 
 ```mermaid
 flowchart LR
@@ -40,10 +40,15 @@ flowchart LR
     query -->|"direct Parquet / manifest scan"| iceberg_data["Iceberg table files\nobject storage"]
 ```
 
-| Path | Metadata and commit authority | Large-object route | Write contract |
-|---|---|---|---|
-| Native `lake.<namespace>.<table>` | Lake Metasrv and its per-table version protocol | SDK and Query read/write object storage directly; table rows hold `DataLocation` metadata | Lake `FILE` appends are the typed write path |
-| Federated `iceberg.<namespace>.<table>` | External Iceberg REST catalog and Iceberg snapshot/commit protocol | Query reads Iceberg manifests and Parquet directly with its workload identity | Scan-only; Lake rejects Iceberg DDL/DML and never imports or commits Iceberg state |
+| Path | Choose it when | Metadata and commit authority | Large-object route | Write contract |
+|---|---|---|---|---|
+| Native `lake.<namespace>.<table>` | You need Lake-managed ingest, immutable table versions, and `FILE` rows for video/model artifacts. | Lake Metasrv and its per-table version protocol | SDK and Query read/write object storage directly; table rows hold `DataLocation` metadata. | Lake `FILE` appends are the typed write path. |
+| Federated `iceberg.<namespace>.<table>` | Another system already owns an Iceberg REST catalog and Lake only needs exact-snapshot SQL scans. | External Iceberg REST catalog and Iceberg snapshot/commit protocol | Query reads Iceberg manifests and Parquet directly with its workload identity. | Scan-only; Lake rejects Iceberg DDL/DML and never imports or commits Iceberg state. |
+
+The authority boundary is deliberately one-way: a native Lake table is not an
+Iceberg table with a different URI, and an Iceberg table is not copied into
+Metasrv. Use `FILE` for Lake-managed large-object ingest; use
+`iceberg.<namespace>.<table>` to read an external table that remains external.
 
 For the full invariant set and the rendered topology, read the
 [architecture guide](docs/architecture.md) and its

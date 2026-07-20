@@ -51,6 +51,18 @@ extra property explicit: Flight tickets pin the external snapshot selected at
 planning, but object bytes continue to travel directly between Query and the
 Iceberg table's object storage.
 
+### Pick the table authority before writing SQL
+
+| If you need | Address it as | Authority and byte path |
+|---|---|---|
+| Lake-owned writes, per-table versions, and video/model artifacts represented by `FILE` | `lake.<namespace>.<table>` | Metasrv coordinates the native table version; the SDK streams object bytes to or from the Lake-managed stage and stores only immutable `DataLocation` metadata in the row. |
+| SQL scans of an already-managed Iceberg table | `iceberg.<namespace>.<table>` | The external REST catalog owns snapshots, commits, and GC; Query pins one external snapshot and reads Parquet/manifests directly with its workload identity. |
+
+Neither choice crosses the authority boundary: Lake does not import or commit
+Iceberg state, and the Iceberg catalog does not become an alternate commit path
+for a native Lake table. In particular, neither Metasrv nor a Flight request
+proxies multi-gigabyte object bytes.
+
 ## Planned robot-training data model
 
 This section distinguishes implemented contracts from the target model. Today
