@@ -1,351 +1,258 @@
 # Verification report — issue #316
 
-- base_sha: 3729455699c7d9ed28b7b57263ab8abf5a283a50
-- head_sha: 7947d1c29a9ff1d52d9d1ae541a43b813aba972b
+- base_sha: `3729455699c7d9ed28b7b57263ab8abf5a283a50`
+- head_sha: `f2fd5ad379c01a111c893b631a04edfc718bc08b`
+- verification_carrier: `6ee3d754658f7d7d7a46180d14102a7bad5ca2da` (empty; parent is `head_sha`)
 - score_authority: verifier
 - implementer_evidence: self_check_only
 - lane: 1
 - spec: `specs/issue-316-typed-arrow-append.spec.md`
-- candidate_workspace: `/Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append`
-- candidate_revision_note: workspace `@` was empty carrier `8694924734d78bcdbf61c89730889d62c0bdf752`; every artifact/diff assertion was pinned to its exact parent repair commit `7947d1c29a9ff1d52d9d1ae541a43b813aba972b`. Plain Git HEAD was not used because it resolved to another colocated checkout.
-- context_isolation: the prompt disclosed only prior product/report commit identifiers, not their evidence. No implementer/reviewer hand-off or prior report content was read or trusted.
+
+The verifier did not read or rely on the implementer hand-off or the old/intermediate
+verification report. All candidate commands below ran from
+`.worktrees/issue-316-typed-arrow-append`; `jj diff --from f2fd5ad3 --to @`
+reported `0 files changed`, so the tested tree is the exact product head rather than
+plain Git HEAD from another checkout.
 
 ## Commands
 
-### Environment and revision pin
-
-`mise run doctor`
+### Environment and identity
 
 ```text
+$ mise run doctor
+[doctor] $ bun scripts/doctor.ts
 [ ok ] mise tools installed
 [ ok ] nightly rustfmt
 [ ok ] cargo check
-[ ok ] jj repo: /Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append
-[ ok ] gh authenticated
-[ ok ] git remote: origin
-```
+[ ok ] jj repo: /Users/ryan/code/rararulab/lake
 
-`jj st`
-
-```text
+$ jj st
 The working copy has no changes.
-Working copy  (@) : ppuyqrwz 86949247 (empty) (no description set)
-Parent commit (@-): zpnkkqkr 7947d1c2 fix(sdk): bound typed Arrow append encoding (#316)
+Working copy  (@) : soqplzwm 6ee3d754 (empty) (no description set)
+Parent commit (@-): kznsvwou f2fd5ad3 fix(sdk): preserve dictionary Arrow encoding (#316)
+
+$ jj diff --from f2fd5ad379c01a111c893b631a04edfc718bc08b --to @ --stat
+0 files changed, 0 insertions(+), 0 deletions(-)
+
+$ mise x -- cargo metadata --format-version 1 --no-deps | jq -r .target_directory
+/Users/ryan/Library/Caches/lake/target
 ```
 
-`jj log --no-graph -r '@|@-|7947d1c29a9ff1d52d9d1ae541a43b813aba972b|3729455699c7d9ed28b7b57263ab8abf5a283a50' -T 'commit_id ++ " " ++ change_id ++ " " ++ description.first_line() ++ "\n"'`
+The candidate shared target resolved to the documented project cache and was used only
+for the exact candidate tree. Freshness below refers to runtime data/state, not a needless
+dependency rebuild.
+
+### Fresh-data full gate and cold boot
+
+Before the gate, the workspace-local `data/` was removed. The gate then rebuilt runtime
+state and drove the real CLI path.
 
 ```text
-8694924734d78bcdbf61c89730889d62c0bdf752 ppuyqrwzyquprvrskuxmzutvusqlwkpt
-7947d1c29a9ff1d52d9d1ae541a43b813aba972b zpnkkqkrsynvvrkpvttzzrqlzsqxyqtu fix(sdk): bound typed Arrow append encoding (#316)
-3729455699c7d9ed28b7b57263ab8abf5a283a50 zpunyvupkmuymuntvlpmlmyvosqolwqq fix(release): schedule Release Please recovery (#313) (#317)
-```
+$ rm -rf -- /Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append/data
+$ mise run gate
+[e2e] $ cargo run -p lake-cli -- selftest
+[test] $ cargo test --workspace --all-targets
+[hooks] $ prek run --all-files
+[test-adbc] $ cargo test -p lake-query --test adbc_interop -- --ignored --test-threads=1
+[site-check] $ bun run --cwd site check
 
-`git merge-base 7947d1c29a9ff1d52d9d1ae541a43b813aba972b origin/main`
-
-```text
-3729455699c7d9ed28b7b57263ab8abf5a283a50
-```
-
-### Candidate quality gate
-
-An initial attempt to set `CARGO_TARGET_DIR` outside `mise` was explicitly disqualified because project `[env]` overrode it; its raw executable path exposed the mistake:
-
-`CARGO_TARGET_DIR=/tmp/lake-verify-316-candidate-target.1C33ii mise run gate`
-
-```text
-[e2e]      Running `/Users/ryan/Library/Caches/lake/target/debug/lake selftest`
-Finished in 35.16s
-```
-
-No base build ever used that shared target. A temporary `cargo` wrapper was then verified with `cargo metadata` to force the isolated target for every nested `mise` cargo invocation.
-
-Cold-build candidate run from an empty isolated target:
-
-`LAKE_VERIFY_TARGET=/tmp/lake-verify-316-candidate-target.1C33ii PATH=/tmp/lake-verify-316-bin:$PATH mise run gate`
-
-```text
-[test-adbc] test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 2.59s
-[test] running 72 tests
-[test] test result: ok. 69 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 11.64s
-[test] Finished in 379.80s
-Finished in 379.81s
-```
-
-That run proved a cold, isolated build but inherited data created by the disqualified attempt, so its e2e result was not counted as cold-boot evidence. The complete gate was rerun after deleting the workspace data directory:
-
-`rm -rf /Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append/data && test ! -e /Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append/data && LAKE_VERIFY_TARGET=/tmp/lake-verify-316-candidate-target.1C33ii PATH=/tmp/lake-verify-316-bin:$PATH mise run gate`
-
-```text
+[hooks] Finished in 66.6ms
+[test-adbc] test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.66s
 [site-check] Result (24 files):
 [site-check] - 0 errors
 [site-check] - 0 warnings
 [site-check] - 0 hints
 [site-check] All matched files use Prettier code style!
-[site-check] Checked 8 generated site artifacts.
-[test-adbc] test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.74s
+[site-check] 90 page(s) built in 3.09s
+[site-check] Tests:        107 passed, 107 total
+
 [e2e] created table robots.episodes
 [e2e] committed robots.episodes at v2
+[e2e] +----------+----------+------------+
+[e2e] | robot_id | episodes | avg_reward |
+[e2e] +----------+----------+------------+
 [e2e] | alpha    | 2        | 0.8        |
 [e2e] | beta     | 1        | 0.4        |
+[e2e] +----------+----------+------------+
 [e2e] self-check ok
-[test] running 72 tests
-[test] test result: ok. 69 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 11.59s
-[test] Finished in 34.40s
-Finished in 34.41s
+
+[test] Running unittests src/lib.rs (.../lake_sdk-1e4363291a75de51)
+[test] running 73 tests
+[test] test append_checkpoint::tests::durable_checkpoint_accepts_maximum_typed_append_partition ... ok
+[test] test tests::sdk_typed_arrow_append_preserves_dictionary_encoding ... ok
+[test] test tests::sdk_typed_arrow_append_rejects_unbounded_inputs_before_schema_rpc ... ok
+[test] test tests::sdk_typed_arrow_append_stops_encoding_at_payload_limit ... ok
+[test] test tests::sdk_typed_arrow_append_checkpoint_partition_boundary_is_consistent ... ok
+[test] test tests::sdk_typed_arrow_append_rejects_invalid_batches_before_put ... ok
+[test] test tests::sdk_typed_arrow_append_commits_episode_artifact_bundle ... ok
+[test] test tests::sdk_typed_arrow_append_reuses_durable_idempotent_transport ... ok
+[test] test result: ok. 70 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 11.73s
+Finished in 36.04s
+exit: 0
 ```
 
-All other `cargo test --workspace --all-targets` result lines in the same gate were `ok` with zero failures.
+The macOS linker emitted its existing `__eh_frame section too large` warning; it did not
+change command status and direct clippy with `-D warnings` remained clean.
 
-### Direct formatting and lint
-
-`LAKE_VERIFY_TARGET=/tmp/lake-verify-316-candidate-target.1C33ii PATH=/tmp/lake-verify-316-bin:$PATH cargo +nightly fmt --all -- --check`
+### Direct Rust checks
 
 ```text
-exit 0; no stdout/stderr
+$ cargo +nightly fmt --all -- --check
+exit: 0
+
+$ cargo clippy -p lake-sdk --all-targets --all-features --no-deps -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.66s
+exit: 0
 ```
 
-`LAKE_VERIFY_TARGET=/tmp/lake-verify-316-candidate-target.1C33ii PATH=/tmp/lake-verify-316-bin:$PATH cargo clippy -p lake-sdk --all-targets --all-features --no-deps -- -D warnings`
+### Lane-1 lifecycle and zero-match guard
 
 ```text
-    Checking lake-sdk v1.8.4 (/Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append/crates/lake-sdk)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 08s
-```
-
-### Lane 1 lifecycle and selectors
-
-`LAKE_VERIFY_TARGET=/tmp/lake-verify-316-candidate-target.1C33ii PATH=/tmp/lake-verify-316-bin:$PATH mise run spec-lifecycle specs/issue-316-typed-arrow-append.spec.md`
-
-```text
+$ mise run spec-lifecycle specs/issue-316-typed-arrow-append.spec.md
+[spec-lifecycle] $ bun scripts/spec-lifecycle-guard.ts "${usage_spec?}"
 === Lifecycle Report (guarded) ===
 Spec: typed-arrow-append  stage: complete  passed: true
   [PASS] Episode and ArtifactRef rows append through a Query-only SDK
   [PASS] invalid Arrow input fails before append side effects
   [PASS] Arrow input memory and batch fan-out are bounded before schema lookup
   [PASS] encoded Flight collection stops at the exact payload ceiling
+  [PASS] compact Dictionary input preserves its exact Flight schema
   [PASS] an ambiguous Arrow append converges without a duplicate commit
   [PASS] checkpointing accepts the same maximum batch partition as memory-only preparation
+  [PASS] checkpoint framing accepts the exact dictionary-aware message ceiling
 spec-lifecycle-guard: OK — every Test selector executed >=1 test
+exit: 0
 ```
 
-Each acceptance selector was then run directly:
-
-`cargo test -p lake-sdk sdk_typed_arrow_append_commits_episode_artifact_bundle`
+Each selector was also run directly; every command selected exactly one real test.
 
 ```text
+$ cargo test -p lake-sdk sdk_typed_arrow_append_commits_episode_artifact_bundle
 running 1 test
 test tests::sdk_typed_arrow_append_commits_episode_artifact_bundle ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.35s
-```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 72 filtered out
 
-`cargo test -p lake-sdk sdk_typed_arrow_append_rejects_invalid_batches_before_put`
-
-```text
+$ cargo test -p lake-sdk sdk_typed_arrow_append_rejects_invalid_batches_before_put
 running 1 test
 test tests::sdk_typed_arrow_append_rejects_invalid_batches_before_put ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.32s
-```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 72 filtered out
 
-`cargo test -p lake-sdk sdk_typed_arrow_append_rejects_unbounded_inputs_before_schema_rpc`
-
-```text
+$ cargo test -p lake-sdk sdk_typed_arrow_append_rejects_unbounded_inputs_before_schema_rpc
 running 1 test
 test tests::sdk_typed_arrow_append_rejects_unbounded_inputs_before_schema_rpc ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.00s
-```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 72 filtered out
 
-`cargo test -p lake-sdk sdk_typed_arrow_append_stops_encoding_at_payload_limit`
-
-```text
+$ cargo test -p lake-sdk sdk_typed_arrow_append_stops_encoding_at_payload_limit
 running 1 test
 test tests::sdk_typed_arrow_append_stops_encoding_at_payload_limit ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.00s
-```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 72 filtered out
 
-`cargo test -p lake-sdk sdk_typed_arrow_append_reuses_durable_idempotent_transport`
+$ cargo test -p lake-sdk sdk_typed_arrow_append_preserves_dictionary_encoding
+running 1 test
+test tests::sdk_typed_arrow_append_preserves_dictionary_encoding ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 72 filtered out
 
-```text
+$ cargo test -p lake-sdk sdk_typed_arrow_append_reuses_durable_idempotent_transport
 running 1 test
 test tests::sdk_typed_arrow_append_reuses_durable_idempotent_transport ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.47s
-```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 72 filtered out
 
-`cargo test -p lake-sdk sdk_typed_arrow_append_checkpoint_partition_boundary_is_consistent`
-
-```text
+$ cargo test -p lake-sdk sdk_typed_arrow_append_checkpoint_partition_boundary_is_consistent
 running 1 test
 test tests::sdk_typed_arrow_append_checkpoint_partition_boundary_is_consistent ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.14s
-```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 72 filtered out
 
-### Fresh boot
-
-`rm -rf /Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append/data && test ! -e /Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append/data && LAKE_VERIFY_TARGET=/tmp/lake-verify-316-candidate-target.1C33ii PATH=/tmp/lake-verify-316-bin:$PATH cargo run -p lake-cli -- selftest`
-
-```text
-created table robots.episodes
-committed robots.episodes at v2
-+----------+----------+------------+
-| robot_id | episodes | avg_reward |
-+----------+----------+------------+
-| alpha    | 2        | 0.8        |
-| beta     | 1        | 0.4        |
-+----------+----------+------------+
-self-check ok
-```
-
-### Additional candidate regressions
-
-`cargo test -p lake-sdk durable_checkpoint_accepts_maximum_typed_append_partition`
-
-```text
+$ cargo test -p lake-sdk durable_checkpoint_accepts_maximum_typed_append_partition
 running 1 test
 test append_checkpoint::tests::durable_checkpoint_accepts_maximum_typed_append_partition ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.09s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 72 filtered out
 ```
 
-`cargo test -p lake-sdk sdk_batch_insert`
+### Fixed-base transition
 
-```text
-running 4 tests
-test tests::sdk_batch_insert_flight_bound_uses_protobuf_size ... ok
-test tests::sdk_batch_insert_rejects_empty_and_excessive_batches ... ok
-test tests::sdk_batch_insert_validates_every_row_before_upload ... ok
-test tests::sdk_batch_insert_commits_multiple_files_as_one_version ... ok
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 68 filtered out; finished in 0.68s
-```
-
-### Throwaway public-API hostile driver
-
-The uncommitted driver lived only under `/tmp`, depended on the exact candidate workspace, and was removed after execution.
-
-`cargo run --manifest-path /tmp/lake-verify-316-probe/Cargo.toml`
-
-```text
-single zero-row batch: typed EmptyBatch(index=0), schema_rpcs=0
-one row + 9999 zero-row batches: typed EmptyBatch(index=1), schema_rpcs=0
->64MiB Binary buffer: typed BatchInputSize, schema_rpcs=0
->64MiB Utf8 buffer: typed BatchInputSize, schema_rpcs=0
-one-row lower boundary: committed v2
-CJK multi-batch append: committed two batches atomically at v3
-10000-row upper boundary: committed v4
-schema metadata mismatch: typed TableSchemaMismatch, version remains v4
-shared insert/insert_many + SQL reload: v6, 10006 exact rows, CJK preserved
-all issue-316 throwaway hostile probes passed
-```
-
-### Exact-base transition
-
-Temporary base workspace: `/tmp/lake-verify-316-base.Si93eZ/ws`, empty `@` with exact parent `3729455699c7d9ed28b7b57263ab8abf5a283a50`. All Cargo invocations used the initially empty, base-only target `/tmp/lake-verify-316-base-target.N8qsdk`; the candidate/shared target was never used.
-
-Each of the six direct selector commands was run at exact base. Their identical result was:
+The fixed base was checked in an isolated workspace/target, never against the candidate's
+shared cache. The actual `cargo metadata` target was verified as isolated. At
+`3729455699c7d9ed28b7b57263ab8abf5a283a50`, all eight exact filters reported:
 
 ```text
 running 0 tests
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 65 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; filtered out
 ```
 
-The six commands were:
+The guarded lifecycle therefore failed closed on all eight selectors:
 
 ```text
-cargo test -p lake-sdk sdk_typed_arrow_append_commits_episode_artifact_bundle
-cargo test -p lake-sdk sdk_typed_arrow_append_rejects_invalid_batches_before_put
-cargo test -p lake-sdk sdk_typed_arrow_append_rejects_unbounded_inputs_before_schema_rpc
-cargo test -p lake-sdk sdk_typed_arrow_append_stops_encoding_at_payload_limit
-cargo test -p lake-sdk sdk_typed_arrow_append_reuses_durable_idempotent_transport
-cargo test -p lake-sdk sdk_typed_arrow_append_checkpoint_partition_boundary_is_consistent
-```
-
-The candidate guard/spec was then driven against exact-base code with absolute `bun` and `agent-spec` paths:
-
-`bun scripts/spec-lifecycle-guard.ts specs/issue-316-typed-arrow-append.spec.md` (candidate guard/spec, `--code .` resolving the base workspace)
-
-```text
-=== Lifecycle Report (guarded) ===
-Spec: typed-arrow-append  stage: complete  passed: true
-  [PASS] Episode and ArtifactRef rows append through a Query-only SDK
-  [PASS] invalid Arrow input fails before append side effects
-  [PASS] Arrow input memory and batch fan-out are bounded before schema lookup
-  [PASS] encoded Flight collection stops at the exact payload ceiling
-  [PASS] an ambiguous Arrow append converges without a duplicate commit
-  [PASS] checkpointing accepts the same maximum batch partition as memory-only preparation
-
 spec-lifecycle-guard: FAIL — Test selector(s) matched ZERO tests (0 passed; filtered out):
-  - Episode and ArtifactRef rows append through a Query-only SDK
-  - invalid Arrow input fails before append side effects
-  - Arrow input memory and batch fan-out are bounded before schema lookup
-  - encoded Flight collection stops at the exact payload ceiling
-  - an ambiguous Arrow append converges without a duplicate commit
-  - checkpointing accepts the same maximum batch partition as memory-only preparation
 Every lane-1 Test: selector must resolve to >=1 real test function — see specs/README.md.
+exit: 1
 ```
 
-Exit status: 1, expected rejection.
-
-`cargo test -p lake-sdk` at exact base:
-
-```text
-running 65 tests
-test result: ok. 62 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 11.73s
-```
-
-The exact base already had a committed verifier artifact at `14356d08badd9c035cbe898ec0c88649620ec9c6`; its contents were not read. Per the role contract and repair instructions, the full base gate was not redundantly rerun. The affected crate's complete old suite and all six guarded transitions were rerun independently.
+No base workspace, base target, probe workspace, probe target, or generated `data/`
+remained after verification. In particular, the isolated work did not write
+`/Users/ryan/Library/Caches/lake/target`.
 
 ## Transition matrix
 
-- fail_to_pass:
-  - Base: every one of the six spec selectors matched zero tests; the guard rejected all six with exit 1.
-  - Repair head: every selector executed exactly one test and passed; the guarded lifecycle reported six PASS results and `spec-lifecycle-guard: OK`.
-  - Expected vs observed: expected the new public typed append, local input bounds, incremental encoded bound, durable retry, and checkpoint partition behavior to be absent at base and present at repair; observed exactly that transition.
-- pass_to_fail: 0.
-  - Exact base `lake-sdk`: 62 passed, 0 failed, 3 ignored.
-  - Repair `lake-sdk`: 69 passed, 0 failed, 3 ignored.
-  - Repair full workspace gate: zero failures; direct fmt and clippy: exit 0.
+- fail_to_pass: 8/8 required selectors changed from zero-match at fixed base (and guarded
+  lifecycle rejection) to one executed passing test each at product head; guarded lifecycle
+  changed from FAIL to `stage: complete  passed: true`.
+- pass_to_fail: 0. The fresh candidate gate passed the complete pre-existing workspace suite,
+  ADBC interoperability suite, site checks, and real e2e self-check. Scalar `insert` and
+  `insert_many` coverage remained green inside the 70-passing `lake-sdk` suite.
 
 ## Probes
 
-1. Single and fan-out zero-row batches before schema RPC
-   - Input: one zero-row batch; then one valid row followed by 9,999 zero-row batches.
-   - Expected: typed `EmptyBatch`, no schema RPC, no Flight encoding/put.
-   - Observed: `EmptyBatch(index=0)` and `EmptyBatch(index=1)` respectively; schema RPC counter stayed 0.
-   - PASS.
+### Compact hostile Dictionary wire
 
-2. Oversized caller buffers before schema RPC/Flight encoding
-   - Input: one-row Binary and Utf8 batches whose Arrow buffer memory exceeded 64 MiB.
-   - Expected: typed `BatchInputSize`, schema RPC counter 0.
-   - Observed: both returned `BatchInputSize`; schema RPC counter stayed 0.
-   - PASS.
+- Input: 10,000 `Int32` keys all reference one CJK UTF-8 dictionary value of approximately
+  8 KiB (`字` repeated); physical Arrow buffers are below 64 MiB, while hydration would be
+  `8,190 * 10,000 = 81,900,000` bytes, above 64 MiB.
+- Expected: `DictionaryHandling::Resend`; compact schema/dictionary/record messages; decoded
+  schema and `RecordBatch` exactly equal the input.
+- Observed: `sdk_typed_arrow_append_preserves_dictionary_encoding` passed. The test asserts
+  physical input `< 64 MiB`, hypothetical hydrated bytes `> 64 MiB`, successful bounded
+  encoding, exact decoded Dictionary schema, and exact decoded batch. Source inspection pins
+  the encoder to `DictionaryHandling::Resend`; the bounded collector accounts protobuf
+  `encoded_len()` incrementally. PASS.
 
-3. Incremental Flight collection
-   - Input: three-message observable stream, with the second message crossing the exact protobuf-size ceiling.
-   - Expected: reject on message two and never poll message three.
-   - Observed: direct selector passed its `polled == 2` assertion.
-   - PASS.
+### Dictionary-node and message-count boundaries
 
-4. Memory/durable framing parity
-   - Input: schema + 4,096 record messages with checkpointing off/on; separately the derived maximum 10,001 messages.
-   - Expected: both modes accept, durable reload byte-for-byte exact, maximum framing accepted.
-   - Observed: spec selector and 10,001-message checkpoint regression both passed.
-   - PASS.
+- Input: 17 top-level Dictionary fields with an unreachable schema endpoint; recursive nested
+  Dictionary shapes; boundary of 16 nodes.
+- Expected: 17 rejects as typed `BatchDictionaryCount { actual: 17, maximum: 16 }` before schema
+  RPC; 16 is accepted by local validation.
+- Observed: the hostile selector passed with the unreachable endpoint and exact 17/16 typed
+  error. Inspection of the exercised validator shows a bounded explicit traversal through
+  List/ListView/FixedSizeList/LargeList/LargeListView/Map/Struct/Union/Dictionary/
+  RunEndEncoded nodes and rejects only when `dictionaries > 16`, so nested 17 rejects and exact
+  16 remains admissible before RPC. PASS.
 
-5. Public runtime boundaries and exact schema
-   - Input: 1 row, two CJK batches, 10,000 rows, then identical fields with mismatched schema metadata.
-   - Expected: valid boundaries commit atomically; CJK survives; metadata mismatch is typed and publishes nothing.
-   - Observed: versions advanced v2, v3, v4; mismatch returned `TableSchemaMismatch` and stayed v4; SQL reload preserved CJK.
-   - PASS.
+- Formula: `1 + 10,000 * (1 + 16) = 170,001` Flight messages.
+- Checkpoint framing: `4 + 170,001 * 4 = 680,008` bytes, below the 1 MiB overhead budget.
+- Observed: `durable_checkpoint_accepts_maximum_typed_append_partition` saved and loaded all
+  170,001 messages byte-for-byte. Both checkpoint encode and decode reject counts greater than
+  `MAX_APPEND_FLIGHT_MESSAGES`; the bounded Flight collector applies the same maximum. PASS.
 
-6. Durable ambiguity and shared scalar append path
-   - Input: lost first typed append result; then public `insert` and `insert_many` after typed batches.
-   - Expected: retry reuses one durable identity and commits once; shared legacy path remains functional.
-   - Observed: ambiguous selector retried twice and ended at one v2 commit with checkpoint removed; throwaway runtime advanced scalar writes to v6 and reloaded exactly 10,006 rows; `sdk_batch_insert` was 4/4.
-   - PASS.
+### Remaining hostile corpus and regressions
 
-## Cleanup
-
-- Temporary base workspace was forgotten with `jj workspace forget verify-316-base-Si93eZ`.
-- Temporary base workspace, base target, candidate target, throwaway probe, cargo wrapper, and candidate `data/` were removed.
-- No temporary base Cargo command used `/Users/ryan/Library/Caches/lake/target`.
+- Empty input and a later zero-row batch: typed reject; selector passed before schema RPC.
+- One-row and exact 10,000-row boundaries: accepted; exact 10,000-row CJK Dictionary probe
+  encoded/decoded, while ordinary one-row append coverage passed in the SDK suite.
+- `Binary`/`Utf8` physical buffer over 64 MiB: the generic per-array
+  `get_buffer_memory_size()` saturating sum rejects before schema lookup; the >64 MiB Binary
+  reproducer passed and the same type-independent guard covers Utf8.
+- Encoded overflow: second message rejected and observable third message was never polled
+  (`polled == 2`); selector passed.
+- Partition parity: 4,096 one-row batches encoded to 4,097 messages; memory-only and durable
+  preparation both succeeded and reload was byte-for-byte exact.
+- Schema metadata mismatch: exact `Schema` equality (including metadata) rejects before DoPut;
+  schema-mismatch/table-mismatch selector passed without publication.
+- Ambiguous retry: same operation identity, digest, payload, and checkpoint reused; two attempts
+  converged on version 2, one commit, then removed the checkpoint.
+- Episode/ArtifactRef e2e: Query-only public `append_batches` committed one version and public SQL
+  read back exactly one Episode plus every ArtifactRef.
+- Scalar `insert`/`insert_many`: full SDK/gate regression suite remained green. PASS.
 
 ## Verdict
 
-PASS — exact repair head `7947d1c29a9ff1d52d9d1ae541a43b813aba972b` passes the isolated full gate, six guarded Lane 1 criteria, fresh boot, hostile bounds/reload probes, and exact-base fail-to-pass transition with `pass_to_fail = 0`.
+PASS — exact product head `f2fd5ad379c01a111c893b631a04edfc718bc08b` passes the fresh full gate, direct Rust checks, all 8 guarded lane-1 criteria, cold-boot write/read path, hostile Dictionary and bound checks, with `pass_to_fail = 0`.
