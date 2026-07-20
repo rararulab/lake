@@ -20,6 +20,9 @@
 //! dependencies, so every crate can depend on `lake-common` freely.
 
 mod data_location;
+mod episode_manifest;
+#[cfg(test)]
+mod episode_manifest_tests;
 mod file_write;
 mod ids;
 mod location;
@@ -29,6 +32,11 @@ mod principal;
 mod robotics;
 
 pub use data_location::DataLocation;
+pub use episode_manifest::{
+    EPISODE_MANIFEST_FORMAT_VERSION, EPISODE_MANIFEST_MEDIA_TYPE, EpisodeManifestDraftV1,
+    EpisodeManifestError, EpisodeManifestV1, EpisodeSummaryV1, LayerKindV1, LayerV1,
+    ManifestArtifactBindingV1, RecordingV1, StreamV1, TimelineKindV1, TimelineV1,
+};
 pub use file_write::{
     AppendOperation, AppendOperationId, AppendPayloadDigest, FILE_APPEND_TYPE_URL,
     FileAppendRequest,
