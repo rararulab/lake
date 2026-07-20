@@ -73,12 +73,12 @@ fn release_artifact_contract_uses_invocation_workspace() {
 }
 
 #[test]
-fn mise_target_directory_is_workspace_isolated() {
+fn mise_target_directory_is_shared_across_jj_workspaces() {
     let target_dir = toml_string(&read("mise.toml"), "CARGO_TARGET_DIR")
         .expect("mise must configure CARGO_TARGET_DIR");
     assert_eq!(
-        target_dir, "{{xdg_cache_home}}/lake/target/{{config_root | hash}}",
-        "the shared Cargo cache must use an immutable workspace-specific target directory"
+        target_dir, "{{xdg_cache_home}}/lake/target",
+        "all Jujutsu workspaces must reuse the repository Cargo cache rather than retain one build tree per checkout"
     );
 }
 
