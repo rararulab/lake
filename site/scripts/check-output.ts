@@ -32,8 +32,8 @@ const icebergFederation = readFileSync(
 );
 
 for (const text of [
-  "The lakehouse for embodied AI",
-  "Design targets",
+  "An open-source lakehouse for embodied-AI data",
+  "robot-training direction",
   "Documentation",
 ]) {
   if (!home.includes(text)) throw new Error(`Landing page is missing: ${text}`);

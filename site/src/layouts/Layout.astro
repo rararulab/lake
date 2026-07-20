@@ -1,4 +1,5 @@
 ---
+import { Font } from "astro:assets";
 import config from "@/config";
 import { withBase } from "@/utils/withBase";
 import "@/styles/global.css";
@@ -29,7 +30,11 @@ const socialImageURL = new URL(withBase("default-og.svg"), Astro.site ?? Astro.u
     <link rel="canonical" href={canonicalURL} />
     <link rel="sitemap" href={withBase("sitemap-index.xml")} />
     <meta name="generator" content={Astro.generator} />
-    <meta name="theme-color" content="#151512" />
+    <meta name="theme-color" content="" />
+    <Font
+      cssVariable="--font-google-sans-code"
+      preload={[{ subset: "latin", weight: 400, style: "normal" }]}
+    />
     <title>{pageTitle}</title>
     <meta name="description" content={description} />
     <meta name="author" content={config.site.author} />
@@ -51,11 +56,13 @@ const socialImageURL = new URL(withBase("default-og.svg"), Astro.site ?? Astro.u
           stored === "light" || stored === "dark" ? stored : dark ? "dark" : "light";
         document.documentElement.dataset.theme = theme;
         document.documentElement.classList.toggle("dark", theme === "dark");
-        window.__lakeTheme = theme;
+        window.__theme = { value: theme };
       })();
     </script>
   </head>
-  <body class="flex min-h-[100dvh] flex-col">
+  <body
+    class="bg-background font-app text-foreground selection:bg-accent/75 selection:text-accent-foreground flex min-h-svh flex-col"
+  >
     <slot />
     <script>
       import "@/scripts/theme";

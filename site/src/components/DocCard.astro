@@ -1,0 +1,26 @@
+---
+import type { DocEntry } from "@/utils/docs";
+import { getDocTitle, getDocUrl } from "@/utils/docs";
+
+interface Props {
+  entry: DocEntry;
+  description?: string;
+  heading?: "h2" | "h3";
+}
+
+const {
+  entry,
+  description = entry.data.description,
+  heading: Heading = "h3",
+} = Astro.props;
+---
+
+<li class="my-6 list-none">
+  <a
+    href={getDocUrl(entry)}
+    class="text-accent inline-block text-lg font-medium decoration-dashed underline-offset-4 hover:underline focus-visible:no-underline focus-visible:underline-offset-0"
+  >
+    <Heading>{getDocTitle(entry)}</Heading>
+  </a>
+  {description && <p class="mt-1">{description}</p>}
+</li>

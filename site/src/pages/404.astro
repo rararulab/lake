@@ -7,19 +7,15 @@ import { withBase } from "@/utils/withBase";
 
 <Layout title="Page not found">
   <Header />
-  <main
-    id="main-content"
-    class="content-shell grid flex-1 place-items-center py-20 text-center"
-  >
-    <div>
-      <p class="text-accent font-code text-8xl font-semibold tracking-[-0.08em]">404</p>
-      <h1 class="mt-5 text-3xl font-semibold">Page not found</h1>
-      <p class="text-muted-foreground mt-3">
-        The route does not exist in this static build.
-      </p>
+  <main id="main-content" class="app-layout flex flex-1 items-center justify-center">
+    <div class="mb-14 flex flex-col items-center justify-center text-center">
+      <h1 class="text-accent text-9xl font-bold">404</h1>
+      <span aria-hidden="true">¯\_(ツ)_/¯</span>
+      <p class="mt-4 text-2xl sm:text-3xl">Page not found</p>
+      <p class="mt-2">The route does not exist in this static build.</p>
       <a
         href={withBase("")}
-        class="decoration-accent hover:text-accent mt-8 inline-flex rounded font-semibold underline decoration-dashed underline-offset-8"
+        class="hover:text-accent my-6 text-lg underline decoration-dashed underline-offset-8"
       >
         Return home
       </a>

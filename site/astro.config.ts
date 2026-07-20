@@ -4,7 +4,7 @@ import sitemap from "@astrojs/sitemap";
 import tailwindcss from "@tailwindcss/vite";
 import { cp } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { defineConfig } from "astro/config";
+import { defineConfig, fontProviders } from "astro/config";
 import rehypeCallouts from "rehype-callouts";
 import remarkToc from "remark-toc";
 import config from "./astro-paper.config";
@@ -57,4 +57,15 @@ export default defineConfig({
   // copies resolve to 7.3.6. Their runtime contracts match, while TypeScript
   // treats Vite's private plugin-container types as nominally distinct.
   vite: { plugins: [tailwindcss() as never] },
+  fonts: [
+    {
+      name: "Google Sans Code",
+      cssVariable: "--font-google-sans-code",
+      provider: fontProviders.google(),
+      fallbacks: ["monospace"],
+      weights: [300, 400, 500, 600, 700],
+      styles: ["normal", "italic"],
+      formats: ["woff", "ttf"],
+    },
+  ],
 });
