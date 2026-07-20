@@ -7,9 +7,11 @@ is implemented today. `goal.md` remains the north star and
 
 ## Problem
 
-Lake already stores immutable multimodal files and SQL metadata, but it does not
-yet define what an Episode or training dataset means. That omission becomes an
-observable compatibility bug as soon as two importers exist.
+Lake stores immutable multimodal files and SQL metadata and now has a canonical
+Episode manifest plus a shared bounded RRD/MCAP metadata-adapter seam. The
+remaining compatibility risk is wiring those contracts into ingestion,
+revision selection, and training reads without letting either format become the
+catalog authority.
 
 Reproducer:
 
@@ -19,10 +21,10 @@ Reproducer:
    or table row, and whether Lake or an external catalog owns membership.
 3. Query both through a future training reader.
 
-Both importers can satisfy the current immutable `DataLocation` rules while
-producing datasets that cannot share selection, revisions, splits, layers, or
-provenance. The format integration therefore needs a shared domain contract
-before it needs format parsers.
+Without the shared seam, both importers could satisfy immutable `DataLocation`
+rules while producing datasets that cannot share selection, revisions, splits,
+layers, or provenance. `lake-adapters` now closes the metadata-contract part of
+that gap; upload/commit and TrainingView workflows remain separate slices.
 
 ## Product outcome
 
@@ -232,6 +234,12 @@ entire Artifact. Footers are optional: the Adapter must detect their absence
 and fall back to a linear scan rather than promise a partial read. See the
 [RRD format](https://rerun.io/docs/concepts/logging-and-ingestion/rrd-format).
 
+Implemented status: `lake-adapters::RrdAdapter` validates the public Rerun
+header/footer/protobuf contracts, reads only indexed metadata when the footer is
+present, and drives `DecoderApp` over a caller-capped full-file fallback when it
+is absent. Exact byte and request budgets are charged before source I/O; corrupt
+present footer spans, checksums, or payloads fail closed.
+
 The Adapter records the producer version because Viewer compatibility tracks
 the RRD version. It extracts only Episode-level searchable properties into Lake;
 detailed chunk metadata remains in the RRD footer or an immutable sidecar.
@@ -248,6 +256,12 @@ schema, time-range, and attachment summaries. Rerun-compatible views may be
 materialized without replacing the original bytes. MCAP has a published format
 specification and conformant libraries for Rust, Python, C++, and other
 languages; see the [MCAP specification](https://mcap.dev/spec).
+
+Implemented status: `lake-adapters::McapAdapter` drives MCAP's sans-I/O Header
+and Summary readers against the same bounded range source. Summary-less files
+use a caller-capped linear reader with record/decompressed-size limits and CRC
+validation. Topic/schema/codec, producer, time range, and message counts map to
+the same canonical Lake manifest kernel used by RRD.
 
 ### LeRobot
 
@@ -377,11 +391,13 @@ explicitly.
   every multi-Artifact reference.
 - [x] Add a generic typed Arrow append path rather than extending the narrow SQL
   parser one scalar at a time.
-- Prove the format seam with at least two Adapters.
+- [x] Prove the format seam with bounded RRD and MCAP Adapters returning the
+  exact `EpisodeManifestV1` public contract.
 
 ### 1. Inspectable Episodes
 
-- Extract RRD and second-format metadata at ingest.
+- [x] Extract RRD and MCAP metadata into canonical Episode manifests with
+  indexed reads and finite fallbacks. Upload/append wiring remains planned.
 - Add a read-only Python client for Flight SQL, `DataLocation`, and range reads.
 - Open authorized RRD Artifacts in a version-matched Rerun Viewer.
 

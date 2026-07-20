@@ -1,0 +1,32 @@
+[package]
+name = "lake-adapters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Bounded robot-recording metadata adapters for Lake"
+
+[dependencies]
+async-trait = { workspace = true }
+bon = { workspace = true }
+bytes = { workspace = true }
+lake-common = { workspace = true }
+mcap = { workspace = true }
+re_chunk = { workspace = true }
+re_log_encoding = { workspace = true }
+re_log_types = { workspace = true }
+re_protos = { workspace = true }
+re_sorbet = { workspace = true }
+sha2 = { workspace = true }
+snafu = { workspace = true }
+
+[dev-dependencies]
+re_log_encoding = { workspace = true, features = ["encoder"] }
+re_sdk_types = { workspace = true }
+tempfile = "^3.27"
+tokio = { workspace = true }
+
+[lints]
+workspace = true
