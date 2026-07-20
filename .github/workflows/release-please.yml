@@ -3,8 +3,11 @@ name: Release Please
 on:
   push:
     branches: [main]
-  # Recovery path for a delayed or missed push event. Release Please remains
-  # the sole writer of release PRs, manifests, tags, and GitHub Releases.
+  # Reconciles a transient GitHub API/Actions failure through the same
+  # idempotent release authority, without a second release writer.
+  schedule:
+    - cron: "17 * * * *"
+  # Immediate operator recovery for a delayed or missed push event.
   workflow_dispatch:
 
 concurrency:
