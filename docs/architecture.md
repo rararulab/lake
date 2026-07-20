@@ -662,8 +662,10 @@ design-level ones:
   batches. It rejects zero-row, inconsistent, oversized-buffer, or
   authoritative-table-schema-mismatched input before `DoPut`; exact protobuf
   sizes are accumulated incrementally and stop at the 64 MiB Flight ceiling.
-  At most 10,001 messages (one schema plus one hydrated record message per row)
-  enter either the memory-only or durable checkpoint path. Both reuse the same
+  At most 16 nested Dictionary nodes are resent without hydration, preserving
+  compact values and the exact schema. A conservative 170,001-message ceiling
+  (one schema plus 10,000 rows times one record and 16 dictionaries) bounds both
+  the encoder queue and durable checkpoint framing. Both paths reuse the same
   UUIDv7 identity, digest, and ambiguous-result retry machinery as scalar/`FILE`
   inserts. Query-only clients can use this path because existing `DataLocation`
   values are metadata; no object discovery, upload, or byte proxy occurs.

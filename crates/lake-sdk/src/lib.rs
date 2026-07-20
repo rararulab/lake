@@ -35,7 +35,7 @@ use arrow::{
 use arrow_flight::{
     Action, CancelFlightInfoRequest, CancelStatus, FlightClient, FlightData, FlightDescriptor,
     FlightInfo, PollInfo, PutResult, Ticket,
-    encode::FlightDataEncoderBuilder,
+    encode::{DictionaryHandling, FlightDataEncoderBuilder},
     error::FlightError,
     sql::{CommandStatementQuery, ProstMessageExt, client::FlightSqlServiceClient},
 };
@@ -76,7 +76,9 @@ const MAX_INSERT_INPUT_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INSERT_OUTPUT_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INSERT_FLIGHT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_APPEND_INPUT_BYTES: usize = MAX_INSERT_FLIGHT_BYTES;
-const MAX_APPEND_FLIGHT_MESSAGES: usize = MAX_INSERT_BATCH_ROWS + 1;
+const MAX_APPEND_DICTIONARY_FIELDS: usize = 16;
+const MAX_APPEND_FLIGHT_MESSAGES: usize =
+    1 + MAX_INSERT_BATCH_ROWS * (MAX_APPEND_DICTIONARY_FIELDS + 1);
 const MAX_PENDING_APPEND_CHECKPOINTS: usize = 1_024;
 const ASYNC_QUERY_HANDLE_VERSION: u8 = 1;
 const MAX_ASYNC_QUERY_HANDLE_BYTES: usize = 16 * 1024;
@@ -294,6 +296,11 @@ pub enum SdkError {
         "append encodes to {actual} Flight messages, above the {maximum}-message limit"
     ))]
     BatchMessageCount { actual: usize, maximum: usize },
+
+    #[snafu(display(
+        "append schema contains {actual} dictionary fields, above the {maximum}-field limit"
+    ))]
+    BatchDictionaryCount { actual: usize, maximum: usize },
 
     #[snafu(display("Arrow batch {batch_index} does not match the first batch schema"))]
     BatchSchemaMismatch { batch_index: usize },
@@ -1145,11 +1152,12 @@ impl LakeClient {
     /// non-empty and have the same exact schema, and that schema must equal
     /// the table schema resolved through Query. Caller-local Arrow buffers
     /// and the exact encoded Flight payload are each capped at 64 MiB;
-    /// encoding stops at the first overflow. Validation and Flight encoding
-    /// are bounded before the first append `DoPut`. This method carries
-    /// only Arrow values, including any existing [`DataLocation`] metadata;
-    /// it never uploads object bytes or requires SDK-process object-store
-    /// credentials.
+    /// encoding stops at the first overflow. Up to 16 nested Dictionary nodes
+    /// retain their exact schema and compact values through Flight dictionary
+    /// resend. Validation and Flight encoding are bounded before the first
+    /// append `DoPut`. This method carries only Arrow values, including any
+    /// existing [`DataLocation`] metadata; it never uploads object bytes or
+    /// requires SDK-process object-store credentials.
     pub async fn append_batches(
         &self,
         table: &TableRef,
@@ -2154,6 +2162,7 @@ fn validate_append_batches(
     let (rows, input_bytes) = batches.iter().enumerate().try_fold(
         (0usize, 0usize),
         |(rows, input_bytes), (batch_index, batch)| {
+            validate_append_dictionary_fields(batch.schema_ref().as_ref())?;
             if batch.schema().as_ref() != schema.as_ref() {
                 return Err(SdkError::BatchSchemaMismatch { batch_index });
             }
@@ -2189,10 +2198,54 @@ async fn encode_append_batches(
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
 ) -> Result<Vec<FlightData>> {
+    validate_append_dictionary_fields(schema.as_ref())?;
     let messages = FlightDataEncoderBuilder::new()
+        .with_dictionary_handling(DictionaryHandling::Resend)
         .with_schema(schema)
         .build(futures::stream::iter(batches.into_iter().map(Ok)));
     collect_flight_messages_bounded(messages, MAX_INSERT_FLIGHT_BYTES).await
+}
+
+fn validate_append_dictionary_fields(schema: &Schema) -> Result<usize> {
+    let mut pending = schema
+        .fields()
+        .iter()
+        .map(|field| field.data_type())
+        .collect::<Vec<_>>();
+    let mut dictionaries = 0usize;
+    while let Some(data_type) = pending.pop() {
+        match data_type {
+            DataType::List(field)
+            | DataType::ListView(field)
+            | DataType::FixedSizeList(field, _)
+            | DataType::LargeList(field)
+            | DataType::LargeListView(field)
+            | DataType::Map(field, _) => pending.push(field.data_type()),
+            DataType::Struct(fields) => {
+                pending.extend(fields.iter().map(|field| field.data_type()));
+            }
+            DataType::Union(fields, _) => {
+                pending.extend(fields.iter().map(|(_, field)| field.data_type()));
+            }
+            DataType::Dictionary(key, value) => {
+                dictionaries = dictionaries.saturating_add(1);
+                if dictionaries > MAX_APPEND_DICTIONARY_FIELDS {
+                    return Err(SdkError::BatchDictionaryCount {
+                        actual:  dictionaries,
+                        maximum: MAX_APPEND_DICTIONARY_FIELDS,
+                    });
+                }
+                pending.push(key.as_ref());
+                pending.push(value.as_ref());
+            }
+            DataType::RunEndEncoded(run_ends, values) => {
+                pending.push(run_ends.data_type());
+                pending.push(values.data_type());
+            }
+            _ => {}
+        }
+    }
+    Ok(dictionaries)
 }
 
 async fn collect_flight_messages_bounded<S>(messages: S, maximum: usize) -> Result<Vec<FlightData>>
@@ -2249,15 +2302,19 @@ mod tests {
     };
 
     use arrow::{
-        array::{Array, BinaryArray, Int64Array, StringArray, StructArray},
+        array::{
+            Array, ArrayRef, BinaryArray, DictionaryArray, Int32Array, Int64Array, StringArray,
+            StructArray,
+        },
         buffer::{Buffer, OffsetBuffer, ScalarBuffer},
-        datatypes::{DataType, Field, Schema},
+        datatypes::{DataType, Field, Int32Type, Schema},
         record_batch::RecordBatch,
     };
     use arrow_flight::{
         Action, ActionType, CancelStatus, Criteria, Empty, FlightData, FlightDescriptor,
         FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, PollInfo, PutResult,
         Result as FlightResult, SchemaResult, Ticket,
+        decode::{DecodedPayload, FlightDataDecoder},
         encode::FlightDataEncoderBuilder,
         error::FlightError,
         flight_service_server::{FlightService, FlightServiceServer},
@@ -2307,12 +2364,12 @@ mod tests {
     use tonic::{Request, Response, Status};
 
     use crate::{
-        APPEND_RETRY_WINDOW, FileUpload, InsertValue, LakeClient, MAX_INSERT_BATCH_ROWS,
-        MAX_INSERT_FLIGHT_BYTES, MAX_INSERT_INPUT_METADATA_BYTES, MAX_SCHEMA_CACHE_CAPACITY,
-        MAX_SCHEMA_CACHE_TTL, PresignedRead, QueryOnlyObjectStore, SchemaCache, SchemaCacheConfig,
-        SdkError, ambiguous_append_error, collect_flight_messages_bounded, data_location,
-        encode_append_batches, resume_pending_with, retry_ambiguous_append_with_window,
-        validate_flight_payload_size,
+        APPEND_RETRY_WINDOW, FileUpload, InsertValue, LakeClient, MAX_APPEND_DICTIONARY_FIELDS,
+        MAX_INSERT_BATCH_ROWS, MAX_INSERT_FLIGHT_BYTES, MAX_INSERT_INPUT_METADATA_BYTES,
+        MAX_SCHEMA_CACHE_CAPACITY, MAX_SCHEMA_CACHE_TTL, PresignedRead, QueryOnlyObjectStore,
+        SchemaCache, SchemaCacheConfig, SdkError, ambiguous_append_error,
+        collect_flight_messages_bounded, data_location, encode_append_batches, resume_pending_with,
+        retry_ambiguous_append_with_window, validate_flight_payload_size,
     };
 
     #[derive(Clone)]
@@ -4700,6 +4757,31 @@ mod tests {
             Err(SdkError::BatchInputSize { actual, maximum })
                 if actual > maximum && maximum == MAX_INSERT_FLIGHT_BYTES
         ));
+
+        let dictionary: DictionaryArray<Int32Type> = vec!["bounded"].into_iter().collect();
+        let dictionary_schema = Arc::new(Schema::new(
+            (0..=MAX_APPEND_DICTIONARY_FIELDS)
+                .map(|index| {
+                    Field::new(
+                        format!("dictionary_{index}"),
+                        dictionary.data_type().clone(),
+                        false,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let columns = (0..=MAX_APPEND_DICTIONARY_FIELDS)
+            .map(|_| Arc::new(dictionary.clone()) as ArrayRef)
+            .collect::<Vec<_>>();
+        let excessive_dictionaries = RecordBatch::try_new(dictionary_schema, columns).unwrap();
+        assert!(matches!(
+            local_only
+                .append_batches(&table, vec![excessive_dictionaries])
+                .await,
+            Err(SdkError::BatchDictionaryCount { actual, maximum })
+                if actual == MAX_APPEND_DICTIONARY_FIELDS + 1
+                    && maximum == MAX_APPEND_DICTIONARY_FIELDS
+        ));
     }
 
     #[tokio::test]
@@ -4724,6 +4806,48 @@ mod tests {
                 if actual > limit && limit == maximum
         ));
         assert_eq!(polled.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn sdk_typed_arrow_append_preserves_dictionary_encoding() {
+        let dictionary_value = "字".repeat(8 * 1024 / "字".len());
+        let keys = Int32Array::from(vec![0_i32; MAX_INSERT_BATCH_ROWS]);
+        let values = Arc::new(StringArray::from(vec![dictionary_value.clone()]));
+        let dictionary = DictionaryArray::<Int32Type>::try_new(keys, values).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "task",
+            dictionary.data_type().clone(),
+            false,
+        )]));
+        let expected = RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap();
+        let physical_input_bytes = expected
+            .columns()
+            .iter()
+            .map(|column| column.get_buffer_memory_size())
+            .sum::<usize>();
+        assert!(physical_input_bytes < MAX_INSERT_FLIGHT_BYTES);
+        assert!(
+            dictionary_value.len().saturating_mul(MAX_INSERT_BATCH_ROWS) > MAX_INSERT_FLIGHT_BYTES,
+            "hydrating repeated values would cross the payload ceiling"
+        );
+
+        let messages = encode_append_batches(schema.clone(), vec![expected.clone()])
+            .await
+            .expect("compact dictionary encoding stays below the payload ceiling");
+        let mut decoder =
+            FlightDataDecoder::new(stream::iter(messages.into_iter().map(Ok::<_, FlightError>)));
+        let mut decoded_schema = None;
+        let mut decoded_batches = Vec::new();
+        while let Some(decoded) = decoder.next().await {
+            match decoded.unwrap().payload {
+                DecodedPayload::None => {}
+                DecodedPayload::Schema(actual) => decoded_schema = Some(actual),
+                DecodedPayload::RecordBatch(actual) => decoded_batches.push(actual),
+            }
+        }
+
+        assert_eq!(decoded_schema.as_deref(), Some(schema.as_ref()));
+        assert_eq!(decoded_batches, [expected]);
     }
 
     #[tokio::test]

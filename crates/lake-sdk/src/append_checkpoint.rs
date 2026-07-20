@@ -29,6 +29,8 @@ use crate::{
 const FORMAT_VERSION: u32 = 1;
 const CHECKPOINT_SUFFIX: &str = ".append.pb";
 const MAX_CHECKPOINT_OVERHEAD: u64 = 1024 * 1024;
+const MAX_MESSAGE_FRAMING_BYTES: usize = 4 + MAX_APPEND_FLIGHT_MESSAGES * 4;
+const _: () = assert!(MAX_MESSAGE_FRAMING_BYTES <= MAX_CHECKPOINT_OVERHEAD as usize);
 
 #[derive(Clone, PartialEq, Message)]
 struct AppendCheckpointV1 {
@@ -513,7 +515,8 @@ mod tests {
         AppendCheckpointV1, decode_messages, encode_messages, integrity_digest, save_atomic_inner,
     };
     use crate::{
-        MAX_INSERT_BATCH_ROWS, MAX_INSERT_FLIGHT_BYTES, PendingAppend, SdkError, append_checkpoint,
+        MAX_APPEND_DICTIONARY_FIELDS, MAX_APPEND_FLIGHT_MESSAGES, MAX_INSERT_BATCH_ROWS,
+        MAX_INSERT_FLIGHT_BYTES, PendingAppend, SdkError, append_checkpoint,
     };
 
     fn pending() -> PendingAppend {
@@ -565,7 +568,9 @@ mod tests {
     #[tokio::test]
     async fn durable_checkpoint_accepts_maximum_typed_append_partition() {
         let root = tempfile::tempdir().unwrap();
-        let maximum_messages = MAX_INSERT_BATCH_ROWS + 1;
+        let maximum_messages = 1 + MAX_INSERT_BATCH_ROWS
+            .saturating_mul(MAX_APPEND_DICTIONARY_FIELDS.saturating_add(1));
+        assert_eq!(MAX_APPEND_FLIGHT_MESSAGES, maximum_messages);
         let pending = pending_with_message_count(maximum_messages);
 
         assert!(

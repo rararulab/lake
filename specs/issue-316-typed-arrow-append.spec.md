@@ -51,6 +51,10 @@ Rerun Hub clone, training orchestrator, or cross-table transaction engine.
   array buffer memory at 64 MiB. This caller-local guard prevents a single
   oversized Binary/Utf8 value from first being duplicated into an unbounded
   encoded buffer; exact protobuf size remains the final transport authority.
+- Preserve Dictionary arrays and their exact schema with Flight dictionary
+  resend rather than hydration. Cap nested Dictionary nodes at 16 before any
+  RPC so one encoded input batch has bounded dictionary queue fan-out; compact
+  shared values are never expanded into repeated values in SDK memory.
 - Require every supplied batch to have the exact same Arrow schema, including
   field names, order, data types, nullability, and schema metadata. Validate
   this caller-local property before any RPC.
@@ -60,11 +64,13 @@ Rerun Hub clone, training orchestrator, or cross-table transaction engine.
   default filling, or schema evolution.
 - Encode all batches as one bounded Arrow Flight stream and retain the existing
   64 MiB encoded payload ceiling. Collect messages incrementally, stop on the
-  first exact protobuf-size overflow, and permit at most 10,001 messages: one
-  schema plus at most one hydrated record message per accepted row. The same
-  derived limit governs checkpoint framing. The append has one UUIDv7 operation
-  identity, one payload digest, one durable checkpoint, and one table-version
-  result.
+  first exact protobuf-size overflow, and permit at most 170,001 messages: one
+  schema plus, for every accepted row, at most one record message and 16
+  dictionary messages. This conservative formula also bounds the encoder's
+  per-batch queue, and its four-byte-per-message checkpoint framing remains
+  below the existing 1 MiB checkpoint-overhead allowance. The same limit
+  governs checkpoint save/load. The append has one UUIDv7 operation identity,
+  one payload digest, one durable checkpoint, and one table-version result.
 - Extract one shared append-preparation helper so `append_batches` and the
   existing `insert`/`insert_many` path attach the same command descriptor,
   validate the same payload ceiling, persist the same replay-safe checkpoint,
@@ -150,10 +156,11 @@ Scenario: Arrow input memory and batch fan-out are bounded before schema lookup
     Filter: sdk_typed_arrow_append_rejects_unbounded_inputs_before_schema_rpc
   Level: unit
   Targets: crates/lake-sdk/src/lib.rs
-  Given a valid row followed by a zero-row batch, and a one-row Binary batch
-  whose Arrow buffer exceeds 64 MiB
+  Given a valid row followed by a zero-row batch, a one-row Binary batch whose
+  Arrow buffer exceeds 64 MiB, and a schema with 17 Dictionary nodes
   When `append_batches` performs caller-local validation
-  Then it returns typed empty-batch and input-size errors before any schema RPC
+  Then it returns typed empty-batch, input-size, and dictionary-count errors
+  before any schema RPC
 
 Scenario: encoded Flight collection stops at the exact payload ceiling
   Test:
@@ -166,6 +173,18 @@ Scenario: encoded Flight collection stops at the exact payload ceiling
   When bounded append encoding collects the stream
   Then it rejects at the second message and never polls or materializes the
   third message
+
+Scenario: compact Dictionary input preserves its exact Flight schema
+  Test:
+    Package: lake-sdk
+    Filter: sdk_typed_arrow_append_preserves_dictionary_encoding
+  Level: unit
+  Targets: crates/lake-sdk/src/lib.rs
+  Given 10,000 integer keys reference one 8 KiB UTF-8 dictionary value, so the
+  physical Arrow input is below 64 MiB but hydration would exceed 64 MiB
+  When bounded append encoding produces and decodes the Flight stream
+  Then it resends the compact dictionary, preserves the exact Dictionary
+  schema and values, and never allocates the hydrated representation
 
 Rule: append-recovery — public Arrow writes use the existing durable identity
 
@@ -189,9 +208,21 @@ Scenario: checkpointing accepts the same maximum batch partition as memory-only 
   Level: unit
   Targets: crates/lake-sdk/src/lib.rs, crates/lake-sdk/src/append_checkpoint.rs
   Given 4,096 one-row batches that encode to one schema plus 4,096 record
-  messages and the derived 10,001-message maximum checkpoint framing
+  messages
   When the same typed append is prepared with checkpointing disabled and enabled
   Then both preparations succeed, and the durable payload reloads byte-for-byte
+
+Scenario: checkpoint framing accepts the exact dictionary-aware message ceiling
+  Test:
+    Package: lake-sdk
+    Filter: durable_checkpoint_accepts_maximum_typed_append_partition
+  Level: unit
+  Targets: crates/lake-sdk/src/append_checkpoint.rs
+  Given the conservative maximum of one schema plus 10,000 rows times one
+  record and 16 dictionary messages
+  When the 170,001-message payload is saved and loaded through a checkpoint
+  Then framing remains inside its overhead budget and every message reloads
+  byte-for-byte
 
 ## Out of Scope
 
