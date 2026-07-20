@@ -76,13 +76,15 @@ fn context() -> EpisodeInspectionContext {
         .build()
 }
 
-fn fixture_with_summary() -> (Bytes, Vec<Range<u64>>) {
+fn fixture(emit_summary: bool) -> (Bytes, Vec<Range<u64>>) {
     let cursor = Cursor::new(Vec::new());
     let mut writer = WriteOptions::new()
         .compression(None)
         .profile("ros2")
         .library("robot-collector/1.2.3")
         .chunk_size(Some(64 * 1024))
+        .emit_summary_records(emit_summary)
+        .emit_summary_offsets(emit_summary)
         .create(cursor)
         .expect("create MCAP writer");
     let joint_schema = writer
@@ -156,6 +158,10 @@ fn fixture_with_summary() -> (Bytes, Vec<Range<u64>>) {
     let bytes = writer.into_inner().into_inner();
     (Bytes::from(bytes), payload_ranges)
 }
+
+fn fixture_with_summary() -> (Bytes, Vec<Range<u64>>) { fixture(true) }
+
+fn fixture_without_summary() -> Bytes { fixture(false).0 }
 
 fn generous_budget(file_len: u64) -> ReadBudget {
     ReadBudget::try_new(file_len * 2, 128, file_len, file_len).expect("valid test budget")
@@ -259,6 +265,132 @@ async fn mcap_summary_metadata_stays_within_read_budget() {
         )
         .await
         .expect_err("one-request-short budget must fail");
+    assert!(matches!(
+        error,
+        AdapterError::BudgetExceeded {
+            resource: BudgetResource::Requests,
+            ..
+        }
+    ));
+    assert!(
+        u64::try_from(request_short.ranges().len()).expect("range count fits u64") < request_count
+    );
+}
+
+#[tokio::test]
+async fn mcap_missing_summary_uses_bounded_linear_fallback() {
+    let indexed_bytes = fixture_with_summary().0;
+    let summaryless_bytes = fixture_without_summary();
+    let file_len = u64::try_from(summaryless_bytes.len()).expect("fixture length fits u64");
+    let adapter = McapAdapter;
+
+    let indexed = adapter
+        .inspect(
+            &InstrumentedSource::new(indexed_bytes.clone()),
+            &context(),
+            generous_budget(u64::try_from(indexed_bytes.len()).expect("fixture length fits u64")),
+        )
+        .await
+        .expect("indexed comparison fixture succeeds");
+    let source = InstrumentedSource::new(summaryless_bytes.clone());
+    let fallback = adapter
+        .inspect(
+            &source,
+            &context(),
+            ReadBudget::try_new(file_len, 128, file_len, file_len).expect("exact scan budget"),
+        )
+        .await
+        .expect("bounded summaryless inspection succeeds");
+
+    assert_eq!(fallback, indexed);
+    assert_eq!(source.total_bytes(), file_len);
+    let request_count = u64::try_from(source.ranges().len()).expect("range count fits u64");
+    assert!(request_count > 1);
+    let canonical = fallback.to_json().expect("encode canonical manifest");
+    assert_eq!(
+        lake_common::EpisodeManifestV1::from_json(&canonical)
+            .expect("fallback output is canonical"),
+        fallback
+    );
+
+    adapter
+        .inspect(
+            &InstrumentedSource::new(summaryless_bytes.clone()),
+            &context(),
+            ReadBudget::try_new(file_len, request_count, file_len, file_len)
+                .expect("exact observed budget"),
+        )
+        .await
+        .expect("exact observed fallback budget succeeds");
+
+    let scan_short = InstrumentedSource::new(summaryless_bytes.clone());
+    let error = adapter
+        .inspect(
+            &scan_short,
+            &context(),
+            ReadBudget::try_new(file_len, request_count, file_len - 1, file_len)
+                .expect("one-byte-short scan ceiling"),
+        )
+        .await
+        .expect_err("fallback scan ceiling must fail");
+    assert!(matches!(
+        error,
+        AdapterError::FallbackScanTooLarge {
+            size_bytes,
+            limit_bytes,
+        } if size_bytes == file_len && limit_bytes == file_len - 1
+    ));
+    assert!(scan_short.total_bytes() < file_len);
+
+    let byte_short = InstrumentedSource::new(summaryless_bytes.clone());
+    let error = adapter
+        .inspect(
+            &byte_short,
+            &context(),
+            ReadBudget::try_new(file_len - 1, request_count, file_len, file_len)
+                .expect("one-byte-short I/O budget"),
+        )
+        .await
+        .expect_err("fallback byte budget must fail");
+    assert!(matches!(
+        error,
+        AdapterError::BudgetExceeded {
+            resource: BudgetResource::Bytes,
+            ..
+        }
+    ));
+    assert!(byte_short.total_bytes() < file_len);
+
+    let record_limited = InstrumentedSource::new(summaryless_bytes.clone());
+    let error = adapter
+        .inspect(
+            &record_limited,
+            &context(),
+            ReadBudget::try_new(file_len, request_count, file_len, 1_024)
+                .expect("bounded record budget"),
+        )
+        .await
+        .expect_err("oversized chunk must fail structurally");
+    assert!(matches!(
+        error,
+        AdapterError::RecordTooLarge {
+            format: "mcap",
+            limit_bytes: 1_024,
+            ..
+        }
+    ));
+    assert_eq!(record_limited.total_bytes(), file_len);
+
+    let request_short = InstrumentedSource::new(summaryless_bytes);
+    let error = adapter
+        .inspect(
+            &request_short,
+            &context(),
+            ReadBudget::try_new(file_len, request_count - 1, file_len, file_len)
+                .expect("one-request-short I/O budget"),
+        )
+        .await
+        .expect_err("fallback request budget must fail");
     assert!(matches!(
         error,
         AdapterError::BudgetExceeded {
