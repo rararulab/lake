@@ -30,10 +30,12 @@ uv   = "0.11.26"       # uvx runs the code-review-graph MCP server (.mcp.json)
 [env]
 # CARGO_INCREMENTAL deliberately NOT disabled here: local gates rely on
 # incremental builds for speed. CI sets CARGO_INCREMENTAL=0 itself.
-# Keep heavy Rust artifacts outside each jj workspace. Cargo fingerprints and
-# its target-directory lock still select the right artifact for every revision;
-# this only lets isolated worktrees reuse already-built dependencies.
-CARGO_TARGET_DIR = "{{xdg_cache_home}}/lake/target"
+# Keep heavy Rust artifacts outside each jj workspace without allowing one
+# checkout to run a test executable compiled from another checkout. Cargo does
+# not fingerprint every compile-time source identity, so a workspace hash is
+# part of the target path; incremental artifacts remain reusable across commits
+# within one workspace.
+CARGO_TARGET_DIR = "{{xdg_cache_home}}/lake/target/{{config_root | hash}}"
 CARGO_TERM_COLOR = "always"
 CARGO_NET_RETRY = "10"
 RUST_BACKTRACE = "1"

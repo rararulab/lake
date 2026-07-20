@@ -13,12 +13,15 @@ first.
   second copy of cargo / formatter / linter commands.
 - Rust stays under `rustup` and `rust-toolchain.toml`; mise does not manage
   Rust for this repo.
-- Local mise tasks put Rust artifacts in the user's XDG cache at
-  `lake/target`, rather than in each jj workspace. Cargo's normal fingerprints
-  and target-directory lock keep concurrent revisions correct; the cache is
-  untracked, contains no credentials or source data, and may be deleted to
+- Local mise tasks put Rust artifacts in the user's XDG cache under
+  `lake/target/<workspace-hash>`, rather than in each jj workspace. The hash
+  gives every physical Jujutsu checkout an isolated Cargo target directory:
+  Cargo may reuse incremental artifacts across commits in that checkout, but
+  can never select a test executable compiled by another checkout. The cache
+  is untracked, contains no credentials or source data, and may be deleted to
   force a cold rebuild. CI remains ephemeral and sets its own incremental
-  policy.
+  policy. Tests that inspect repository artifacts must also resolve them from
+  the invocation workspace, never compile-time source paths.
 - **Local-first**: the comprehensive gate runs LOCALLY (`mise run ship`, which
   runs `mise run ci` — gate + dependency policy + doc + spec-selftest +
   LocalStack integration — then a conventional-commit check, then push through
@@ -197,8 +200,19 @@ image backfill with the published release tag:
 gh workflow run release-image.yml --ref main -f tag=vX.Y.Z
 ```
 
+The workflow checks out two immutable revisions. `release-source` is always
+the published tag and is the sole Docker build context; it is validated against
+the GitHub Release target SHA and remains
+`org.opencontainers.image.revision`. `build-recipe` is the workflow revision:
+on a normal release event GitHub supplies the tag revision, while the documented
+manual command dispatches `main` and therefore supplies the current
+Cargo-chef Dockerfile to rebuild an older immutable source. The distinct
+`io.rararulab.lake.build-recipe.revision` OCI label records that recipe SHA; it
+does not change the source identity or release tag.
+
 Wait for the `Publish release image` run to complete, then resolve the
-manifest-list digest before updating a production deployment.
+manifest-list digest and verify both `linux/amd64` and `linux/arm64` before
+updating a production deployment.
 
 ## Review Checklist
 
