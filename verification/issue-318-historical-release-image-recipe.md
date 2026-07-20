@@ -1,15 +1,14 @@
 # Verification report — issue #318 (current candidate)
 
 - jj_base: `3729455699c7d9ed28b7b57263ab8abf5a283a50` (`main@origin`)
-- jj_head: `45693ea8a52fe11653e7ded5c807864f1bcfabd9` (`@-`)
+- jj_head: `36997ca8ac86e0cb26be2072e78a42243e32e6a9` (`@-`)
 - score_authority: verifier
 - implementer_evidence: self_check_only
 
-Verified range, in order: `1ff5d79b` (release recipe), `15bddf38`
-(previous verification record), and `45693ea8` (runtime workspace-path
-repair). The working copy was clean before execution. The colocated Git
-`HEAD` remains detached at `3e37a4a`; Jujutsu commits above identify the
-materialized candidate contents.
+The committed candidate was clean before verification. Its range includes the
+release-recipe change, the runtime-workspace repair, and the target-isolation
+repair. Colocated Git remains detached at `3e37a4a`; the Jujutsu revisions
+above identify the materialized candidate.
 
 ## Commands
 
@@ -25,167 +24,172 @@ materialized candidate contents.
 [ ok ] git remote: origin
 ```
 
-`rm -rf data && mise run gate` exited 0 from a cold e2e state.
+`mise run spec-lint specs/issue-318-historical-release-image-recipe.spec.md`
+
+```text
+Spec: historical-release-image-recipe
+Quality: 100% (determinism: 100%, testability: 100%, coverage: 100%)
+[WARN ] line 7: [output-mode-coverage] spec mentions output behavior but missing explicit scenario coverage for mode(s): file-output
+[INFO ] line 58: [bdd-rule-grouping] 5 scenarios with no Rule grouping
+```
+
+`mise exec -- actionlint .github/workflows/release-image.yml` exited 0 with no
+output.
+
+`rm -rf data && mise run gate` exited 0 from cold e2e state:
 
 ```text
 [hooks] $ prek run --all-files
+[test] $ cargo test --workspace --all-targets
 [e2e] $ cargo run -p lake-cli -- selftest
 [adbc-install] $ uv sync --project interop/adbc --frozen
-[test] $ cargo test --workspace --all-targets
 [test-adbc] $ cargo test -p lake-query --test adbc_interop -- --ignored --test-threads=1
 [site-check] $ bun run --cwd site check
-[hooks] Finished in 44.4ms
-[test] Finished in 33.35s
-Finished in 33.36s
+[hooks] Finished in 83.1ms
+[test] Finished in 36.30s
+Finished in 36.30s
 ```
 
-`mise run spec-lifecycle specs/issue-318-historical-release-image-recipe.spec.md`
+## Default-environment lifecycle and target isolation
+
+This was run directly from the candidate workspace, without overriding
+`CARGO_TARGET_DIR` or any other environment value:
 
 ```text
+$ mise run spec-lifecycle specs/issue-318-historical-release-image-recipe.spec.md
 === Lifecycle Report (guarded) ===
 Spec: historical-release-image-recipe  stage: complete  passed: true
   [PASS] Historical backfill builds immutable source with auditable current recipe
   [PASS] Split checkout preserves trusted multi-architecture publication
   [PASS] Historical recovery still rejects an untrusted release source
   [PASS] Workflow contract follows the invoking Jujutsu workspace
+  [PASS] Cargo target cache is isolated by Jujutsu workspace
 spec-lifecycle-guard: OK — every Test selector executed >=1 test
 ```
 
-The four selectors were also invoked individually:
+Unmodified `mise env` resolved different target directories in the candidate
+and root checkout:
 
 ```text
-$ mise exec -- cargo test -p lake-cli --test release_artifacts release_artifact_contract_uses_invocation_workspace -- --exact --nocapture
-test release_artifact_contract_uses_invocation_workspace ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out
+# candidate workspace
+export CARGO_NET_RETRY=10
+export CARGO_TARGET_DIR=/Users/ryan/Library/Caches/lake/target/a8b983c672dedc8e239a2e00ce66e430078358faa29e7c60e8e4b736fa47b221
+export CARGO_TERM_COLOR=always
 
+# root checkout (/Users/ryan/code/rararulab/lake)
+export CARGO_NET_RETRY=10
+export CARGO_TARGET_DIR=/Users/ryan/Library/Caches/lake/target
+export CARGO_TERM_COLOR=always
+```
+
+The candidate's actual lifecycle selector binary and cold-gate e2e binary were
+both loaded from the hashed target:
+
+```text
+/Users/ryan/Library/Caches/lake/target/a8b983c672dedc8e239a2e00ce66e430078358faa29e7c60e8e4b736fa47b221/debug/deps/release_artifacts-42f4a1e84b020bb8
+/Users/ryan/Library/Caches/lake/target/a8b983c672dedc8e239a2e00ce66e430078358faa29e7c60e8e4b736fa47b221/debug/lake selftest
+```
+
+The five selectors also passed independently under this same default mise
+environment:
+
+```text
 $ mise exec -- cargo test -p lake-cli --test release_artifacts release_image_workflow_separates_source_and_recipe_for_backfills -- --exact
 test release_image_workflow_separates_source_and_recipe_for_backfills ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out
 
 $ mise exec -- cargo test -p lake-cli --test release_artifacts release_image_workflow_is_tag_pinned_and_multiarch -- --exact
 test release_image_workflow_is_tag_pinned_and_multiarch ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out
 
 $ mise exec -- cargo test -p lake-cli --test release_artifacts release_image_workflow_rejects_mismatched_tags_and_preserves_digest_pinning -- --exact
 test release_image_workflow_rejects_mismatched_tags_and_preserves_digest_pinning ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out
+
+$ mise exec -- cargo test -p lake-cli --test release_artifacts release_artifact_contract_uses_invocation_workspace -- --exact --nocapture
+test release_artifact_contract_uses_invocation_workspace ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out
+
+$ mise exec -- cargo test -p lake-cli --test release_artifacts mise_target_directory_is_workspace_isolated -- --exact
+test mise_target_directory_is_workspace_isolated ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out
 ```
 
-`mise exec -- actionlint .github/workflows/release-image.yml` exited 0 with
-no output.
+The fifth contract verifies the configured template is exactly
+`{{xdg_cache_home}}/lake/target/{{config_root | hash}}`. The observed,
+different resolved paths show this is not merely a source-level assertion:
+normal lane-1 execution cannot select the root checkout's global-target test
+binary.
 
-The historical-source planner was rebuilt without cache in an isolated
-Jujutsu workspace at tag `v1.8.4` (`1fbf3ace`):
+## Five scenarios
+
+1. Historical backfill builds immutable source with auditable current recipe:
+   passing selector confirms separate `build-recipe` and `release-source`,
+   source build context, current recipe Dockerfile, and distinct recipe label.
+2. Split checkout preserves trusted multi-architecture publication: passing
+   selector retains SHA-pinned actions, amd64/arm64, cache scope, tags, digest,
+   timeout, and non-cancelling concurrency.
+3. Historical recovery rejects untrusted release source: passing selector and
+   hostile script probes reject malformed, draft, and mismatched releases.
+4. Workflow contract follows the invoking Jujutsu workspace: passing selector
+   resolves contract files from runtime `current_dir()`.
+5. Cargo target cache is isolated by Jujutsu workspace: passing selector plus
+   direct `mise env` evidence proves the hashed candidate target is distinct.
+
+## Historical planner and hostile probes
+
+An isolated Jujutsu workspace at tag `v1.8.4` (`1fbf3ace`) was built using the
+candidate Dockerfile with cache disabled:
 
 ```text
-$ docker build --no-cache --target planner --progress=plain -f <current>/Dockerfile <v1.8.4-workspace>
+$ docker build --no-cache --target planner --progress=plain -f <candidate>/Dockerfile <v1.8.4-workspace>
 #11 [planner 1/2] COPY . .
-#11 DONE 0.1s
+#11 DONE 0.3s
 #12 [planner 2/2] RUN cargo chef prepare --recipe-path recipe.json
-#12 DONE 9.1s
-#13 writing image sha256:e436d151dfe088a7abd5e614907d7797ff3b85db1ff29a46fc7bb63c36849064
-#13 DONE 0.9s
+#12 DONE 11.5s
+#13 writing image sha256:8f267a1749c6d1c843896f885dca8fb4c9a20a71b2a902d742513f8c780d4ea4
+#13 DONE 2.6s
 docker-build-exit=0
 ```
 
-## Four spec scenarios
-
-1. **Historical backfill builds immutable source with auditable current
-   recipe** — selector passed; the current workflow has separate
-   `build-recipe` / `release-source` checkouts, Buildx uses
-   `context: release-source` and `file: build-recipe/Dockerfile`, and records
-   `io.rararulab.lake.build-recipe.revision`.
-2. **Split checkout preserves trusted multi-architecture publication** —
-   selector passed; pinned actions, `linux/amd64,linux/arm64`, cache scope,
-   immutable image tags, digest summary, timeout, and non-cancelling
-   concurrency remain present.
-3. **Historical recovery still rejects an untrusted release source** —
-   selector passed and the executable validation script was driven through
-   hostile release inputs below.
-4. **Workflow contract follows the invoking Jujutsu workspace** — selector
-   passed under the shared project target and under a separately compiled
-   target, described next.
-
-## Runtime-workspace repair verification
-
-The repair changes `root()` to begin at `std::env::current_dir()` and walk to
-the first workspace `Cargo.toml`; it no longer embeds a compile-time checkout
-path. I forced a fresh test build outside Lake's shared target:
-
-```text
-$ mise exec -- env CARGO_TARGET_DIR=/tmp/lake-issue-318-release-artifacts-target cargo test -p lake-cli --test release_artifacts --no-run --message-format=json
-Finished `test` profile [unoptimized + debuginfo] target(s) in 4m 14s
-/tmp/lake-issue-318-release-artifacts-target/debug/deps/release_artifacts-42f4a1e84b020bb8
-```
-
-I then invoked that newly built binary directly from a distinct temporary
-directory containing only `Cargo.toml` with `[workspace]`, setting its probe
-environment variable:
-
-```text
-$ (cd /tmp/lake-issue-318-runtime-root && LAKE_RELEASE_ARTIFACT_ROOT_PROBE=1 <fresh-binary> --exact release_artifact_contract_uses_invocation_workspace --nocapture)
-running 1 test
-test release_artifact_contract_uses_invocation_workspace ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out
-```
-
-Thus the assertion exercises the runtime current directory of the executing
-test binary, not the checkout that compiled it. As a base control, a direct
-selector invocation from a fresh `main@origin` Jujutsu workspace compiled the
-base test source and produced `running 0 tests` / `0 passed; 8 filtered out`
-for `release_image_workflow_separates_source_and_recipe_for_backfills`.
-The current candidate executes the corresponding selector once. An
-experimental base lifecycle invocation with an absolute candidate spec was
-not used as transition evidence because `agent-spec` resolved its code context
-alongside that external spec and returned green; direct base cargo output is
-the authoritative base observation.
-
-## Hostile probes
-
-These probes executed the candidate's exact `Verify release source` shell
-script with isolated tagged Git source and build-recipe repositories plus a
-controlled `gh api` response.
+The candidate's exact `Verify release source` shell script was run against
+isolated tagged Git fixtures with controlled `gh api` output:
 
 ```text
 control=PASS
 VERSION=1.8.4
-RELEASE_REVISION=0e8d48f94ff96b5ffdbeba19027a50058fbfcf0f
-BUILD_RECIPE_REVISION=e4b49aa62998e6c5303198b1126f2220f3f757f3
-
+RELEASE_REVISION=d449b7ea2c9a6c41b3b7c024f9a3ffdfc90b8e0f
+BUILD_RECIPE_REVISION=07721ed0620359c1595df20bbb3e3a7074e842c8
 release tag must be vX.Y.Z: v1.8
 malformed=PASS
-
 manual dispatch requires an already-published release for v1.8.4
 draft=PASS
-
 checked-out tag does not match the trusted release revision
 mismatch=PASS
 ```
 
-The control exported both distinct immutable revisions. A malformed tag, a
-draft release, and a published release whose target SHA differed from the
-checked-out tag each failed before any Buildx step could run.
+The valid control exported separate immutable source and recipe revisions.
+Malformed tag, draft release, and target-SHA mismatch each rejected before a
+Buildx step could execute.
 
 ## Transition matrix
 
-- fail_to_pass: observed. In direct `main@origin` testing, the historical
-  recipe selector resolved to zero tests; the current selector executes one
-  passing test. The new runtime-workspace selector is also absent from base
-  and executes once at `45693ea8`.
-- pass_to_fail: 0. Full gate, all four guarded scenarios, independent
-  selectors, actionlint, uncached historical planner, and probes passed.
+- fail_to_pass: observed. The former global target allowed a lifecycle run to
+  reuse an executable from another checkout. At `36997ca8`, default mise
+  resolution uses the candidate's `config_root` hash and the original
+  unoverridden lifecycle executes all five selectors from that target.
+- pass_to_fail: 0. Gate, spec lint, unoverridden lifecycle, five selectors,
+  actionlint, historical planner, and hostile probes passed.
 
-## Previous-report repair conclusion
+## Prior-report repair conclusion
 
-The previous report is superseded by this one. At `45693ea8`, the release
-artifact contract no longer binds filesystem reads to a Cargo compile-time
-workspace. It was freshly compiled outside the shared target and passed when
-run from a different runtime workspace, while the standard shared-target
-spec lifecycle remains green. The stale-binary / wrong-workspace verification
-failure is therefore repaired.
+The previous report is superseded. `45693ea8` stopped a test binary from
+reading its compiler workspace; `36997ca8` also stops Cargo from selecting a
+binary built by another Jujutsu workspace. The prior lifecycle false-green is
+therefore closed in normal, unmodified mise execution.
 
 ## Verdict
 
-PASS — current JJ head `45693ea8` independently passes all four spec
-scenarios, the clean quality gate, actionlint, historical `v1.8.4` planner,
-runtime workspace isolation check, and release-source trust probes.
+PASS — current JJ head `36997ca8` independently passes the cold quality gate,
+five lane-1 scenarios, spec lint, actionlint, default target isolation,
+historical `v1.8.4` planner, and release-source hostile probes.
