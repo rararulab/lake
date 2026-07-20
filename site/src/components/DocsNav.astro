@@ -60,8 +60,8 @@ const labels: Record<string, string> = {
                       href={getDocUrl(entry)}
                       aria-current={slug === currentSlug ? "page" : undefined}
                       class:list={[
-                        "hover:text-accent block rounded px-2 py-1.5 leading-5 hover:bg-[var(--surface)]",
-                        { "text-accent bg-[var(--surface)]": slug === currentSlug },
+                        "hover:text-accent hover:bg-muted/50 block rounded px-2 py-1.5 leading-5",
+                        { "text-accent bg-muted/50": slug === currentSlug },
                       ]}
                     >
                       {getDocTitle(entry)}

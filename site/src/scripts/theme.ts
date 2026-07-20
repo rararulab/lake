@@ -1,28 +1,49 @@
-declare global {
-  interface Window {
-    __lakeTheme?: "light" | "dark";
-  }
+const THEME_KEY = "theme";
+const LIGHT = "light";
+const DARK = "dark";
+
+function getPreferredTheme(): string {
+  const stored = localStorage.getItem(THEME_KEY);
+  if (stored) return stored;
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? DARK : LIGHT;
 }
 
-export {};
+let themeValue: string =
+  (window as unknown as { __theme?: { value: string } }).__theme?.value ??
+  getPreferredTheme();
 
-function installThemeToggle(): void {
-  const button = document.querySelector<HTMLButtonElement>("#theme-toggle");
+function reflect(): void {
+  const root = document.firstElementChild;
+  root?.setAttribute("data-theme", themeValue);
+  root?.classList.toggle("dark", themeValue === DARK);
+  document.querySelector("#theme-btn")?.setAttribute("aria-label", themeValue);
+
+  const background = window.getComputedStyle(document.body).backgroundColor;
+  document
+    .querySelector('meta[name="theme-color"]')
+    ?.setAttribute("content", background);
+}
+
+function setup(): void {
+  reflect();
+  const button = document.querySelector<HTMLButtonElement>("#theme-btn");
   if (!button || button.dataset.ready === "true") return;
 
   button.dataset.ready = "true";
   button.addEventListener("click", () => {
-    const root = document.documentElement;
-    const next = root.dataset.theme === "dark" ? "light" : "dark";
-    root.dataset.theme = next;
-    root.classList.toggle("dark", next === "dark");
-    localStorage.setItem("theme", next);
-    button.setAttribute(
-      "aria-label",
-      `Use ${next === "dark" ? "light" : "dark"} theme`
-    );
+    themeValue = themeValue === LIGHT ? DARK : LIGHT;
+    localStorage.setItem(THEME_KEY, themeValue);
+    reflect();
   });
 }
 
-installThemeToggle();
-document.addEventListener("astro:page-load", installThemeToggle);
+setup();
+document.addEventListener("astro:page-load", setup);
+
+window
+  .matchMedia("(prefers-color-scheme: dark)")
+  .addEventListener("change", ({ matches }) => {
+    themeValue = matches ? DARK : LIGHT;
+    localStorage.setItem(THEME_KEY, themeValue);
+    reflect();
+  });

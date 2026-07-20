@@ -6,31 +6,29 @@
   --color-muted: var(--muted);
   --color-muted-foreground: var(--muted-foreground);
   --color-border: var(--border);
-  --font-app: var(--font-geist);
-  --font-code: var(--font-geist-mono);
+  --font-app: var(--font-google-sans-code);
+  --font-code: var(--font-google-sans-code);
 }
 
 :root,
 [data-theme="light"] {
   color-scheme: light;
-  --background: #fbfaf7;
-  --foreground: #292824;
-  --accent: #c64c1a;
+  --background: #fdfdfd;
+  --foreground: #282728;
+  --accent: #006cac;
   --accent-foreground: #ffffff;
-  --muted: #ebe8e1;
-  --muted-foreground: #6f6c63;
-  --border: #ddd8ce;
-  --surface: #f3f0e9;
+  --muted: #e6e6e6;
+  --muted-foreground: #6b7280;
+  --border: #ece9e9;
 }
 
 [data-theme="dark"] {
   color-scheme: dark;
-  --background: #151512;
-  --foreground: #efede6;
-  --accent: #ff7038;
-  --accent-foreground: #1b0c06;
-  --muted: #282822;
-  --muted-foreground: #aaa79e;
-  --border: #3b3932;
-  --surface: #1d1d19;
+  --background: #212737;
+  --foreground: #eaedf3;
+  --accent: #ff6b01;
+  --accent-foreground: #ffffff;
+  --muted: #343f60;
+  --muted-foreground: #afb9ca;
+  --border: #ab4b08;
 }
