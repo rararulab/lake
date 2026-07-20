@@ -60,8 +60,8 @@ $ rm -rf data && mise run gate
 [hooks] $ prek run --all-files
 [test] $ cargo test --workspace --all-targets
 [e2e] $ cargo run -p lake-cli -- selftest
-[site-install] $ npm install --prefix site
-[adbc-install] $ npm install --prefix crates/lake-adbc
+[site-install] $ bun install --cwd site --frozen-lockfile
+[adbc-install] $ uv sync --project interop/adbc --frozen
 [hooks] Finished in 66.7ms
 [test] Finished in 34.32s
 Finished in 34.33s
