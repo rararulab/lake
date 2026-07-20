@@ -1,88 +1,59 @@
-# Verification report — issue #308
+# Verification report — issue #308 (final rebase audit)
 
-- base_sha: 3e37a4a324d986b813479d8ece9af884cc20866e
-- head_sha: ec5454e45b667fa17d44f1654b030961609471a2
+- base_sha: 98e1667e7afc39279715e2001a20ea0e029970e1
+- head_sha: 6aec163b249f27af08988bef02d222265802b93d
+- pre_rebase_head: 39d4ebf645689e6af7c6e8e5dc62e8a8d917060b
+- previous_review_head: 5b8167481ff9f49b68c70365c5b3c60942a6564f
 - score_authority: verifier
 - implementer_evidence: self_check_only
 - lane: 1
 - spec: `specs/issue-308-episode-manifest-v1.spec.md`
 
-The jj workspace has an empty working-copy commit `77e619b7` whose parent is
-the candidate above; `jj diff --from @- --to @` reported zero files changed, so
-the tested tree is exactly `ec5454e4`. This jj workspace is an ignored
-subdirectory of the colocated Git checkout, so plain `git rev-parse HEAD` from
-inside it resolves the parent checkout's `main` pointer rather than the jj
-candidate. The pinned SHAs therefore come from `jj @-` plus an explicit
-`git -C /Users/ryan/code/rararulab/lake merge-base <candidate> origin/main`.
+This report scores the exact post-rebase candidate above. No earlier PASS was
+carried forward: the full gate, static checks, lane-1 lifecycle, every bound
+selector, base selector transition, and hostile probes were rerun after the
+rebase onto main issue #312.
 
-No implementer hand-off or prior report was read. The pre-existing report was
-replaced with evidence gathered in this verification run.
+The jj workspace has an uncommitted verifier-only change to this report.
+The product candidate is its parent `@-`. Plain Git HEAD in this ignored jj
+subdirectory points at the parent checkout, so both candidate and merge-base
+were resolved with the explicit candidate commit ID.
 
 ## Commands
 
-### Environment and clean candidate state
-
-`mise run doctor`
-
-```text
-[doctor] $ bun scripts/doctor.ts
-[ ok ] mise tools installed
-[ ok ] nightly rustfmt
-[ ok ] cargo check
-[ ok ] jj repo: /Users/ryan/code/rararulab/lake/.worktrees/issue-308-episode-manifest-v1
-[ ok ] gh authenticated
-[ ok ] git remote: origin
-```
-
-`jj st`
-
-```text
-The working copy has no changes.
-Working copy  (@) : rnwsssxw 77e619b7 (empty) (no description set)
-Parent commit (@-): mstprsrt ec5454e4 feat(robotics): define EpisodeManifest v1 contract (#308)
-```
-
-`jj diff --from @- --to @ --stat`
-
-```text
-0 files changed, 0 insertions(+), 0 deletions(-)
-```
+### Pinned post-rebase state
 
 `jj log -r @- --no-graph -T 'commit_id ++ "\n"'`
 
 ```text
-ec5454e45b667fa17d44f1654b030961609471a2
+6aec163b249f27af08988bef02d222265802b93d
 ```
 
-`git -C /Users/ryan/code/rararulab/lake merge-base ec5454e45b667fa17d44f1654b030961609471a2 origin/main`
+`git -C /Users/ryan/code/rararulab/lake merge-base 6aec163b249f27af08988bef02d222265802b93d origin/main`
 
 ```text
-3e37a4a324d986b813479d8ece9af884cc20866e
+98e1667e7afc39279715e2001a20ea0e029970e1
 ```
 
-The candidate diff contained only allowed paths:
+`jj status` before verification:
 
 ```text
-Cargo.lock
-crates/lake-common/AGENT.md
-crates/lake-common/Cargo.toml
-crates/lake-common/src/episode_manifest.rs
-crates/lake-common/src/episode_manifest_tests.rs
-crates/lake-common/src/lib.rs
-docs/architecture.md
-docs/design/robot-training-lakehouse.md
-specs/issue-308-episode-manifest-v1.spec.md
+Working copy changes:
+M verification/report.md
+Working copy  (@) : ytkrzwyt 79a53d14 (no description set)
+Parent commit (@-): xvnurqqz 6aec163b fix(robotics): enforce canonical manifest identity (#308)
 ```
+
+`jj diff --summary` contained only:
+
+```text
+M verification/report.md
+```
+
+The exact workspace `data/` directory had no active `lsof +D` result and
+was removed before the gate.
 
 ### Full quality gate from cold state
-
-Before the gate, the workspace path was checked exactly, `lsof +D` found no
-process using its `data/`, and that directory was removed.
-
-```text
-data_active_processes=0
-removed_stale_data=yes
-```
 
 `mise run gate`
 
@@ -93,7 +64,12 @@ exit_code: 0
 [e2e] $ cargo run -p lake-cli -- selftest
 [hooks] cargo fmt............................................(no files to check)Skipped
 [hooks] cargo clippy.........................................(no files to check)Skipped
-[hooks] Finished in 67.6ms
+[hooks] Finished in 64.0ms
+[test-adbc] test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.71s
+[site-check] Result (24 files):
+[site-check] - 0 errors
+[site-check] - 0 warnings
+[site-check] - 0 hints
 [e2e] created table robots.episodes
 [e2e] committed robots.episodes at v2
 [e2e] +----------+----------+------------+
@@ -103,15 +79,14 @@ exit_code: 0
 [e2e] | beta     | 1        | 0.4        |
 [e2e] +----------+----------+------------+
 [e2e] self-check ok
-[test] test result: ok. 62 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 11.63s
-[test] Finished in 34.34s
-Finished in 34.35s
+[test] test result: ok. 62 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 11.74s
+[test] Finished in 35.73s
+Finished in 35.73s
 ```
 
-Because `prek` inherited the parent Git checkout's subdirectory pathspec, both
-hooks matched zero tracked paths. The exact hook commands were therefore run
-directly against the candidate workspace instead of accepting that false-green
-portion of the wrapper.
+The prek hooks inherited the jj-subdirectory Git pathspec and matched no files,
+so they were not accepted as fmt/clippy evidence. Both commands were run
+directly:
 
 `cargo +nightly fmt --all -- --check`
 
@@ -124,9 +99,8 @@ exit_code: 0
 
 ```text
 exit_code: 0
-    Checking lake-common v1.8.4 (/Users/ryan/code/rararulab/lake/.worktrees/issue-308-episode-manifest-v1/crates/lake-common)
     Checking lake-cli v1.8.4 (/Users/ryan/code/rararulab/lake/.worktrees/issue-308-episode-manifest-v1/crates/lake-cli)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 19s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.86s
 ```
 
 ### Lane-1 lifecycle and bound selectors
@@ -149,7 +123,7 @@ spec-lifecycle-guard: OK — every Test selector executed >=1 test
 ```text
 running 1 test
 test episode_manifest_tests::episode_manifest_v1_roundtrips_two_recording_formats ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
 ```
 
 `cargo test -p lake-common episode_manifest_v1_binds_complete_artifact_refs`
@@ -157,7 +131,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; fini
 ```text
 running 1 test
 test episode_manifest_tests::episode_manifest_v1_binds_complete_artifact_refs ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
 ```
 
 `cargo test -p lake-common episode_manifest_v1_rejects_artifact_binding_mismatch`
@@ -165,35 +139,24 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; fini
 ```text
 running 1 test
 test episode_manifest_tests::episode_manifest_v1_rejects_artifact_binding_mismatch ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
 ```
 
 `cargo test -p lake-common episode_manifest_v1_rejects_invalid_wire`
 
 ```text
-running 1 test
+running 3 tests
+test episode_manifest_tests::episode_manifest_v1_rejects_invalid_wire_duplicate_artifact_identity ... ok
 test episode_manifest_tests::episode_manifest_v1_rejects_invalid_wire ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+test episode_manifest_tests::episode_manifest_v1_rejects_invalid_wire_noncanonical_json_bytes ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
 ```
 
-### Base transition evidence
+### New-base acceptance transition
 
-The base was exported from the main Git root to an isolated `mktemp` directory;
-all four candidate selectors matched zero tests. Under Lake's
-`spec-lifecycle-guard`, zero matches are an acceptance failure even though
-Cargo itself exits zero.
-
-The first archive attempt was invoked from the ignored jj subdirectory, so Git
-implicitly filtered for `.worktrees/issue-308-episode-manifest-v1/**` and the
-temporary archive had no `Cargo.toml`:
-
-```text
-error: manifest path `/var/folders/qk/93970_h952g3pmjljflsljt40000gn/T//lake-308-base.JtA66j/Cargo.toml` does not exist
-```
-
-It was discarded as setup evidence and rerun correctly with
-`git -C /Users/ryan/code/rararulab/lake archive --format=tar 3e37a4a324d986b813479d8ece9af884cc20866e`.
-Each of these base commands was then run with `--locked`:
+Base `98e1667e7afc39279715e2001a20ea0e029970e1` was exported from the
+Git root into an isolated `mktemp` tree. Each selector was run with
+`--locked`:
 
 ```text
 cargo test --manifest-path <base>/Cargo.toml --locked -p lake-common episode_manifest_v1_roundtrips_two_recording_formats
@@ -202,95 +165,103 @@ cargo test --manifest-path <base>/Cargo.toml --locked -p lake-common episode_man
 cargo test --manifest-path <base>/Cargo.toml --locked -p lake-common episode_manifest_v1_rejects_invalid_wire
 ```
 
-Raw result for each selector:
+Every selector produced:
 
 ```text
 running 0 tests
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
 ```
 
-### Feature-specific runtime verification
+Under the spec-lifecycle zero-match guard this is an acceptance failure.
+The isolated base tree was deleted.
 
-N/A. This issue adds an I/O-free `lake-common` value/wire contract and
-explicitly adds no CLI, server, Query, Metasrv, SDK, storage-engine, or other
-application surface. There is therefore no candidate application endpoint to
-boot and drive for EpisodeManifest itself. Inventing a CLI flow would exceed
-the spec. The cold `mise run gate` e2e above still booted the existing real
-system from a deleted `data/` directory and passed as a regression check, but
-it is not claimed as feature-specific EpisodeManifest coverage.
+### Post-rebase hostile probes
 
-### Hostile probes
+An isolated temporary binary crate depended on the pinned candidate's public
+`lake-common` API. It used CJK identities and created its own manifest and
+ArtifactRefs. No candidate implementation or test was edited.
 
-A temporary integration test was added only for execution, run with the command
-below, and deleted before the final clean-state check. It was never committed
-and made no implementation change.
-
-`cargo test -p lake-common --test issue_308_verifier_hostile -- --nocapture`
+`cargo run --manifest-path /tmp/lake-308-rebase-probe/Cargo.toml --quiet`
 
 ```text
-running 3 tests
-future_version_observed=UnsupportedVersion { version: 65535, supported: 1 }
-duplicate_field_observed=Json { source: Error("duplicate field `format_version`", line: 1, column: 36) }
-test wire_rejects_max_future_version_and_duplicate_top_level_field ... ok
-balanced_multiset_observed=ArtifactBindingMismatch { expected: 3, observed: 3 }
-test balanced_multiset_substitution_fails_even_when_ref_count_matches ... ok
-stale_digest_observed=ManifestObjectMismatch { field: "sha256" }
-test equal_length_stale_manifest_digest_hits_sha256_check ... ok
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+pretty=Err(NonCanonical)
+reordered=Err(NonCanonical)
+trailing=Err(NonCanonical)
+equivalent_number=Err(NonCanonical)
+duplicate_identity=Err(DuplicateIdentity { kind: "Artifact binding", identity: "对象-1" })
+canonical_digest_exact_multiset=Ok(episode=剧集-001, refs=2)
 ```
+
+The temporary probe tree was deleted after the run.
+
+### Reviewer P1 transition anchor
+
+Before the rebase, this same verifier exported old review head
+`5b8167481ff9f49b68c70365c5b3c60942a6564f`, copied only the repaired
+regression tests over its old implementation, and observed both tests fail:
+
+```text
+episode_manifest_v1_rejects_invalid_wire_noncanonical_json_bytes:
+test result: FAILED. 0 passed; 1 failed; 10 filtered out
+exit_code: 101
+
+episode_manifest_v1_rejects_invalid_wire_duplicate_artifact_identity:
+test result: FAILED. 0 passed; 1 failed; 10 filtered out
+exit_code: 101
+```
+
+Both exact tests are `ok` in the fresh post-rebase three-test selector above.
+
+### Feature runtime judgment
+
+Feature-specific runtime remains N/A. The changed surface is a pure, I/O-free
+`lake-common` value/wire/binding contract with no CLI, SDK, Query, Metasrv,
+object-store, or engine endpoint. The real-system e2e was still cold-booted by
+`mise run gate` and passed as a baseline regression check.
 
 ## Transition matrix
 
 - fail_to_pass:
-  - `episode_manifest_v1_roundtrips_two_recording_formats`: expected base
-    selector absent / guarded acceptance failure, head one passing test;
-    observed base `0 passed, 5 filtered out`, head `1 passed, 0 failed`.
-  - `episode_manifest_v1_binds_complete_artifact_refs`: expected base selector
-    absent / guarded acceptance failure, head one passing test; observed base
-    `0 passed, 5 filtered out`, head `1 passed, 0 failed`.
-  - `episode_manifest_v1_rejects_artifact_binding_mismatch`: expected base
-    selector absent / guarded acceptance failure, head one passing test;
-    observed base `0 passed, 5 filtered out`, head `1 passed, 0 failed`.
-  - `episode_manifest_v1_rejects_invalid_wire`: expected base selector absent /
-    guarded acceptance failure, head one passing test; observed base `0 passed,
-    5 filtered out`, head `1 passed, 0 failed`.
-- pass_to_fail: 0; full workspace gate, direct fmt, direct clippy, lifecycle,
-  all bound selectors, and all hostile probes completed with exit code 0.
+  - New base `98e1667e` -> candidate: all four spec selectors changed from
+    zero matches to the expected 1/1/1/3 passing tests.
+  - Review head `5b816748` -> candidate: bytewise non-canonical JSON changed
+    from regression-test exit 101 to four observed `NonCanonical` results.
+  - Review head `5b816748` -> candidate: same Artifact identity with
+    different binding semantics changed from exit 101 to observed
+    `DuplicateIdentity { kind: "Artifact binding" }`.
+- pass_to_fail: 0. The post-rebase full gate, direct fmt/clippy, lifecycle,
+  every selector, and all hostile/success probes passed on the exact candidate.
 
 ## Probes
 
-1. Future/noncanonical wire matrix
-   - Input: canonical CJK-bearing manifest changed to `format_version=65535`;
-     separately, syntactically valid JSON with a duplicate top-level
-     `format_version` field.
-   - Expected: typed unsupported-version error for the former and strict JSON
-     decode error for the latter.
-   - Observed: `UnsupportedVersion { version: 65535, supported: 1 }` and JSON
-     `duplicate field 'format_version'`.
+1. Bytewise non-canonical JSON matrix
+   - Input: CJK manifest encoded as pretty JSON, reordered-map JSON, compact
+     JSON plus a trailing newline, and `0.95` rewritten as equivalent
+     `9.5e-1`.
+   - Expected: all return `NonCanonical`.
+   - Observed: four `Err(NonCanonical)` values.
    - Result: PASS.
-2. Balanced ArtifactRef multiset substitution
-   - Input: exact three non-manifest refs changed by removing `artifact-c` and
-     duplicating `artifact-a`, preserving total observed count at three.
-   - Expected: rejection based on multiset identity/multiplicity, not a length
-     comparison.
-   - Observed: `ArtifactBindingMismatch { expected: 3, observed: 3 }`.
+2. Duplicate identity with different binding semantics
+   - Input: second binding with `artifact_id = "对象-1"` but different role
+     and selector.
+   - Expected: `DuplicateIdentity` keyed by Artifact identity.
+   - Observed: `DuplicateIdentity { kind: "Artifact binding", identity: "对象-1" }`.
    - Result: PASS.
-3. Equal-length stale manifest digest
-   - Input: manifest ArtifactRef with correct media type and byte length, but
-     SHA-256 computed from a one-byte-mutated equal-length payload.
-   - Expected: the isolated digest check rejects it.
-   - Observed: `ManifestObjectMismatch { field: "sha256" }`.
+3. Canonical digest and exact multiset success path
+   - Input: exact manifest SHA-256/media type/length and one exact
+     non-manifest ArtifactRef for the one logical binding.
+   - Expected: successful CJK Episode bundle with two ArtifactRefs.
+   - Observed: `Ok(episode=剧集-001, refs=2)`.
    - Result: PASS.
 
 ## Issues
 
-None in the candidate. The jj-subdirectory Git pathspec behavior caused the
-wrapper's fmt/clippy hooks to skip and the first base archive attempt to be
-empty; both were explicitly corrected with direct commands and a Git-root
-archive before scoring.
+None. The jj-subdirectory pathspec skip was closed by direct fmt/clippy.
+The full workspace gate on the #312 baseline passed, so the rebase introduced
+no observed regression.
 
 ## Verdict
 
-PASS — the clean candidate gate, direct static gates, lane-1 lifecycle, all
-bound selectors, observed base-to-head transitions, and three hostile probes
-all meet the contract with zero regressions.
+PASS — exact post-rebase head `6aec163b249f` passes the complete gate,
+lane-1 contract, direct static checks, both repaired P1 hostile cases, and the
+original digest/exact-multiset success path with zero observed regressions.
