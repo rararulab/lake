@@ -132,6 +132,16 @@ pub enum AdapterError {
     ))]
     FallbackScanTooLarge { size_bytes: u64, limit_bytes: u64 },
 
+    /// One declared source-format record exceeded the per-record decode limit.
+    #[snafu(display(
+        "{format} record requires {size_bytes} bytes; configured ceiling is {limit_bytes}"
+    ))]
+    RecordTooLarge {
+        format:      &'static str,
+        size_bytes:  u64,
+        limit_bytes: u64,
+    },
+
     /// An upstream format decoder rejected bytes or metadata.
     #[snafu(display("{format} metadata is invalid: {message}"))]
     Format {
