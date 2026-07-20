@@ -85,6 +85,7 @@ an ingestion/commit path, or per-sample traffic through Query or Metasrv.
 ### Allowed Changes
 Cargo.toml
 Cargo.lock
+release-please-config.json
 crates/lake-adapters/**
 docs/architecture.md
 docs/design/robot-training-lakehouse.md

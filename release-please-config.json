@@ -13,6 +13,11 @@
     {
       "type": "toml",
       "path": "Cargo.lock",
+      "jsonpath": "$.package[?(@.name.value == \"lake-adapters\")].version"
+    },
+    {
+      "type": "toml",
+      "path": "Cargo.lock",
       "jsonpath": "$.package[?(@.name.value == \"lake-common\")].version"
     },
     {
