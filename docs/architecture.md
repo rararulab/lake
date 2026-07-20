@@ -658,13 +658,15 @@ design-level ones:
   entries after a bounded TTL, and exposes explicit per-table/full invalidation
   for coordinated replacement. This removes per-row schema planning without
   weakening Query/Metasrv append validation.
-- The Rust SDK also accepts 1..=10,000 rows across caller-owned Arrow batches.
-  It rejects empty, inconsistent, or authoritative-table-schema-mismatched input
-  before `DoPut`, encodes at most one 64 MiB Flight payload, and reuses the same
-  UUIDv7 identity, digest, durable checkpoint, and ambiguous-result retry path
-  as scalar/`FILE` inserts. Query-only clients can use this path because existing
-  `DataLocation` values are metadata; no object discovery, upload, or byte proxy
-  occurs.
+- The Rust SDK also accepts 1..=10,000 rows across caller-owned, non-empty Arrow
+  batches. It rejects zero-row, inconsistent, oversized-buffer, or
+  authoritative-table-schema-mismatched input before `DoPut`; exact protobuf
+  sizes are accumulated incrementally and stop at the 64 MiB Flight ceiling.
+  At most 10,001 messages (one schema plus one hydrated record message per row)
+  enter either the memory-only or durable checkpoint path. Both reuse the same
+  UUIDv7 identity, digest, and ambiguous-result retry machinery as scalar/`FILE`
+  inserts. Query-only clients can use this path because existing `DataLocation`
+  values are metadata; no object discovery, upload, or byte proxy occurs.
 - Each stateless Query replica has finite process-local admission: bounded
   concurrent planning/execution, bounded queue wait, a stream-held execution
   deadline, and pre-planning SQL/ticket size checks. Authenticated tenants first

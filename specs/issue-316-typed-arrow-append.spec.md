@@ -43,9 +43,14 @@ Rerun Hub clone, training orchestrator, or cross-table transaction engine.
   Result<Version>` as the generic public write surface. Ownership makes the
   first implementation finite and lets the existing Flight encoder consume
   batches without cloning their arrays.
-- Accept 1..=10,000 aggregate rows. Reject an empty vector, batches whose total
-  row count is zero or over the limit, and arithmetic overflow before schema
-  lookup or `DoPut`.
+- Accept 1..=10,000 aggregate rows. Reject an empty vector, every individual
+  zero-row batch, an aggregate over the limit, and arithmetic overflow before
+  schema lookup or `DoPut`. Because each accepted batch contributes at least
+  one row, the batch count is also bounded by 10,000.
+- Before schema lookup or Flight encoding, cap the saturating sum of Arrow
+  array buffer memory at 64 MiB. This caller-local guard prevents a single
+  oversized Binary/Utf8 value from first being duplicated into an unbounded
+  encoded buffer; exact protobuf size remains the final transport authority.
 - Require every supplied batch to have the exact same Arrow schema, including
   field names, order, data types, nullability, and schema metadata. Validate
   this caller-local property before any RPC.
@@ -54,8 +59,12 @@ Rerun Hub clone, training orchestrator, or cross-table transaction engine.
   authoritative schema; v1 performs no coercion, projection, field reordering,
   default filling, or schema evolution.
 - Encode all batches as one bounded Arrow Flight stream and retain the existing
-  64 MiB encoded payload ceiling. The append has one UUIDv7 operation identity,
-  one payload digest, one durable checkpoint, and one table-version result.
+  64 MiB encoded payload ceiling. Collect messages incrementally, stop on the
+  first exact protobuf-size overflow, and permit at most 10,001 messages: one
+  schema plus at most one hydrated record message per accepted row. The same
+  derived limit governs checkpoint framing. The append has one UUIDv7 operation
+  identity, one payload digest, one durable checkpoint, and one table-version
+  result.
 - Extract one shared append-preparation helper so `append_batches` and the
   existing `insert`/`insert_many` path attach the same command descriptor,
   validate the same payload ceiling, persist the same replay-safe checkpoint,
@@ -135,6 +144,29 @@ Scenario: invalid Arrow input fails before append side effects
   Then each returns a typed bounded error before `DoPut`, locally invalid
   inputs perform no schema RPC, and no table version is published
 
+Scenario: Arrow input memory and batch fan-out are bounded before schema lookup
+  Test:
+    Package: lake-sdk
+    Filter: sdk_typed_arrow_append_rejects_unbounded_inputs_before_schema_rpc
+  Level: unit
+  Targets: crates/lake-sdk/src/lib.rs
+  Given a valid row followed by a zero-row batch, and a one-row Binary batch
+  whose Arrow buffer exceeds 64 MiB
+  When `append_batches` performs caller-local validation
+  Then it returns typed empty-batch and input-size errors before any schema RPC
+
+Scenario: encoded Flight collection stops at the exact payload ceiling
+  Test:
+    Package: lake-sdk
+    Filter: sdk_typed_arrow_append_stops_encoding_at_payload_limit
+  Level: unit
+  Targets: crates/lake-sdk/src/lib.rs
+  Given a finite Flight encoder stream whose second message crosses the exact
+  protobuf-size limit and which has an observable third message
+  When bounded append encoding collects the stream
+  Then it rejects at the second message and never polls or materializes the
+  third message
+
 Rule: append-recovery — public Arrow writes use the existing durable identity
 
 Scenario: an ambiguous Arrow append converges without a duplicate commit
@@ -149,6 +181,17 @@ Scenario: an ambiguous Arrow append converges without a duplicate commit
   Then the same UUIDv7 identity, digest, encoded payload, and checkpoint are
   reused, exactly one table version is committed, and the conclusive success
   removes the checkpoint
+
+Scenario: checkpointing accepts the same maximum batch partition as memory-only preparation
+  Test:
+    Package: lake-sdk
+    Filter: sdk_typed_arrow_append_checkpoint_partition_boundary_is_consistent
+  Level: unit
+  Targets: crates/lake-sdk/src/lib.rs, crates/lake-sdk/src/append_checkpoint.rs
+  Given 4,096 one-row batches that encode to one schema plus 4,096 record
+  messages and the derived 10,001-message maximum checkpoint framing
+  When the same typed append is prepared with checkpointing disabled and enabled
+  Then both preparations succeed, and the durable payload reloads byte-for-byte
 
 ## Out of Scope
 

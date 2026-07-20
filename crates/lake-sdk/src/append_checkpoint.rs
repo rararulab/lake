@@ -22,12 +22,13 @@ use prost_types::Any;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::{PendingAppend, Result, SdkError, validate_flight_payload_size};
+use crate::{
+    MAX_APPEND_FLIGHT_MESSAGES, PendingAppend, Result, SdkError, validate_flight_payload_size,
+};
 
 const FORMAT_VERSION: u32 = 1;
 const CHECKPOINT_SUFFIX: &str = ".append.pb";
 const MAX_CHECKPOINT_OVERHEAD: u64 = 1024 * 1024;
-const MAX_FLIGHT_MESSAGES: usize = 4_096;
 
 #[derive(Clone, PartialEq, Message)]
 struct AppendCheckpointV1 {
@@ -308,7 +309,7 @@ fn integrity_digest(checkpoint: &AppendCheckpointV1) -> Vec<u8> {
 }
 
 fn encode_messages(messages: &[FlightData]) -> Result<Vec<u8>> {
-    if messages.len() > MAX_FLIGHT_MESSAGES {
+    if messages.len() > MAX_APPEND_FLIGHT_MESSAGES {
         return Err(invalid(
             Path::new("<prepared append>"),
             "Flight message count exceeds checkpoint limit",
@@ -346,7 +347,7 @@ fn decode_messages(payload: &[u8], path: &Path) -> Result<Vec<FlightData>> {
     let mut cursor = 0usize;
     let count = usize::try_from(read_u32(payload, &mut cursor, path)?)
         .expect("u32 always fits supported usize");
-    if count > MAX_FLIGHT_MESSAGES {
+    if count > MAX_APPEND_FLIGHT_MESSAGES {
         return Err(invalid(
             path,
             "Flight message count exceeds checkpoint limit",
@@ -511,7 +512,9 @@ mod tests {
     use super::{
         AppendCheckpointV1, decode_messages, encode_messages, integrity_digest, save_atomic_inner,
     };
-    use crate::{MAX_INSERT_FLIGHT_BYTES, PendingAppend, SdkError, append_checkpoint};
+    use crate::{
+        MAX_INSERT_BATCH_ROWS, MAX_INSERT_FLIGHT_BYTES, PendingAppend, SdkError, append_checkpoint,
+    };
 
     fn pending() -> PendingAppend {
         let operation_id = AppendOperationId::generate();
@@ -534,6 +537,62 @@ mod tests {
             messages,
             checkpoint: None,
         }
+    }
+
+    fn pending_with_message_count(message_count: usize) -> PendingAppend {
+        assert!(message_count >= 1);
+        let operation_id = AppendOperationId::generate();
+        let mut messages = vec![FlightData::default(); message_count];
+        let request = FileAppendRequest::new(
+            TableRef::new("robots", "episodes"),
+            operation_id.clone(),
+            lake_flight::append_flight_payload_digest(&messages),
+        );
+        messages[0].flight_descriptor = Some(FlightDescriptor::new_cmd(
+            Any {
+                type_url: FILE_APPEND_TYPE_URL.to_owned(),
+                value:    request.command_payload(),
+            }
+            .encode_to_vec(),
+        ));
+        PendingAppend {
+            operation_id,
+            messages,
+            checkpoint: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_checkpoint_accepts_maximum_typed_append_partition() {
+        let root = tempfile::tempdir().unwrap();
+        let maximum_messages = MAX_INSERT_BATCH_ROWS + 1;
+        let pending = pending_with_message_count(maximum_messages);
+
+        assert!(
+            append_checkpoint::save(None, &pending, "query-only", MAX_INSERT_FLIGHT_BYTES,)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let path = append_checkpoint::save(
+            Some(root.path()),
+            &pending,
+            "query-only",
+            MAX_INSERT_FLIGHT_BYTES,
+        )
+        .await
+        .expect("checkpoint-on accepts the same maximum partition")
+        .expect("checkpoint path");
+        assert!(path.is_file());
+        let loaded = append_checkpoint::load(
+            Some(root.path()),
+            pending.operation_id(),
+            "query-only",
+            MAX_INSERT_FLIGHT_BYTES,
+        )
+        .await
+        .expect("maximum partition reloads");
+        assert_eq!(loaded.messages, pending.messages);
     }
 
     #[tokio::test]

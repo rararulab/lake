@@ -75,6 +75,8 @@ const MAX_INSERT_BATCH_ROWS: usize = 10_000;
 const MAX_INSERT_INPUT_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INSERT_OUTPUT_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INSERT_FLIGHT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_APPEND_INPUT_BYTES: usize = MAX_INSERT_FLIGHT_BYTES;
+const MAX_APPEND_FLIGHT_MESSAGES: usize = MAX_INSERT_BATCH_ROWS + 1;
 const MAX_PENDING_APPEND_CHECKPOINTS: usize = 1_024;
 const ASYNC_QUERY_HANDLE_VERSION: u8 = 1;
 const MAX_ASYNC_QUERY_HANDLE_BYTES: usize = 16 * 1024;
@@ -281,6 +283,17 @@ pub enum SdkError {
 
     #[snafu(display("append metadata is {actual} bytes, above the {maximum}-byte limit"))]
     BatchMetadataSize { actual: usize, maximum: usize },
+
+    #[snafu(display("append Arrow input is {actual} bytes, above the {maximum}-byte limit"))]
+    BatchInputSize { actual: usize, maximum: usize },
+
+    #[snafu(display("Arrow batch {batch_index} has zero rows"))]
+    EmptyBatch { batch_index: usize },
+
+    #[snafu(display(
+        "append encodes to {actual} Flight messages, above the {maximum}-message limit"
+    ))]
+    BatchMessageCount { actual: usize, maximum: usize },
 
     #[snafu(display("Arrow batch {batch_index} does not match the first batch schema"))]
     BatchSchemaMismatch { batch_index: usize },
@@ -1128,12 +1141,15 @@ impl LakeClient {
 
     /// Append caller-owned Arrow batches to one exact table version.
     ///
-    /// The aggregate must contain 1..=10,000 rows, every batch must have the
-    /// same exact schema, and that schema must equal the table schema resolved
-    /// through Query. Validation and Flight encoding are bounded before the
-    /// first append `DoPut`. This method carries only Arrow values, including
-    /// any existing [`DataLocation`] metadata; it never uploads object bytes
-    /// or requires SDK-process object-store credentials.
+    /// The aggregate must contain 1..=10,000 rows, every batch must be
+    /// non-empty and have the same exact schema, and that schema must equal
+    /// the table schema resolved through Query. Caller-local Arrow buffers
+    /// and the exact encoded Flight payload are each capped at 64 MiB;
+    /// encoding stops at the first overflow. Validation and Flight encoding
+    /// are bounded before the first append `DoPut`. This method carries
+    /// only Arrow values, including any existing [`DataLocation`] metadata;
+    /// it never uploads object bytes or requires SDK-process object-store
+    /// credentials.
     pub async fn append_batches(
         &self,
         table: &TableRef,
@@ -1258,12 +1274,7 @@ impl LakeClient {
             );
         }
         let batch = RecordBatch::try_new(schema, arrays).context(ArrowSnafu)?;
-        let messages = FlightDataEncoderBuilder::new()
-            .with_schema(batch.schema())
-            .build(futures::stream::iter(vec![Ok(batch)]))
-            .try_collect::<Vec<_>>()
-            .await
-            .context(FlightSnafu)?;
+        let messages = encode_append_batches(batch.schema(), vec![batch]).await?;
         self.prepare_append_messages(insert.table, messages).await
     }
 
@@ -1272,19 +1283,14 @@ impl LakeClient {
         table: &TableRef,
         batches: Vec<RecordBatch>,
     ) -> Result<PendingAppend> {
-        let input_schema = validate_append_batches(&batches)?;
+        let input_schema = validate_append_batches(&batches, MAX_APPEND_INPUT_BYTES)?;
         let table_schema = self.table_schema(table).await?;
         if input_schema.as_ref() != table_schema.as_ref() {
             return Err(SdkError::TableSchemaMismatch {
                 table: table.to_string(),
             });
         }
-        let messages = FlightDataEncoderBuilder::new()
-            .with_schema(input_schema)
-            .build(futures::stream::iter(batches.into_iter().map(Ok)))
-            .try_collect::<Vec<_>>()
-            .await
-            .context(FlightSnafu)?;
+        let messages = encode_append_batches(input_schema, batches).await?;
         self.prepare_append_messages(table.clone(), messages).await
     }
 
@@ -2134,7 +2140,10 @@ fn data_location_metadata_bytes(location: &DataLocation) -> usize {
         .saturating_add(std::mem::size_of::<u64>())
 }
 
-fn validate_append_batches(batches: &[RecordBatch]) -> Result<SchemaRef> {
+fn validate_append_batches(
+    batches: &[RecordBatch],
+    maximum_input_bytes: usize,
+) -> Result<SchemaRef> {
     let Some(first) = batches.first() else {
         return Err(SdkError::BatchRowCount {
             actual:  0,
@@ -2142,12 +2151,14 @@ fn validate_append_batches(batches: &[RecordBatch]) -> Result<SchemaRef> {
         });
     };
     let schema = first.schema();
-    let rows = batches
-        .iter()
-        .enumerate()
-        .try_fold(0usize, |rows, (batch_index, batch)| {
+    let (rows, input_bytes) = batches.iter().enumerate().try_fold(
+        (0usize, 0usize),
+        |(rows, input_bytes), (batch_index, batch)| {
             if batch.schema().as_ref() != schema.as_ref() {
                 return Err(SdkError::BatchSchemaMismatch { batch_index });
+            }
+            if batch.num_rows() == 0 {
+                return Err(SdkError::EmptyBatch { batch_index });
             }
             let rows = rows.saturating_add(batch.num_rows());
             if rows > MAX_INSERT_BATCH_ROWS {
@@ -2156,15 +2167,60 @@ fn validate_append_batches(batches: &[RecordBatch]) -> Result<SchemaRef> {
                     maximum: MAX_INSERT_BATCH_ROWS,
                 });
             }
-            Ok(rows)
-        })?;
-    if rows == 0 {
-        return Err(SdkError::BatchRowCount {
-            actual:  rows,
-            maximum: MAX_INSERT_BATCH_ROWS,
-        });
-    }
+            let batch_bytes = batch.columns().iter().fold(0usize, |total, column| {
+                total.saturating_add(column.get_buffer_memory_size())
+            });
+            let input_bytes = input_bytes.saturating_add(batch_bytes);
+            if input_bytes > maximum_input_bytes {
+                return Err(SdkError::BatchInputSize {
+                    actual:  input_bytes,
+                    maximum: maximum_input_bytes,
+                });
+            }
+            Ok((rows, input_bytes))
+        },
+    )?;
+    debug_assert!(rows > 0);
+    debug_assert!(input_bytes <= maximum_input_bytes);
     Ok(schema)
+}
+
+async fn encode_append_batches(
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<FlightData>> {
+    let messages = FlightDataEncoderBuilder::new()
+        .with_schema(schema)
+        .build(futures::stream::iter(batches.into_iter().map(Ok)));
+    collect_flight_messages_bounded(messages, MAX_INSERT_FLIGHT_BYTES).await
+}
+
+async fn collect_flight_messages_bounded<S>(messages: S, maximum: usize) -> Result<Vec<FlightData>>
+where
+    S: Stream<Item = std::result::Result<FlightData, FlightError>>,
+{
+    futures::pin_mut!(messages);
+    let mut collected = Vec::new();
+    let mut encoded_bytes = 0usize;
+    while let Some(message) = messages.next().await {
+        let message = message.context(FlightSnafu)?;
+        let actual_messages = collected.len().saturating_add(1);
+        if actual_messages > MAX_APPEND_FLIGHT_MESSAGES {
+            return Err(SdkError::BatchMessageCount {
+                actual:  actual_messages,
+                maximum: MAX_APPEND_FLIGHT_MESSAGES,
+            });
+        }
+        encoded_bytes = encoded_bytes.saturating_add(message.encoded_len());
+        if encoded_bytes > maximum {
+            return Err(SdkError::BatchMetadataSize {
+                actual: encoded_bytes,
+                maximum,
+            });
+        }
+        collected.push(message);
+    }
+    Ok(collected)
 }
 
 fn validate_flight_payload_size(messages: &[FlightData], maximum: usize) -> Result<()> {
@@ -2193,7 +2249,8 @@ mod tests {
     };
 
     use arrow::{
-        array::{Array, Int64Array, StringArray, StructArray},
+        array::{Array, BinaryArray, Int64Array, StringArray, StructArray},
+        buffer::{Buffer, OffsetBuffer, ScalarBuffer},
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
     };
@@ -2219,7 +2276,7 @@ mod tests {
         routing::{any, get},
     };
     use bytes::Bytes;
-    use futures::TryStreamExt;
+    use futures::{StreamExt, TryStreamExt, stream};
     use lake_common::{
         DataLocation, ManagedStageDescriptor, Principal, PrincipalId, PrincipalRole, TableLocation,
         TableRef, TenantId, Version,
@@ -2251,10 +2308,11 @@ mod tests {
 
     use crate::{
         APPEND_RETRY_WINDOW, FileUpload, InsertValue, LakeClient, MAX_INSERT_BATCH_ROWS,
-        MAX_INSERT_INPUT_METADATA_BYTES, MAX_SCHEMA_CACHE_CAPACITY, MAX_SCHEMA_CACHE_TTL,
-        PresignedRead, QueryOnlyObjectStore, SchemaCache, SchemaCacheConfig, SdkError,
-        ambiguous_append_error, data_location, resume_pending_with,
-        retry_ambiguous_append_with_window, validate_flight_payload_size,
+        MAX_INSERT_FLIGHT_BYTES, MAX_INSERT_INPUT_METADATA_BYTES, MAX_SCHEMA_CACHE_CAPACITY,
+        MAX_SCHEMA_CACHE_TTL, PresignedRead, QueryOnlyObjectStore, SchemaCache, SchemaCacheConfig,
+        SdkError, ambiguous_append_error, collect_flight_messages_bounded, data_location,
+        encode_append_batches, resume_pending_with, retry_ambiguous_append_with_window,
+        validate_flight_payload_size,
     };
 
     #[derive(Clone)]
@@ -4565,7 +4623,7 @@ mod tests {
         ));
         assert!(matches!(
             local_only.append_batches(&table, vec![zero_rows]).await,
-            Err(SdkError::BatchRowCount { actual: 0, .. })
+            Err(SdkError::EmptyBatch { batch_index: 0 })
         ));
         assert!(matches!(
             local_only
@@ -4595,6 +4653,122 @@ mod tests {
                 .current_version,
             Version(1)
         );
+    }
+
+    #[tokio::test]
+    async fn sdk_typed_arrow_append_rejects_unbounded_inputs_before_schema_rpc() {
+        let local_only = LakeClient {
+            query:                 tonic::transport::Endpoint::from_static("http://127.0.0.1:9")
+                .connect_lazy(),
+            objects:               Arc::new(QueryOnlyObjectStore),
+            security:              ClientSecurity::new(),
+            schema_cache:          SchemaCache::new(SchemaCacheConfig::default()),
+            upload_checkpoint_dir: None,
+        };
+        let table = TableRef::new("robots", "episodes");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Binary,
+            false,
+        )]));
+        let one_row = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(BinaryArray::from(vec![b"bounded".as_slice()]))],
+        )
+        .unwrap();
+        let zero_rows = RecordBatch::new_empty(schema.clone());
+
+        assert!(matches!(
+            local_only
+                .append_batches(&table, vec![one_row, zero_rows])
+                .await,
+            Err(SdkError::EmptyBatch { batch_index: 1 })
+        ));
+
+        let oversized_len = MAX_INSERT_FLIGHT_BYTES + 1;
+        let oversized = BinaryArray::new(
+            OffsetBuffer::new(ScalarBuffer::from(vec![
+                0_i32,
+                i32::try_from(oversized_len).unwrap(),
+            ])),
+            Buffer::from(vec![0_u8; oversized_len]),
+            None,
+        );
+        let oversized = RecordBatch::try_new(schema, vec![Arc::new(oversized)]).unwrap();
+        assert!(matches!(
+            local_only.append_batches(&table, vec![oversized]).await,
+            Err(SdkError::BatchInputSize { actual, maximum })
+                if actual > maximum && maximum == MAX_INSERT_FLIGHT_BYTES
+        ));
+    }
+
+    #[tokio::test]
+    async fn sdk_typed_arrow_append_stops_encoding_at_payload_limit() {
+        let polled = Arc::new(AtomicUsize::new(0));
+        let message = FlightData {
+            data_body: vec![0_u8; 32].into(),
+            ..FlightData::default()
+        };
+        let maximum = message.encoded_len();
+        let messages = stream::iter((0..3).map(move |_| Ok::<_, FlightError>(message.clone())))
+            .inspect({
+                let polled = polled.clone();
+                move |_| {
+                    polled.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+        assert!(matches!(
+            collect_flight_messages_bounded(messages, maximum).await,
+            Err(SdkError::BatchMetadataSize { actual, maximum: limit })
+                if actual > limit && limit == maximum
+        ));
+        assert_eq!(polled.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn sdk_typed_arrow_append_checkpoint_partition_boundary_is_consistent() {
+        let root = tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "episode_id",
+            DataType::Utf8,
+            false,
+        )]));
+        let one_row = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["episode-1"]))],
+        )
+        .unwrap();
+        let batches = std::iter::repeat_n(one_row, 4_096).collect::<Vec<_>>();
+        let messages = encode_append_batches(schema, batches).await.unwrap();
+        assert_eq!(messages.len(), 4_097, "schema plus one message per row");
+
+        let table = TableRef::new("robots", "episodes");
+        let without_checkpoint = LakeClient {
+            query:                 tonic::transport::Endpoint::from_static("http://127.0.0.1:9")
+                .connect_lazy(),
+            objects:               Arc::new(QueryOnlyObjectStore),
+            security:              ClientSecurity::new(),
+            schema_cache:          SchemaCache::new(SchemaCacheConfig::default()),
+            upload_checkpoint_dir: None,
+        };
+        let mut with_checkpoint = without_checkpoint.clone();
+        with_checkpoint.upload_checkpoint_dir = Some(root.path().join("checkpoints"));
+
+        let ephemeral = without_checkpoint
+            .prepare_append_messages(table.clone(), messages.clone())
+            .await
+            .expect("checkpoint-off preparation accepts the boundary");
+        let durable = with_checkpoint
+            .prepare_append_messages(table, messages)
+            .await
+            .expect("checkpoint-on preparation accepts the same boundary");
+        assert!(ephemeral.checkpoint.is_none());
+        let loaded = with_checkpoint
+            .load_pending_append(durable.operation_id())
+            .await
+            .expect("boundary checkpoint reloads");
+        assert_eq!(loaded.messages, durable.messages);
     }
 
     #[tokio::test]

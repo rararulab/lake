@@ -10,6 +10,9 @@ The Rust SDK's typed write and direct-read surface.
   generic writes accept exact-schema Arrow batches without widening that parser.
 - Caller-local batch validation precedes schema RPCs, and authoritative schema
   validation completes before upload or append `DoPut`.
+- Generic Arrow appends reject every zero-row batch, cap aggregate Arrow buffer
+  memory before encoding, collect exact protobuf sizes incrementally, and use
+  the same row-derived Flight-message ceiling in memory and durable checkpoints.
 - A `DataLocation` row is appended only after every referenced object upload
   succeeds; per-table visibility remains owned by `Metasrv::append`.
 - Ambiguous append retries reuse one UUIDv7 identity, digest, and encoded Arrow

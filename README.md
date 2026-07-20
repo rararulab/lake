@@ -156,9 +156,12 @@ let version = client
 Adapters that already produce a complete Arrow contract do not need to flatten
 it through the SQL binder. `append_batches` accepts exact-schema batches,
 validates 1..=10,000 aggregate rows against the table schema through Query, and
-uses the same durable idempotent append machinery. Because it carries existing
-`DataLocation` metadata rather than object bytes, it also works with a
-query-only client:
+uses the same durable idempotent append machinery. Every batch must be
+non-empty; caller-local Arrow buffers and the exact encoded Flight payload are
+each capped at 64 MiB, and encoding stops on the first overflow. The derived
+10,001-message ceiling is identical with checkpointing on or off. Because the
+append carries existing `DataLocation` metadata rather than object bytes, it
+also works with a query-only client:
 
 ```rust
 let client = LakeClient::connect_query_only("http://127.0.0.1:50051").await?;
