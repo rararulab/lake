@@ -16,13 +16,14 @@ successfully.
 | Git base SHA | `3e37a4a324d986b813479d8ece9af884cc20866e` |
 | Git head SHA | `3e37a4a324d986b813479d8ece9af884cc20866e` |
 | JJ content base | `b47110ed18e7e889b40cd8cee1dc577c69f0b4d5` (`main@origin`) |
-| JJ content head | `45643a6df80d99be522e592ac180a713c4d7a30a` (`test(release): lock cargo-chef cache inputs (#321)`) |
+| JJ content head | `4499a887d8979c99906620248a7d9e4e03b53935` (`test(release): lock complete cargo-chef input set (#321)`) |
 
 The Git SHA pair is the required raw result of `git merge-base HEAD origin/main`
 and `git rev-parse HEAD` in this colocated JJ checkout. It does not identify
 the candidate content: the independently inspected JJ range
-`main@origin..@-` ends at `45643a6d` and contains the original Dockerfile fix,
-two verification-report commits, and the final contract-test repair.
+`main@origin..@-` ends at `4499a887` and contains the original Dockerfile fix,
+two verification-report commits, and two successive contract-test repairs; the
+latest is `4499a887`.
 
 ## Candidate and environment
 
@@ -51,7 +52,7 @@ COPY . .
 Thus the exact dependency is present before cooking, while application source
 copy remains after the cook cache layer.
 
-At the final repair head, a direct scan of the builder pre-cook interval found
+At the current repair head, a direct scan of the builder pre-cook interval found
 exactly these two planner transfers and no others:
 
 ```text
@@ -115,9 +116,9 @@ There is no altered query, SQL, storage, or RPC runtime surface in this
 change.  The full cold-state self-test covered the project runtime surface;
 the direct Docker build below covers the changed release-build surface.
 
-## Repair re-verification — `45643a6d`
+## First repair re-verification — `45643a6d`
 
-The latest candidate commit changes only the release-artifact contract test:
+This repair commit changes only the release-artifact contract test:
 
 ```text
 $ jj show --summary -r 45643a6d
@@ -184,6 +185,71 @@ Finished in 33.42s
 exit=0
 ```
 
+## P1 repair re-verification — `4499a887`
+
+The second repair again changes only the release-artifact contract test:
+
+```text
+$ jj show --summary -r 4499a887
+M crates/lake-cli/tests/release_artifacts.rs
+```
+
+The test now collects every `COPY --from=planner` from `FROM chef AS builder`
+up to `cargo chef cook`, rather than starting at the recipe COPY. The Dockerfile
+is unchanged, so the existing native historical-builder evidence remains
+applicable and was not repeated.
+
+I placed the reviewer-specified broad transfer immediately after the builder
+stage declaration and **before** the recipe COPY:
+
+```dockerfile
+FROM chef AS builder
+COPY --from=planner /src/third_party third_party
+COPY --from=planner /src/recipe.json recipe.json
+```
+
+The exact selector failed, proving that the expanded scan rejects this former
+blind spot; the Dockerfile was restored immediately after the probe:
+
+```text
+$ mise exec -- cargo test -p lake-cli --test release_artifacts release_image_hydrates_path_dependencies_before_cargo_chef_cook -- --exact
+running 1 test
+test release_image_hydrates_path_dependencies_before_cargo_chef_cook ... FAILED
+assertion `left == right` failed: the builder must receive only the recipe and its exact path dependency before cooking
+  left: ["COPY --from=planner /src/third_party third_party", "COPY --from=planner /src/recipe.json recipe.json", "COPY --from=planner /src/third_party/datafusion-execution third_party/datafusion-execution"]
+ right: ["COPY --from=planner /src/recipe.json recipe.json", "COPY --from=planner /src/third_party/datafusion-execution third_party/datafusion-execution"]
+pre-recipe-broad-copy-probe-exit=101
+```
+
+The restored candidate passed all required positive checks:
+
+```text
+$ mise exec -- cargo test -p lake-cli --test release_artifacts release_image_hydrates_path_dependencies_before_cargo_chef_cook -- --exact
+running 1 test
+test release_image_hydrates_path_dependencies_before_cargo_chef_cook ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out
+exit=0
+
+$ mise run spec-lifecycle specs/issue-321-cargo-chef-path-dependencies.spec.md
+=== Lifecycle Report (guarded) ===
+Spec: cargo-chef-path-dependencies  stage: complete  passed: true
+  [PASS] Cargo-chef receives the historical path dependency before cooking
+  [PASS] Path hydration retains the dependency-cache boundary
+  [PASS] Missing path input is rejected before the release build
+spec-lifecycle-guard: OK — every Test selector executed >=1 test
+exit=0
+
+$ rm -rf data && mise run gate
+[hooks] $ prek run --all-files
+[test] $ cargo test --workspace --all-targets
+[e2e] $ cargo run -p lake-cli -- selftest
+[adbc-install] $ uv sync --project interop/adbc --frozen
+[site-install] $ bun install --cwd site --frozen-lockfile
+[test] Finished in 33.73s
+Finished in 33.73s
+exit=0
+```
+
 ## Historical-source end-to-end proof
 
 I created a separate, clean JJ workspace at the `v1.8.4` tag
@@ -209,9 +275,9 @@ docker-builder-exit=0
 | --- | --- | --- | --- |
 | Exact pre-cook transfer of `third_party/datafusion-execution` | Absent from Dockerfile; no regression selector source | Present before `cargo chef cook` | fail → pass |
 | Selector `release_image_hydrates_path_dependencies_before_cargo_chef_cook` | Fresh base test invocation reported `running 0 tests`, `11 filtered out`, process exit 0 | Runs exactly 1 test and passes | fail → pass (zero-match is rejected by lifecycle guard) |
-| Only recipe + exact path dependency may cross planner → builder before cook | No allow-list contract | Broad `third_party` probe fails with a three-item actual list against the two-item allow-list | regression guard added and demonstrated |
+| Only recipe + exact path dependency may cross planner → builder before cook | No allow-list contract | Broad `third_party` probe before recipe fails with a three-item actual list against the two-item allow-list | regression guard added and demonstrated |
 | Cook cache boundary before `COPY . .` | Not protected by this new contract | Exact selector passes; order retained | pass |
-| Existing mandatory gate | Not re-scored | Green on original candidate and again at repair head | no pass → fail |
+| Existing mandatory gate | Not re-scored | Green on original candidate and at both repair heads, including `4499a887` | no pass → fail |
 
 The base command was deliberately recorded rather than inferred:
 
@@ -237,7 +303,7 @@ copy of the candidate Dockerfile.  They were expected to fail and did fail.
 | --- | --- | --- | --- |
 | Missing hydration | Remove only `COPY --from=planner /src/third_party/datafusion-execution third_party/datafusion-execution` | `cargo chef cook` exits 101: cannot read `/src/third_party/datafusion-execution/Cargo.toml`; Docker exits 1 | PASS — the path input is necessary before cook |
 | Wrong source path | Replace the planner source with `/src/third_party/not-datafusion-execution` | Docker `COPY` fails: source not found; Docker exits 1 | PASS — the transfer is exact, not broad or accidental |
-| Broad planner transfer (`45643a6d`) | Add `COPY --from=planner /src/third_party third_party` while retaining the exact transfer | Static selector exits 101 and reports three actual planner copies versus its two-copy allow-list | PASS — broad cache inputs are explicitly rejected |
+| Broad planner transfer before recipe (`4499a887`) | Add `COPY --from=planner /src/third_party third_party` immediately after `FROM chef AS builder` | Static selector exits 101 and reports three actual planner copies versus its two-copy allow-list | PASS — the complete builder pre-cook interval is locked down |
 
 Raw terminal endings:
 
@@ -256,17 +322,17 @@ wrong-path-exit=1
 ## Scope and cleanup
 
 The candidate changes only the Docker recipe, its contract test, specification,
-and supporting documentation; the final repair changes only the contract test.
-It does not introduce release authority, credentials, tags, or runtime
+and supporting documentation; both reviewer repairs change only the contract
+test. It does not introduce release authority, credentials, tags, or runtime
 behavior. Verification created no candidate code changes. Temporary historical
 and base JJ workspaces, Docker probe files, logs, and the successful temporary
-image were removed after evidence capture; the temporary gate logs from the
-repair re-check were also removed.
+image were removed after evidence capture; temporary gate logs from both
+repair re-checks were also removed.
 
 ## Verdict
 
 PASS. The regression is covered at the static contract boundary and by a
 native, no-cache `v1.8.4` Docker builder build that actually executes
-`cargo chef cook`; the latest repair additionally proves the contract rejects
-a broad planner transfer. Mandatory project gates and every spec selector are
-green at the repair head.
+`cargo chef cook`; the latest repair additionally proves the allow-list begins
+at the builder-stage declaration and rejects a broad pre-recipe transfer.
+Mandatory project gates and every spec selector are green at `4499a887`.
