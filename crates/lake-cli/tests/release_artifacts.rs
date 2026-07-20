@@ -371,6 +371,31 @@ fn release_image_caches_rust_dependencies_before_copying_application_sources() {
 }
 
 #[test]
+fn release_image_hydrates_path_dependencies_before_cargo_chef_cook() {
+    let dockerfile = read("Dockerfile");
+    let recipe = dockerfile
+        .find("COPY --from=planner /src/recipe.json recipe.json")
+        .expect("Docker build must transfer the generated dependency recipe");
+    let path_dependency = dockerfile
+        .find(
+            "COPY --from=planner /src/third_party/datafusion-execution third_party/datafusion-execution",
+        )
+        .expect("Cargo-chef cook must receive the local path dependency from the planner");
+    let cook = dockerfile
+        .find("cargo chef cook --release --recipe-path recipe.json")
+        .expect("Docker build must cook the dependency recipe");
+    let application = dockerfile
+        .rfind("COPY . .")
+        .expect("Docker build must copy application sources after cooking dependencies");
+
+    assert!(
+        recipe < path_dependency && path_dependency < cook && cook < application,
+        "the path dependency must be a cache input after the recipe and before cooking, not part \
+         of the later application-source copy"
+    );
+}
+
+#[test]
 fn release_workflows_have_explicit_execution_budgets() {
     let ci = ci_workflow();
     let jobs = ci["jobs"].as_mapping().expect("CI jobs");
