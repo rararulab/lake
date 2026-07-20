@@ -32,6 +32,7 @@ Release Please authority, not a second release writer.
 crates/lake-cli/tests/release_artifacts.rs
 docs/guides/mise-ci.md
 specs/issue-313-release-please-recovery-schedule.spec.md
+verification/issue-313-release-please-recovery-schedule.md
 
 ### Forbidden
 release-please-config.json
