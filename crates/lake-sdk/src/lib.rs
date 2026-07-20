@@ -17,7 +17,7 @@
 mod append_checkpoint;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fmt, io,
     ops::Range,
     path::{Path, PathBuf},
@@ -30,12 +30,16 @@ use arrow::{
     array::{ArrayRef, StringArray, StructArray},
     datatypes::{DataType, Schema, SchemaRef},
     error::ArrowError,
+    ipc::writer::{
+        CompressionContext, DictionaryHandling as IpcDictionaryHandling, DictionaryTracker,
+        IpcDataGenerator, IpcWriteOptions,
+    },
     record_batch::RecordBatch,
 };
 use arrow_flight::{
     Action, CancelFlightInfoRequest, CancelStatus, FlightClient, FlightData, FlightDescriptor,
     FlightInfo, PollInfo, PutResult, Ticket,
-    encode::{DictionaryHandling, FlightDataEncoderBuilder},
+    encode::GRPC_TARGET_MAX_FLIGHT_SIZE_BYTES,
     error::FlightError,
     sql::{CommandStatementQuery, ProstMessageExt, client::FlightSqlServiceClient},
 };
@@ -2199,11 +2203,123 @@ async fn encode_append_batches(
     batches: Vec<RecordBatch>,
 ) -> Result<Vec<FlightData>> {
     validate_append_dictionary_fields(schema.as_ref())?;
-    let messages = FlightDataEncoderBuilder::new()
-        .with_dictionary_handling(DictionaryHandling::Resend)
-        .with_schema(schema)
-        .build(futures::stream::iter(batches.into_iter().map(Ok)));
+    let messages = futures::stream::iter(AppendFlightEncoder::new(
+        schema,
+        batches,
+        GRPC_TARGET_MAX_FLIGHT_SIZE_BYTES,
+    ));
     collect_flight_messages_bounded(messages, MAX_INSERT_FLIGHT_BYTES).await
+}
+
+/// Exact-schema Arrow IPC encoder that yields at most one gRPC-sized slice at a
+/// time.
+///
+/// `arrow-flight` 58's high-level encoder normalizes some nested fields before
+/// writing the schema and queues every slice of one input batch before
+/// yielding. Using the IPC generator directly preserves the caller's schema and
+/// prevents shared-child `ListView` layouts from multiplying into an unbounded
+/// in-memory queue before the encoded-byte limit can stop them.
+struct AppendFlightEncoder {
+    batches:            std::vec::IntoIter<RecordBatch>,
+    current_batch:      Option<RecordBatch>,
+    current_offset:     usize,
+    rows_per_slice:     usize,
+    max_message_bytes:  usize,
+    data_generator:     IpcDataGenerator,
+    dictionary_tracker: DictionaryTracker,
+    compression:        CompressionContext,
+    options:            IpcWriteOptions,
+    pending_messages:   VecDeque<FlightData>,
+    encoded_slices:     usize,
+    failed:             bool,
+}
+
+impl AppendFlightEncoder {
+    fn new(schema: SchemaRef, batches: Vec<RecordBatch>, max_message_bytes: usize) -> Self {
+        let data_generator = IpcDataGenerator::default();
+        let options =
+            IpcWriteOptions::default().with_dictionary_handling(IpcDictionaryHandling::Resend);
+        let mut dictionary_tracker = DictionaryTracker::new(false);
+        let schema_message = data_generator.schema_to_bytes_with_dictionary_tracker(
+            schema.as_ref(),
+            &mut dictionary_tracker,
+            &options,
+        );
+        Self {
+            batches: batches.into_iter(),
+            current_batch: None,
+            current_offset: 0,
+            rows_per_slice: 0,
+            max_message_bytes: max_message_bytes.max(1),
+            data_generator,
+            dictionary_tracker,
+            compression: CompressionContext::default(),
+            options,
+            pending_messages: VecDeque::from([schema_message.into()]),
+            encoded_slices: 0,
+            failed: false,
+        }
+    }
+
+    fn next_slice(&mut self) -> Option<RecordBatch> {
+        loop {
+            if let Some(batch) = self.current_batch.as_ref()
+                && self.current_offset < batch.num_rows()
+            {
+                let length = self
+                    .rows_per_slice
+                    .min(batch.num_rows() - self.current_offset);
+                let slice = batch.slice(self.current_offset, length);
+                self.current_offset += length;
+                return Some(slice);
+            }
+
+            let batch = self.batches.next()?;
+            let batch_bytes = batch.columns().iter().fold(0usize, |total, column| {
+                total.saturating_add(column.get_buffer_memory_size())
+            });
+            let slice_count = batch_bytes
+                .div_ceil(self.max_message_bytes)
+                .max(1)
+                .min(batch.num_rows().max(1));
+            self.rows_per_slice = (batch.num_rows() / slice_count).max(1);
+            self.current_offset = 0;
+            self.current_batch = Some(batch);
+        }
+    }
+}
+
+impl Iterator for AppendFlightEncoder {
+    type Item = std::result::Result<FlightData, FlightError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(message) = self.pending_messages.pop_front() {
+            return Some(Ok(message));
+        }
+        if self.failed {
+            return None;
+        }
+
+        let batch = self.next_slice()?;
+        self.encoded_slices = self.encoded_slices.saturating_add(1);
+        match self.data_generator.encode(
+            &batch,
+            &mut self.dictionary_tracker,
+            &self.options,
+            &mut self.compression,
+        ) {
+            Ok((dictionaries, record_batch)) => {
+                self.pending_messages
+                    .extend(dictionaries.into_iter().map(FlightData::from));
+                self.pending_messages.push_back(record_batch.into());
+                self.pending_messages.pop_front().map(Ok)
+            }
+            Err(error) => {
+                self.failed = true;
+                Some(Err(error.into()))
+            }
+        }
+    }
 }
 
 fn validate_append_dictionary_fields(schema: &Schema) -> Result<usize> {
@@ -2289,6 +2405,7 @@ fn validate_flight_payload_size(messages: &[FlightData], maximum: usize) -> Resu
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         convert::Infallible,
         io,
         path::PathBuf,
@@ -2303,11 +2420,11 @@ mod tests {
 
     use arrow::{
         array::{
-            Array, ArrayRef, BinaryArray, DictionaryArray, Int32Array, Int64Array, StringArray,
-            StructArray,
+            Array, ArrayRef, BinaryArray, DictionaryArray, Int32Array, Int64Array, LargeListArray,
+            ListViewArray, StringArray, StructArray, UInt8Array, UnionArray,
         },
         buffer::{Buffer, OffsetBuffer, ScalarBuffer},
-        datatypes::{DataType, Field, Int32Type, Schema},
+        datatypes::{DataType, Field, Int32Type, Schema, UnionFields, UnionMode},
         record_batch::RecordBatch,
     };
     use arrow_flight::{
@@ -2364,12 +2481,13 @@ mod tests {
     use tonic::{Request, Response, Status};
 
     use crate::{
-        APPEND_RETRY_WINDOW, FileUpload, InsertValue, LakeClient, MAX_APPEND_DICTIONARY_FIELDS,
-        MAX_INSERT_BATCH_ROWS, MAX_INSERT_FLIGHT_BYTES, MAX_INSERT_INPUT_METADATA_BYTES,
-        MAX_SCHEMA_CACHE_CAPACITY, MAX_SCHEMA_CACHE_TTL, PresignedRead, QueryOnlyObjectStore,
-        SchemaCache, SchemaCacheConfig, SdkError, ambiguous_append_error,
-        collect_flight_messages_bounded, data_location, encode_append_batches, resume_pending_with,
-        retry_ambiguous_append_with_window, validate_flight_payload_size,
+        APPEND_RETRY_WINDOW, AppendFlightEncoder, FileUpload, InsertValue, LakeClient,
+        MAX_APPEND_DICTIONARY_FIELDS, MAX_INSERT_BATCH_ROWS, MAX_INSERT_FLIGHT_BYTES,
+        MAX_INSERT_INPUT_METADATA_BYTES, MAX_SCHEMA_CACHE_CAPACITY, MAX_SCHEMA_CACHE_TTL,
+        PresignedRead, QueryOnlyObjectStore, SchemaCache, SchemaCacheConfig, SdkError,
+        ambiguous_append_error, collect_flight_messages_bounded, data_location,
+        encode_append_batches, resume_pending_with, retry_ambiguous_append_with_window,
+        validate_flight_payload_size,
     };
 
     #[derive(Clone)]
@@ -4848,6 +4966,101 @@ mod tests {
 
         assert_eq!(decoded_schema.as_deref(), Some(schema.as_ref()));
         assert_eq!(decoded_batches, [expected]);
+    }
+
+    #[tokio::test]
+    async fn sdk_typed_arrow_append_preserves_large_list_and_union_metadata() {
+        let large_list = LargeListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some([Some(1), Some(2)]),
+            Some([Some(3), None]),
+        ]);
+        let union_fields = UnionFields::try_new(
+            vec![3, 7],
+            vec![
+                Field::new("integer", DataType::Int32, false),
+                Field::new("text", DataType::Utf8, false),
+            ],
+        )
+        .unwrap();
+        let union = UnionArray::try_new(
+            union_fields.clone(),
+            ScalarBuffer::from(vec![3_i8, 7_i8]),
+            None,
+            vec![
+                Arc::new(Int32Array::from(vec![11, 0])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["", "robot"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let schema = Arc::new(
+            Schema::new(vec![
+                Field::new("trajectory", large_list.data_type().clone(), false)
+                    .with_metadata(HashMap::from([("semantic".into(), "waypoints".into())])),
+                Field::new(
+                    "observation",
+                    DataType::Union(union_fields, UnionMode::Sparse),
+                    false,
+                )
+                .with_metadata(HashMap::from([("semantic".into(), "sensor-value".into())])),
+            ])
+            .with_metadata(HashMap::from([("dataset".into(), "robot-training".into())])),
+        );
+        let expected =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(large_list), Arc::new(union)])
+                .unwrap();
+
+        let messages = encode_append_batches(schema.clone(), vec![expected.clone()])
+            .await
+            .expect("exact nested schema encodes");
+        let mut decoder =
+            FlightDataDecoder::new(stream::iter(messages.into_iter().map(Ok::<_, FlightError>)));
+        let mut decoded_schema = None;
+        let mut decoded_batches = Vec::new();
+        while let Some(decoded) = decoder.next().await {
+            match decoded.unwrap().payload {
+                DecodedPayload::None => {}
+                DecodedPayload::Schema(actual) => decoded_schema = Some(actual),
+                DecodedPayload::RecordBatch(actual) => decoded_batches.push(actual),
+            }
+        }
+
+        assert_eq!(decoded_schema.as_deref(), Some(schema.as_ref()));
+        assert_eq!(decoded_batches, [expected]);
+    }
+
+    #[test]
+    fn sdk_typed_arrow_append_encodes_list_view_slices_lazily() {
+        let rows = 32;
+        let child_len = 64 * 1024;
+        let values = Arc::new(UInt8Array::from(vec![1_u8; child_len])) as ArrayRef;
+        let list_view = ListViewArray::new(
+            Arc::new(Field::new("item", DataType::UInt8, false)),
+            ScalarBuffer::from(vec![0_i32; rows]),
+            ScalarBuffer::from(vec![child_len as i32; rows]),
+            values,
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "shared_observation",
+            list_view.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list_view)]).unwrap();
+        let physical_input_bytes = batch
+            .columns()
+            .iter()
+            .map(|column| column.get_buffer_memory_size())
+            .sum::<usize>();
+        assert!(physical_input_bytes < child_len + 1024);
+
+        let mut encoder = AppendFlightEncoder::new(schema, vec![batch], 2 * 1024);
+        let schema_message = encoder.next().unwrap().unwrap();
+        assert!(schema_message.data_body.is_empty());
+        let first_slice = encoder.next().unwrap().unwrap();
+        assert!(first_slice.data_body.len() >= child_len);
+        assert_eq!(encoder.encoded_slices, 1);
+        assert!(encoder.pending_messages.is_empty());
+        assert_eq!(encoder.current_offset, 1);
     }
 
     #[tokio::test]

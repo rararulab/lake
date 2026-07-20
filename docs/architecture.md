@@ -663,12 +663,15 @@ design-level ones:
   authoritative-table-schema-mismatched input before `DoPut`; exact protobuf
   sizes are accumulated incrementally and stop at the 64 MiB Flight ceiling.
   At most 16 nested Dictionary nodes are resent without hydration, preserving
-  compact values and the exact schema. A conservative 170,001-message ceiling
-  (one schema plus 10,000 rows times one record and 16 dictionaries) bounds both
-  the encoder queue and durable checkpoint framing. Both paths reuse the same
-  UUIDv7 identity, digest, and ambiguous-result retry machinery as scalar/`FILE`
-  inserts. Query-only clients can use this path because existing `DataLocation`
-  values are metadata; no object discovery, upload, or byte proxy occurs.
+  compact values and the exact schema, including nested type widths and field
+  metadata. The IPC encoder yields one gRPC-sized slice at a time so a
+  shared-child ListView cannot queue amplified copies ahead of the size guard.
+  A conservative 170,001-message ceiling (one schema plus 10,000 rows times one
+  record and 16 dictionaries) bounds per-slice fan-out and durable checkpoint
+  framing. Both paths reuse the same UUIDv7 identity, digest, and
+  ambiguous-result retry machinery as scalar/`FILE` inserts. Query-only clients
+  can use this path because existing `DataLocation` values are metadata; no
+  object discovery, upload, or byte proxy occurs.
 - Each stateless Query replica has finite process-local admission: bounded
   concurrent planning/execution, bounded queue wait, a stream-held execution
   deadline, and pre-planning SQL/ticket size checks. Authenticated tenants first

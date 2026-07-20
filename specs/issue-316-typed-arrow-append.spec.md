@@ -51,10 +51,12 @@ Rerun Hub clone, training orchestrator, or cross-table transaction engine.
   array buffer memory at 64 MiB. This caller-local guard prevents a single
   oversized Binary/Utf8 value from first being duplicated into an unbounded
   encoded buffer; exact protobuf size remains the final transport authority.
-- Preserve Dictionary arrays and their exact schema with Flight dictionary
-  resend rather than hydration. Cap nested Dictionary nodes at 16 before any
-  RPC so one encoded input batch has bounded dictionary queue fan-out; compact
-  shared values are never expanded into repeated values in SDK memory.
+- Preserve the caller's exact Arrow schema on the wire, including nested type
+  widths and field metadata. Use the low-level IPC generator rather than the
+  Flight 58 schema-normalization path, and resend Dictionary arrays rather than
+  hydrating them. Cap nested Dictionary nodes at 16 before any RPC so one
+  encoded slice has bounded dictionary fan-out; compact shared values are never
+  expanded into repeated values in SDK memory.
 - Require every supplied batch to have the exact same Arrow schema, including
   field names, order, data types, nullability, and schema metadata. Validate
   this caller-local property before any RPC.
@@ -66,11 +68,14 @@ Rerun Hub clone, training orchestrator, or cross-table transaction engine.
   64 MiB encoded payload ceiling. Collect messages incrementally, stop on the
   first exact protobuf-size overflow, and permit at most 170,001 messages: one
   schema plus, for every accepted row, at most one record message and 16
-  dictionary messages. This conservative formula also bounds the encoder's
-  per-batch queue, and its four-byte-per-message checkpoint framing remains
-  below the existing 1 MiB checkpoint-overhead allowance. The same limit
-  governs checkpoint save/load. The append has one UUIDv7 operation identity,
-  one payload digest, one durable checkpoint, and one table-version result.
+  dictionary messages. Encode and yield one gRPC-sized zero-copy slice at a
+  time, so shared-child ListView layouts cannot materialize all amplified
+  slices before the collector observes its first overflow. The conservative
+  message formula bounds each slice's fan-out, and its four-byte-per-message
+  checkpoint framing remains below the existing 1 MiB checkpoint-overhead
+  allowance. The same limit governs checkpoint save/load. The append has one
+  UUIDv7 operation identity, one payload digest, one durable checkpoint, and
+  one table-version result.
 - Extract one shared append-preparation helper so `append_batches` and the
   existing `insert`/`insert_many` path attach the same command descriptor,
   validate the same payload ceiling, persist the same replay-safe checkpoint,
@@ -185,6 +190,30 @@ Scenario: compact Dictionary input preserves its exact Flight schema
   When bounded append encoding produces and decodes the Flight stream
   Then it resends the compact dictionary, preserves the exact Dictionary
   schema and values, and never allocates the hydrated representation
+
+Scenario: nested Arrow types and field metadata remain exact on the wire
+  Test:
+    Package: lake-sdk
+    Filter: sdk_typed_arrow_append_preserves_large_list_and_union_metadata
+  Level: unit
+  Targets: crates/lake-sdk/src/lib.rs
+  Given one batch with a LargeList field, a sparse Union field carrying outer
+  metadata, and schema metadata
+  When bounded append encoding produces and decodes the Flight stream
+  Then the decoded schema and RecordBatch exactly equal the caller's input,
+  without narrowing LargeList to List or dropping Union field metadata
+
+Scenario: shared-child ListView slices are encoded lazily
+  Test:
+    Package: lake-sdk
+    Filter: sdk_typed_arrow_append_encodes_list_view_slices_lazily
+  Level: unit
+  Targets: crates/lake-sdk/src/lib.rs
+  Given 32 ListView rows all reference one shared child buffer and the test
+  gRPC target makes each row a separate slice
+  When the append encoder yields its schema and first data message
+  Then exactly one slice has been encoded, no later slice is queued, and the
+  encoded-size collector can reject before materializing the remaining slices
 
 Rule: append-recovery — public Arrow writes use the existing durable identity
 
