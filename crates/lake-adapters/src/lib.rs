@@ -14,3 +14,10 @@
 
 //! Bounded, format-neutral metadata adapters for robot recordings.
 
+mod model;
+mod source;
+
+pub use self::{
+    model::{AdapterError, BudgetResource, EpisodeInspectionContext, RecordingAdapter},
+    source::{RandomAccessSource, ReadBudget, SourceError},
+};

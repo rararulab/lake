@@ -48,11 +48,10 @@ Run: `jj commit -m "feat(adapters): scaffold bounded format seam (#323)"`
 - Create: `crates/lake-adapters/src/source.rs`
 - Create: `crates/lake-adapters/src/model.rs`
 - Modify: `crates/lake-adapters/src/lib.rs`
-- Create: `crates/lake-adapters/tests/budget.rs`
 
-**Step 1:** Write failing tests for an in-memory counting source. Cover exact byte/range budgets, a one-byte-short budget, a one-range-short budget, short reads, and invalid ranges. Assert the underlying source is not called for a request that would exceed budget.
+**Step 1:** Write failing unit tests in `source.rs` for an in-memory counting source. Cover exact byte/range budgets, a one-byte-short budget, a one-range-short budget, short reads, and invalid ranges. Assert the underlying source is not called for a request that would exceed budget while keeping the enforcement wrapper crate-private.
 
-Run: `cargo test -p lake-adapters --test budget`
+Run: `cargo test -p lake-adapters source::tests`
 
 Expected: FAIL because the source and budget types do not exist.
 
@@ -69,7 +68,7 @@ Expected: FAIL because the source and budget types do not exist.
 
 **Step 4:** Re-run the focused test.
 
-Run: `cargo test -p lake-adapters --test budget`
+Run: `cargo test -p lake-adapters source::tests`
 
 Expected: PASS.
 
