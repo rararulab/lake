@@ -21,6 +21,10 @@
 shared Cargo target cannot make the workflow-contract binary read files from a
 different Jujutsu checkout.
 
+**Step 1b:** Add `mise_target_directory_is_workspace_isolated` so the default
+Cargo target cannot select an executable compiled by a different Jujutsu
+checkout before the runtime-path contract runs.
+
 **Step 2:** Run `mise exec -- cargo test -p lake-cli --test release_artifacts release_image_workflow_separates_source_and_recipe_for_backfills`; expect failure because the old workflow has one checkout and context `.`.
 
 ### Task 2: Separate recipe from release source
@@ -44,6 +48,21 @@ different Jujutsu checkout.
 **Step 1:** Explain that manual historical backfills dispatched from `main` use the main workflow's Docker recipe while retaining tag source authority, and identify both OCI revision labels.
 
 **Step 2:** Run `mise run spec-lint specs/issue-318-historical-release-image-recipe.spec.md` and `mise run spec-lifecycle specs/issue-318-historical-release-image-recipe.spec.md`.
+
+### Task 3a: Isolate local Cargo artifacts
+
+**Files:**
+- Modify: `mise.toml`
+- Modify: `docs/guides/mise-ci.md`
+
+**Step 1:** Key the cache-resident `CARGO_TARGET_DIR` by a hash of mise's
+active workspace root, retaining incremental builds within one checkout while
+preventing Jujutsu workspaces from sharing test executables with embedded
+source identities.
+
+**Step 2:** Run the new focused contract as a red test, configure the target
+path, then prove the normal shared-environment lifecycle is green after a
+foreign workspace has populated its own target directory.
 
 ### Task 4: Gate and ship
 

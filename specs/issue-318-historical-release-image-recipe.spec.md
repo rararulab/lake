@@ -33,6 +33,7 @@ authority mutable.
 
 ### Allowed Changes
 - .github/workflows/release-image.yml
+- mise.toml
 - crates/lake-cli/tests/release_artifacts.rs
 - docs/guides/mise-ci.md
 - docs/plans/2026-07-20-historical-release-image-recipe.md
@@ -91,8 +92,17 @@ Scenario: Workflow contract follows the invoking Jujutsu workspace
   Given a cached release-artifact test executable from a different Jujutsu
   workspace
   When the contract runs from the candidate workspace
-  Then it resolves workflow and documentation files from that invocation
-  workspace rather than a compile-time checkout path
+   Then it resolves workflow and documentation files from that invocation
+   workspace rather than a compile-time checkout path
+
+Scenario: Cargo target cache is isolated by Jujutsu workspace
+  Test:
+    Package: lake-cli
+    Filter: mise_target_directory_is_workspace_isolated
+  Given independent Jujutsu workspaces with a shared XDG cache root
+  When either workspace invokes a lane-1 Cargo selector
+  Then its target directory includes a stable hash of the active workspace
+  and cannot reuse a test executable compiled by another checkout
 
 ## Out of Scope
 

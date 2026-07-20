@@ -13,14 +13,15 @@ first.
   second copy of cargo / formatter / linter commands.
 - Rust stays under `rustup` and `rust-toolchain.toml`; mise does not manage
   Rust for this repo.
-- Local mise tasks put Rust artifacts in the user's XDG cache at
-  `lake/target`, rather than in each jj workspace. Cargo's normal fingerprints
-  and target-directory lock keep concurrent revisions correct; the cache is
-  untracked, contains no credentials or source data, and may be deleted to
+- Local mise tasks put Rust artifacts in the user's XDG cache under
+  `lake/target/<workspace-hash>`, rather than in each jj workspace. The hash
+  gives every physical Jujutsu checkout an isolated Cargo target directory:
+  Cargo may reuse incremental artifacts across commits in that checkout, but
+  can never select a test executable compiled by another checkout. The cache
+  is untracked, contains no credentials or source data, and may be deleted to
   force a cold rebuild. CI remains ephemeral and sets its own incremental
-  policy. Tests that inspect repository artifacts must resolve them from the
-  invocation workspace, never compile-time source paths, so a reused test
-  executable cannot read a different jj workspace.
+  policy. Tests that inspect repository artifacts must also resolve them from
+  the invocation workspace, never compile-time source paths.
 - **Local-first**: the comprehensive gate runs LOCALLY (`mise run ship`, which
   runs `mise run ci` — gate + dependency policy + doc + spec-selftest +
   LocalStack integration — then a conventional-commit check, then push through
