@@ -155,10 +155,12 @@ first.
 Release Please maintains one repository release for the entire lake workspace.
 It does not publish the internal crates, which remain `publish = false`.
 
-- `.github/workflows/release-please.yml` runs after a push to `main`. It also
-  exposes `workflow_dispatch` as the recovery path when GitHub delayed or
-  missed a push event; dispatch it on `main`, never by hand-editing release
-  files or tags.
+- `.github/workflows/release-please.yml` runs after a push to `main` and on an
+  hourly, off-the-hour reconciliation schedule. The scheduled run reuses the
+  same idempotent Release Please authority after a transient GitHub API or
+  Actions failure. `workflow_dispatch` remains the immediate recovery path
+  when GitHub delayed or missed a push event; dispatch it on `main`, never by
+  hand-editing release files or tags.
 - `release-please-config.json` uses the `simple` strategy because upstream
   release-please cannot currently process Cargo members that inherit
   `version.workspace = true` through its `cargo-workspace` plugin

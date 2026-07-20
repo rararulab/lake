@@ -332,6 +332,46 @@ fn release_please_dispatches_image_publication_for_root_release() {
 }
 
 #[test]
+fn release_please_has_automatic_recovery_triggers() {
+    let workflow = release_please_workflow();
+    let triggers = &workflow["on"];
+    let trigger_map = triggers.as_mapping().expect("Release Please triggers");
+    assert!(
+        triggers["push"]["branches"]
+            .as_sequence()
+            .is_some_and(|branches| branches
+                .iter()
+                .any(|branch| branch.as_str() == Some("main")))
+    );
+    assert!(trigger_map.contains_key(Value::String("workflow_dispatch".into())));
+    assert!(
+        triggers["schedule"]
+            .as_sequence()
+            .is_some_and(|schedules| schedules
+                .iter()
+                .any(|schedule| schedule["cron"].as_str() == Some("17 * * * *"))),
+        "Release Please must retry its existing authority hourly after a transient platform \
+         failure"
+    );
+
+    let steps = workflow["jobs"]["release"]["steps"]
+        .as_sequence()
+        .expect("Release Please steps");
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| {
+                step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("googleapis/release-please-action@"))
+            })
+            .count(),
+        1,
+        "scheduled recovery must reuse the existing Release Please authority"
+    );
+}
+
+#[test]
 fn release_please_covers_every_workspace_lockfile_package() {
     let workspace_version = workspace_version();
     let lockfile_selectors = release_lockfile_selectors();
