@@ -1,121 +1,188 @@
 # Verification report — issue #316
 
 - base_sha: 3729455699c7d9ed28b7b57263ab8abf5a283a50
-- head_sha: 680f2c2c206ee0d671d412e979772d9166ba08b6
-- workspace_carrier_sha: abeaf5e9324557e6e230eadd035135ffde65a20d
+- head_sha: 7947d1c29a9ff1d52d9d1ae541a43b813aba972b
 - score_authority: verifier
 - implementer_evidence: self_check_only
-
-`head_sha` is the product commit (`@-`) whose tree was verified. The workspace
-revision `@` was the empty carrier commit `abeaf5e9…`; `jj diff --from @- --to
-@ --summary` produced no output, so both revisions had the same candidate tree.
-The colocated repository's Git `HEAD` was
-`3e37a4a324d986b813479d8ece9af884cc20866e`, which belonged to another
-workspace and was deliberately not used as the candidate. The base is
-`heads(::@ & ::main@origin)` at verification time.
+- lane: 1
+- spec: `specs/issue-316-typed-arrow-append.spec.md`
+- candidate_workspace: `/Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append`
+- candidate_revision_note: workspace `@` was empty carrier `8694924734d78bcdbf61c89730889d62c0bdf752`; every artifact/diff assertion was pinned to its exact parent repair commit `7947d1c29a9ff1d52d9d1ae541a43b813aba972b`. Plain Git HEAD was not used because it resolved to another colocated checkout.
+- context_isolation: the prompt disclosed only prior product/report commit identifiers, not their evidence. No implementer/reviewer hand-off or prior report content was read or trusted.
 
 ## Commands
 
-### Candidate identity and clean state
+### Environment and revision pin
+
+`mise run doctor`
 
 ```text
-$ jj st
-The working copy has no changes.
-Working copy  (@) : kmvmwukx abeaf5e9 (empty) (no description set)
-Parent commit (@-): llqqkslz 680f2c2c feat(sdk): append generic typed Arrow batches (#316)
-
-$ jj log -r '@|@-|heads(::@ & ::main@origin)' --no-graph -T '<change> <commit> <bookmarks> | <description>'
-kmvmwukxlzss abeaf5e9324557e6e230eadd035135ffde65a20d  |
-llqqkslzxusq 680f2c2c206ee0d671d412e979772d9166ba08b6  | feat(sdk): append generic typed Arrow batches (#316)
-zpunyvupkmuy 3729455699c7d9ed28b7b57263ab8abf5a283a50 main | fix(release): schedule Release Please recovery (#313) (#317)
-
-$ jj diff --from @- --to @ --summary
-<no output>
-
-$ git rev-parse HEAD
-3e37a4a324d986b813479d8ece9af884cc20866e
+[ ok ] mise tools installed
+[ ok ] nightly rustfmt
+[ ok ] cargo check
+[ ok ] jj repo: /Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append
+[ ok ] gh authenticated
+[ ok ] git remote: origin
 ```
 
-All changed paths were within the spec's allowlist: `README.md`,
-`crates/lake-sdk/**`, `docs/architecture.md`,
-`docs/design/robot-training-lakehouse.md`, and the issue spec.
+`jj st`
+
+```text
+The working copy has no changes.
+Working copy  (@) : ppuyqrwz 86949247 (empty) (no description set)
+Parent commit (@-): zpnkkqkr 7947d1c2 fix(sdk): bound typed Arrow append encoding (#316)
+```
+
+`jj log --no-graph -r '@|@-|7947d1c29a9ff1d52d9d1ae541a43b813aba972b|3729455699c7d9ed28b7b57263ab8abf5a283a50' -T 'commit_id ++ " " ++ change_id ++ " " ++ description.first_line() ++ "\n"'`
+
+```text
+8694924734d78bcdbf61c89730889d62c0bdf752 ppuyqrwzyquprvrskuxmzutvusqlwkpt
+7947d1c29a9ff1d52d9d1ae541a43b813aba972b zpnkkqkrsynvvrkpvttzzrqlzsqxyqtu fix(sdk): bound typed Arrow append encoding (#316)
+3729455699c7d9ed28b7b57263ab8abf5a283a50 zpunyvupkmuymuntvlpmlmyvosqolwqq fix(release): schedule Release Please recovery (#313) (#317)
+```
+
+`git merge-base 7947d1c29a9ff1d52d9d1ae541a43b813aba972b origin/main`
+
+```text
+3729455699c7d9ed28b7b57263ab8abf5a283a50
+```
 
 ### Candidate quality gate
 
-Before each runtime boot, the candidate workspace's exact `data/` directory
-was removed after confirming that no process held it.
+An initial attempt to set `CARGO_TARGET_DIR` outside `mise` was explicitly disqualified because project `[env]` overrode it; its raw executable path exposed the mistake:
+
+`CARGO_TARGET_DIR=/tmp/lake-verify-316-candidate-target.1C33ii mise run gate`
 
 ```text
-$ rm -rf /Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append/data && mise run gate
-[hooks] $ prek run --all-files
-[test] $ cargo test --workspace --all-targets
-[e2e] $ cargo run -p lake-cli -- selftest
+[e2e]      Running `/Users/ryan/Library/Caches/lake/target/debug/lake selftest`
+Finished in 35.16s
+```
+
+No base build ever used that shared target. A temporary `cargo` wrapper was then verified with `cargo metadata` to force the isolated target for every nested `mise` cargo invocation.
+
+Cold-build candidate run from an empty isolated target:
+
+`LAKE_VERIFY_TARGET=/tmp/lake-verify-316-candidate-target.1C33ii PATH=/tmp/lake-verify-316-bin:$PATH mise run gate`
+
+```text
+[test-adbc] test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 2.59s
+[test] running 72 tests
+[test] test result: ok. 69 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 11.64s
+[test] Finished in 379.80s
+Finished in 379.81s
+```
+
+That run proved a cold, isolated build but inherited data created by the disqualified attempt, so its e2e result was not counted as cold-boot evidence. The complete gate was rerun after deleting the workspace data directory:
+
+`rm -rf /Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append/data && test ! -e /Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append/data && LAKE_VERIFY_TARGET=/tmp/lake-verify-316-candidate-target.1C33ii PATH=/tmp/lake-verify-316-bin:$PATH mise run gate`
+
+```text
 [site-check] Result (24 files):
 [site-check] - 0 errors
 [site-check] - 0 warnings
 [site-check] - 0 hints
-[test-adbc] test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.66s
+[site-check] All matched files use Prettier code style!
+[site-check] Checked 8 generated site artifacts.
+[test-adbc] test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.74s
 [e2e] created table robots.episodes
 [e2e] committed robots.episodes at v2
 [e2e] | alpha    | 2        | 0.8        |
 [e2e] | beta     | 1        | 0.4        |
 [e2e] self-check ok
-[test] running 68 tests
-[test] test tests::sdk_typed_arrow_append_rejects_invalid_batches_before_put ... ok
-[test] test tests::sdk_typed_arrow_append_commits_episode_artifact_bundle ... ok
-[test] test tests::sdk_typed_arrow_append_reuses_durable_idempotent_transport ... ok
-[test] test result: ok. 65 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 11.59s
-[test] Finished in 35.27s
-Finished in 35.28s
+[test] running 72 tests
+[test] test result: ok. 69 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 11.59s
+[test] Finished in 34.40s
+Finished in 34.41s
 ```
 
-The `prek` step reported both Rust hooks as skipped because its Git-based file
-selection saw the unrelated shared Git `HEAD`. Direct candidate-tree checks
-closed that multi-workspace false-green path:
+All other `cargo test --workspace --all-targets` result lines in the same gate were `ok` with zero failures.
+
+### Direct formatting and lint
+
+`LAKE_VERIFY_TARGET=/tmp/lake-verify-316-candidate-target.1C33ii PATH=/tmp/lake-verify-316-bin:$PATH cargo +nightly fmt --all -- --check`
 
 ```text
-$ cargo +nightly fmt --all -- --check
-<no output; exit 0>
+exit 0; no stdout/stderr
+```
 
-$ cargo clippy -p lake-sdk --all-targets --all-features --no-deps -- -D warnings
+`LAKE_VERIFY_TARGET=/tmp/lake-verify-316-candidate-target.1C33ii PATH=/tmp/lake-verify-316-bin:$PATH cargo clippy -p lake-sdk --all-targets --all-features --no-deps -- -D warnings`
+
+```text
     Checking lake-sdk v1.8.4 (/Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append/crates/lake-sdk)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.19s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 08s
 ```
 
-### Candidate spec lifecycle and every selector
+### Lane 1 lifecycle and selectors
+
+`LAKE_VERIFY_TARGET=/tmp/lake-verify-316-candidate-target.1C33ii PATH=/tmp/lake-verify-316-bin:$PATH mise run spec-lifecycle specs/issue-316-typed-arrow-append.spec.md`
 
 ```text
-$ mise run spec-lifecycle specs/issue-316-typed-arrow-append.spec.md
-[spec-lifecycle] $ bun scripts/spec-lifecycle-guard.ts "${usage_spec?}"
 === Lifecycle Report (guarded) ===
 Spec: typed-arrow-append  stage: complete  passed: true
   [PASS] Episode and ArtifactRef rows append through a Query-only SDK
   [PASS] invalid Arrow input fails before append side effects
+  [PASS] Arrow input memory and batch fan-out are bounded before schema lookup
+  [PASS] encoded Flight collection stops at the exact payload ceiling
   [PASS] an ambiguous Arrow append converges without a duplicate commit
+  [PASS] checkpointing accepts the same maximum batch partition as memory-only preparation
 spec-lifecycle-guard: OK — every Test selector executed >=1 test
-
-$ cargo test -p lake-sdk sdk_typed_arrow_append_commits_episode_artifact_bundle
-running 1 test
-test tests::sdk_typed_arrow_append_commits_episode_artifact_bundle ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 67 filtered out; finished in 0.67s
-
-$ cargo test -p lake-sdk sdk_typed_arrow_append_rejects_invalid_batches_before_put
-running 1 test
-test tests::sdk_typed_arrow_append_rejects_invalid_batches_before_put ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 67 filtered out; finished in 0.32s
-
-$ cargo test -p lake-sdk sdk_typed_arrow_append_reuses_durable_idempotent_transport
-running 1 test
-test tests::sdk_typed_arrow_append_reuses_durable_idempotent_transport ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 67 filtered out; finished in 0.47s
 ```
 
-### Fresh cold boot
+Each acceptance selector was then run directly:
+
+`cargo test -p lake-sdk sdk_typed_arrow_append_commits_episode_artifact_bundle`
 
 ```text
-$ rm -rf /Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append/data && cargo run -p lake-cli -- selftest
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.22s
-     Running `target/debug/lake selftest`
+running 1 test
+test tests::sdk_typed_arrow_append_commits_episode_artifact_bundle ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.35s
+```
+
+`cargo test -p lake-sdk sdk_typed_arrow_append_rejects_invalid_batches_before_put`
+
+```text
+running 1 test
+test tests::sdk_typed_arrow_append_rejects_invalid_batches_before_put ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.32s
+```
+
+`cargo test -p lake-sdk sdk_typed_arrow_append_rejects_unbounded_inputs_before_schema_rpc`
+
+```text
+running 1 test
+test tests::sdk_typed_arrow_append_rejects_unbounded_inputs_before_schema_rpc ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.00s
+```
+
+`cargo test -p lake-sdk sdk_typed_arrow_append_stops_encoding_at_payload_limit`
+
+```text
+running 1 test
+test tests::sdk_typed_arrow_append_stops_encoding_at_payload_limit ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.00s
+```
+
+`cargo test -p lake-sdk sdk_typed_arrow_append_reuses_durable_idempotent_transport`
+
+```text
+running 1 test
+test tests::sdk_typed_arrow_append_reuses_durable_idempotent_transport ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.47s
+```
+
+`cargo test -p lake-sdk sdk_typed_arrow_append_checkpoint_partition_boundary_is_consistent`
+
+```text
+running 1 test
+test tests::sdk_typed_arrow_append_checkpoint_partition_boundary_is_consistent ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.14s
+```
+
+### Fresh boot
+
+`rm -rf /Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append/data && test ! -e /Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append/data && LAKE_VERIFY_TARGET=/tmp/lake-verify-316-candidate-target.1C33ii PATH=/tmp/lake-verify-316-bin:$PATH cargo run -p lake-cli -- selftest`
+
+```text
 created table robots.episodes
 committed robots.episodes at v2
 +----------+----------+------------+
@@ -127,131 +194,158 @@ committed robots.episodes at v2
 self-check ok
 ```
 
-The changed path itself was driven end to end by the first selector and the
-hostile driver: public Query-only `LakeClient::append_batches` wrote one
-operation through Query/Metasrv, and normal public SQL read the committed rows
-back in the same fresh process. No managed stage or object-store credential was
-constructed by that client.
+### Additional candidate regressions
 
-### Hostile probe driver
-
-The driver was a throwaway crate under `/tmp`, linked by path to the exact
-candidate crates. Its source and RocksDB/Lance state were removed after the
-run; no workspace implementation file was changed.
+`cargo test -p lake-sdk durable_checkpoint_accepts_maximum_typed_append_partition`
 
 ```text
-$ cargo run --quiet
-warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
-  |
-  = note: `#[warn(linker_messages)]` on by default
-
-probe-cjk-multibatch: PASS version=2 rows_read=2 values=回合-一,回合-二
-probe-exact-upper-bound: PASS version=3 appended_rows=10000 total_rows_read=10004
-probe-schema-metadata-mismatch: PASS error=TableSchemaMismatch version_unchanged=3
+running 1 test
+test append_checkpoint::tests::durable_checkpoint_accepts_maximum_typed_append_partition ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.09s
 ```
 
-### Base transition and regression baseline
-
-A fresh temporary jj workspace was created with product parent exactly
-`3729455699c7d9ed28b7b57263ab8abf5a283a50`; its generated empty workspace
-carrier was `93f6eda64e1a3928b67d7a7a0e39beaf79560ab0` and had the base tree. The
-temporary workspace and its runtime data were removed after verification.
+`cargo test -p lake-sdk sdk_batch_insert`
 
 ```text
-$ jj st
-The working copy has no changes.
-Working copy  (@) : tzwrxvsk 93f6eda6 (empty) (no description set)
-Parent commit (@-): zpunyvup 37294556 main | fix(release): schedule Release Please recovery (#313) (#317)
+running 4 tests
+test tests::sdk_batch_insert_flight_bound_uses_protobuf_size ... ok
+test tests::sdk_batch_insert_rejects_empty_and_excessive_batches ... ok
+test tests::sdk_batch_insert_validates_every_row_before_upload ... ok
+test tests::sdk_batch_insert_commits_multiple_files_as_one_version ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 68 filtered out; finished in 0.68s
+```
 
-$ rm -rf /Users/ryan/code/rararulab/lake/.worktrees/verify-issue316-base/data && mise run gate
-[hooks] cargo fmt............................................(no files to check)Skipped
-[hooks] cargo clippy.........................................(no files to check)Skipped
-[site-check] Result (24 files):
-[site-check] - 0 errors
-[site-check] - 0 warnings
-[site-check] - 0 hints
-[test-adbc] test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 22.64s
-[e2e] created table robots.episodes
-[e2e] committed robots.episodes at v2
-[e2e] self-check ok
-[test] running 65 tests
-[test] test result: ok. 62 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 11.19s
-[test] Finished in 315.69s
-Finished in 315.70s
+### Throwaway public-API hostile driver
 
-$ cargo test -p lake-sdk sdk_typed_arrow_append_commits_episode_artifact_bundle
+The uncommitted driver lived only under `/tmp`, depended on the exact candidate workspace, and was removed after execution.
+
+`cargo run --manifest-path /tmp/lake-verify-316-probe/Cargo.toml`
+
+```text
+single zero-row batch: typed EmptyBatch(index=0), schema_rpcs=0
+one row + 9999 zero-row batches: typed EmptyBatch(index=1), schema_rpcs=0
+>64MiB Binary buffer: typed BatchInputSize, schema_rpcs=0
+>64MiB Utf8 buffer: typed BatchInputSize, schema_rpcs=0
+one-row lower boundary: committed v2
+CJK multi-batch append: committed two batches atomically at v3
+10000-row upper boundary: committed v4
+schema metadata mismatch: typed TableSchemaMismatch, version remains v4
+shared insert/insert_many + SQL reload: v6, 10006 exact rows, CJK preserved
+all issue-316 throwaway hostile probes passed
+```
+
+### Exact-base transition
+
+Temporary base workspace: `/tmp/lake-verify-316-base.Si93eZ/ws`, empty `@` with exact parent `3729455699c7d9ed28b7b57263ab8abf5a283a50`. All Cargo invocations used the initially empty, base-only target `/tmp/lake-verify-316-base-target.N8qsdk`; the candidate/shared target was never used.
+
+Each of the six direct selector commands was run at exact base. Their identical result was:
+
+```text
 running 0 tests
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 65 filtered out; finished in 0.00s
+```
 
-$ cargo test -p lake-sdk sdk_typed_arrow_append_rejects_invalid_batches_before_put
-running 0 tests
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 65 filtered out; finished in 0.00s
+The six commands were:
 
-$ cargo test -p lake-sdk sdk_typed_arrow_append_reuses_durable_idempotent_transport
-running 0 tests
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 65 filtered out; finished in 0.00s
+```text
+cargo test -p lake-sdk sdk_typed_arrow_append_commits_episode_artifact_bundle
+cargo test -p lake-sdk sdk_typed_arrow_append_rejects_invalid_batches_before_put
+cargo test -p lake-sdk sdk_typed_arrow_append_rejects_unbounded_inputs_before_schema_rpc
+cargo test -p lake-sdk sdk_typed_arrow_append_stops_encoding_at_payload_limit
+cargo test -p lake-sdk sdk_typed_arrow_append_reuses_durable_idempotent_transport
+cargo test -p lake-sdk sdk_typed_arrow_append_checkpoint_partition_boundary_is_consistent
+```
 
-$ mise run spec-lifecycle /Users/ryan/code/rararulab/lake/.worktrees/issue-316-typed-arrow-append/specs/issue-316-typed-arrow-append.spec.md
+The candidate guard/spec was then driven against exact-base code with absolute `bun` and `agent-spec` paths:
+
+`bun scripts/spec-lifecycle-guard.ts specs/issue-316-typed-arrow-append.spec.md` (candidate guard/spec, `--code .` resolving the base workspace)
+
+```text
 === Lifecycle Report (guarded) ===
 Spec: typed-arrow-append  stage: complete  passed: true
   [PASS] Episode and ArtifactRef rows append through a Query-only SDK
   [PASS] invalid Arrow input fails before append side effects
+  [PASS] Arrow input memory and batch fan-out are bounded before schema lookup
+  [PASS] encoded Flight collection stops at the exact payload ceiling
   [PASS] an ambiguous Arrow append converges without a duplicate commit
+  [PASS] checkpointing accepts the same maximum batch partition as memory-only preparation
 
 spec-lifecycle-guard: FAIL — Test selector(s) matched ZERO tests (0 passed; filtered out):
   - Episode and ArtifactRef rows append through a Query-only SDK
   - invalid Arrow input fails before append side effects
+  - Arrow input memory and batch fan-out are bounded before schema lookup
+  - encoded Flight collection stops at the exact payload ceiling
   - an ambiguous Arrow append converges without a duplicate commit
+  - checkpointing accepts the same maximum batch partition as memory-only preparation
 Every lane-1 Test: selector must resolve to >=1 real test function — see specs/README.md.
-[spec-lifecycle] ERROR task failed
 ```
 
-The first attempt to run the base gate from an external `/tmp` jj workspace
-failed before tests because `prek` could not find a Git ancestor. The exact
-base was recreated under the repository's standard `.worktrees/` directory;
-the successful clean gate above is the base evidence used for scoring.
+Exit status: 1, expected rejection.
+
+`cargo test -p lake-sdk` at exact base:
+
+```text
+running 65 tests
+test result: ok. 62 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 11.73s
+```
+
+The exact base already had a committed verifier artifact at `14356d08badd9c035cbe898ec0c88649620ec9c6`; its contents were not read. Per the role contract and repair instructions, the full base gate was not redundantly rerun. The affected crate's complete old suite and all six guarded transitions were rerun independently.
 
 ## Transition matrix
 
 - fail_to_pass:
-  - `sdk_typed_arrow_append_commits_episode_artifact_bundle`: base matched zero
-    tests and the guard failed; head executed 1 test and passed, including
-    Query-only append plus public SQL readback.
-  - `sdk_typed_arrow_append_rejects_invalid_batches_before_put`: base matched
-    zero tests and the guard failed; head executed 1 test and passed all local
-    and authoritative schema rejection cases without publishing a version.
-  - `sdk_typed_arrow_append_reuses_durable_idempotent_transport`: base matched
-    zero tests and the guard failed; head executed 1 test and passed checkpoint
-    reload, identical payload reuse, ambiguous retry convergence, exactly one
-    committed version, and checkpoint cleanup.
-- pass_to_fail: 0. Base and head full gates both completed with zero failed
-  tests; the head lake-sdk count is exactly the base's 62 passing tests plus
-  the 3 new passing selectors (65 total), with the same 3 ignored tests.
+  - Base: every one of the six spec selectors matched zero tests; the guard rejected all six with exit 1.
+  - Repair head: every selector executed exactly one test and passed; the guarded lifecycle reported six PASS results and `spec-lifecycle-guard: OK`.
+  - Expected vs observed: expected the new public typed append, local input bounds, incremental encoded bound, durable retry, and checkpoint partition behavior to be absent at base and present at repair; observed exactly that transition.
+- pass_to_fail: 0.
+  - Exact base `lake-sdk`: 62 passed, 0 failed, 3 ignored.
+  - Repair `lake-sdk`: 69 passed, 0 failed, 3 ignored.
+  - Repair full workspace gate: zero failures; direct fmt and clippy: exit 0.
 
 ## Probes
 
-1. CJK plus multi-batch input
-   - Input: two exact-schema Episode/ArtifactRef batches in one call, with
-     `回合-一` / `回合-二`, `机械臂-甲` / `机械臂-乙`, and CJK task/layer values.
-   - Expected: one version commits all rows and SQL returns the original UTF-8
-     values.
-   - Observed: `Version(2)`, two Episode rows read back exactly; PASS.
-2. Exact aggregate upper boundary
-   - Input: one exact-schema RecordBatch with exactly 10,000 rows.
-   - Expected: accepted (the limit is inclusive), one new version, all rows
-     queryable.
-   - Observed: `Version(3)` and SQL `COUNT(*) = 10,004` after the prior four
-     rows; PASS.
-3. Schema metadata mismatch
-   - Input: fields, order, data types, and arrays identical to the authoritative
-     schema, but with one extra schema metadata key.
-   - Expected: typed exact-schema rejection and no append side effect.
-   - Observed: `SdkError::TableSchemaMismatch`; table stayed at `Version(3)`;
-     PASS.
+1. Single and fan-out zero-row batches before schema RPC
+   - Input: one zero-row batch; then one valid row followed by 9,999 zero-row batches.
+   - Expected: typed `EmptyBatch`, no schema RPC, no Flight encoding/put.
+   - Observed: `EmptyBatch(index=0)` and `EmptyBatch(index=1)` respectively; schema RPC counter stayed 0.
+   - PASS.
+
+2. Oversized caller buffers before schema RPC/Flight encoding
+   - Input: one-row Binary and Utf8 batches whose Arrow buffer memory exceeded 64 MiB.
+   - Expected: typed `BatchInputSize`, schema RPC counter 0.
+   - Observed: both returned `BatchInputSize`; schema RPC counter stayed 0.
+   - PASS.
+
+3. Incremental Flight collection
+   - Input: three-message observable stream, with the second message crossing the exact protobuf-size ceiling.
+   - Expected: reject on message two and never poll message three.
+   - Observed: direct selector passed its `polled == 2` assertion.
+   - PASS.
+
+4. Memory/durable framing parity
+   - Input: schema + 4,096 record messages with checkpointing off/on; separately the derived maximum 10,001 messages.
+   - Expected: both modes accept, durable reload byte-for-byte exact, maximum framing accepted.
+   - Observed: spec selector and 10,001-message checkpoint regression both passed.
+   - PASS.
+
+5. Public runtime boundaries and exact schema
+   - Input: 1 row, two CJK batches, 10,000 rows, then identical fields with mismatched schema metadata.
+   - Expected: valid boundaries commit atomically; CJK survives; metadata mismatch is typed and publishes nothing.
+   - Observed: versions advanced v2, v3, v4; mismatch returned `TableSchemaMismatch` and stayed v4; SQL reload preserved CJK.
+   - PASS.
+
+6. Durable ambiguity and shared scalar append path
+   - Input: lost first typed append result; then public `insert` and `insert_many` after typed batches.
+   - Expected: retry reuses one durable identity and commits once; shared legacy path remains functional.
+   - Observed: ambiguous selector retried twice and ended at one v2 commit with checkpoint removed; throwaway runtime advanced scalar writes to v6 and reloaded exactly 10,006 rows; `sdk_batch_insert` was 4/4.
+   - PASS.
+
+## Cleanup
+
+- Temporary base workspace was forgotten with `jj workspace forget verify-316-base-Si93eZ`.
+- Temporary base workspace, base target, candidate target, throwaway probe, cargo wrapper, and candidate `data/` were removed.
+- No temporary base Cargo command used `/Users/ryan/Library/Caches/lake/target`.
 
 ## Verdict
 
-PASS — the exact product head passes the clean gate, guarded lane-1 lifecycle,
-all selectors, fresh cold boot, end-to-end Query-only write/read drive, and all
-three hostile probes; all three expected base failures became real passing
-tests and `pass_to_fail` is 0.
+PASS — exact repair head `7947d1c29a9ff1d52d9d1ae541a43b813aba972b` passes the isolated full gate, six guarded Lane 1 criteria, fresh boot, hostile bounds/reload probes, and exact-base fail-to-pass transition with `pass_to_fail = 0`.
