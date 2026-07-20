@@ -199,6 +199,32 @@ fn release_image_workflow_reuses_scoped_build_cache() {
 }
 
 #[test]
+fn release_image_caches_rust_dependencies_before_copying_application_sources() {
+    let dockerfile = read("Dockerfile");
+    let install = dockerfile
+        .find("cargo install cargo-chef --locked --version")
+        .expect("Docker build must pin cargo-chef");
+    let prepare = dockerfile
+        .find("cargo chef prepare --recipe-path recipe.json")
+        .expect("Docker build must prepare a dependency recipe");
+    let cook = dockerfile
+        .find("cargo chef cook --release --recipe-path recipe.json")
+        .expect("Docker build must cook the dependency recipe");
+    let application = dockerfile
+        .rfind("COPY . .")
+        .expect("Docker build must copy application sources after cooking dependencies");
+    let build = dockerfile
+        .rfind("cargo build --locked --release --package lake-cli --bin lake")
+        .expect("Docker build must compile lake after copying application sources");
+
+    assert!(install < prepare && prepare < cook && cook < application && application < build);
+    assert!(
+        !dockerfile[cook..application].contains("--mount=type=cache,target=/src/target"),
+        "the cooked target must be part of an exportable BuildKit layer"
+    );
+}
+
+#[test]
 fn release_workflows_have_explicit_execution_budgets() {
     let ci = ci_workflow();
     let jobs = ci["jobs"].as_mapping().expect("CI jobs");
