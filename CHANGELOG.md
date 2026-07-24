@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.9.0](https://github.com/rararulab/lake/compare/v1.8.4...v1.9.0) (2026-07-24)
+
+
+### Features
+
+* **robotics:** define EpisodeManifest v1 contract ([#308](https://github.com/rararulab/lake/issues/308)) ([#315](https://github.com/rararulab/lake/issues/315)) ([2dca0bc](https://github.com/rararulab/lake/commit/2dca0bc8766bda1de4955a80427a82e0fd2bf926))
+* **sdk:** append generic typed Arrow batches ([#316](https://github.com/rararulab/lake/issues/316)) ([#322](https://github.com/rararulab/lake/issues/322)) ([b47110e](https://github.com/rararulab/lake/commit/b47110ed18e7e889b40cd8cee1dc577c69f0b4d5))
+
+
+### Bug Fixes
+
+* **ci:** bound Iceberg and release workflow execution ([#303](https://github.com/rararulab/lake/issues/303)) ([#304](https://github.com/rararulab/lake/issues/304)) ([b35fca1](https://github.com/rararulab/lake/commit/b35fca19ac02ce31e4427a88088e865e05242e40))
+* **ci:** restore formatting gate ([#306](https://github.com/rararulab/lake/issues/306)) ([#309](https://github.com/rararulab/lake/issues/309)) ([3e37a4a](https://github.com/rararulab/lake/commit/3e37a4a324d986b813479d8ece9af884cc20866e))
+* **release:** hydrate Cargo-chef path dependency ([#321](https://github.com/rararulab/lake/issues/321)) ([#324](https://github.com/rararulab/lake/issues/324)) ([b17d12a](https://github.com/rararulab/lake/commit/b17d12a9e271abcf2b55fe9dcc4355181f643647))
+* **release:** recover historical image builds ([#318](https://github.com/rararulab/lake/issues/318)) ([#320](https://github.com/rararulab/lake/issues/320)) ([aa72839](https://github.com/rararulab/lake/commit/aa728397515ba88163c82c3e010f2aeb4bead0ea))
+* **release:** schedule Release Please recovery ([#313](https://github.com/rararulab/lake/issues/313)) ([#317](https://github.com/rararulab/lake/issues/317)) ([3729455](https://github.com/rararulab/lake/commit/3729455699c7d9ed28b7b57263ab8abf5a283a50))
+* **site:** use AstroPaper visual theme ([#319](https://github.com/rararulab/lake/issues/319)) ([92e5fcf](https://github.com/rararulab/lake/commit/92e5fcfe32ac52de5807471e1c7f21802d64511f))
+* **tooling:** share Cargo target artifacts across jj workspaces ([#326](https://github.com/rararulab/lake/issues/326)) ([#329](https://github.com/rararulab/lake/issues/329)) ([60b4707](https://github.com/rararulab/lake/commit/60b4707800b71514e7ce8212110905c075012833))
+
+
+### Performance Improvements
+
+* **release:** cache Rust dependency image layers ([#311](https://github.com/rararulab/lake/issues/311)) ([#312](https://github.com/rararulab/lake/issues/312)) ([98e1667](https://github.com/rararulab/lake/commit/98e1667e7afc39279715e2001a20ea0e029970e1))
+
 ## [1.8.4](https://github.com/rararulab/lake/compare/v1.8.3...v1.8.4) (2026-07-19)
 
 
